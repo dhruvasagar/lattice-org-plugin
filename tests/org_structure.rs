@@ -781,3 +781,143 @@ async fn org_chords_are_scoped_to_org_buffers() {
 
     let _ = chord("x"); // keep the helper used if the assertions above change
 }
+
+// ── OM.6: subtree move, meta-return, toggle heading ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_subtree_carries_its_children_and_swaps_with_a_sibling() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Root\n** One\nbody one\n** Two\n*** Kid\n** Three\n",
+    )
+    .await;
+
+    // From `** Two`, move up: it trades places with `** One`, and `*** Kid`
+    // travels with it rather than being left behind under `** One`.
+    goto_line(&mut editor, 3);
+    press(&mut editor, "<leader>oK");
+    assert_eq!(
+        text(&editor),
+        "* Root\n** Two\n*** Kid\n** One\nbody one\n** Three\n",
+        "the subtree moved whole, and the sibling it passed stayed intact"
+    );
+
+    // And back down again: the pair of chords is an identity.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>oJ");
+    assert_eq!(
+        text(&editor),
+        "* Root\n** One\nbody one\n** Two\n*** Kid\n** Three\n",
+        "moving back down restores the original order"
+    );
+}
+
+/// At either end of the sibling chain the chord CONSUMES the key and does
+/// nothing — it does not decline.
+///
+/// This is the test that caught the difference. When these actions returned
+/// `Effect::Declined`, the dispatcher re-resolved the sequence with org's
+/// layer removed and ran its trailing key on its own: `<leader>oJ` executed
+/// vim's `J` and joined two lines. A chord that found no sibling to move must
+/// not edit the buffer. `<Tab>` still declines (OM.5) because it has a real
+/// meaning to fall through to; a `<leader>o`-prefixed chord has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_past_the_end_of_the_sibling_chain_consumes_the_key() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Root\n** Only child\n* Next root\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    // `** Only child` has no sibling in either direction — `* Next root` is
+    // shallower, so it is a parent boundary, not a peer.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>oK");
+    assert_eq!(
+        text(&editor),
+        original,
+        "no sibling above: nothing happened"
+    );
+    press(&mut editor, "<leader>oJ");
+    assert_eq!(
+        text(&editor),
+        original,
+        "no sibling below either — and crucially `J` did not join these lines"
+    );
+}
+
+/// A move is ONE edit, so `u` restores both subtrees together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subtree_move_is_one_undo_step() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* One\nbody\n* Two\nmore\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<leader>oK");
+    assert_eq!(text(&editor), "* Two\nmore\n* One\nbody\n");
+    press(&mut editor, "u");
+    assert_eq!(text(&editor), original, "one undo reverses the whole swap");
+}
+
+/// Meta-return inserts AFTER the subtree, so a headline's children are not
+/// reparented under the new sibling. This is the assertion that distinguishes
+/// respect-content from the naive "insert on the next line".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_inserts_a_sibling_after_the_whole_subtree() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\nbody\n* Two\n").await;
+
+    // On the level-1 headline, whose subtree runs through `body`.
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader><CR>");
+    assert_eq!(
+        text(&editor),
+        "* One\n** Child\nbody\n* \n* Two\n",
+        "the new sibling landed after the subtree, not between One and Child"
+    );
+
+    // The level came from the enclosing headline, not from a fixed 1.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader><CR>");
+    assert_eq!(
+        text(&editor),
+        "* One\n** Child\nbody\n** \n* \n* Two\n",
+        "a level-2 headline gets a level-2 sibling"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggle_heading_converts_a_line_both_ways() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Two\nsome note\n").await;
+
+    // A body line becomes a SIBLING of the headline it sits under — level 2
+    // here, not level 1.
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<leader>o*");
+    assert_eq!(text(&editor), "* One\n** Two\n** some note\n");
+
+    // And back: the stars and their separating space both go.
+    press(&mut editor, "<leader>o*");
+    assert_eq!(text(&editor), "* One\n** Two\nsome note\n");
+}

@@ -202,6 +202,65 @@ pub fn parent_headline(line: impl Fn(u32) -> Option<String>, from: u32) -> Optio
     })
 }
 
+// ── OM.6: subtree move, meta-return, toggle heading ──
+
+/// The previous SIBLING of the headline at `start`: the nearest headline above
+/// it at the same level, without crossing a shallower one.
+///
+/// Not "the previous headline" — from a level-2 headline the previous headline
+/// may be a level-3 child of an earlier sibling, and moving the subtree past it
+/// would interleave two trees. Stopping at a shallower level is what keeps the
+/// move inside one parent.
+pub fn prev_sibling(line: impl Fn(u32) -> Option<String>, start: u32, level: usize) -> Option<u32> {
+    (0..start).rev().find_map(|i| {
+        match line(i).as_deref().and_then(headline_level) {
+            Some(lvl) if lvl == level => Some(Some(i)),
+            // A shallower headline is the parent boundary: there is no earlier
+            // sibling under it. `Some(None)` stops the scan; `find_map` on the
+            // outer `Option` then yields `None`.
+            Some(lvl) if lvl < level => Some(None),
+            _ => None,
+        }
+    })?
+}
+
+/// The next SIBLING of the headline at `start`. The mirror of
+/// [`prev_sibling`]; a shallower headline ends the parent's children.
+pub fn next_sibling(
+    line: impl Fn(u32) -> Option<String>,
+    start: u32,
+    level: usize,
+    line_count: u32,
+) -> Option<u32> {
+    (start + 1..line_count).find_map(|i| match line(i).as_deref().and_then(headline_level) {
+        Some(lvl) if lvl == level => Some(Some(i)),
+        Some(lvl) if lvl < level => Some(None),
+        _ => None,
+    })?
+}
+
+/// Turn a line into a headline, or a headline back into a plain line.
+///
+/// `org-toggle-heading`. A body line becomes a headline at `level`; a headline
+/// loses its stars. `None` for a line that is neither (an empty line has
+/// nothing to promote and nothing to strip).
+pub fn toggle_heading(line: &str, level: usize) -> Option<String> {
+    if let Some(lvl) = headline_level(line) {
+        // Strip the stars AND the single space that separates them, which is
+        // part of the marker rather than part of the title.
+        return Some(
+            line[lvl..]
+                .strip_prefix(' ')
+                .unwrap_or(&line[lvl..])
+                .to_string(),
+        );
+    }
+    if line.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{} {line}", "*".repeat(level)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +433,88 @@ mod tests {
         // Demote has no such ceiling; everything moves together.
         let (out, _) = shift_headlines(&l, 0, 2, 1).expect("demote always fits");
         assert_eq!(out, "** One\n*** Child\n**** Grand");
+    }
+
+    // ── OM.6 ──
+
+    /// The distinction the whole slice turns on: a SIBLING is not "the
+    /// previous headline". `** Two`'s predecessor by line order is `*** Kid`,
+    /// but its sibling is `** One`. Swapping with the former would splice a
+    /// level-2 subtree into the middle of another one's children.
+    #[test]
+    fn siblings_skip_over_a_previous_subtrees_children() {
+        let (l, n) = buf("* Root\n** One\n*** Kid\nbody\n** Two\n*** Kid2\n** Three\n");
+        assert_eq!(
+            prev_sibling(&l, 4, 2),
+            Some(1),
+            "`** Two`'s sibling is `** One`"
+        );
+        assert_eq!(next_sibling(&l, 4, 2, n), Some(6), "and `** Three` follows");
+        // The ends of the sibling chain.
+        assert_eq!(prev_sibling(&l, 1, 2), None, "`** One` is the first child");
+        assert_eq!(next_sibling(&l, 6, 2, n), None, "`** Three` is the last");
+    }
+
+    /// A shallower headline is a hard boundary. `** B` lives under a different
+    /// parent from `** A`, so neither is the other's sibling — moving one past
+    /// the other would silently reparent it.
+    #[test]
+    fn a_shallower_headline_ends_the_sibling_chain() {
+        let (l, n) = buf("* First\n** A\n* Second\n** B\n");
+        assert_eq!(
+            prev_sibling(&l, 3, 2),
+            None,
+            "`* Second` blocks the scan up"
+        );
+        assert_eq!(next_sibling(&l, 1, 2, n), None, "and blocks the scan down");
+        // Level-1 headlines ARE siblings of each other.
+        assert_eq!(next_sibling(&l, 0, 1, n), Some(2));
+        assert_eq!(prev_sibling(&l, 2, 1), Some(0));
+    }
+
+    #[test]
+    fn toggle_heading_round_trips() {
+        assert_eq!(
+            toggle_heading("body text", 1).as_deref(),
+            Some("* body text")
+        );
+        assert_eq!(
+            toggle_heading("* body text", 1).as_deref(),
+            Some("body text")
+        );
+        // The level comes from the caller (the enclosing headline's), so a body
+        // line under `** Two` becomes a level-3 headline, not a level-1 one.
+        assert_eq!(toggle_heading("note", 3).as_deref(), Some("*** note"));
+        // Stripping takes exactly one space — the marker's — and leaves any
+        // deliberate indentation in the title alone.
+        assert_eq!(
+            toggle_heading("**   spaced", 1).as_deref(),
+            Some("  spaced")
+        );
+        // A titleless headline degrades to an empty line, not to `" "`.
+        assert_eq!(toggle_heading("** ", 1).as_deref(), Some(""));
+        // Nothing to do on a blank line: no stars to strip, no text to promote.
+        assert_eq!(toggle_heading("", 1), None);
+        assert_eq!(toggle_heading("   ", 1), None);
+    }
+
+    /// Reading a whole 10k-line file to find a sibling would cost 10k boundary
+    /// crossings per keypress. Both scans stop at the parent boundary.
+    #[test]
+    fn the_sibling_scan_stops_at_the_parent() {
+        use std::cell::Cell;
+        let mut lines = vec!["* Parent".to_string(), "** Child".to_string()];
+        lines.extend((0..10_000).map(|i| format!("body {i}")));
+        let reads = Cell::new(0u32);
+        let accessor = |i: u32| {
+            reads.set(reads.get() + 1);
+            lines.get(i as usize).cloned()
+        };
+        assert_eq!(prev_sibling(accessor, 1, 2), None);
+        assert!(
+            reads.get() <= 2,
+            "read {} lines to hit the parent one line up",
+            reads.get()
+        );
     }
 }

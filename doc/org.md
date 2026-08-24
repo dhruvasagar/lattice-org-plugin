@@ -51,10 +51,52 @@ hide, and a fold marker on every bare headline is noise.
 A `#+BEGIN_SRC` block is highlighted as a block and folds as one. Highlighting
 the code *inside* it in its own language is injection, and is not wired yet.
 
+## Moving around
+
+| | |
+|---|---|
+| `]]` `[[` | next / previous headline, at any level |
+| `g{` | up to the parent headline |
+
+These are **motions**, so they compose with operators and take counts the way
+vim's own do: `d]]` deletes to the next headline, `3]]` moves down three.
+
+## Structure
+
+| | |
+|---|---|
+| `<leader>oh` `<leader>ol` | promote / demote the headline |
+| `<leader>oH` `<leader>oL` | promote / demote the whole subtree |
+| `<leader>oK` `<leader>oJ` | move the subtree up / down past a sibling |
+| `<leader><CR>` | new headline at the same level, after this subtree |
+| `<leader>o*` | toggle the current line between headline and text |
+| `<Tab>` `<S-Tab>` | cycle this headline / the whole buffer |
+
+Each is one edit, so one `u` undoes it whole — demoting a subtree puts every
+star back in a single step, and a subtree move restores both subtrees at once.
+
+Three refusals are deliberate:
+
+- **Promoting a level-1 subtree is refused entirely**, not applied to the
+  children that could move. Shifting only those would turn a child into a
+  sibling of its own parent.
+- **Moving a subtree stops at its parent.** `<leader>oK` swaps with the
+  previous *sibling*, skipping over any deeper headlines in between; at either
+  end of the chain it does nothing rather than splicing the subtree into
+  another parent's children.
+- **`<leader><CR>` inserts after the whole subtree**, not on the next line.
+  Inserting directly under a headline would put the new one in front of that
+  headline's children and silently adopt them.
+
+`<Tab>` is the one key here that falls through: on a headline it cycles
+visibility, and anywhere else it means what it usually means. The
+`<leader>o` chords are org's alone, so when there is nothing to do they
+simply do nothing.
+
 ## What this plugin is not
 
-Editing. Headline promotion and demotion, subtree motion, TODO cycling,
-visibility cycling, tables, agenda — none of that is here. Those belong to
-org-mode the *major mode*, a separate piece of work that rides seams which
-already exist (`modes`, `keymap`, `grammar`). This plugin is the language:
-what an org file *is*, not what you do to it.
+TODO cycling, tables, and the agenda are not here yet. Nor is code
+highlighting *inside* a source block, which needs injection.
+
+Everything above rides seams that already exist (`language`, `modes`,
+`grammar`, `help`) — nothing in lattice knows what a headline is.

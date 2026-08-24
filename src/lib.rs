@@ -89,6 +89,12 @@ const AROUND_SUBTREE: u32 = 4;
 const CYCLE: u32 = 5;
 const CYCLE_GLOBAL: u32 = 6;
 
+/// Structural editing (OM.6).
+const MOVE_SUBTREE_UP: u32 = 7;
+const MOVE_SUBTREE_DOWN: u32 = 8;
+const META_RETURN: u32 = 9;
+const TOGGLE_HEADING: u32 = 10;
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -155,6 +161,13 @@ impl Guest for Component {
                 bind("<leader>ol", "org-demote-headline"),
                 bind("<leader>oH", "org-promote-subtree"),
                 bind("<leader>oL", "org-demote-subtree"),
+                // OM.6. `oK` / `oJ` are nvim-orgmode's verbatim — vim's own
+                // `K` / `J` are not shadowed because these sit behind the
+                // `<leader>o` prefix.
+                bind("<leader>oK", "org-move-subtree-up"),
+                bind("<leader>oJ", "org-move-subtree-down"),
+                bind("<leader><CR>", "org-meta-return"),
+                bind("<leader>o*", "org-toggle-heading"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
                 // prefixes rather than terminal bindings, so unlike `>>` / `<<`
                 // these transplant unchanged. `g{` is emacs's
@@ -294,6 +307,31 @@ impl Guest for Component {
             &spec(),
             DEMOTE_SUBTREE,
         );
+        // OM.6 — structural editing.
+        register_action(
+            "org-move-subtree-up",
+            "Swap the subtree at the cursor with the sibling above it",
+            &spec(),
+            MOVE_SUBTREE_UP,
+        );
+        register_action(
+            "org-move-subtree-down",
+            "Swap the subtree at the cursor with the sibling below it",
+            &spec(),
+            MOVE_SUBTREE_DOWN,
+        );
+        register_action(
+            "org-meta-return",
+            "Insert a new headline at the same level, after this subtree",
+            &spec(),
+            META_RETURN,
+        );
+        register_action(
+            "org-toggle-heading",
+            "Toggle the line at the cursor between a headline and plain text",
+            &spec(),
+            TOGGLE_HEADING,
+        );
     }
 
     /// Org's manual, compiled into this component and handed over once at
@@ -406,6 +444,194 @@ fn clamped_cursor(
     }
 }
 
+/// One `Replace` over `[from..=to]`, with the caret placed at `cursor`.
+///
+/// Every OM.6 action rewrites a contiguous run of lines, so they all funnel
+/// through here. The range ends at the last line's end and NOT at its newline,
+/// which is what keeps a whole-subtree rewrite from eating the blank line after
+/// it — the same rule `shift` follows.
+fn replace_lines(
+    ctx: &ActionContext,
+    from: u32,
+    to: u32,
+    to_len: u32,
+    text: String,
+    cursor: Position,
+) -> Vec<Effect> {
+    vec![Effect::ApplyEdit(
+        lattice::plugin_host::types::ApplyEditPayload {
+            target: ctx.buffer_id,
+            edit: Edit {
+                range: Range {
+                    start: Position {
+                        line: from,
+                        byte: 0,
+                    },
+                    end: Position {
+                        line: to,
+                        byte: to_len,
+                    },
+                },
+                kind: EditKind::Replace(text),
+            },
+            cursor: Some(cursor),
+        },
+    )]
+}
+
+/// Read `[from..=to]` as owned lines. One boundary crossing per line, which is
+/// unavoidable for a span we are about to rewrite wholesale.
+fn read_lines(doc: &Document, from: u32, to: u32) -> Option<Vec<String>> {
+    (from..=to).map(|i| doc.line(i)).collect()
+}
+
+/// Swap the subtree at the cursor with its previous or next SIBLING.
+///
+/// `<leader>oK` / `<leader>oJ`. Two subtrees trade places as one edit, so `u`
+/// puts them back in one step.
+///
+/// Sibling, not "the adjacent headline" — see `headline::prev_sibling`. Moving
+/// a level-2 subtree "up" past a level-3 headline would splice it into another
+/// parent's children, which is a silent reparent, not a move.
+///
+/// ## Why `None` and not `Declined` when there is no sibling
+///
+/// `Declined` is right for `<Tab>` (OM.5): `<Tab>` has a native meaning worth
+/// falling through to, so declining composes. It is WRONG here, and not
+/// harmlessly so.
+///
+/// A declined chord is re-resolved with org's layer removed, and for a
+/// multi-key sequence that ends up executing the trailing key on its own. So a
+/// declined `<leader>oJ` runs vim's `J` and JOINS TWO LINES — the buffer is
+/// modified by a key that was supposed to have found nothing to do. `<leader>o*`
+/// would run `*` (search word under cursor), `<leader><CR>` would run `<CR>`.
+/// A test caught the join; the others are the same shape.
+///
+/// The distinction is whether the chord is org's alone. `<Tab>` is shared, so
+/// it declines. Everything behind the `<leader>o` prefix is org's, has nothing
+/// underneath it, and so CONSUMES the key and does nothing.
+fn move_subtree(ctx: &ActionContext, doc: &Document, up: bool) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let count = doc.line_count();
+    let Some((start, level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let end = headline::subtree_end(line, start, count);
+
+    // `first` and `second` are the two spans in DOCUMENT order; the edit
+    // rewrites them swapped. Naming them by position rather than by
+    // "mine"/"theirs" is what lets one body serve both directions.
+    let (first, first_end, second, second_end) = if up {
+        let Some(prev) = headline::prev_sibling(line, start, level) else {
+            return vec![Effect::None];
+        };
+        (prev, start - 1, start, end)
+    } else {
+        let Some(next) = headline::next_sibling(line, start, level, count) else {
+            return vec![Effect::None];
+        };
+        (start, end, next, headline::subtree_end(line, next, count))
+    };
+
+    let (Some(head), Some(tail)) = (
+        read_lines(doc, first, first_end),
+        read_lines(doc, second, second_end),
+    ) else {
+        return vec![Effect::None];
+    };
+    let last_len = tail.last().map_or(0, |s| s.len()) as u32;
+    let mut swapped = tail;
+    swapped.extend(head);
+    let text = swapped.join("\n");
+
+    // The caret rides its own subtree. Moving up, the cursor line drops by the
+    // length of the sibling that was jumped; moving down, it rises by it.
+    let jumped = if up {
+        start - first
+    } else {
+        second_end - first_end
+    };
+    let cursor = Position {
+        line: if up {
+            ctx.cursor.line - jumped
+        } else {
+            ctx.cursor.line + jumped
+        },
+        byte: ctx.cursor.byte,
+    };
+    replace_lines(ctx, first, second_end, last_len, text, cursor)
+}
+
+/// Insert a new sibling headline after the subtree at the cursor, and put the
+/// caret on it ready to type.
+///
+/// `<leader><CR>`, org's `M-RET`.
+///
+/// **After the subtree, not after the headline line.** Both readings exist in
+/// the wild (emacs's `org-insert-heading` vs `org-insert-heading-respect-content`
+/// on `C-RET`), and the difference only shows on a headline that HAS children:
+/// inserting immediately below the headline line puts the new sibling in front
+/// of its own children, which reparents every one of them under it. That is a
+/// silent restructure from a key that means "new heading", and this plugin
+/// already refuses that class of surprise — `restar` declines a level-0 promote
+/// for the same reason. Respect-content is the non-destructive reading.
+///
+/// Declines in a file's preamble: with no enclosing headline there is no level
+/// to inherit, and guessing level 1 would make `<leader><CR>` mean something
+/// different depending on where the cursor happens to be.
+fn meta_return(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let Some((start, level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let end = headline::subtree_end(line, start, doc.line_count());
+    let Some(last) = doc.line(end) else {
+        return vec![Effect::None];
+    };
+    let stars = "*".repeat(level);
+    // A zero-width range at the end of the subtree's last line: the newline is
+    // part of the INSERTED text, so the line above keeps its own.
+    let cursor = Position {
+        line: end + 1,
+        byte: stars.len() as u32 + 1,
+    };
+    replace_lines(
+        ctx,
+        end,
+        end,
+        last.len() as u32,
+        format!("{last}\n{stars} "),
+        cursor,
+    )
+}
+
+/// Turn the line at the cursor into a headline, or a headline back into text.
+///
+/// `<leader>o*`, org's `org-toggle-heading`. The new headline takes the level of
+/// the headline it lands under, so a body line under `** Two` becomes a `**`
+/// sibling rather than a top-level heading — promoting a note out of its section
+/// is not what the key means. With no enclosing headline it becomes level 1.
+///
+/// Declines on a blank line: there is nothing to promote and no stars to strip.
+fn toggle_heading(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let at = ctx.cursor.line;
+    let Some(text) = doc.line(at) else {
+        return vec![Effect::None];
+    };
+    let level = headline::enclosing_headline(line, at).map_or(1, |(_, lvl)| lvl);
+    let Some(new) = headline::toggle_heading(&text, level) else {
+        return vec![Effect::None];
+    };
+    // Clamp: stripping stars shortens the line, and a caret parked past the new
+    // end would jump visibly on a key that only re-marks one line.
+    let cursor = Position {
+        line: at,
+        byte: ctx.cursor.byte.min(new.len() as u32),
+    };
+    replace_lines(ctx, at, at, text.len() as u32, new, cursor)
+}
+
 impl GrammarCallbacks for Component {
     fn apply_action(
         callback: u32,
@@ -441,6 +667,11 @@ impl GrammarCallbacks for Component {
             // `<S-Tab>` is whole-buffer, so it does not decline: org's global
             // cycle is meaningful wherever the cursor is.
             CYCLE_GLOBAL => Ok(vec![Effect::AppAction(AppEffect::CycleFoldsGlobal)]),
+            // OM.6.
+            MOVE_SUBTREE_UP => Ok(move_subtree(&ctx, doc, true)),
+            MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
+            META_RETURN => Ok(meta_return(&ctx, doc)),
+            TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }

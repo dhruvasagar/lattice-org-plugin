@@ -267,6 +267,51 @@ async fn promoting_past_level_one_refuses_rather_than_flattening() {
     assert_eq!(text(&editor), original);
 }
 
+/// A refused shift consumes the key and moves NOTHING — not the text, and not
+/// the caret.
+///
+/// The caret is the assertion that matters. These chords end in `h` / `l` /
+/// `H` / `L`, so while they returned `Effect::Declined` the dispatcher
+/// re-resolved the sequence with org's layer removed and ran that trailing key
+/// on its own: a refused `<leader>ol` moved the cursor right. A text-only
+/// assertion could not see it, which is how it survived OM.3. `<leader>oJ`'s
+/// trailing `J` was the same bug with a loud symptom (it joined two lines).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_shift_moves_neither_text_nor_caret() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // Level 1: promoting is refused, so `<leader>oh` / `<leader>oH` have
+    // nothing to do.
+    let original = "* One
+** Child
+";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 0);
+    editor.cursor.byte = 2;
+    for chord in ["<leader>oh", "<leader>oH", "<leader>ol", "<leader>oL"] {
+        let before = editor.cursor;
+        let text_before = text(&editor);
+        if chord.ends_with('l') || chord.ends_with('L') {
+            // Demote succeeds, so undo it and only check the refusals above.
+            press(&mut editor, chord);
+            press(&mut editor, "u");
+            assert_eq!(text(&editor), text_before, "{chord}: undo restored");
+            continue;
+        }
+        press(&mut editor, chord);
+        assert_eq!(text(&editor), text_before, "{chord}: text untouched");
+        assert_eq!(
+            (editor.cursor.line, editor.cursor.byte),
+            (before.line, before.byte),
+            "{chord}: a refused shift must not move the caret either"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_buffer_with_no_headline_leaves_the_chord_to_fall_through() {
     if org_plugin_wasm().is_none() {

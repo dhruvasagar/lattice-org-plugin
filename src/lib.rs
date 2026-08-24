@@ -365,15 +365,21 @@ impl Guest for Component {
 /// between the caret and its headline, and a subtree op reads its subtree,
 /// which it must read anyway to rewrite it.
 ///
-/// Declines (rather than erroring) whenever there is nothing to do: the cursor
-/// is in a file's preamble with no headline above it, or the shift is refused
-/// at level 1. `Effect::Declined` means the chord was not consumed, so the
-/// dispatcher re-resolves it against the layers below — `<leader>oh` in a
-/// buffer with no headlines falls through instead of swallowing the key.
+/// Does nothing (rather than erroring) whenever there is nothing to do: the
+/// cursor is in a file's preamble with no headline above it, or the shift is
+/// refused at level 1.
+///
+/// `Effect::None` and NOT `Effect::Declined` — see `move_subtree` for the full
+/// argument. In short: a declined chord is re-resolved with org's layer removed,
+/// and for a multi-key sequence that runs the trailing key alone. These four
+/// chords end in `h` / `l` / `H` / `L`, so declining moved the CARET instead of
+/// doing nothing — invisible in a text assertion, which is why it survived
+/// OM.3. `<leader>oJ`'s trailing `J` joined two lines and was caught at OM.6;
+/// this is the same shape with a quieter symptom.
 fn shift(ctx: &ActionContext, doc: &Document, delta: isize, whole_subtree: bool) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let Some((start, _level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
-        return vec![Effect::Declined];
+        return vec![Effect::None];
     };
     let end = if whole_subtree {
         headline::subtree_end(line, start, doc.line_count())
@@ -381,7 +387,7 @@ fn shift(ctx: &ActionContext, doc: &Document, delta: isize, whole_subtree: bool)
         start
     };
     let Some((text, end_len)) = headline::shift_headlines(line, start, end, delta) else {
-        return vec![Effect::Declined];
+        return vec![Effect::None];
     };
 
     // ONE edit over the whole span — see `shift_headlines`. The range runs from

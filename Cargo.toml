@@ -1,0 +1,53 @@
+# The reference org language plugin (LG.4).
+#
+# Lives outside the lattice tree, which is the point: it is the thing a user's
+# plugin manager clones and builds on boot (PM.5–PM.8), and the shape a real
+# language plugin takes. Nothing in lattice knows what org is.
+#
+# The component is a `wasm32-wasip2` cdylib:
+#
+#     cargo build --release --target wasm32-wasip2
+#
+# `cargo test` builds this crate for the HOST instead, so the integration
+# tests below load the wasm artefact from `target/wasm32-wasip2/release/` and
+# SKIP when it is absent. Build the component first or they test nothing.
+[package]
+name = "lattice-org-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+# The moved-from-lattice integration tests drive a REAL editor: they boot one,
+# load this plugin's component through the loader, and dispatch chords. That
+# needs the host crates, so `cargo test` here compiles the editor.
+#
+# PATH deps against a local lattice checkout — portable enough for the author,
+# not for a stranger cloning this repo. Switch to `git = ...` (pinned to the
+# lattice tag whose `wit/` is vendored here) before anyone else needs to run
+# them; the vendored WIT and these deps must describe the SAME lattice, or the
+# component builds against one ABI and is tested against another.
+[dev-dependencies]
+lattice-core = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-core" }
+lattice-grammar = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-grammar" }
+lattice-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-host" }
+lattice-keymap = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-keymap" }
+lattice-mode = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-mode" }
+lattice-plugin-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-host" }
+lattice-plugin-loader = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-loader" }
+lattice-protocol = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-protocol" }
+lattice-syntax = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-syntax" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+arc-swap = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]

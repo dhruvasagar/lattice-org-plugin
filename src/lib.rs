@@ -41,6 +41,7 @@ wit_bindgen::generate!({
             include lattice:plugin-host/help-plugin@0.1.0;
             include lattice:plugin-host/modes-plugin@0.1.0;
             include lattice:plugin-host/grammar-plugin@0.1.0;
+            include lattice:plugin-host/config-plugin@0.1.0;
         }
     "#,
     path: "wit",
@@ -49,9 +50,11 @@ wit_bindgen::generate!({
 });
 
 mod headline;
+mod todo;
 
 use exports::lattice::plugin_host::grammar_callbacks::Guest as GrammarCallbacks;
 use lattice::plugin_host::buffer::Document;
+use lattice::plugin_host::config::{get_option, register_option, OptionType};
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
 use lattice::plugin_host::help::register_topic;
 use lattice::plugin_host::language::{register_language, LanguageSpec};
@@ -95,11 +98,75 @@ const MOVE_SUBTREE_DOWN: u32 = 8;
 const META_RETURN: u32 = 9;
 const TOGGLE_HEADING: u32 = 10;
 
+/// `org-todo-mode` (OM.7).
+const TODO_CYCLE: u32 = 11;
+const TODO_CYCLE_BACK: u32 = 12;
+const PRIORITY_CYCLE: u32 = 13;
+const SET_TAGS: u32 = 14;
+/// The second half of `<leader>o:` — the host dispatches this with the
+/// prompt's text once the user submits.
+const SET_TAGS_SUBMIT: u32 = 15;
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
 
+/// Fallbacks for the two options, used when the config seam is not wired (the
+/// manifest may not declare `config`) or the option was somehow not registered.
+/// `get_option` returning `none` must degrade to working defaults rather than
+/// disabling the keys.
+const DEFAULT_TODO_KEYWORDS: &str = "TODO | DONE";
+const DEFAULT_HIGHEST_PRIORITY: &str = "C";
+
+/// The configured keyword sequence, read fresh on each use.
+///
+/// Read per keystroke rather than cached at load: `:set org.todo-keywords=…`
+/// must take effect on the next press, and caching would need an
+/// `OptionChanged` subscription to stay honest. The read is one host call
+/// against an in-memory registry, which is far below the budget a chord has —
+/// and cheaper than the buffer reads the same action already does.
+fn todo_keywords() -> Vec<String> {
+    let spec = get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string());
+    let parsed = todo::parse_keywords(&spec);
+    // A user who sets the option to nothing gets the default rather than a
+    // dead key: an empty sequence would make `<leader>ot` cycle between one
+    // state and itself.
+    if parsed.is_empty() {
+        todo::parse_keywords(DEFAULT_TODO_KEYWORDS)
+    } else {
+        parsed
+    }
+}
+
+/// The lowest priority letter in the cycle — `C` gives `A`/`B`/`C`.
+fn highest_priority() -> char {
+    get_option("highest-priority")
+        .unwrap_or_else(|| DEFAULT_HIGHEST_PRIORITY.to_string())
+        .chars()
+        .next()
+        .filter(char::is_ascii_alphabetic)
+        .unwrap_or('C')
+}
+
 impl Guest for Component {
+    /// OM.7's options. Auto-namespaced by the host to `org.*`, so these are
+    /// `org.todo-keywords` and `org.highest-priority` to the user.
+    fn register_options() {
+        let _ = register_option(
+            "todo-keywords",
+            OptionType::String,
+            DEFAULT_TODO_KEYWORDS,
+            "TODO keywords `<leader>ot` cycles through, in order. `|` separates \
+             not-done from done states and is ignored when cycling.",
+        );
+        let _ = register_option(
+            "highest-priority",
+            OptionType::String,
+            DEFAULT_HIGHEST_PRIORITY,
+            "The last priority letter `<leader>o,` cycles to. `C` gives A, B, C.",
+        );
+    }
+
     fn register_languages() {
         let _ = register_language(&LanguageSpec {
             name: "org".to_string(),
@@ -200,6 +267,34 @@ impl Guest for Component {
                 bind("<S-Tab>", "org-global-cycle"),
             ],
             target_language: Some("org".to_string()),
+        });
+
+        // OM.7 — `org-todo-mode`, a MINOR riding the major above.
+        //
+        // A second mode rather than four more chords on `org-mode`, because
+        // the two answer different questions. `org-mode` is what an org file
+        // IS — structure, folding, motions — and is not optional. Keyword
+        // cycling is a workflow: plenty of org files are outlines with no TODO
+        // in them, and a user who wants the outliner without the task tracker
+        // can `:org-todo-mode` off and keep everything else. Splitting it also
+        // means `org.todo-keywords` has an obvious owner.
+        //
+        // `Majors(["org-mode"])` is the activation policy the WIT provides for
+        // exactly this: the host activates the minor on buffers whose major is
+        // named, and nowhere else. No `target_language` — a minor must not be
+        // indexed as a language's major (the seam warns and ignores it).
+        register_mode(&ModeDeclaration {
+            id: "org-todo-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Majors(vec!["org-mode".to_string()]),
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![
+                bind("<leader>ot", "org-todo-cycle"),
+                bind("<leader>oT", "org-todo-cycle-back"),
+                bind("<leader>o,", "org-priority-cycle"),
+                bind("<leader>o:", "org-set-tags"),
+            ],
+            target_language: None,
         });
     }
 
@@ -331,6 +426,39 @@ impl Guest for Component {
             "Toggle the line at the cursor between a headline and plain text",
             &spec(),
             TOGGLE_HEADING,
+        );
+        // OM.7 — `org-todo-mode`'s actions. Registered here, with the rest of
+        // the plugin's grammar, because the `grammar` seam is drained once per
+        // plugin and both modes resolve their bindings against it.
+        register_action(
+            "org-todo-cycle",
+            "Cycle the TODO keyword on this headline forward",
+            &spec(),
+            TODO_CYCLE,
+        );
+        register_action(
+            "org-todo-cycle-back",
+            "Cycle the TODO keyword on this headline backward",
+            &spec(),
+            TODO_CYCLE_BACK,
+        );
+        register_action(
+            "org-priority-cycle",
+            "Cycle this headline's priority: none, A, B, C, none",
+            &spec(),
+            PRIORITY_CYCLE,
+        );
+        register_action(
+            "org-set-tags",
+            "Set this headline's tags, prompting with the current ones",
+            &spec(),
+            SET_TAGS,
+        );
+        register_action(
+            "org-set-tags-submit",
+            "Apply tags submitted from the org tag prompt (internal)",
+            &spec(),
+            SET_TAGS_SUBMIT,
         );
     }
 
@@ -638,6 +766,91 @@ fn toggle_heading(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     replace_lines(ctx, at, at, text.len() as u32, new, cursor)
 }
 
+/// Rewrite the enclosing headline's line through `f`.
+///
+/// Every `org-todo-mode` action is "find the headline I am under, change one
+/// field, put the line back", so they share this. Note it operates on the
+/// ENCLOSING headline, not the cursor's line: `<leader>ot` from inside a
+/// subtree's body marks that subtree's headline, which is what org does and
+/// what makes the key usable without navigating first.
+fn rewrite_headline(
+    ctx: &ActionContext,
+    doc: &Document,
+    f: impl FnOnce(&str, &[String]) -> Option<String>,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let Some((start, _)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let (Some(text), keywords) = (doc.line(start), todo_keywords()) else {
+        return vec![Effect::None];
+    };
+    let Some(new) = f(&text, &keywords) else {
+        return vec![Effect::None];
+    };
+    if new == text {
+        // No change: skip the edit rather than push a no-op onto the undo
+        // stack. `u` after a key that did nothing must not "undo" it.
+        return vec![Effect::None];
+    }
+    // The caret keeps its line. Its column is clamped because the headline can
+    // shorten (dropping `TODO ` moves everything left by five).
+    let cursor = if ctx.cursor.line == start {
+        Position {
+            line: start,
+            byte: ctx.cursor.byte.min(new.len() as u32),
+        }
+    } else {
+        ctx.cursor
+    };
+    replace_lines(ctx, start, start, text.len() as u32, new, cursor)
+}
+
+/// `<leader>o:` — prompt for tags, pre-filled with the current ones.
+///
+/// Two hops, because collecting text from the user is asynchronous: this
+/// returns `OpenPrompt` naming `org-set-tags-submit`, the host runs the
+/// minibuffer, and on submit dispatches that action with the typed string in
+/// `ctx.args`. Escape dispatches nothing, so dismissing leaves the line alone.
+fn set_tags_prompt(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let Some((start, _)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let keywords = todo_keywords();
+    let initial = doc
+        .line(start)
+        .and_then(|t| todo::parse(&t, &keywords).map(|h| todo::tags_string(&h)))
+        .unwrap_or_default();
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: "Tags: ".to_string(),
+            initial,
+            on_submit_action: "org-set-tags-submit".to_string(),
+            buffer_name: None,
+        },
+    )]
+}
+
+/// The submitted text, whichever `args` shape the host used to carry it.
+fn submitted_text(args: &Args) -> Option<String> {
+    match args {
+        Args::String(s) => Some(s.clone()),
+        Args::Char(c) => Some(c.to_string()),
+        Args::List(items) => items.first().map(|v| match v {
+            lattice::plugin_host::types::ArgValue::String(s) => s.clone(),
+            lattice::plugin_host::types::ArgValue::Raw(s) => s.clone(),
+            lattice::plugin_host::types::ArgValue::Char(c) => c.to_string(),
+            other => format!("{other:?}"),
+        }),
+        // `none` is a submitted EMPTY prompt, which means "clear the tags" —
+        // distinct from Escape, which dispatches nothing at all and so never
+        // reaches this function.
+        Args::None => Some(String::new()),
+        Args::Bytes(_) => None,
+    }
+}
+
 impl GrammarCallbacks for Component {
     fn apply_action(
         callback: u32,
@@ -678,6 +891,28 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
+            // OM.7.
+            TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, |line, kw| {
+                todo::cycle_keyword(line, kw, true)
+            })),
+            TODO_CYCLE_BACK => Ok(rewrite_headline(&ctx, doc, |line, kw| {
+                todo::cycle_keyword(line, kw, false)
+            })),
+            PRIORITY_CYCLE => {
+                let highest = highest_priority();
+                Ok(rewrite_headline(&ctx, doc, move |line, kw| {
+                    todo::cycle_priority(line, kw, highest, true)
+                }))
+            }
+            SET_TAGS => Ok(set_tags_prompt(&ctx, doc)),
+            SET_TAGS_SUBMIT => {
+                let Some(tags) = submitted_text(&ctx.args) else {
+                    return Ok(vec![Effect::None]);
+                };
+                Ok(rewrite_headline(&ctx, doc, move |line, kw| {
+                    todo::set_tags(line, kw, &tags)
+                }))
+            }
             other => Err(format!("org: unknown action callback {other}")),
         }
     }

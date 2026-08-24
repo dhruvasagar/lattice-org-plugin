@@ -72,7 +72,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"modes\", \"language\", \"help\"]\n",
+        "id = \"org\"\nprovides = [\"modes\", \"language\", \"help\", \"config\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), wasm).unwrap();
@@ -93,6 +93,7 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             mode_registry: Some(editor.mode_registry.clone()),
             keymap: Some(editor.keymap.clone()),
             help_topics: Some(editor.help_topics.clone()),
+            config_registry: Some(editor.config.clone()),
             ..Default::default()
         },
     )

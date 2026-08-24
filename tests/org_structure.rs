@@ -63,6 +63,7 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             mode_registry: Some(editor.mode_registry.clone()),
             keymap: Some(editor.keymap.clone()),
             help_topics: Some(editor.help_topics.clone()),
+            config_registry: Some(editor.config.clone()),
             ..Default::default()
         },
     )
@@ -76,7 +77,7 @@ async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\"]\n",
+        "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -112,9 +113,25 @@ async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
         }
     }
 
+    // OM.7: `org-todo-mode` needs TWO per-tick drains, in this order, and both
+    // are races against a test that dispatches immediately.
+    //
+    //   1. The manifest's `default_mode` makes the loader publish
+    //      `ModeEnablementRequested`, and a plugin minor is INERT until that
+    //      lands — `auto_activatable_minors` filters on enablement (CI.3).
+    //   2. Opening the file publishes `MajorEntered`, and the minor is
+    //      activated from THAT, against the buffer's now-org major.
+    //
+    // Enablement must precede the open or step 2 finds the mode still
+    // disabled; activation must follow it or the policy sees an empty major.
+    // `run_tick_pending` is the aggregator both drains hang off, so call it
+    // rather than hand-picking, and call it on both sides of the open.
+    editor.run_tick_pending();
+
     let file = base.join("notes.org");
     std::fs::write(&file, text).unwrap();
     editor.do_edit(Some(file), false);
+    editor.run_tick_pending();
     assert_eq!(
         editor
             .active_modes
@@ -499,7 +516,7 @@ async fn the_boot_subscription_expands_rows_without_any_keypress() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\"]\n",
+        "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), &wasm).unwrap();
@@ -965,4 +982,246 @@ async fn toggle_heading_converts_a_line_both_ways() {
     // And back: the stars and their separating space both go.
     press(&mut editor, "<leader>o*");
     assert_eq!(text(&editor), "* One\n** Two\nsome note\n");
+}
+
+// ── OM.7: org-todo-mode ──
+
+/// The slice's exit criterion: the minor rides `org-mode` and resolves
+/// NOWHERE else. Activation is the host's, from `ActivationPolicy::Majors` —
+/// the plugin names the major it wants and contributes no activation code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_todo_mode_is_a_minor_scoped_to_org_buffers() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor(base.path(), "* TODO Task\n").await;
+
+    let todo_mode = ModeId::new("org-todo-mode");
+    let registry = editor.mode_registry.load();
+    assert_eq!(
+        registry.get(todo_mode).expect("registered").kind(),
+        lattice_mode::ModeKind::Minor,
+        "it declared `minor` and must not have been promoted to a major"
+    );
+    // A minor must never be indexed as a language's major — that slot belongs
+    // to org-mode, and taking it would leave org files with no outliner.
+    assert_eq!(
+        registry.find_major_for_lang("org"),
+        Some(ModeId::new("org-mode")),
+        "org-mode still owns the language"
+    );
+    drop(registry);
+
+    // Active on this buffer, because its major is org-mode.
+    assert!(
+        editor
+            .active_modes
+            .get(&editor.document_buffer_id)
+            .is_some_and(|m| m.is_active(todo_mode)),
+        "the minor activated on an org buffer"
+    );
+
+    // Its chords resolve with org-mode context and not without it.
+    let seq = parse_chord_sequence(&editor.keymap.expand_leader("<leader>ot")).unwrap();
+    assert!(
+        matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &seq,
+                &[ModeId::new("org-mode"), todo_mode]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<leader>ot resolves in an org buffer"
+    );
+    assert!(
+        !matches!(
+            editor
+                .keymap
+                .lookup_with_context(lattice_keymap::BindingMode::Normal, &seq, &[]),
+            LookupResult::Bound { .. }
+        ),
+        "and resolves nowhere else — no active mode, no binding"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn todo_keywords_cycle_forward_and_back_through_the_empty_state() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\n").await;
+
+    goto_line(&mut editor, 0);
+    // The default `org.todo-keywords` is `TODO | DONE`, so `|` is a separator
+    // and not a state.
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "* TODO Task\n");
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "* DONE Task\n");
+    press(&mut editor, "<leader>ot");
+    assert_eq!(
+        text(&editor),
+        "* Task\n",
+        "the empty state is part of the cycle"
+    );
+    press(&mut editor, "<leader>oT");
+    assert_eq!(
+        text(&editor),
+        "* DONE Task\n",
+        "and backwards wraps the other way"
+    );
+}
+
+/// `:set org.todo-keywords=…` takes effect on the NEXT press, which is why the
+/// option is read per keystroke rather than cached at load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_keyword_sequence_comes_from_the_option() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\n").await;
+
+    // The plugin's options are namespaced by its id.
+    assert_eq!(
+        editor
+            .config
+            .get_string_by_name("org.todo-keywords")
+            .as_deref(),
+        Some("TODO | DONE"),
+        "the config seam registered the option under the plugin's namespace, \
+         with the declared default"
+    );
+    // The path `:set org.todo-keywords=…` is backed by (per config.wit).
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=PROPOSED ACCEPTED")
+        .expect("the option accepts a new sequence");
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+    assert_eq!(
+        text(&editor),
+        "* PROPOSED Task\n",
+        "the reconfigured sequence is used on the very next press"
+    );
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "* ACCEPTED Task\n");
+}
+
+/// Cycling a keyword must not disturb the priority or the tags — the reason
+/// the guest parses and re-renders the whole headline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cycling_preserves_priority_and_tags() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "** TODO [#A] Ship it :work:urgent:\n").await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "** DONE [#A] Ship it :work:urgent:\n");
+
+    press(&mut editor, "<leader>o,");
+    assert_eq!(
+        text(&editor),
+        "** DONE [#B] Ship it :work:urgent:\n",
+        "priority advanced; keyword and tags untouched"
+    );
+}
+
+/// From inside a subtree the keys mark the ENCLOSING headline, so they work
+/// without navigating to it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn todo_cycling_works_from_inside_the_subtree() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\nbody\nmore body\n").await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "* TODO One\nbody\nmore body\n");
+}
+
+/// With no headline above the caret there is nothing to mark. Like OM.6, the
+/// key is CONSUMED — declining would re-dispatch the trailing `t`, and in
+/// Normal mode `t` waits for a target character, leaving the editor in a
+/// pending state the user never asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn todo_cycling_in_a_preamble_consumes_the_key() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "#+TITLE: Notes\njust prose\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), original);
+    press(&mut editor, "<leader>o,");
+    assert_eq!(text(&editor), original);
+}
+
+/// `<leader>o:` is a TWO-HOP flow: the action returns `OpenPrompt` naming
+/// `org-set-tags-submit`, the host runs the minibuffer, and submitting
+/// dispatches that action with the typed text in `ctx.args`.
+///
+/// **Only the binding is asserted here, and that is a layer limit rather than
+/// a gap in the feature.** `Effect::OpenPrompt` is applied by the RENDERER
+/// (`lattice-ui-tui/src/app/dispatch.rs`), not by `Editor` — at this level the
+/// chord surfaces as `Action::Invoke` and the effect is consumed inside it, so
+/// `editor.modal` never leaves `Normal` however correct the plugin is. Hop two
+/// is no more reachable: dispatching an invocation WITH args needs
+/// `handle_action`, which is `pub(crate)` to `lattice-host`.
+///
+/// So the split is: `todo.rs`'s unit tests own the tag logic (`set_tags`
+/// parses both `:a:b:` and bare words, replaces rather than appends, and
+/// clears on empty), this owns the wiring, and the round trip through a real
+/// minibuffer wants an app-layer test in `lattice-ui-tui`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tag_prompt_chord_is_wired_to_the_plugins_action() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor(base.path(), "* TODO Ship it\n").await;
+
+    // Both halves of the flow must be registered: the chord the user presses,
+    // and the action the payload names for the host to dispatch on submit. A
+    // typo in either is a silent dead end at runtime.
+    let seq = parse_chord_sequence(&editor.keymap.expand_leader("<leader>o:")).unwrap();
+    assert!(
+        matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &seq,
+                &[ModeId::new("org-mode"), ModeId::new("org-todo-mode")]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<leader>o: is bound in an org buffer"
+    );
+    assert!(
+        editor
+            .registry
+            .load()
+            .id_by_name("org-set-tags-submit")
+            .is_some(),
+        "the action the OpenPrompt payload names is registered, so the host \
+         has something to dispatch when the user submits"
+    );
 }

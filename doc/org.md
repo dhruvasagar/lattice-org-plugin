@@ -93,10 +93,40 @@ visibility, and anywhere else it means what it usually means. The
 `<leader>o` chords are org's alone, so when there is nothing to do they
 simply do nothing.
 
+## Tasks
+
+These live in `org-todo-mode`, a minor mode that switches itself on in every
+org buffer. `:org-todo-mode` toggles it, and `:set org.enabled=false` keeps it
+off — the outliner above is unaffected either way.
+
+| | |
+|---|---|
+| `<leader>ot` `<leader>oT` | cycle the TODO keyword forward / back |
+| `<leader>o,` | cycle the priority |
+| `<leader>o:` | set tags, prompting with the current ones |
+
+The empty state is part of both cycles, so a keyword or priority can always be
+cleared by cycling past the end rather than deleting it by hand.
+
+Each key acts on the headline you are *under*, so you can mark a task from
+anywhere in its body without navigating to it first. Cycling a keyword leaves
+the priority and tags exactly where they were.
+
+### Options
+
+| | |
+|---|---|
+| `org.todo-keywords` | the sequence, default `TODO \| DONE` |
+| `org.highest-priority` | last priority letter, default `C` (so A, B, C) |
+
+`\|` separates not-done from done states, as in org's `#+TODO:` line. It is
+ignored when cycling. Both options are read on each keypress, so
+`:set org.todo-keywords=PROPOSED ACCEPTED REJECTED` takes effect immediately.
+
 ## What this plugin is not
 
-TODO cycling, tables, and the agenda are not here yet. Nor is code
-highlighting *inside* a source block, which needs injection.
+Tables and the agenda are not here yet. Nor is code highlighting *inside* a
+source block, which needs injection.
 
 Everything above rides seams that already exist (`language`, `modes`,
 `grammar`, `help`) — nothing in lattice knows what a headline is.

@@ -150,6 +150,31 @@ parent's box.
 
 `[-]` is org's partial state. Toggling one completes it.
 
+## Timestamps
+
+| | |
+|---|---|
+| `<C-a>` `<C-x>` | step the component under the cursor forward / back |
+
+```org
+SCHEDULED: <2026-08-25 Tue>
+[2026-08-25 Tue 10:30]
+```
+
+The cursor picks the component: the year, month, day, hour or minute it sits
+on. Anywhere else in the stamp — including on a bracket or the day name — it
+means the **day**, which is what you usually want.
+
+The day name is recomputed on every edit, so it can never disagree with the
+date. `31 Jan` stepped by a month lands on the end of February rather than an
+impossible `31 Feb`, and a time crossing midnight moves the date rather than
+wrapping in place and quietly meaning the wrong day.
+
+These are the one pair of org keys that **fall through**. `<C-a>` / `<C-x>`
+are vim's increment and decrement, so off a timestamp they are left to mean
+that — org shadows them only where a timestamp actually is. (Lattice has no
+increment command yet, so today they simply do nothing off a stamp.)
+
 ## Images
 
 `[[file:diagram.png]]` on a line of its own draws the image inline, in the

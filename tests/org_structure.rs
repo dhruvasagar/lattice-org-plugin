@@ -1324,3 +1324,74 @@ async fn nested_lists_roll_up_to_the_nearest_cookie() {
         "the headline still counts only its DIRECT children: {out}"
     );
 }
+
+// ── OM.9: timestamps ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_a_steps_the_timestamp_component_under_the_cursor() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nSCHEDULED: <2026-08-25 Tue>\n").await;
+
+    // On the day digits.
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 20;
+    press(&mut editor, "<C-a>");
+    assert_eq!(
+        text(&editor),
+        "* Task\nSCHEDULED: <2026-08-26 Wed>\n",
+        "the day stepped AND the weekday was recomputed"
+    );
+
+    press(&mut editor, "<C-x>");
+    assert_eq!(text(&editor), "* Task\nSCHEDULED: <2026-08-25 Tue>\n");
+}
+
+/// The one place declining is right in this plugin.
+///
+/// `<C-a>` / `<C-x>` are vim's increment / decrement — a genuinely SHARED
+/// chord — so org must not swallow them off a timestamp, or shadowing them
+/// inside org buffers would break incrementing ordinary numbers.
+///
+/// **Lattice has no increment command yet**, so today the decline resolves to
+/// nothing and the buffer is simply untouched. That is the assertion here:
+/// org did not consume the key and did not edit. When increment lands, this
+/// binding composes with it for free — which is exactly what declining buys
+/// and what consuming would have foreclosed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn off_a_timestamp_ctrl_a_declines_rather_than_swallowing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Task\ncount: 41\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 7;
+    press(&mut editor, "<C-a>");
+    assert_eq!(
+        text(&editor),
+        original,
+        "org declined; nothing else is bound to <C-a> yet"
+    );
+}
+
+/// A time crossing midnight moves the date — wrapping in place would leave
+/// the stamp silently lying about which day it means.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_time_crossing_midnight_moves_the_date_end_to_end() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "<2026-08-25 Tue 23:30>\n").await;
+
+    goto_line(&mut editor, 0);
+    editor.cursor.byte = 17;
+    press(&mut editor, "<C-a>");
+    assert_eq!(text(&editor), "<2026-08-26 Wed 00:30>\n");
+}

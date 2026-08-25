@@ -53,6 +53,7 @@ wit_bindgen::generate!({
 mod checkbox;
 mod headline;
 mod links;
+mod timestamp;
 mod todo;
 
 use exports::lattice::plugin_host::grammar_callbacks::Guest as GrammarCallbacks;
@@ -116,6 +117,10 @@ const TOGGLE_INLINE_IMAGES: u32 = 16;
 
 /// `<C-Space>` (OM.8).
 const TOGGLE_CHECKBOX: u32 = 17;
+
+/// `<C-a>` / `<C-x>` (OM.9).
+const TIMESTAMP_UP: u32 = 18;
+const TIMESTAMP_DOWN: u32 = 19;
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -275,6 +280,12 @@ impl Guest for Component {
                 // OM.8: org's own binding. `<C-Space>` is unbound in vim's
                 // Normal mode, so nothing is shadowed.
                 bind("<C-Space>", "org-toggle-checkbox"),
+                // OM.9: `<C-a>` / `<C-x>` are vim's increment / decrement.
+                // These SHADOW them inside org buffers and DECLINE off a
+                // timestamp, so the builtin still works on ordinary numbers —
+                // the one place in this plugin where declining is right.
+                bind("<C-a>", "org-timestamp-up"),
+                bind("<C-x>", "org-timestamp-down"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
                 // prefixes rather than terminal bindings, so unlike `>>` / `<<`
                 // these transplant unchanged. `g{` is emacs's
@@ -460,6 +471,18 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-timestamp-up",
+            "Step the timestamp component under the cursor forward",
+            &spec(),
+            TIMESTAMP_UP,
+        );
+        register_action(
+            "org-timestamp-down",
+            "Step the timestamp component under the cursor back",
+            &spec(),
+            TIMESTAMP_DOWN,
         );
         register_action(
             "org-toggle-checkbox",
@@ -944,6 +967,8 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
+            TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
+            TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
             // IM.7: flips `org.inline-images`. The option is global rather
             // than per-buffer because the producer is per-plugin, and a
             // per-buffer answer would mean the guest tracking buffer state it
@@ -1264,6 +1289,42 @@ fn toggle_checkbox(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         at,
         last_text.len() as u32,
         body.join("\n"),
+        ctx.cursor,
+    )
+}
+
+/// OM.9 — step the timestamp component under the cursor.
+///
+/// **This one DECLINES**, and it is the only action in the plugin that
+/// should. `<C-a>` / `<C-x>` are vim's increment / decrement: a genuinely
+/// SHARED chord with a real meaning to fall through to. Off a timestamp the
+/// user means the builtin, and `Effect::Declined` re-resolves to it —
+/// so `<C-a>` on `count: 41` still gives `42` inside an org buffer.
+///
+/// Contrast every `<leader>o…` action, which consumes: those are org's alone
+/// and have nothing beneath them, and declining would run their trailing key
+/// as an unrelated command.
+///
+/// A single-key chord, so the fall-through resolves cleanly — the multi-key
+/// hazard that made `<leader>oJ` run vim's `J` does not arise here.
+fn step_timestamp(ctx: &ActionContext, doc: &Document, delta: i64) -> Vec<Effect> {
+    let Some(text) = doc.line(ctx.cursor.line) else {
+        return vec![Effect::Declined];
+    };
+    let Some(stamp) = timestamp::stamp_at(&text, ctx.cursor.byte as usize) else {
+        return vec![Effect::Declined];
+    };
+    let part = timestamp::part_at(&text, &stamp, ctx.cursor.byte as usize);
+    let updated = timestamp::step(&text, &stamp, part, delta);
+    if updated == text {
+        return vec![Effect::Declined];
+    }
+    replace_lines(
+        ctx,
+        ctx.cursor.line,
+        ctx.cursor.line,
+        text.len() as u32,
+        updated,
         ctx.cursor,
     )
 }

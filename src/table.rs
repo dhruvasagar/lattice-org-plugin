@@ -1,0 +1,265 @@
+//! OM.12 — org tables: finding them, and aligning their columns.
+//!
+//! ```org
+//! | Name  | Qty |
+//! |-------+-----|
+//! | bread |   1 |
+//! ```
+//!
+//! ## Alignment is a whole-table operation
+//!
+//! A column's width is the widest cell in it, so touching one cell can change
+//! every row. That is why this works on the contiguous block of table lines
+//! rather than a line at a time, and why the result lands as ONE edit — a
+//! half-aligned table is a worse state than either end.
+//!
+//! ## Width is measured in characters, not bytes
+//!
+//! A table of names with accents lines up only if `é` counts as one column.
+//! Full width-aware measurement (CJK, emoji) belongs to the renderer; this
+//! uses `chars().count()`, which is right for the Latin-plus-accents case that
+//! covers most org tables and is honestly wrong for CJK — recorded rather than
+//! silently approximated.
+
+/// A row's cells, or a separator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Row {
+    /// `| a | b |` — the trimmed cell texts.
+    Cells(Vec<String>),
+    /// `|---+---|` — a rule between sections.
+    Separator,
+}
+
+/// True when `line` is part of a table.
+pub fn is_table_line(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+/// Parse a table line into cells or a separator.
+pub fn parse_row(line: &str) -> Option<Row> {
+    let t = line.trim();
+    if !t.starts_with('|') {
+        return None;
+    }
+    let inner = t.trim_start_matches('|').trim_end_matches('|');
+    // A separator is dashes and pluses only — `|---+---|`.
+    if !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c == '-' || c == '+' || c == '|' || c.is_whitespace())
+        && inner.contains('-')
+    {
+        return Some(Row::Separator);
+    }
+    Some(Row::Cells(
+        inner.split('|').map(|c| c.trim().to_string()).collect(),
+    ))
+}
+
+/// The contiguous run of table lines containing `at`, as `(first, last)`.
+pub fn table_bounds(
+    line: impl Fn(u32) -> Option<String>,
+    at: u32,
+    line_count: u32,
+) -> Option<(u32, u32)> {
+    if !line(at).is_some_and(|t| is_table_line(&t)) {
+        return None;
+    }
+    let mut first = at;
+    while first > 0 && line(first - 1).is_some_and(|t| is_table_line(&t)) {
+        first -= 1;
+    }
+    let mut last = at;
+    while last + 1 < line_count && line(last + 1).is_some_and(|t| is_table_line(&t)) {
+        last += 1;
+    }
+    Some((first, last))
+}
+
+/// Align a table's rows, returning one rendered line per input row.
+///
+/// Every row is padded to the same column widths, and a separator is redrawn
+/// to match. Ragged rows are fine: a row with fewer cells than its widest
+/// sibling is padded out, because refusing to align a table mid-edit — the
+/// exact moment a row IS ragged — would make the key useless when it is most
+/// wanted.
+pub fn align(rows: &[Row]) -> Vec<String> {
+    let columns = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Cells(c) => Some(c.len()),
+            Row::Separator => None,
+        })
+        .max()
+        .unwrap_or(0);
+    if columns == 0 {
+        return rows.iter().map(|_| "|".to_string()).collect();
+    }
+    let mut widths = vec![0usize; columns];
+    for r in rows {
+        if let Row::Cells(cells) = r {
+            for (i, c) in cells.iter().enumerate() {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+        }
+    }
+    rows.iter()
+        .map(|r| match r {
+            Row::Separator => {
+                let mut s = String::from("|");
+                for (i, w) in widths.iter().enumerate() {
+                    if i > 0 {
+                        s.push('+');
+                    }
+                    s.push_str(&"-".repeat(w + 2));
+                }
+                s.push('|');
+                s
+            }
+            Row::Cells(cells) => {
+                let mut s = String::from("|");
+                for (i, w) in widths.iter().enumerate() {
+                    let cell = cells.get(i).map(String::as_str).unwrap_or("");
+                    let pad = w - cell.chars().count();
+                    s.push(' ');
+                    s.push_str(cell);
+                    s.push_str(&" ".repeat(pad));
+                    s.push(' ');
+                    s.push('|');
+                }
+                s
+            }
+        })
+        .collect()
+}
+
+/// Which cell (0-based) `byte` falls in, on a table row.
+pub fn cell_at(line: &str, byte: usize) -> usize {
+    let upto = &line[..byte.min(line.len())];
+    // Cells are separated by `|`; the leading one opens the row, so the count
+    // of pipes before the cursor minus that opener is the index.
+    upto.matches('|').count().saturating_sub(1)
+}
+
+/// Byte offset where cell `index`'s text starts, on an aligned row.
+///
+/// Used to place the caret after `<Tab>`. Returns the end of the line when
+/// the index is past the last cell, so a `<Tab>` off the end parks sensibly
+/// rather than at column zero.
+pub fn cell_start(line: &str, index: usize) -> usize {
+    let mut seen = 0usize;
+    for (i, ch) in line.char_indices() {
+        if ch == '|' {
+            // The pipe that OPENS cell `index` is the index-th one — the
+            // leading `|` opens cell 0. Skip it and the single padding space.
+            if seen == index {
+                return (i + 2).min(line.len());
+            }
+            seen += 1;
+        }
+    }
+    line.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_table_lines_and_separators() {
+        assert!(is_table_line("| a | b |"));
+        assert!(is_table_line("  |---+---|"));
+        assert!(!is_table_line("not a table"));
+        assert_eq!(parse_row("|---+---|"), Some(Row::Separator));
+        assert_eq!(
+            parse_row("| a | b |"),
+            Some(Row::Cells(vec!["a".into(), "b".into()]))
+        );
+    }
+
+    /// A row of empty cells is NOT a separator — `| | |` is a blank row, and
+    /// redrawing it as dashes would destroy content the user just made room
+    /// for.
+    #[test]
+    fn an_empty_row_is_not_a_separator() {
+        assert_eq!(
+            parse_row("|  |  |"),
+            Some(Row::Cells(vec!["".into(), "".into()]))
+        );
+    }
+
+    #[test]
+    fn aligns_columns_to_their_widest_cell() {
+        let rows = vec![
+            Row::Cells(vec!["Name".into(), "Qty".into()]),
+            Row::Separator,
+            Row::Cells(vec!["bread".into(), "1".into()]),
+        ];
+        assert_eq!(
+            align(&rows),
+            vec![
+                "| Name  | Qty |".to_string(),
+                "|-------+-----|".to_string(),
+                "| bread | 1   |".to_string(),
+            ]
+        );
+    }
+
+    /// A ragged row is exactly the state a table is in mid-edit, so refusing
+    /// to align one would make the key useless when it is most wanted.
+    #[test]
+    fn a_ragged_row_is_padded_rather_than_refused() {
+        let rows = vec![
+            Row::Cells(vec!["a".into(), "b".into(), "c".into()]),
+            Row::Cells(vec!["x".into()]),
+        ];
+        assert_eq!(
+            align(&rows),
+            vec!["| a | b | c |".to_string(), "| x |   |   |".to_string()]
+        );
+    }
+
+    /// Accented Latin lines up only if `é` counts as one column.
+    #[test]
+    fn width_is_measured_in_characters_not_bytes() {
+        let rows = vec![
+            Row::Cells(vec!["café".into()]),
+            Row::Cells(vec!["ab".into()]),
+        ];
+        assert_eq!(
+            align(&rows),
+            vec!["| café |".to_string(), "| ab   |".to_string()]
+        );
+    }
+
+    fn buf(text: &str) -> (impl Fn(u32) -> Option<String> + use<>, u32) {
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let n = lines.len() as u32;
+        (move |i: u32| lines.get(i as usize).cloned(), n)
+    }
+
+    #[test]
+    fn bounds_cover_the_contiguous_run_only() {
+        let (l, n) = buf("prose\n| a |\n|---|\n| b |\nmore prose\n| other |\n");
+        assert_eq!(table_bounds(&l, 2, n), Some((1, 3)));
+        assert_eq!(table_bounds(&l, 5, n), Some((5, 5)), "a separate table");
+        assert_eq!(table_bounds(&l, 0, n), None, "not on a table");
+    }
+
+    #[test]
+    fn cell_index_follows_the_cursor() {
+        let l = "| a | b | c |";
+        assert_eq!(cell_at(l, 2), 0);
+        assert_eq!(cell_at(l, 6), 1);
+        assert_eq!(cell_at(l, 10), 2);
+    }
+
+    #[test]
+    fn cell_start_places_the_caret_on_the_cells_text() {
+        let l = "| a | bb | c |";
+        assert_eq!(&l[cell_start(l, 0)..cell_start(l, 0) + 1], "a");
+        assert_eq!(&l[cell_start(l, 1)..cell_start(l, 1) + 2], "bb");
+        // Past the last cell parks at the end rather than column zero.
+        assert_eq!(cell_start(l, 9), l.len());
+    }
+}

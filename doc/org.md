@@ -150,6 +150,37 @@ parent's box.
 
 `[-]` is org's partial state. Toggling one completes it.
 
+## Tables
+
+These live in `org-table-mode`, a minor mode on org buffers.
+
+| | |
+|---|---|
+| `<Tab>` `<S-Tab>` | align the table and step a cell forward / back |
+| `<leader>o\|` | align without moving |
+
+```org
+| Name  | Qty |
+|-------+-----|
+| bread |   1 |
+```
+
+Alignment is a **whole-table** operation — a column is as wide as its widest
+cell, so touching one cell can change every row — and it lands as one edit, so
+`u` restores the table in a single step.
+
+Stepping past the last cell of a row moves to the next row, so `<Tab>` walks
+the table rather than stalling at its right edge. A ragged row is padded
+rather than refused: mid-edit is exactly when a table *is* ragged, and that is
+when the key is most wanted.
+
+`<Tab>` here is the second hop of a chain. In a table it aligns; on a headline
+it falls through to the outline cycle; anywhere else it means whatever `<Tab>`
+usually means.
+
+Column widths are counted in characters, so accented Latin lines up. CJK and
+emoji, which occupy two cells, do not yet.
+
 ## Links
 
 | | |

@@ -53,6 +53,7 @@ wit_bindgen::generate!({
 mod checkbox;
 mod headline;
 mod links;
+mod table;
 mod timestamp;
 mod todo;
 
@@ -124,6 +125,11 @@ const TIMESTAMP_DOWN: u32 = 19;
 
 /// `<leader>oo` (OM.10).
 const OPEN_LINK: u32 = 20;
+
+/// `org-table-mode` (OM.12).
+const TABLE_NEXT_CELL: u32 = 21;
+const TABLE_PREV_CELL: u32 = 22;
+const TABLE_ALIGN: u32 = 23;
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -351,6 +357,27 @@ impl Guest for Component {
             ],
             target_language: None,
         });
+
+        // OM.12 — `org-table-mode`, the third mode.
+        //
+        // Its `<Tab>` sits ABOVE `org-mode`'s in the layer order, and declines
+        // when the cursor is not in a table. That makes the chain two hops:
+        // table → headline cycle → whatever `<Tab>` natively means. The chain
+        // only actually works because the dispatcher was fixed to peel ONE
+        // keymap layer per decline (lattice `b9f6e3f6`); before that a decline
+        // dropped every mode layer at once and skipped org-mode entirely.
+        register_mode(&ModeDeclaration {
+            id: "org-table-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Majors(vec!["org-mode".to_string()]),
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![
+                bind("<Tab>", "org-table-next-cell"),
+                bind("<S-Tab>", "org-table-prev-cell"),
+                bind("<leader>o|", "org-table-align"),
+            ],
+            target_language: None,
+        });
     }
 
     /// The promote/demote actions (OM.3).
@@ -475,6 +502,24 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-table-next-cell",
+            "Move to the next table cell, aligning the table",
+            &spec(),
+            TABLE_NEXT_CELL,
+        );
+        register_action(
+            "org-table-prev-cell",
+            "Move to the previous table cell, aligning the table",
+            &spec(),
+            TABLE_PREV_CELL,
+        );
+        register_action(
+            "org-table-align",
+            "Align the table under the cursor",
+            &spec(),
+            TABLE_ALIGN,
         );
         register_action(
             "org-open-link",
@@ -977,6 +1022,9 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
+            TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
+            TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
+            TABLE_ALIGN => Ok(table_move(&ctx, doc, 0)),
             OPEN_LINK => Ok(open_link(&ctx, doc)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
             TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
@@ -1383,4 +1431,77 @@ fn open_link(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
             }
         }
     }
+}
+
+/// OM.12 — align the table under the cursor and step `delta` cells.
+///
+/// `delta == 0` aligns without moving (`<leader>o|`).
+///
+/// **Declines when the cursor is not in a table**, which is what makes
+/// `<Tab>` compose: `org-table-mode` sits above `org-mode`, so a decline here
+/// falls to org's headline cycle, and a decline there falls to whatever
+/// `<Tab>` natively means. Three outcomes from one key, and none of them a
+/// host special case.
+///
+/// Alignment is whole-table and lands as ONE edit: a column's width is the
+/// widest cell in it, so touching one cell can change every row, and a
+/// half-aligned table is a worse state than either end.
+fn table_move(ctx: &ActionContext, doc: &Document, delta: i32) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let count = doc.line_count();
+    let Some((first, last)) = table::table_bounds(line, ctx.cursor.line, count) else {
+        return vec![Effect::Declined];
+    };
+
+    let rows: Vec<table::Row> = (first..=last)
+        .filter_map(|i| line(i).and_then(|t| table::parse_row(&t)))
+        .collect();
+    if rows.is_empty() {
+        return vec![Effect::Declined];
+    }
+    let aligned = table::align(&rows);
+
+    // Where the caret lands. Stepping past the last cell of a row moves to
+    // the next row's first cell, which is what makes `<Tab>` walk a table
+    // rather than stalling at its right edge.
+    let here = ctx.cursor.line;
+    let row_index = (here - first) as usize;
+    let cell = line(here)
+        .map(|t| table::cell_at(&t, ctx.cursor.byte as usize))
+        .unwrap_or(0);
+    let (mut target_row, mut target_cell) = (row_index, cell as i32 + delta);
+    if delta != 0 {
+        let cells_here = match rows.get(row_index) {
+            Some(table::Row::Cells(c)) => c.len() as i32,
+            _ => 1,
+        };
+        if target_cell >= cells_here {
+            target_row = (row_index + 1).min(rows.len().saturating_sub(1));
+            target_cell = 0;
+        } else if target_cell < 0 {
+            target_row = row_index.saturating_sub(1);
+            target_cell = match rows.get(target_row) {
+                Some(table::Row::Cells(c)) => c.len() as i32 - 1,
+                _ => 0,
+            };
+        }
+    }
+    let target_line = first + target_row as u32;
+    let byte = aligned
+        .get(target_row)
+        .map(|t| table::cell_start(t, target_cell.max(0) as usize))
+        .unwrap_or(0) as u32;
+
+    let last_len = line(last).map(|t| t.len()).unwrap_or(0) as u32;
+    replace_lines(
+        ctx,
+        first,
+        last,
+        last_len,
+        aligned.join("\n"),
+        Position {
+            line: target_line,
+            byte,
+        },
+    )
 }

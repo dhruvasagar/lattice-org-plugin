@@ -149,6 +149,25 @@ async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
     editor
 }
 
+/// Enable a plugin minor and activate it on the open buffer. A plugin minor
+/// is inert until enabled (CI.3), and only `org-todo-mode` gets that for free
+/// via the manifest's `default_mode`.
+fn enable_minor(editor: &mut Editor, mode: &str) {
+    {
+        let mut next = (**editor.mode_registry.load()).clone();
+        next.set_minor_enabled(ModeId::new(mode), true);
+        editor.mode_registry.store(std::sync::Arc::new(next));
+    }
+    let proto = lattice_protocol::ids::BufferId::new(editor.document_buffer_id.0 as u64);
+    editor
+        .event_bus
+        .publish(lattice_protocol::Event::MajorEntered {
+            buffer: proto,
+            major: "org-mode".into(),
+        });
+    editor.run_tick_pending();
+}
+
 fn chord(s: &str) -> KeyChord {
     parse_chord_sequence(s)
         .expect("parseable chord")
@@ -1453,4 +1472,57 @@ async fn opening_off_a_link_does_nothing() {
     press(&mut editor, "<leader>oo");
     assert_eq!(text(&editor), original);
     assert_eq!(editor.cursor.line, 1);
+}
+
+// ── OM.12: tables ──
+
+/// `<Tab>` in a table aligns it and steps a cell. The alignment is
+/// whole-table and one edit, so `u` restores it in one step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tab_in_a_table_aligns_and_steps_a_cell() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "| Name | Qty |\n|---+---|\n| bread | 1 |\n";
+    let mut editor = org_editor(base.path(), original).await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    goto_line(&mut editor, 0);
+    editor.cursor.byte = 2;
+    press(&mut editor, "<Tab>");
+
+    assert_eq!(
+        text(&editor),
+        "| Name  | Qty |\n|-------+-----|\n| bread | 1   |\n",
+        "the whole table aligned to its widest cells"
+    );
+
+    press(&mut editor, "u");
+    assert_eq!(text(&editor), original, "one undo restores the whole table");
+}
+
+/// The payoff from the dispatcher fix: `org-table-mode`'s `<Tab>` declines
+/// off a table, and the chord reaches `org-mode`'s headline cycle rather than
+/// falling past every mode layer to the builtin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tab_off_a_table_falls_through_to_the_headline_cycle() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* One\nbody\n";
+    let mut editor = org_editor(base.path(), original).await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    // On a headline, NOT in a table: table-mode declines, org-mode cycles.
+    goto_line(&mut editor, 0);
+    let before = text(&editor);
+    press(&mut editor, "<Tab>");
+    assert_eq!(
+        text(&editor),
+        before,
+        "cycling changes visibility, never text — and no stray tab was inserted"
+    );
 }

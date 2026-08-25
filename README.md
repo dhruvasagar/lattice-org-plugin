@@ -1,35 +1,49 @@
-# org — the reference language plugin
+# org — the reference plugin
 
-The first real consumer of lattice's `language` seam
-([`plugin-languages.md`](../../docs/dev/architecture/plugin-languages.md)),
-and the shape a language plugin takes.
+The first real consumer of lattice's `language` seam, and by now of six
+others. Design: `docs/dev/architecture/org-mode.md` in the lattice tree;
+sequencing: `docs/dev/operations/slice-plans/org-mode.md`.
 
-**This is reference source, not a bundled plugin.** It is not a workspace
-member and `cargo build` never compiles it. Bundled plugins live in
-`plugins/`; org deliberately does not, because org's grammar is 2.2 MB of
-generated C maintained outside crates.io — and design §1's whole argument is
+**This lives outside the lattice tree, and that is the point.** It is what a
+user's plugin manager clones and builds on boot, so it has to work as an
+ordinary external repository rather than as a directory someone remembered to
+exclude. It began as `examples/org-plugin` and moved out at OM.6.
+
+It is not a bundled plugin and never will be: org's grammar is 2.2 MB of
+generated C maintained outside crates.io, and design §1's whole argument is
 that such a grammar is *the plugin's* build artefact, not the editor's.
-Putting it under `plugins/` would mean every workspace build either carried
-that weight or reached the network.
+Vendoring it would mean every lattice build either carried that weight or
+reached the network.
 
 ## What it does
 
-Registers one language:
-
-| | |
+| seam | what org contributes |
 |---|---|
-| name | `org` |
-| extensions | `.org`, `.org_archive` |
-| grammar | [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org), compiled to wasm by `build.rs` |
-| queries | `queries/highlights.scm`, `queries/folds.scm` |
-| `:help` | `doc/org.md`, shipped inside the component |
+| `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
+| `modes` | four modes — `org-mode` (major), `org-todo-mode`, `org-table-mode`, `org-agenda-mode` |
+| `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing |
+| `config` | `org.todo-keywords`, `org.highest-priority`, `org.inline-images` |
+| `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
+| `agenda-source` | dated rows for `:agenda` — what a row is, when it falls, how it sorts |
+| `help` | `doc/org.md`, shipped inside the component; `:help org` |
 
-## Two seams from one component
+The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
+compiled to wasm by `build.rs`.
 
-A component implements exactly ONE WIT world, so a plugin providing both
-`language` and `help` needs a world importing both. Bundled plugins get theirs
-written into lattice's own `wit/` — but an external plugin cannot add a world
-to someone else's package.
+**Nothing in lattice knows what a headline is.** Three host changes were
+needed across the whole of it and none of them names org: a language index on
+the mode registry, a `target-language` field on the mode declaration, and a
+lifted restriction that had kept majors off the `modes` seam. The
+`agenda-source` seam that landed last is generic in the same way — the plugin
+declares which file extensions it wants offered, so lattice never learns what
+a `.org` file is either.
+
+## Seven seams from one component
+
+A component implements exactly ONE WIT world, so a plugin providing seven
+seams needs a world importing all seven. Bundled plugins get theirs written
+into lattice's own `wit/` — but an external plugin cannot add a world to
+someone else's package.
 
 It does not need to. WIT `include` composes worlds, and `wit-bindgen` resolves
 an `inline` package against the interfaces found at `path`, so this plugin
@@ -41,10 +55,11 @@ Three details, each a build error if missed: `include` needs the version
 per reached interface; and the inline package needs a name distinct from
 lattice's.
 
-That is the whole plugin. Everything else org needs — headline promotion,
-subtree motion, TODO and visibility cycling, agenda, tables — is *org-mode the
-major mode*, a separate track riding seams that already exist (`modes`,
-`keymap`, `grammar`). It is gated on nothing here.
+`wit/` here is a **vendored copy** of lattice's, and the two must describe the
+same lattice or the component builds against one ABI and is tested against
+another. The dev-dependencies below are path deps into a local checkout for
+the same reason — portable enough for the author, not for a stranger cloning
+this repo. Switching them to a pinned `git =` is the outstanding chore.
 
 ## Per-level headlines, and why they were the interesting part
 
@@ -84,18 +99,37 @@ bytes; the host then rejects the registration with a named reason rather than
 failing the build.
 
 ```sh
-cd examples/org-plugin
 cargo build --release --target wasm32-wasip2
 ```
 
-The component lands at
-`target/wasm32-wasip2/release/org_plugin.wasm`. Point a plugin directory at it
-with a `plugin.toml`:
+The component lands at `target/wasm32-wasip2/release/lattice_org_plugin.wasm`.
+Point a plugin directory at it with a `plugin.toml`:
 
 ```toml
 id = "org"
-provides = ["language", "help"]
+provides = ["language", "modes", "grammar", "config", "media", "agenda-source", "help"]
+default_mode = "org-todo-mode"
 ```
+
+The order of `provides` is cosmetic — the loader sorts by real registration
+dependency before draining, so a manifest that lists `modes` before `grammar`
+still resolves every keymap binding. That was not always true, and org is the
+plugin it would have bitten.
+
+`default_mode` is load-bearing: it is what publishes the enablement request
+for `org-todo-mode`, and without it the mode registers correctly and simply
+never activates. It also auto-registers the `org.enabled` gate, so
+`:set org.enabled=false` turns the task layer off and leaves the outliner.
 
 In normal use the plugin manager does this for you from the git source
 (PM.5–PM.8) and caches the build under `~/.config/lattice/plugins/`.
+
+## Tests
+
+`cargo test` compiles this crate for the HOST and boots a real editor against
+the component — so build the component first or the integration tests skip
+and you have tested nothing:
+
+```sh
+cargo build --release --target wasm32-wasip2 && cargo test
+```

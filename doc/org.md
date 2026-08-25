@@ -270,10 +270,69 @@ every linked file to find out would read files you never asked about.
 Remote links (`[[https://…/a.png]]`) stay links too: fetching them would mean
 network traffic you did not ask for.
 
+## Agenda
+
+`:agenda` collects every dated headline across your org files into one view,
+ordered by date and grouped by day.
+
+| | |
+|---|---|
+| `:agenda` | build it over the current project |
+| `:agenda ~/notes` | build it over somewhere else |
+| `<CR>` | jump to the entry's file and line |
+| `gr` | re-scan |
+| `<leader>ot` `<leader>oT` `<leader>o,` | change the TODO state or priority, **from the agenda** |
+
+A row is an **open** headline carrying a date:
+
+```org
+* TODO Ship the thing
+  DEADLINE: <2026-08-25 Tue>
+* TODO Water the plants
+  SCHEDULED: <2026-08-29 Sat>
+* Standup <2026-08-26 Wed 09:30>
+```
+
+The rows are real excerpts of the files they came from, not rendered text.
+That is what makes the last row of the table above possible: editing in the
+agenda edits the file, so you can mark something DONE without opening it.
+An agenda you can only read would be a lesser feature wearing the name.
+
+Three things are deliberately **not** rows:
+
+- **A done headline**, however dated. An agenda that lists what you finished
+  is a log, not a plan. What counts as done is the right-hand side of the `|`
+  in `org.todo-keywords`; a keyword list with no `|` has no done states at all,
+  which is org's own rule.
+- **An inactive `[2026-08-25 Tue]` stamp.** That is what inactive means —
+  counting them would drag every `CLOSED:` line and every logbook entry in.
+- **A `SCHEDULED:` that is not directly under its headline.** Only the line
+  immediately below counts, because one under a *child* headline belongs to
+  the child, and dating the parent with it would send `<CR>` to the wrong line.
+
+Within a day, deadlines come before scheduled items, which come before bare
+timestamps; within those, `[#A]` before `[#B]` before no priority — unranked
+rather than urgent. Days you have missed are labelled as such, because a
+deadline the view stays quiet about is the failure the tool exists to prevent.
+
+The scan runs off the UI thread and reads only the files this plugin claims,
+so `:agenda` in a source checkout with no org files in it costs a directory
+walk. One malformed file is skipped and the scan continues; if the plugin
+stops answering entirely the view keeps the rows it collected and the
+headerline says it is partial.
+
+Lattice itself contributes the walk, the ordering and the view — see
+`:help agenda-view-mode`. What a *dated row* is comes entirely from here.
+
 ## What this plugin is not
 
-Tables and the agenda are not here yet. Nor is code highlighting *inside* a
-source block, which needs injection.
+Code highlighting *inside* a source block is not here; it needs injection.
+Neither is anything that writes to a file other than the one you are in —
+archiving (`<leader>o$`), refile and capture all move a subtree to another
+file, and the plugin ABI has no effect that can do that yet. Export
+backends, babel, table formulas, column view and org-roam are out of scope
+rather than pending.
 
 Everything above rides seams that already exist (`language`, `modes`,
-`grammar`, `help`) — nothing in lattice knows what a headline is.
+`grammar`, `config`, `media`, `agenda-source`, `help`) — nothing in lattice
+knows what a headline is.

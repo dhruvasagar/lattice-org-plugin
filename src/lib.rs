@@ -131,6 +131,16 @@ const TABLE_NEXT_CELL: u32 = 21;
 const TABLE_PREV_CELL: u32 = 22;
 const TABLE_ALIGN: u32 = 23;
 
+/// Row / column structure (OM.13).
+const TABLE_ROW_UP: u32 = 24;
+const TABLE_ROW_DOWN: u32 = 25;
+const TABLE_COL_LEFT: u32 = 26;
+const TABLE_COL_RIGHT: u32 = 27;
+const TABLE_INSERT_ROW: u32 = 28;
+const TABLE_INSERT_COL: u32 = 29;
+const TABLE_DELETE_ROW: u32 = 30;
+const TABLE_DELETE_COL: u32 = 31;
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -375,6 +385,17 @@ impl Guest for Component {
                 bind("<Tab>", "org-table-next-cell"),
                 bind("<S-Tab>", "org-table-prev-cell"),
                 bind("<leader>o|", "org-table-align"),
+                // OM.13. Deliberately the outliner's directional letters
+                // (`K`/`J` move, `H`/`L` for columns) so one mnemonic covers
+                // subtrees and table rows alike.
+                bind("<leader>tK", "org-table-row-up"),
+                bind("<leader>tJ", "org-table-row-down"),
+                bind("<leader>tH", "org-table-column-left"),
+                bind("<leader>tL", "org-table-column-right"),
+                bind("<leader>tr", "org-table-insert-row"),
+                bind("<leader>tc", "org-table-insert-column"),
+                bind("<leader>tdr", "org-table-delete-row"),
+                bind("<leader>tdc", "org-table-delete-column"),
             ],
             target_language: None,
         });
@@ -515,6 +536,42 @@ impl Guest for Component {
             &spec(),
             TABLE_PREV_CELL,
         );
+        for (name, doc_text, cb) in [
+            ("org-table-row-up", "Move this table row up", TABLE_ROW_UP),
+            (
+                "org-table-row-down",
+                "Move this table row down",
+                TABLE_ROW_DOWN,
+            ),
+            (
+                "org-table-column-left",
+                "Move this column left",
+                TABLE_COL_LEFT,
+            ),
+            (
+                "org-table-column-right",
+                "Move this column right",
+                TABLE_COL_RIGHT,
+            ),
+            (
+                "org-table-insert-row",
+                "Insert a row below",
+                TABLE_INSERT_ROW,
+            ),
+            (
+                "org-table-insert-column",
+                "Insert a column after",
+                TABLE_INSERT_COL,
+            ),
+            ("org-table-delete-row", "Delete this row", TABLE_DELETE_ROW),
+            (
+                "org-table-delete-column",
+                "Delete this column",
+                TABLE_DELETE_COL,
+            ),
+        ] {
+            register_action(name, doc_text, &spec(), cb);
+        }
         register_action(
             "org-table-align",
             "Align the table under the cursor",
@@ -1025,6 +1082,7 @@ impl GrammarCallbacks for Component {
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
             TABLE_ALIGN => Ok(table_move(&ctx, doc, 0)),
+            TABLE_ROW_UP..=TABLE_DELETE_COL => Ok(table_structure(&ctx, doc, callback)),
             OPEN_LINK => Ok(open_link(&ctx, doc)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
             TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
@@ -1501,6 +1559,115 @@ fn table_move(ctx: &ActionContext, doc: &Document, delta: i32) -> Vec<Effect> {
         aligned.join("\n"),
         Position {
             line: target_line,
+            byte,
+        },
+    )
+}
+
+/// OM.13 — move, insert and delete table rows and columns.
+///
+/// Every one of these is whole-table: a structural change re-aligns, because
+/// a moved column takes its width with it and leaving the rest ragged would
+/// look broken. One edit, so `u` restores the table in a step.
+///
+/// Declines off a table, so the `<leader>t…` chords stay available to
+/// anything else that wants them outside one.
+fn table_structure(ctx: &ActionContext, doc: &Document, action: u32) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let count = doc.line_count();
+    let Some((first, last)) = table::table_bounds(line, ctx.cursor.line, count) else {
+        return vec![Effect::Declined];
+    };
+    let mut rows: Vec<table::Row> = (first..=last)
+        .filter_map(|i| line(i).and_then(|t| table::parse_row(&t)))
+        .collect();
+    if rows.is_empty() {
+        return vec![Effect::Declined];
+    }
+
+    let row = (ctx.cursor.line - first) as usize;
+    let col = line(ctx.cursor.line)
+        .map(|t| table::cell_at(&t, ctx.cursor.byte as usize))
+        .unwrap_or(0);
+
+    // Where the caret should end up. A move follows its row or column —
+    // losing the cursor after moving a row is what makes the key feel broken.
+    let (mut new_row, mut new_col) = (row, col);
+    let changed = match action {
+        TABLE_ROW_UP => {
+            let ok = row > 0 && table::swap_rows(&mut rows, row, row - 1);
+            if ok {
+                new_row = row - 1;
+            }
+            ok
+        }
+        TABLE_ROW_DOWN => {
+            let ok = table::swap_rows(&mut rows, row, row + 1);
+            if ok {
+                new_row = row + 1;
+            }
+            ok
+        }
+        TABLE_COL_LEFT => {
+            let ok = col > 0 && table::swap_columns(&mut rows, col, col - 1);
+            if ok {
+                new_col = col - 1;
+            }
+            ok
+        }
+        TABLE_COL_RIGHT => {
+            let ok = table::swap_columns(&mut rows, col, col + 1);
+            if ok {
+                new_col = col + 1;
+            }
+            ok
+        }
+        TABLE_INSERT_ROW => {
+            table::insert_row(&mut rows, row);
+            new_row = row + 1;
+            true
+        }
+        TABLE_INSERT_COL => {
+            table::insert_column(&mut rows, col);
+            new_col = col + 1;
+            true
+        }
+        TABLE_DELETE_ROW => {
+            let ok = table::delete_row(&mut rows, row);
+            if ok {
+                new_row = row.min(rows.len().saturating_sub(1));
+            }
+            ok
+        }
+        TABLE_DELETE_COL => {
+            let ok = table::delete_column(&mut rows, col);
+            if ok {
+                new_col = col.min(table::column_count(&rows).saturating_sub(1));
+            }
+            ok
+        }
+        _ => false,
+    };
+    if !changed {
+        // Refused (the last row, a separator, an edge) — consume rather than
+        // decline: the user is in a table and meant a table command.
+        return vec![Effect::None];
+    }
+
+    let aligned = table::align(&rows);
+    let last_len = line(last).map(|t| t.len()).unwrap_or(0) as u32;
+    let byte = aligned
+        .get(new_row)
+        .map(|t| table::cell_start(t, new_col))
+        .unwrap_or(0) as u32;
+    replace_lines(
+        ctx,
+        first,
+        last,
+        last_len,
+        aligned.join("\n"),
+        Position {
+            line: first + new_row as u32,
             byte,
         },
     )

@@ -1526,3 +1526,69 @@ async fn tab_off_a_table_falls_through_to_the_headline_cycle() {
         "cycling changes visibility, never text — and no stray tab was inserted"
     );
 }
+
+// ── OM.13: table rows and columns ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_rows_and_columns_move_and_the_caret_follows() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "| a | b |\n| c | d |\n").await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    // Move the second row up.
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 2;
+    press(&mut editor, "<leader>tK");
+    assert_eq!(text(&editor), "| c | d |\n| a | b |\n");
+    assert_eq!(editor.cursor.line, 0, "the caret followed its row");
+
+    // Move the first column right.
+    press(&mut editor, "<leader>tL");
+    assert_eq!(text(&editor), "| d | c |\n| b | a |\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inserting_a_row_and_column_widens_the_whole_table() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "| a | b |\n").await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    goto_line(&mut editor, 0);
+    editor.cursor.byte = 2;
+    press(&mut editor, "<leader>tr");
+    assert_eq!(
+        text(&editor),
+        "| a | b |\n|   |   |\n",
+        "as wide as the table"
+    );
+
+    press(&mut editor, "<leader>tc");
+    let out = text(&editor);
+    assert!(out.starts_with("| a |   | b |"), "every row widened: {out}");
+}
+
+/// A table with no rows is not a table, and a rule marks a section — both
+/// refuse rather than silently destroying structure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_row_and_a_separator_refuse_to_be_destroyed() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "| a |\n";
+    let mut editor = org_editor(base.path(), original).await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>tdr");
+    assert_eq!(text(&editor), original, "the only row survives");
+    press(&mut editor, "<leader>tdc");
+    assert_eq!(text(&editor), original, "the only column survives");
+}

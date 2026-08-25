@@ -95,7 +95,10 @@ pub fn align(rows: &[Row]) -> Vec<String> {
     if columns == 0 {
         return rows.iter().map(|_| "|".to_string()).collect();
     }
-    let mut widths = vec![0usize; columns];
+    // Floor of 1: a column whose cells are all empty still has to be visible
+    // and wide enough to put the caret in — a zero-width column renders as
+    // `||` and there is nowhere to type.
+    let mut widths = vec![1usize; columns];
     for r in rows {
         if let Row::Cells(cells) = r {
             for (i, c) in cells.iter().enumerate() {
@@ -159,6 +162,101 @@ pub fn cell_start(line: &str, index: usize) -> usize {
         }
     }
     line.len()
+}
+
+// ── OM.13: moving and inserting rows and columns ──
+
+/// Swap rows `a` and `b`. Out-of-range indices leave the table untouched.
+pub fn swap_rows(rows: &mut [Row], a: usize, b: usize) -> bool {
+    if a == b || a >= rows.len() || b >= rows.len() {
+        return false;
+    }
+    // Refuse to move a separator: a rule marks a section boundary, and
+    // dragging it through the body would silently re-section the table.
+    if matches!(rows[a], Row::Separator) || matches!(rows[b], Row::Separator) {
+        return false;
+    }
+    rows.swap(a, b);
+    true
+}
+
+/// Swap column `a` with `b` across every row.
+pub fn swap_columns(rows: &mut [Row], a: usize, b: usize) -> bool {
+    if a == b {
+        return false;
+    }
+    let width = column_count(rows);
+    if a >= width || b >= width {
+        return false;
+    }
+    for row in rows.iter_mut() {
+        if let Row::Cells(cells) = row {
+            // Pad first: a ragged row would otherwise lose the swap silently,
+            // leaving one row's columns transposed against the rest.
+            while cells.len() <= a.max(b) {
+                cells.push(String::new());
+            }
+            cells.swap(a, b);
+        }
+    }
+    true
+}
+
+/// Insert an empty row below `at`.
+pub fn insert_row(rows: &mut Vec<Row>, at: usize) {
+    let width = column_count(rows).max(1);
+    let index = (at + 1).min(rows.len());
+    rows.insert(index, Row::Cells(vec![String::new(); width]));
+}
+
+/// Insert an empty column after `at` in every row.
+pub fn insert_column(rows: &mut [Row], at: usize) {
+    for row in rows.iter_mut() {
+        if let Row::Cells(cells) = row {
+            let index = (at + 1).min(cells.len());
+            cells.insert(index, String::new());
+        }
+    }
+}
+
+/// Delete row `at`, unless it is the table's only content row — a table with
+/// no rows is not a table, and the key would silently destroy it.
+pub fn delete_row(rows: &mut Vec<Row>, at: usize) -> bool {
+    if at >= rows.len() {
+        return false;
+    }
+    let content = rows.iter().filter(|r| matches!(r, Row::Cells(_))).count();
+    if content <= 1 && matches!(rows[at], Row::Cells(_)) {
+        return false;
+    }
+    rows.remove(at);
+    true
+}
+
+/// Delete column `at`, unless it is the last one.
+pub fn delete_column(rows: &mut [Row], at: usize) -> bool {
+    if column_count(rows) <= 1 {
+        return false;
+    }
+    for row in rows.iter_mut() {
+        if let Row::Cells(cells) = row {
+            if at < cells.len() {
+                cells.remove(at);
+            }
+        }
+    }
+    true
+}
+
+/// The widest row's cell count.
+pub fn column_count(rows: &[Row]) -> usize {
+    rows.iter()
+        .filter_map(|r| match r {
+            Row::Cells(c) => Some(c.len()),
+            Row::Separator => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -244,6 +342,76 @@ mod tests {
         assert_eq!(table_bounds(&l, 2, n), Some((1, 3)));
         assert_eq!(table_bounds(&l, 5, n), Some((5, 5)), "a separate table");
         assert_eq!(table_bounds(&l, 0, n), None, "not on a table");
+    }
+
+    fn table(rows: &[&str]) -> Vec<Row> {
+        rows.iter().filter_map(|r| parse_row(r)).collect()
+    }
+
+    #[test]
+    fn rows_swap_and_columns_swap_across_every_row() {
+        let mut t = table(&["| a | b |", "| c | d |"]);
+        assert!(swap_rows(&mut t, 0, 1));
+        assert_eq!(align(&t)[0], "| c | d |");
+
+        let mut t = table(&["| a | b |", "| c | d |"]);
+        assert!(swap_columns(&mut t, 0, 1));
+        assert_eq!(
+            align(&t),
+            vec!["| b | a |".to_string(), "| d | c |".to_string()]
+        );
+    }
+
+    /// A rule marks a section boundary; dragging it through the body would
+    /// silently re-section the table.
+    #[test]
+    fn a_separator_refuses_to_be_moved() {
+        let mut t = table(&["| a |", "|---|", "| b |"]);
+        assert!(!swap_rows(&mut t, 1, 2));
+        assert_eq!(t[1], Row::Separator);
+    }
+
+    /// A ragged row must be padded before a column swap, or it silently
+    /// keeps its columns transposed against every other row.
+    #[test]
+    fn a_column_swap_pads_ragged_rows_first() {
+        let mut t = table(&["| a | b | c |", "| x |"]);
+        assert!(swap_columns(&mut t, 0, 2));
+        assert_eq!(
+            align(&t),
+            vec!["| c | b | a |".to_string(), "|   |   | x |".to_string()]
+        );
+    }
+
+    #[test]
+    fn inserting_a_row_matches_the_tables_width() {
+        let mut t = table(&["| a | b |", "| c | d |"]);
+        insert_row(&mut t, 0);
+        assert_eq!(t.len(), 3);
+        assert_eq!(align(&t)[1], "|   |   |", "as wide as the table");
+    }
+
+    #[test]
+    fn inserting_a_column_widens_every_row() {
+        let mut t = table(&["| a | b |", "|---+---|", "| c | d |"]);
+        insert_column(&mut t, 0);
+        assert_eq!(align(&t)[0], "| a |   | b |");
+        assert_eq!(align(&t)[2], "| c |   | d |");
+    }
+
+    /// A table with no rows is not a table — deleting the last one would
+    /// silently destroy it.
+    #[test]
+    fn the_last_row_and_column_refuse_deletion() {
+        let mut t = table(&["| a |"]);
+        assert!(!delete_row(&mut t, 0));
+        assert!(!delete_column(&mut t, 0));
+        assert_eq!(align(&t), vec!["| a |".to_string()]);
+
+        let mut t = table(&["| a | b |", "| c | d |"]);
+        assert!(delete_row(&mut t, 0));
+        assert!(delete_column(&mut t, 0));
+        assert_eq!(align(&t), vec!["| d |".to_string()]);
     }
 
     #[test]

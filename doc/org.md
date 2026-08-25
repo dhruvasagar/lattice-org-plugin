@@ -178,6 +178,20 @@ when the key is most wanted.
 it falls through to the outline cycle; anywhere else it means whatever `<Tab>`
 usually means.
 
+| | |
+|---|---|
+| `<leader>tK` `<leader>tJ` | move this row up / down |
+| `<leader>tH` `<leader>tL` | move this column left / right |
+| `<leader>tr` `<leader>tc` | insert a row below / column after |
+| `<leader>tdr` `<leader>tdc` | delete this row / column |
+
+The directional letters are the outliner's, so one mnemonic covers subtrees
+and table rows alike. The caret follows what it moved.
+
+A separator refuses to be dragged through the body — a rule marks a section,
+and moving it would silently re-section the table. The last row and the last
+column refuse deletion, because a table with neither is not a table.
+
 Column widths are counted in characters, so accented Latin lines up. CJK and
 emoji, which occupy two cells, do not yet.
 

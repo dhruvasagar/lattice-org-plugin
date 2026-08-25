@@ -55,6 +55,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+mod agenda;
 mod checkbox;
 mod headline;
 mod links;
@@ -671,14 +672,11 @@ impl Guest for Component {
         );
     }
 
-    // ── OM.A1: the agenda seam ──────────────────────────────────────────
+    // ── OM.A1 / OM.A2: the agenda seam ──────────────────────────────────
     //
-    // Deliberately trivial in this slice: one row per headline, grouped by
-    // file, in file order. It proves the seam end to end — the host walks,
-    // reads, calls, sorts and builds excerpts without knowing what a
-    // headline is — and nothing more. OM.A2 replaces the body with org's
-    // actual semantics (TODO state, `SCHEDULED:` / `DEADLINE:`, date
-    // arithmetic, date groups).
+    // The host walks files and builds excerpts; everything org about the
+    // agenda lives in `agenda.rs`. See its module docs for what counts as a
+    // row and why.
 
     /// The host offers this plugin `.org` and `.org_archive` files and no
     /// others. It is the same pair `register_languages` claims, and the
@@ -688,36 +686,75 @@ impl Guest for Component {
         vec!["org".to_string(), "org_archive".to_string()]
     }
 
-    /// Nothing to drop yet — this slice's `scan` is a pure function of the
-    /// file it is given. OM.A2's is not (it anchors every relative date
-    /// against one "today" captured per scan), which is what the export is
-    /// for.
-    fn begin() {}
-
-    fn scan(path: String, text: String) -> Result<Vec<Entry>, String> {
-        let file = path.rsplit('/').next().unwrap_or(&path).to_string();
-        Ok(text
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| headline::headline_level(line).is_some())
-            .map(|(i, _)| Entry {
-                line: i as u32,
-                end_line: i as u32,
-                // One group per file in this slice, so every row of a file
-                // sits under one header. A DATE group spanning files is
-                // OM.A2's job and needs the parsing this slice does not do.
-                group: file.clone(),
-                label: file.clone(),
-                // One key for every row, which under the host's STABLE sort
-                // means "keep walk order" — file by file, line by line.
-                // That is the honest answer for a slice with no dates in
-                // it: any other key here would be an ordering invented to
-                // look like one. OM.A2 replaces it with an epoch day, and
-                // that is when rows start interleaving across files.
-                sort_key: 0,
-            })
-            .collect())
+    /// Capture the two things that must be the SAME for every file of one
+    /// scan, and would drift if they were read per file.
+    ///
+    /// *Today*, because a scan that crosses midnight must not label half its
+    /// rows against one day and half against the next — a row moving from
+    /// "today" to "overdue" partway down the view is worse than being a few
+    /// hours stale.
+    ///
+    /// *The keyword set*, because `:set org.todo-keywords` landing mid-scan
+    /// would change what counts as done halfway through the project, and an
+    /// agenda that hides an entry in one file and shows its twin in another
+    /// is not a stale answer, it is an incoherent one.
+    fn begin() {
+        let today = today_epoch_day();
+        let keywords = agenda::Keywords::from_spec(
+            &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
+        );
+        // Single-threaded guest, one actor, calls serialised by the host's
+        // per-plugin channel — so a `thread_local` IS the whole of the
+        // synchronisation story, and `begin`-then-`scan` ordering is a host
+        // guarantee rather than something the guest has to defend.
+        SCAN.set(Some(ScanState { today, keywords }));
     }
+
+    fn scan(_path: String, text: String) -> Result<Vec<Entry>, String> {
+        // `begin` is contractually called first. Refusing rather than
+        // defaulting makes a host that stops calling it fail loudly on the
+        // first file instead of producing a silently mis-dated agenda.
+        SCAN.with_borrow(|state| {
+            let Some(state) = state.as_ref() else {
+                return Err("org: scan before begin".to_string());
+            };
+            Ok(agenda::scan_file(&text, &state.keywords)
+                .into_iter()
+                .map(|row| Entry {
+                    line: row.line,
+                    end_line: row.end_line,
+                    group: agenda::group_key(row.day),
+                    label: agenda::group_label(row.day, state.today),
+                    sort_key: agenda::sort_key(&row),
+                })
+                .collect())
+        })
+    }
+}
+
+/// Per-scan state, captured in `begin`.
+struct ScanState {
+    today: i64,
+    keywords: agenda::Keywords,
+}
+
+thread_local! {
+    static SCAN: std::cell::RefCell<Option<ScanState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Today, as days since the Unix epoch, from the host clock.
+///
+/// `SystemTime` in a wasip2 component resolves through `wasi:clocks`, which
+/// the host wires for every seam. A clock that refuses (a jumped-back system
+/// time is the realistic case) yields day 0 — 1970 — so every real row reads
+/// as overdue. That is deliberately conspicuous: an agenda quietly anchored
+/// to the wrong day looks correct and is not.
+fn today_epoch_day() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
 }
 
 /// The shared body of all four promote/demote actions.

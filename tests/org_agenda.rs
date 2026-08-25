@@ -1,10 +1,16 @@
-//! OM.A1 — `:agenda` over real org files, produced by the real plugin.
+//! OM.A1 / OM.A2 — `:agenda` over real org files, produced by the real plugin.
 //!
-//! The slice's exit criterion: excerpts appear in a multibuffer. This walks
-//! the whole path — discover → load → the `agenda-source` seam drains → the
-//! host's agenda provider walks a directory of `.org` files → the plugin's
-//! `scan` answers → the rows land as excerpts, in the plugin's order, under
-//! the plugin's headers.
+//! The exit criterion for both: a 3-file fixture produces a date-grouped
+//! agenda in the right order. This walks the whole path — discover → load →
+//! the `agenda-source` seam drains → the host's agenda provider walks a
+//! directory of `.org` files → the plugin's `scan` answers with dated rows →
+//! the rows land as excerpts, interleaved ACROSS files by date, under one
+//! header per day.
+//!
+//! Dates in the corpus are written relative to the day the test runs, so the
+//! assertions are about ordering and grouping rather than about a fixed
+//! calendar that would rot. A hard-coded `2026-08-25` would pass today and
+//! read "overdue" forever after.
 //!
 //! ## Mode-ownership acid test
 //!
@@ -90,21 +96,91 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
     )
 }
 
-/// A small org corpus, plus a file nothing claims.
+/// Today, as the guest computes it — days since the epoch.
+fn today() -> i64 {
+    (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 86_400) as i64
+}
+
+/// `<YYYY-MM-DD Day>` for `today() + offset`, in org's active-stamp syntax.
+///
+/// Hinnant's `civil_from_days` + Zeller, restated here rather than imported:
+/// the plugin's copies are in a `cdylib` compiled for wasm, and a test that
+/// reused them would be checking the guest's arithmetic against itself.
+fn stamp(offset: i64) -> String {
+    let z = today() + offset + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+
+    // Zeller, shifted to 0 = Sunday. 1970-01-01 was a Thursday, so the
+    // simpler `(days + 4) % 7` would also do — but this matches what the
+    // guest computes, which is what the header must agree with.
+    let (zm, zy) = if m < 3 { (m + 12, y - 1) } else { (m, y) };
+    let (k, j) = (zy % 100, zy / 100);
+    let h = (d + (13 * (zm + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    const NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let name = NAMES[(((h + 6) % 7) as usize) % 7];
+
+    format!("<{y:04}-{m:02}-{d:02} {name}>")
+}
+
+/// Three org files whose dated rows deliberately do NOT sort in walk order,
+/// plus a file nothing claims.
+///
+/// The interleave is the point: `home.org` holds both the earliest row and
+/// the latest, so an agenda that merely concatenated each file's rows would
+/// come out in a different order and the assertion below would catch it.
 fn write_corpus(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("work.org"),
-        "#+TITLE: work\n* TODO Ship the thing\n** Sub task\nsome body\n",
+        format!(
+            "#+TITLE: work\n\
+             * TODO Ship the thing\n  SCHEDULED: {}\n\
+             * DONE Already shipped\n  SCHEDULED: {}\n\
+             * TODO No date on this one\nbody\n",
+            stamp(1),
+            stamp(1),
+        ),
     )
     .unwrap();
     std::fs::write(
         dir.join("home.org"),
-        "* Groceries\nmilk\n* TODO Fix the tap\n",
+        format!(
+            "* TODO Fix the tap\n  DEADLINE: {}\n\
+             * Groceries\nmilk\n\
+             * TODO Water the plants\n  SCHEDULED: {}\n",
+            stamp(-2),
+            stamp(3),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("notes.org"),
+        format!(
+            "* Standup {}\n\
+             * Old note [{}]\n",
+            stamp(1),
+            // Inactive: never a row, whatever its date.
+            &stamp(1)[1..stamp(1).len() - 1],
+        ),
     )
     .unwrap();
     // Claimed by nobody: the provider must never read it, let alone cross it.
-    std::fs::write(dir.join("main.rs"), "* Top\nfn main() {}\n").unwrap();
+    std::fs::write(
+        dir.join("main.rs"),
+        "* TODO Top\n  SCHEDULED: <2026-01-01 Thu>\n",
+    )
+    .unwrap();
 }
 
 /// Poll until the scan reaches a terminal headerline. The scan hops through
@@ -199,30 +275,61 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
     let handle = mb.handle(view).expect("the view is still open");
     let excerpts = handle.excerpts();
 
-    // Four headlines across two files; `main.rs` contributes nothing because
-    // nothing claimed it — its `* Top` line would show up if the walk had
-    // read it.
+    // Four rows, and the misses are as load-bearing as the hits:
+    //   * `main.rs` contributes nothing — nothing claimed `.rs`, so it was
+    //     never read (its `* TODO Top` would be here if it had been);
+    //   * `DONE Already shipped` is filtered — an agenda listing what you
+    //     finished is a log, not a plan;
+    //   * `TODO No date on this one` is filtered — undated is not agenda-able;
+    //   * `Old note [<date>]` is filtered — an INACTIVE stamp is never a row.
     assert_eq!(excerpts.len(), 4, "got {status:?}");
 
-    // One header per file (the OM.A1 grouping), blank on the file's other
-    // rows. Walk order is not guaranteed between `home.org` and `work.org`,
-    // so the assertion is on the SHAPE: two headers, two blanks, and every
-    // header naming a file in the corpus.
+    // --- The headline claim of OM.A2: rows interleave ACROSS files by date.
+    //
+    // home.org holds both the earliest (deadline, 2 days ago) and the latest
+    // (scheduled, in 3 days). If each file's rows were merely concatenated,
+    // those two would be adjacent — this ordering is only reachable through
+    // the cross-file sort on the guest's `sort_key`.
     let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
-    let named: Vec<&String> = titles.iter().filter(|t| !t.is_empty()).collect();
-    assert_eq!(named.len(), 2, "one header per file, got {titles:?}");
-    for title in &named {
-        assert!(
-            ["work.org", "home.org"].contains(&title.as_str()),
-            "a header names its file, got {title}"
-        );
-    }
-    assert_eq!(titles[1], "", "a file's second row continues its group");
+    assert!(
+        titles[0].contains("overdue by 2 day(s)"),
+        "the overdue deadline leads, got {titles:?}"
+    );
+    assert!(
+        titles[1].contains("(tomorrow)"),
+        "then tomorrow's group, got {titles:?}"
+    );
+    assert_eq!(
+        titles[2], "",
+        "…whose SECOND row continues the group and renders no header — and it \
+         came from a different FILE, which is the property a per-file grouping \
+         could not express"
+    );
+    assert!(
+        titles[3].contains("in 3 day(s)"),
+        "then the furthest-out group, got {titles:?}"
+    );
 
-    // Rows of one file share one source document, so an edit through one row
-    // is visible through its neighbour.
-    let sources_used: std::collections::HashSet<_> = excerpts.iter().map(|e| e.source).collect();
-    assert_eq!(sources_used.len(), 2, "one source document per file");
+    // Tomorrow's group is drawn from two different files, which is exactly
+    // what "a date group spans files" means.
+    let tomorrow_sources: std::collections::HashSet<_> =
+        excerpts[1..3].iter().map(|e| e.source).collect();
+    assert_eq!(
+        tomorrow_sources.len(),
+        2,
+        "one date group, two source documents"
+    );
+
+    // The overdue deadline's excerpt spans its planning line, so the row
+    // shows the date rather than a bare title the user has to jump to read.
+    assert_eq!(
+        excerpts[0].end_line,
+        excerpts[0].start_line + 1,
+        "a scheduled/deadline row spans its planning line"
+    );
+    // …and a bare-timestamp row does not, because there is no planning line
+    // under it to show.
+    assert_eq!(excerpts[2].end_line, excerpts[2].start_line);
 
     match status {
         HeaderlineStatus::Complete { summary, .. } => {

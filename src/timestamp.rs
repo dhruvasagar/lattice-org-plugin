@@ -70,6 +70,56 @@ pub fn weekday(year: i32, month: u32, day: u32) -> usize {
     (((h + 6) % 7) as usize) % 7
 }
 
+/// Days since the Unix epoch for a civil date. Howard Hinnant's
+/// `days_from_civil`, which is exact for every date in the proleptic
+/// Gregorian calendar and is 20 lines of integer arithmetic — where pulling
+/// `chrono` into a wasm guest would be a dependency tree for it.
+///
+/// OM.A2 uses it as the agenda's ordering primitive: an epoch day is a single
+/// `i64` that sorts correctly across months and years, which a `(y, m, d)`
+/// tuple crossing the ABI as one `sort-key` cannot be.
+pub fn epoch_day(year: i32, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year } as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = month as i64;
+    let d = day as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// The first timestamp in `line`, active or not, if there is one.
+///
+/// [`stamp_at`] answers "is the cursor in a stamp"; this answers "does this
+/// line carry one". The agenda needs the second and would otherwise have to
+/// probe every byte offset to get it.
+pub fn first_stamp(line: &str) -> Option<Stamp> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let (close, active) = match b[i] {
+            b'<' => (b'>', true),
+            b'[' => (b']', false),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some(end) = line[i..].find(close as char).map(|o| i + o) else {
+            break;
+        };
+        if let Some(mut s) = parse_inner(&line[i + 1..end]) {
+            s.start = i;
+            s.end = end + 1;
+            s.active = active;
+            return Some(s);
+        }
+        i = end + 1;
+    }
+    None
+}
+
 /// Find the timestamp containing `byte`, if the cursor is inside one.
 pub fn stamp_at(line: &str, byte: usize) -> Option<Stamp> {
     let b = line.as_bytes();

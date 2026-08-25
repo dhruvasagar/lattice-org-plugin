@@ -41,6 +41,27 @@ pub struct Headline<'a> {
 /// The `|` is org's separator between "not done" and "done" states. It matters
 /// to the agenda, not to cycling, so it is dropped here and the slice that
 /// needs the distinction can re-read the option.
+/// The keyword list split at `|` into (not-done, done).
+///
+/// [`parse_keywords`] drops the separator because cycling does not care; the
+/// AGENDA does — org hides completed entries by default, and "completed"
+/// means "the keyword is on the right of the bar". A spec with no `|` has no
+/// done states at all, which is org's rule and not a degradation: the user
+/// who writes `#+TODO: A B C` meant three open states.
+pub fn split_keywords(spec: &str) -> (Vec<String>, Vec<String>) {
+    let mut not_done = Vec::new();
+    let mut done = Vec::new();
+    let mut past_bar = false;
+    for word in spec.split_whitespace() {
+        if word == "|" {
+            past_bar = true;
+            continue;
+        }
+        if past_bar { &mut done } else { &mut not_done }.push(word.to_string());
+    }
+    (not_done, done)
+}
+
 pub fn parse_keywords(spec: &str) -> Vec<String> {
     spec.split_whitespace()
         .filter(|w| *w != "|")

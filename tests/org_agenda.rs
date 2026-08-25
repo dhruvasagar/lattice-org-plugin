@@ -34,6 +34,7 @@ use lattice_host::editor::Editor;
 use lattice_multibuffer::{HeaderlineStatus, MultibufferRegistryHandle};
 use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{discover, LoaderServices, PluginLoader};
+use lattice_protocol::parse_chord_sequence;
 
 /// See `org_major_mode.rs` — `Editor::boot` auto-discovers plugins on a
 /// spawned task, which flakes ~1-in-6 against a developer's real
@@ -59,7 +60,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"agenda-source\", \"modes\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
+        "id = \"org\"\nprovides = [\"agenda-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), wasm).unwrap();
@@ -357,4 +358,107 @@ async fn agenda_declines_when_no_plugin_provides_rows() {
         }
         other => panic!("expected a Declined outcome, got {other:?}"),
     }
+}
+
+/// Dispatch a multi-key sequence written with `<leader>`, expanding it the same
+/// way the binding did — so the test types what the user types.
+fn press(editor: &mut Editor, keys: &str) {
+    let expanded = editor.keymap.expand_leader(keys);
+    let seq = parse_chord_sequence(&expanded).expect("parses");
+    let mut partial = Vec::new();
+    for c in seq {
+        let _ = editor.dispatch_chord(c, &mut partial);
+    }
+}
+
+/// OM.A3's exit criterion, and the claim §6.1 said decided the whole design:
+/// **changing a TODO state in the agenda writes the source file.**
+///
+/// An agenda you can only read is a lesser feature wearing the name. This is
+/// the assertion that says it is not one.
+///
+/// Three things have to be true at once and each has failed independently
+/// during this slice:
+///   1. `org-agenda-mode` is activated on the view — a MANUAL policy the host
+///      drives off the plugin's `view-mode` export, because no policy can say
+///      "the buffer the agenda provider just built";
+///   2. its chord resolves in a buffer whose major is `multibuffer-mode`;
+///   3. the edit is translated from composed to source coordinates and lands
+///      in the file the row came from, which is the multibuffer substrate's
+///      job and the reason an agenda row is an excerpt rather than a string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_a_todo_state_in_the_agenda_writes_the_source_document() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let file = notes.join("only.org");
+    std::fs::write(
+        &file,
+        format!("* TODO Ship the thing\n  SCHEDULED: {}\n", stamp(0)),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1);
+    let view = match lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+    settle_agenda(&mb, view).await;
+
+    let handle = mb.handle(view).unwrap();
+    assert_eq!(handle.excerpts().len(), 1, "one dated row");
+
+    // The plugin's mode is on the view, activated by the host off the
+    // `view-mode` export. Without this the chord below resolves to nothing
+    // and the test would fail on the text assertion with no clue why.
+    assert!(
+        editor
+            .active_modes
+            .get(&view)
+            .is_some_and(|m| m.has_minor(lattice_mode::ModeId::new("org-agenda-mode"))),
+        "the host activated the SOURCE's mode on the view it built"
+    );
+
+    // Type it the way the user does, in the agenda, on the row's headline.
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+    press(&mut editor, "<leader>ot");
+    editor.run_tick_pending();
+
+    // The edit landed in the SOURCE document — the file the row came from,
+    // not the composed view.
+    let source = handle.excerpts()[0].source;
+    let source_text = handle
+        .source_text(source)
+        .expect("the row's source document is still attached");
+    assert!(
+        source_text.starts_with("* DONE Ship the thing"),
+        "the TODO state changed in the source file, got {source_text:?}"
+    );
+    assert!(
+        source_text.contains("SCHEDULED:"),
+        "…and only the keyword changed"
+    );
 }

@@ -374,6 +374,44 @@ impl Guest for Component {
             target_language: None,
         });
 
+        // OM.A3 — `org-agenda-mode`, the fourth mode.
+        //
+        // MANUAL activation, and that is the whole reason it is a separate
+        // mode rather than a wider policy on `org-todo-mode`. The agenda view
+        // is a multibuffer: its major is `multibuffer-mode`, so
+        // `Majors(["org-mode"])` never fires there — and
+        // `Majors(["multibuffer-mode"])` would fire in project-search results
+        // and magit diffs too, where `<leader>ot` means nothing.
+        //
+        // No activation policy can say "the buffer the agenda provider just
+        // built", so the HOST activates it, on the strength of this plugin's
+        // `view-mode` export naming it. The keymap and every handler body
+        // stay here.
+        //
+        // The chords are the SAME actions `org-todo-mode` binds, deliberately
+        // — cycling a TODO state means one thing, and the agenda is a place
+        // you do it FROM. What differs is only which buffer the edit lands
+        // in, and that is the multibuffer substrate's job: an edit in the
+        // view is translated to source coordinates and written to the file
+        // the row came from.
+        //
+        // `<leader>o:` (tags) is NOT here. It is a two-hop prompt flow whose
+        // submit action re-reads the buffer, and the composed→source
+        // translation of that second hop is untested; binding it would ship a
+        // chord that might write to the wrong file.
+        register_mode(&ModeDeclaration {
+            id: "org-agenda-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Manual,
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![
+                bind("<leader>ot", "org-todo-cycle"),
+                bind("<leader>oT", "org-todo-cycle-back"),
+                bind("<leader>o,", "org-priority-cycle"),
+            ],
+            target_language: None,
+        });
+
         // OM.12 — `org-table-mode`, the third mode.
         //
         // Its `<Tab>` sits ABOVE `org-mode`'s in the layer order, and declines
@@ -684,6 +722,17 @@ impl Guest for Component {
     /// language, so it cannot read the answer off one.
     fn extensions() -> Vec<String> {
         vec!["org".to_string(), "org_archive".to_string()]
+    }
+
+    /// OM.A3: the mode the host activates on the agenda view, so org's TODO
+    /// chords work on org's own rows there.
+    ///
+    /// The view's GENERIC behaviour — `gr`, jump-to-source — is not named
+    /// here and is not this plugin's: refreshing the agenda re-runs the
+    /// host's walk, which only the host can do. What this claims is the part
+    /// that is actually org.
+    fn view_mode() -> Option<String> {
+        Some("org-agenda-mode".to_string())
     }
 
     /// Capture the two things that must be the SAME for every file of one

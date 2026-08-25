@@ -72,7 +72,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"modes\", \"language\", \"help\", \"config\"]\ndefault_mode = \"org-todo-mode\"\n",
+        "id = \"org\"\nprovides = [\"modes\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), wasm).unwrap();
@@ -94,6 +94,12 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             keymap: Some(editor.keymap.clone()),
             help_topics: Some(editor.help_topics.clone()),
             config_registry: Some(editor.config.clone()),
+            // IM.6b: the media seam fails the whole load when unwired, by
+            // design — a plugin declaring `media` whose images can never be
+            // drawn should say so rather than load silently half-working.
+            media_registry: Some(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+                lattice_mode::MediaSourceRegistry::new(),
+            ))),
             ..Default::default()
         },
     )

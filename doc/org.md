@@ -123,6 +123,34 @@ the priority and tags exactly where they were.
 ignored when cycling. Both options are read on each keypress, so
 `:set org.todo-keywords=PROPOSED ACCEPTED REJECTED` takes effect immediately.
 
+## Images
+
+`[[file:diagram.png]]` on a line of its own draws the image inline, in the
+GPUI build. `<leader>oI` toggles them; `:set org.inline-images=true` is the
+persistent form.
+
+| | |
+|---|---|
+| `<leader>oI` | show / hide inline images |
+| `org.inline-images` | bool, default **off** |
+
+Off by default for two reasons. An org file can reference anything, and a
+buffer that silently reads and decodes every referenced file the moment it
+opens is a surprise. And the terminal build cannot draw images at all — it
+shows the link's description (or the file name) in a box of the same height,
+so the two builds scroll identically and only one shows pictures.
+
+Only a link **alone on its line** becomes an image. A block occupies whole
+rows, so it can only hang below a line; a link inside a sentence would put its
+picture on the following row, detached from the text that introduced it.
+Emacs draws the same line for the same reason.
+
+`png`, `jpg`, `gif`, `webp`, `svg` and `bmp` are treated as images. Anything
+else stays a link — `[[file:notes.org]]` is not a broken picture, and probing
+every linked file to find out would read files you never asked about.
+Remote links (`[[https://…/a.png]]`) stay links too: fetching them would mean
+network traffic you did not ask for.
+
 ## What this plugin is not
 
 Tables and the agenda are not here yet. Nor is code highlighting *inside* a

@@ -40,6 +40,7 @@ lattice-keymap = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-
 lattice-mode = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-mode" }
 lattice-plugin-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-host" }
 lattice-plugin-loader = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-loader" }
+lattice-runtime = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-runtime" }
 lattice-protocol = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-protocol" }
 lattice-syntax = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-syntax" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

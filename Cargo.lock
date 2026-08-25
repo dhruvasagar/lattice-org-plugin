@@ -3336,6 +3336,7 @@ dependencies = [
  "lattice-plugin-host",
  "lattice-plugin-loader",
  "lattice-protocol",
+ "lattice-runtime",
  "lattice-syntax",
  "tempfile",
  "tokio",

@@ -42,6 +42,7 @@ wit_bindgen::generate!({
             include lattice:plugin-host/modes-plugin@0.1.0;
             include lattice:plugin-host/grammar-plugin@0.1.0;
             include lattice:plugin-host/config-plugin@0.1.0;
+            include lattice:plugin-host/media-plugin@0.1.0;
         }
     "#,
     path: "wit",
@@ -50,9 +51,11 @@ wit_bindgen::generate!({
 });
 
 mod headline;
+mod links;
 mod todo;
 
 use exports::lattice::plugin_host::grammar_callbacks::Guest as GrammarCallbacks;
+use exports::lattice::plugin_host::media::Guest as MediaProducer;
 use lattice::plugin_host::buffer::Document;
 use lattice::plugin_host::config::{get_option, register_option, OptionType};
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
@@ -64,9 +67,9 @@ use lattice::plugin_host::modes::{
 };
 use lattice::plugin_host::tree_sitter::TreeSnapshot;
 use lattice::plugin_host::types::{
-    ActionContext, ActionSpec, AppEffect, Args, Edit, EditKind, Effect, ExCommandContext,
-    MotionContext, MotionResult, MotionSpec, OperatorContext, Position, Range, TextObjectContext,
-    TextObjectSpec,
+    ActionContext, ActionSpec, AppEffect, Args, DecorationContext, Edit, EditKind, Effect,
+    ExCommandContext, MediaBlock, MediaFit, MotionContext, MotionResult, MotionSpec,
+    OperatorContext, Position, Range, TextObjectContext, TextObjectSpec,
 };
 
 /// Callback ids for `apply-action`. The guest chooses these; the host only
@@ -107,6 +110,9 @@ const SET_TAGS: u32 = 14;
 /// prompt's text once the user submits.
 const SET_TAGS_SUBMIT: u32 = 15;
 
+/// `<leader>oI` (IM.7).
+const TOGGLE_INLINE_IMAGES: u32 = 16;
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -117,6 +123,23 @@ struct Component;
 /// disabling the keys.
 const DEFAULT_TODO_KEYWORDS: &str = "TODO | DONE";
 const DEFAULT_HIGHEST_PRIORITY: &str = "C";
+
+/// IM.7: images are OFF by default.
+///
+/// Two reasons, and neither is timidity. A buffer that silently reads and
+/// decodes every referenced file the moment it opens is a surprise — an org
+/// file can reference anything. And the TUI cannot draw them, so on by default
+/// would mean every terminal user paying reserved rows for boxes of alt text
+/// they did not ask for.
+const DEFAULT_INLINE_IMAGES: &str = "false";
+
+/// Whether inline images are enabled, read fresh so `:set` lands on the next
+/// producer trigger.
+fn inline_images_enabled() -> bool {
+    get_option("inline-images")
+        .unwrap_or_else(|| DEFAULT_INLINE_IMAGES.to_string())
+        .eq_ignore_ascii_case("true")
+}
 
 /// The configured keyword sequence, read fresh on each use.
 ///
@@ -164,6 +187,13 @@ impl Guest for Component {
             OptionType::String,
             DEFAULT_HIGHEST_PRIORITY,
             "The last priority letter `<leader>o,` cycles to. `C` gives A, B, C.",
+        );
+        let _ = register_option(
+            "inline-images",
+            OptionType::Boolean,
+            DEFAULT_INLINE_IMAGES,
+            "Draw `[[file:…]]` image links inline. Off by default: an org file \
+             can reference anything, and only the GPUI peer can draw them.",
         );
     }
 
@@ -235,6 +265,9 @@ impl Guest for Component {
                 bind("<leader>oJ", "org-move-subtree-down"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
+                // IM.7: images are off by default, so the toggle is how most
+                // users will ever turn them on.
+                bind("<leader>oI", "org-toggle-inline-images"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
                 // prefixes rather than terminal bindings, so unlike `>>` / `<<`
                 // these transplant unchanged. `g{` is emacs's
@@ -420,6 +453,12 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-toggle-inline-images",
+            "Show or hide inline images for org buffers",
+            &spec(),
+            TOGGLE_INLINE_IMAGES,
         );
         register_action(
             "org-toggle-heading",
@@ -891,6 +930,28 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
+            // IM.7: flips `org.inline-images`. The option is global rather
+            // than per-buffer because the producer is per-plugin, and a
+            // per-buffer answer would mean the guest tracking buffer state it
+            // has no other reason to hold.
+            TOGGLE_INLINE_IMAGES => {
+                let on = !inline_images_enabled();
+                // `set_option` publishes `OptionChanged`, which is what
+                // re-triggers the producer — so the images appear or vanish
+                // without the user touching anything else.
+                if !lattice::plugin_host::config::set_option(
+                    "inline-images",
+                    if on { "true" } else { "false" },
+                ) {
+                    return Err("org: could not set org.inline-images".to_string());
+                }
+                Ok(vec![Effect::Echo(
+                    lattice::plugin_host::types::EchoPayload {
+                        level: lattice::plugin_host::types::EchoLevel::Info,
+                        text: format!("org: inline images {}", if on { "on" } else { "off" }),
+                    },
+                )])
+            }
             // OM.7.
             TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, |line, kw| {
                 todo::cycle_keyword(line, kw, true)
@@ -1067,3 +1128,36 @@ impl GrammarCallbacks for Component {
 }
 
 export!(Component);
+
+/// IM.7 — org's inline-image producer.
+///
+/// Scans the buffer for `[[file:…]]` links alone on their line and reports one
+/// media block per image. The HOST resolves each path against the buffer's
+/// directory, reads the file's intrinsic size, decides how many rows it
+/// reserves and draws it — this guest only says *what* and *where*.
+impl MediaProducer for Component {
+    fn media_blocks(ctx: DecorationContext, text: String) -> Result<Vec<MediaBlock>, String> {
+        if !inline_images_enabled() {
+            // A typed `err`, not an empty list. Empty would mean "I scanned and
+            // found none", which the host caches as the answer; this says "I
+            // produced nothing this trigger" and the host keeps what it had.
+            return Err("org: inline images disabled".to_string());
+        }
+        if ctx.line_count == 0 {
+            return Err("org: empty buffer".to_string());
+        }
+        Ok(text
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| links::image_link(line, i as u32))
+            .map(|link| MediaBlock {
+                anchor_line: link.line,
+                path: link.path,
+                alt: link.description,
+                // `Contain` — never upscale. An icon stretched across the pane
+                // is worse than the icon.
+                fit: MediaFit::Contain,
+            })
+            .collect())
+    }
+}

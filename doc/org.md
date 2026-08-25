@@ -123,6 +123,33 @@ the priority and tags exactly where they were.
 ignored when cycling. Both options are read on each keypress, so
 `:set org.todo-keywords=PROPOSED ACCEPTED REJECTED` takes effect immediately.
 
+## Checkboxes
+
+| | |
+|---|---|
+| `<C-Space>` | toggle the checkbox on this line |
+
+```org
+* Shopping [1/3]
+  - [X] bread
+  - [ ] milk
+  - [ ] eggs
+```
+
+Ticking a box updates the nearest statistics cookie above it in the **same
+edit**, so one `u` puts both back — a list showing `[2/3]` above one ticked
+box is a worse state to be left in than either end.
+
+A cookie keeps its form: `[n/m]` stays a ratio, `[p%]` stays a percentage.
+Percentages truncate, as org's do, so a cookie reads `100%` only when
+everything is genuinely done.
+
+Cookies count **direct children only**. In a nested list each level rolls up
+to its own parent, because a grandchild's state is already reflected in its
+parent's box.
+
+`[-]` is org's partial state. Toggling one completes it.
+
 ## Images
 
 `[[file:diagram.png]]` on a line of its own draws the image inline, in the

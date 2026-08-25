@@ -1231,3 +1231,96 @@ async fn the_tag_prompt_chord_is_wired_to_the_plugins_action() {
          has something to dispatch when the user submits"
     );
 }
+
+// ── OM.8: checkboxes + statistics cookies ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggling_a_checkbox_updates_the_parents_cookie_in_one_edit() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Shopping [1/3]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* Shopping [2/3]\n  - [X] bread\n  - [X] milk\n  - [ ] eggs\n",
+        "the box ticked and the cookie followed"
+    );
+
+    // ONE edit: a single `u` puts both back. A half-undone list showing
+    // `[2/3]` above one ticked box is worse than either end state.
+    press(&mut editor, "u");
+    assert_eq!(text(&editor), original, "one undo reverses box and cookie");
+}
+
+/// A percentage cookie stays a percentage — rewriting it as a ratio would
+/// change the document's style on a keypress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_percentage_cookie_keeps_its_form() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Shopping [0%]\n  - [ ] bread\n  - [ ] milk\n  - [ ] eggs\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* Shopping [33%]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n",
+        "truncated, so 100% means genuinely complete"
+    );
+}
+
+/// `<C-Space>` off a checkbox consumes the key and does nothing. It is org's
+/// chord here with nothing beneath it to fall through to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggling_off_a_checkbox_line_does_nothing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Shopping\nplain prose\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(text(&editor), original);
+}
+
+/// A nested list rolls up one level at a time: ticking a grandchild updates
+/// its own parent's box-count cookie, and the headline's cookie counts only
+/// its direct children.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_lists_roll_up_to_the_nearest_cookie() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Top [0/2]\n  - [ ] a [0/2]\n    - [ ] a1\n    - [ ] a2\n  - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    let out = text(&editor);
+    assert!(
+        out.contains("- [ ] a [1/2]"),
+        "the nearest cookie moved: {out}"
+    );
+    assert!(
+        out.contains("* Top [0/2]"),
+        "the headline still counts only its DIRECT children: {out}"
+    );
+}

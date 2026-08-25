@@ -50,6 +50,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
+mod checkbox;
 mod headline;
 mod links;
 mod todo;
@@ -112,6 +113,9 @@ const SET_TAGS_SUBMIT: u32 = 15;
 
 /// `<leader>oI` (IM.7).
 const TOGGLE_INLINE_IMAGES: u32 = 16;
+
+/// `<C-Space>` (OM.8).
+const TOGGLE_CHECKBOX: u32 = 17;
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -268,6 +272,9 @@ impl Guest for Component {
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
+                // OM.8: org's own binding. `<C-Space>` is unbound in vim's
+                // Normal mode, so nothing is shadowed.
+                bind("<C-Space>", "org-toggle-checkbox"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
                 // prefixes rather than terminal bindings, so unlike `>>` / `<<`
                 // these transplant unchanged. `g{` is emacs's
@@ -453,6 +460,12 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-toggle-checkbox",
+            "Toggle the checkbox on this line and update the parent's cookie",
+            &spec(),
+            TOGGLE_CHECKBOX,
         );
         register_action(
             "org-toggle-inline-images",
@@ -930,6 +943,7 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
+            TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
             // IM.7: flips `org.inline-images`. The option is global rather
             // than per-buffer because the producer is per-plugin, and a
             // per-buffer answer would mean the guest tracking buffer state it
@@ -1160,4 +1174,96 @@ impl MediaProducer for Component {
             })
             .collect())
     }
+}
+
+/// OM.8 — toggle the checkbox on the cursor's line, and bring every ancestor
+/// cookie up to date.
+///
+/// **One edit spanning the whole affected range**, not one per line. Ticking
+/// `milk` under `* Shopping [1/3]` changes two lines, and a single `u` must
+/// put both back — a half-undone list showing `[2/3]` above one ticked box is
+/// a worse state than either end.
+///
+/// Consumes the key rather than declining when there is no checkbox:
+/// `<C-Space>` is org's here and has nothing to fall through to.
+fn toggle_checkbox(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let at = ctx.cursor.line;
+    let Some(text) = doc.line(at) else {
+        return vec![Effect::None];
+    };
+    let Some(item) = checkbox::parse_item(&text) else {
+        return vec![Effect::None];
+    };
+    let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) else {
+        return vec![Effect::None];
+    };
+
+    let count = doc.line_count();
+    // Rewrite from the toggled line down to itself, then extend upward for
+    // each ancestor whose cookie changes. The span is contiguous because an
+    // ancestor is always above its children.
+    let mut rewritten: Vec<(u32, String)> = vec![(at, flipped)];
+    let mut current_indent = item.indent;
+    let mut scan = at;
+    while scan > 0 {
+        scan -= 1;
+        let Some(above) = line(scan) else { break };
+        if above.trim().is_empty() {
+            continue;
+        }
+        let indent = above.len() - above.trim_start().len();
+        let is_headline = headline::headline_level(&above).is_some();
+        // An ancestor is a shallower item, or a headline (which owns the
+        // whole list beneath it whatever its indent).
+        if !is_headline && indent >= current_indent {
+            continue;
+        }
+        let parent_indent = if is_headline { 0 } else { indent };
+        // Tally against the buffer AS IT WILL BE — the toggled line included —
+        // or the cookie would lag one keypress behind the box.
+        let after = |n: u32| -> Option<String> {
+            rewritten
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .or_else(|| line(n))
+        };
+        let (done, total) = checkbox::tally(after, scan, parent_indent, count);
+        if let Some(updated) = checkbox::update_cookie(&above, done, total) {
+            if updated != above {
+                rewritten.push((scan, updated));
+            }
+        }
+        // A parent item may itself be a child of something shallower; a
+        // headline is the top, so stop there.
+        if is_headline {
+            break;
+        }
+        current_indent = indent;
+    }
+
+    let top = rewritten.iter().map(|(i, _)| *i).min().unwrap_or(at);
+    let Some(last_text) = line(at) else {
+        return vec![Effect::None];
+    };
+    let body: Vec<String> = (top..=at)
+        .map(|i| {
+            rewritten
+                .iter()
+                .find(|(j, _)| *j == i)
+                .map(|(_, t)| t.clone())
+                .or_else(|| line(i))
+                .unwrap_or_default()
+        })
+        .collect();
+
+    replace_lines(
+        ctx,
+        top,
+        at,
+        last_text.len() as u32,
+        body.join("\n"),
+        ctx.cursor,
+    )
 }

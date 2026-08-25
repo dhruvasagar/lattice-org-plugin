@@ -150,6 +150,28 @@ parent's box.
 
 `[-]` is org's partial state. Toggling one completes it.
 
+## Links
+
+| | |
+|---|---|
+| `<leader>oo` | open the link under the cursor |
+
+Three destinations, decided by what the link says:
+
+| | |
+|---|---|
+| `[[file:notes.org]]`, `[[notes/a.org]]` | opens as a buffer |
+| `[[https://example.com]]` | goes to the system handler |
+| `[[*Some Heading]]` | jumps to that headline in this file |
+
+Unlike an image, a link does **not** have to be alone on its line — opening
+one mid-sentence is the whole point of the key.
+
+Internal references match the headline **title** exactly, so a `TODO` keyword
+or priority on the target does not get in the way, and case matters. A
+reference that resolves to nothing says so and leaves the cursor where it is;
+jumping to the wrong heading would be worse than not jumping.
+
 ## Timestamps
 
 | | |

@@ -1395,3 +1395,62 @@ async fn a_time_crossing_midnight_moves_the_date_end_to_end() {
     press(&mut editor, "<C-a>");
     assert_eq!(text(&editor), "<2026-08-26 Wed 00:30>\n");
 }
+
+// ── OM.10: links ──
+
+/// An internal `[[*Headline]]` moves the cursor within this buffer — the one
+/// link kind whose whole effect is observable without opening anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_internal_link_jumps_to_its_headline() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Index\nsee [[*Deep Work]] below\n* Other\n* TODO Deep Work\nbody\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 8;
+    press(&mut editor, "<leader>oo");
+    assert_eq!(
+        editor.cursor.line, 3,
+        "jumped to the headline, and the TODO keyword is not part of the title"
+    );
+}
+
+/// A reference that resolves to nothing must not move the cursor somewhere
+/// arbitrary — landing on the wrong heading is worse than not moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unresolved_internal_link_leaves_the_cursor_alone() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Index\n[[*Nowhere]]\n* Other\n").await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 4;
+    press(&mut editor, "<leader>oo");
+    assert_eq!(editor.cursor.line, 1, "still on the link");
+}
+
+/// Off a link the chord is consumed — it is org's, behind `<leader>o`, with
+/// nothing beneath it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_off_a_link_does_nothing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Index\nplain prose\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>oo");
+    assert_eq!(text(&editor), original);
+    assert_eq!(editor.cursor.line, 1);
+}

@@ -122,6 +122,9 @@ const TOGGLE_CHECKBOX: u32 = 17;
 const TIMESTAMP_UP: u32 = 18;
 const TIMESTAMP_DOWN: u32 = 19;
 
+/// `<leader>oo` (OM.10).
+const OPEN_LINK: u32 = 20;
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -284,6 +287,7 @@ impl Guest for Component {
                 // These SHADOW them inside org buffers and DECLINE off a
                 // timestamp, so the builtin still works on ordinary numbers —
                 // the one place in this plugin where declining is right.
+                bind("<leader>oo", "org-open-link"),
                 bind("<C-a>", "org-timestamp-up"),
                 bind("<C-x>", "org-timestamp-down"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
@@ -471,6 +475,12 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-open-link",
+            "Open the link under the cursor: file, URL, or another headline",
+            &spec(),
+            OPEN_LINK,
         );
         register_action(
             "org-timestamp-up",
@@ -967,6 +977,7 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
+            OPEN_LINK => Ok(open_link(&ctx, doc)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
             TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
             // IM.7: flips `org.inline-images`. The option is global rather
@@ -1327,4 +1338,49 @@ fn step_timestamp(ctx: &ActionContext, doc: &Document, delta: i64) -> Vec<Effect
         updated,
         ctx.cursor,
     )
+}
+
+/// OM.10 — open the link under the cursor.
+///
+/// Three destinations, three effects: a file opens as a buffer, a URL goes to
+/// the system handler, and an internal `[[*Headline]]` moves the cursor.
+///
+/// The internal case searches THIS buffer only, which is what org means by
+/// `*Headline`, and matches the title exactly — a fuzzy match that jumped to
+/// the wrong heading would be worse than not jumping. A reference that
+/// resolves to nothing echoes rather than moving the cursor somewhere
+/// arbitrary.
+fn open_link(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let Some(text) = doc.line(ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let Some(link) = links::link_at(&text, ctx.cursor.byte as usize) else {
+        return vec![Effect::None];
+    };
+    match link.target {
+        links::Target::File(path) => vec![Effect::OpenBufferAt(
+            lattice::plugin_host::types::OpenBufferAtPayload {
+                path: Some(path),
+                position: Position { line: 0, byte: 0 },
+                force: false,
+            },
+        )],
+        // The host decides what "open" means for a URI — this guest neither
+        // spawns a process nor touches the network.
+        links::Target::Uri(uri) => vec![Effect::OpenExternalUri(uri)],
+        links::Target::Headline(title) => {
+            let line = |n: u32| doc.line(n);
+            let keywords = todo_keywords();
+            match links::find_headline(line, doc.line_count(), &title, &keywords) {
+                Some(target) => vec![Effect::CursorMove(Position {
+                    line: target,
+                    byte: 0,
+                })],
+                None => vec![Effect::Echo(lattice::plugin_host::types::EchoPayload {
+                    level: lattice::plugin_host::types::EchoLevel::Warn,
+                    text: format!("org: no headline named \"{title}\""),
+                })],
+            }
+        }
+    }
 }

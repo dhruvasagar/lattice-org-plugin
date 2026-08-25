@@ -179,3 +179,168 @@ mod tests {
         }
     }
 }
+
+// ── OM.10: opening a link at point ──
+
+/// What a link points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A file on disk, path as written (the host resolves it).
+    File(String),
+    /// An external URI — `http:`, `https:`, `mailto:` and friends.
+    Uri(String),
+    /// An internal `*Headline` reference, resolved by searching this buffer.
+    Headline(String),
+}
+
+/// A link found under the cursor, with its byte span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    pub target: Target,
+}
+
+/// The link containing `byte`, if the cursor is inside one.
+///
+/// Unlike [`image_link`], this does NOT require the link to be alone on its
+/// line — opening a link in the middle of a sentence is exactly what the key
+/// is for.
+pub fn link_at(line: &str, byte: usize) -> Option<Link> {
+    let mut i = 0;
+    while let Some(open) = line[i..].find("[[").map(|o| i + o) {
+        let Some(close) = line[open..].find("]]").map(|o| open + o + 2) else {
+            break;
+        };
+        if byte >= open && byte < close {
+            let inner = &line[open + 2..close - 2];
+            let path = inner.split_once("][").map(|(p, _)| p).unwrap_or(inner);
+            return classify(path).map(|target| Link {
+                start: open,
+                end: close,
+                target,
+            });
+        }
+        i = close;
+    }
+    None
+}
+
+fn classify(path: &str) -> Option<Target> {
+    let p = path.trim();
+    if p.is_empty() {
+        return None;
+    }
+    if let Some(h) = p.strip_prefix('*') {
+        // `[[*Headline]]` — an internal reference.
+        let h = h.trim();
+        return (!h.is_empty()).then(|| Target::Headline(h.to_string()));
+    }
+    if let Some(f) = p.strip_prefix("file:") {
+        return (!f.trim().is_empty()).then(|| Target::File(f.to_string()));
+    }
+    if has_scheme(p) {
+        return Some(Target::Uri(p.to_string()));
+    }
+    Some(Target::File(p.to_string()))
+}
+
+/// The 0-based line of the headline whose title matches `title`.
+///
+/// Compares the TITLE — stars, and any TODO keyword or priority, are stripped
+/// by the caller's parse. Case-sensitive and exact, like org's own internal
+/// links: a fuzzy match that jumped to the wrong heading would be worse than
+/// not jumping.
+pub fn find_headline(
+    line: impl Fn(u32) -> Option<String>,
+    line_count: u32,
+    title: &str,
+    keywords: &[String],
+) -> Option<u32> {
+    (0..line_count).find(|i| {
+        line(*i)
+            .and_then(|t| crate::todo::parse(&t, keywords).map(|h| h.title == title))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_the_three_kinds() {
+        assert_eq!(
+            link_at("[[file:a.org]]", 3).unwrap().target,
+            Target::File("a.org".into())
+        );
+        assert_eq!(
+            link_at("[[https://example.com]]", 5).unwrap().target,
+            Target::Uri("https://example.com".into())
+        );
+        assert_eq!(
+            link_at("[[*Some Heading]]", 5).unwrap().target,
+            Target::Headline("Some Heading".into())
+        );
+        // A bare path is a file link, as in org.
+        assert_eq!(
+            link_at("[[notes/a.org]]", 4).unwrap().target,
+            Target::File("notes/a.org".into())
+        );
+    }
+
+    /// Opening a link mid-sentence is exactly what the key is for — unlike an
+    /// image, which must be alone on its line to become a block.
+    #[test]
+    fn a_link_inside_a_sentence_still_opens() {
+        let l = "see [[file:a.org][the notes]] for detail";
+        assert!(link_at(l, 10).is_some());
+        // Outside the link's span, there is nothing to open.
+        assert!(link_at(l, 0).is_none());
+        assert!(link_at(l, 35).is_none());
+    }
+
+    #[test]
+    fn the_description_is_ignored_when_resolving_the_target() {
+        let l = "[[file:a.org][a description with ][ brackets]]";
+        assert_eq!(link_at(l, 3).unwrap().target, Target::File("a.org".into()));
+    }
+
+    #[test]
+    fn picks_the_link_the_cursor_is_actually_in() {
+        let l = "[[file:a.org]] and [[file:b.org]]";
+        assert_eq!(link_at(l, 3).unwrap().target, Target::File("a.org".into()));
+        assert_eq!(link_at(l, 22).unwrap().target, Target::File("b.org".into()));
+        assert!(link_at(l, 16).is_none(), "between them");
+    }
+
+    #[test]
+    fn malformed_and_empty_links_are_refused() {
+        assert!(link_at("[[]]", 2).is_none());
+        assert!(link_at("[[*]]", 2).is_none());
+        assert!(link_at("[[file:]]", 3).is_none());
+        assert!(link_at("no link", 2).is_none());
+    }
+
+    /// Exact and case-sensitive, like org's own internal links: jumping to
+    /// the wrong heading is worse than not jumping.
+    #[test]
+    fn internal_links_resolve_against_headline_titles() {
+        let lines = ["* One", "** TODO Deep Work", "text", "** Other"];
+        let get = |i: u32| lines.get(i as usize).map(|s| s.to_string());
+        let kw = crate::todo::parse_keywords("TODO | DONE");
+
+        assert_eq!(
+            find_headline(get, 4, "Deep Work", &kw),
+            Some(1),
+            "the TODO keyword is not part of the title"
+        );
+        assert_eq!(find_headline(get, 4, "Other", &kw), Some(3));
+        assert_eq!(
+            find_headline(get, 4, "deep work", &kw),
+            None,
+            "case matters"
+        );
+        assert_eq!(find_headline(get, 4, "Missing", &kw), None);
+    }
+}

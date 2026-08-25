@@ -43,6 +43,11 @@ wit_bindgen::generate!({
             include lattice:plugin-host/grammar-plugin@0.1.0;
             include lattice:plugin-host/config-plugin@0.1.0;
             include lattice:plugin-host/media-plugin@0.1.0;
+            // OM.A1: the agenda seam. Its three exports (`extensions` /
+            // `begin` / `scan`) sit at WORLD level, so they land on the same
+            // `Guest` trait as `register-languages` rather than behind an
+            // interface — which is why they read differently below.
+            include lattice:plugin-host/agenda-source-plugin@0.1.0;
         }
     "#,
     path: "wit",
@@ -664,6 +669,54 @@ impl Guest for Component {
             // contains these.
             &["fold".to_string()],
         );
+    }
+
+    // ── OM.A1: the agenda seam ──────────────────────────────────────────
+    //
+    // Deliberately trivial in this slice: one row per headline, grouped by
+    // file, in file order. It proves the seam end to end — the host walks,
+    // reads, calls, sorts and builds excerpts without knowing what a
+    // headline is — and nothing more. OM.A2 replaces the body with org's
+    // actual semantics (TODO state, `SCHEDULED:` / `DEADLINE:`, date
+    // arithmetic, date groups).
+
+    /// The host offers this plugin `.org` and `.org_archive` files and no
+    /// others. It is the same pair `register_languages` claims, and the
+    /// duplication is real: an agenda source is not required to have a
+    /// language, so it cannot read the answer off one.
+    fn extensions() -> Vec<String> {
+        vec!["org".to_string(), "org_archive".to_string()]
+    }
+
+    /// Nothing to drop yet — this slice's `scan` is a pure function of the
+    /// file it is given. OM.A2's is not (it anchors every relative date
+    /// against one "today" captured per scan), which is what the export is
+    /// for.
+    fn begin() {}
+
+    fn scan(path: String, text: String) -> Result<Vec<Entry>, String> {
+        let file = path.rsplit('/').next().unwrap_or(&path).to_string();
+        Ok(text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| headline::headline_level(line).is_some())
+            .map(|(i, _)| Entry {
+                line: i as u32,
+                end_line: i as u32,
+                // One group per file in this slice, so every row of a file
+                // sits under one header. A DATE group spanning files is
+                // OM.A2's job and needs the parsing this slice does not do.
+                group: file.clone(),
+                label: file.clone(),
+                // One key for every row, which under the host's STABLE sort
+                // means "keep walk order" — file by file, line by line.
+                // That is the honest answer for a slice with no dates in
+                // it: any other key here would be an ordering invented to
+                // look like one. OM.A2 replaces it with an epoch day, and
+                // that is when rows start interleaving across files.
+                sort_key: 0,
+            })
+            .collect())
     }
 }
 

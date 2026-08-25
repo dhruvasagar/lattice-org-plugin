@@ -43,6 +43,7 @@ lattice-plugin-loader = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/l
 lattice-runtime = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-runtime" }
 lattice-protocol = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-protocol" }
 lattice-syntax = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-syntax" }
+lattice-multibuffer = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-multibuffer" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 arc-swap = "1"

@@ -296,6 +296,23 @@ async fn press_menu_key(editor: &mut Editor, key: &str) {
     apply_renderer_effects(editor, out).await;
 }
 
+/// Press a field's key and answer its prompt — the menu parks, the prompt
+/// takes the value, and `resume_parked_transient` puts the menu back.
+async fn answer_field(editor: &mut Editor, key: &str, value: &str) {
+    press_menu_key(editor, key).await;
+    // The prompt the field opened registers no submit action: the host routes
+    // a parked transient itself (`do_prompt_line_submit` checks for one first).
+    editor.open_prompt_line(
+        String::new(),
+        value.to_string(),
+        String::new(),
+        editor.pending_prompt_buffer_name.clone(),
+    );
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_prompt_line_submit(&mut out);
+    apply_renderer_effects(editor, out).await;
+}
+
 /// Type `text` into the open prompt and submit it, the way `<CR>` does.
 fn submit_prompt(editor: &mut Editor, text: &str) {
     let action = editor
@@ -2554,5 +2571,140 @@ async fn a_broken_set_leaves_the_menu_closed_and_echoes() {
     assert!(
         msg.contains("capture-templates"),
         "the echo names the option at fault: {msg:?}"
+    );
+}
+
+/// OC.4 — a template with `%^{Question}`s collects them as menu FIELDS.
+///
+/// Three named answers before one write is what makes a vocabulary template
+/// possible at all — it is not one line of typed text, it is several fields.
+/// Collected through the mechanism the editor already has (the menu parks, a
+/// prompt takes the value, the menu comes back), so the menu stays the surface
+/// and an answer can be re-edited before anything is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_template_with_questions_collects_them_as_fields() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let vocab = base.path().join("vocab.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"v\"\ndescription = \"Vocab\"\n\
+             target = {{ file = \"{}\" }}\n\
+             body = \"\"\"\n* %^{{Word}} :fc:\n- Context: %^{{Context}}\n- T: %^{{Translation}}\n\"\"\"\n",
+            vocab.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "v").await;
+
+    // The second menu is the FIELDS one, opened for this template — one row
+    // per question, in template order, plus the body and a way to fire.
+    let spec = editor
+        .picker
+        .as_ref()
+        .and_then(|p| p.transient.as_ref())
+        .expect("the fields menu opened")
+        .clone();
+    assert_eq!(spec.title, "Capture: Vocab");
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["Word", "Context", "Translation", "body", "capture", "quit"],
+        "a row per question in TEMPLATE order, then the body, then the fire row"
+    );
+
+    // Answer them, then fire.
+    answer_field(&mut editor, "1", "chat").await;
+    answer_field(&mut editor, "2", "le chat noir").await;
+    answer_field(&mut editor, "3", "cat").await;
+    press_menu_key(&mut editor, "c").await;
+
+    assert_eq!(
+        text_of(&editor, &vocab),
+        "* chat :fc:\n- Context: le chat noir\n- T: cat\n",
+        "each answer substituted at its OWN position"
+    );
+}
+
+/// A template with no questions keeps the direct prompt — one hop, as before.
+///
+/// That is a UX decision rather than an omission: the common template is a
+/// single `%?`, and routing it through a menu would cost three keystrokes to
+/// collect the one value a prompt already asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_template_without_questions_still_captures_in_one_hop() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+    assert!(
+        editor.pending_prompt_submit_action.is_some(),
+        "no questions, so the prompt opens directly rather than a second menu"
+    );
+    submit_prompt(&mut editor, "call the bank");
+
+    assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
+}
+
+/// Abandoning the fields menu writes nothing and leaves nothing behind — the
+/// next capture starts clean rather than inheriting half of this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoning_the_fields_menu_writes_nothing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let vocab = base.path().join("vocab.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"v\"\ndescription = \"Vocab\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* %^{{Word}}\"\n",
+            vocab.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "v").await;
+    answer_field(&mut editor, "1", "chat").await;
+    press_menu_key(&mut editor, "q").await;
+
+    assert!(!vocab.exists(), "abandoning wrote nothing");
+    assert!(editor.picker.is_none(), "and closed the menu");
+
+    // A fresh capture does not inherit the abandoned answer.
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "v").await;
+    press_menu_key(&mut editor, "c").await;
+    assert_eq!(
+        text_of(&editor, &vocab),
+        "* \n",
+        "the new menu started empty — the abandoned answer did not survive"
     );
 }

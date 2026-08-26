@@ -78,6 +78,7 @@ wit_bindgen::generate!({
 mod agenda;
 mod archive;
 mod capture;
+mod capture_flow;
 mod capture_templates;
 mod checkbox;
 mod headline;
@@ -203,6 +204,15 @@ const CAPTURE_SUBMIT: u32 = 36;
 /// fire `org-capture` with a key, and one action that sometimes opens a menu
 /// and sometimes captures would make the row's own args ambiguous.
 const CAPTURE_MENU: u32 = 37;
+
+/// OC.4 — the fields menu's own submit, distinct from the prompt's.
+///
+/// Two actions rather than one that guesses: the prompt hop hands its action
+/// `[text, buffer-name]` and the fields hop hands its action `[key, answers…]`,
+/// and a single action would have to sniff which shape it got. Naming them
+/// separately is what makes each one's arguments a fact rather than an
+/// inference.
+const CAPTURE_FIELDS_SUBMIT: u32 = 38;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -834,6 +844,12 @@ impl Guest for Component {
             CAPTURE,
         );
         register_action(
+            "org-capture-fields-submit",
+            "File the capture the fields menu collected (fired by its own row)",
+            &spec(),
+            CAPTURE_FIELDS_SUBMIT,
+        );
+        register_action(
             "org-capture-submit",
             "File the captured note (dispatched by the prompt on submit)",
             &spec(),
@@ -1384,6 +1400,27 @@ fn capture_open(ctx: &ActionContext) -> Vec<Effect> {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
+
+    // OC.4: a template that asks questions gets the FIELDS MENU — one row per
+    // `%^{Question}` plus the body — because several named answers before one
+    // write is not something a single prompt can express.
+    //
+    // A template with no questions keeps the direct prompt, and that is a UX
+    // decision rather than an omission: the common template is one `%?`, and
+    // routing it through a menu would cost three keystrokes (open, pick the
+    // body field, fire) to collect the one value the prompt already asks for.
+    if !capture_flow::questions(&template.body).is_empty() {
+        return vec![Effect::OpenTransient(
+            lattice::plugin_host::types::OpenTransientPayload {
+                source: CAPTURE_TRANSIENT.to_string(),
+                // What the menu is opened FOR (TR.3a). The builder reads this
+                // to know which template's questions to offer — the reason the
+                // ONE registered source can serve both shapes.
+                args: Args::String(template.key.clone()),
+            },
+        )];
+    }
+
     vec![Effect::OpenPrompt(
         lattice::plugin_host::types::OpenPromptPayload {
             prompt: if template.description.is_empty() {
@@ -1419,6 +1456,50 @@ fn prompt_smuggled_state(args: &Args) -> Option<String> {
         lattice::plugin_host::types::ArgValue::Raw(s) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// OC.4: the fields menu's submit — expand the template around the answers the
+/// menu collected and write it.
+///
+/// `ctx.args` is `[key, answer…]`: the fire row's own argument first, then the
+/// menu's `Argument` rows in declaration order (TR.3b). The LAST answer is the
+/// body — the fields menu appends a body row after the questions, so `%?` is
+/// collected the same way everything else is rather than being a special case
+/// the user reaches by another route.
+fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
+    let Args::List(values) = &ctx.args else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: the capture menu collected nothing".to_string(),
+        })];
+    };
+    let mut collected = values.iter().map(|v| match v {
+        lattice::plugin_host::types::ArgValue::String(s) => s.clone(),
+        lattice::plugin_host::types::ArgValue::Raw(s) => s.clone(),
+        lattice::plugin_host::types::ArgValue::Char(c) => c.to_string(),
+        other => format!("{other:?}"),
+    });
+    let Some(key) = collected.next() else {
+        return vec![Effect::None];
+    };
+    // Re-resolved rather than carried, like the prompt hop: a `:set` between
+    // opening the menu and firing it takes effect, which is what the option
+    // promises.
+    let template = match selected_template(Some(&key)) {
+        Ok(t) => t,
+        Err(effect) => return vec![effect],
+    };
+    let mut answers: Vec<String> = collected.collect();
+    // The body is the last row. A menu that somehow collected nothing still
+    // writes the template — losing it would be worse than writing it bare.
+    let entered = answers.pop().unwrap_or_default();
+
+    vec![Effect::WriteToFile(WriteToFilePayload {
+        path: template.target.file().to_string(),
+        anchor: FileAnchor::End,
+        text: capture::expand_with(&template.body, &entered, &answers, today_epoch_day()),
+        cut: None,
+    })]
 }
 
 fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
@@ -1712,6 +1793,7 @@ impl GrammarCallbacks for Component {
             )]),
             CAPTURE => Ok(capture_open(&ctx)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
+            CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
@@ -2433,7 +2515,7 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
     }
 
     fn build(
-        _ctx: lattice::plugin_host::types::TransientContext,
+        ctx: lattice::plugin_host::types::TransientContext,
     ) -> Result<lattice::plugin_host::types::TransientSpec, String> {
         use lattice::plugin_host::types::{
             Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
@@ -2447,6 +2529,17 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // opens empty says none of that.
         let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
         let set = capture_templates::parse(&source).map_err(|e| e.message())?;
+
+        // OC.4: ONE registered source, two shapes — which one is decided by
+        // what the open was FOR (TR.3a). Opened for nothing, this is the
+        // template chooser; opened for a template key, it is that template's
+        // fields. Two names would have needed two `id()`s, and the seam gives
+        // a guest one.
+        if let Args::String(key) = &ctx.args {
+            if !key.is_empty() {
+                return fields_menu(&set, key.as_str());
+            }
+        }
 
         let mut items: Vec<TransientItem> = set
             .templates
@@ -2486,4 +2579,86 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             footer,
         })
     }
+}
+
+/// OC.4: the fields menu for one template — a row per `%^{Question}`, a row
+/// for the body, and a row that captures.
+///
+/// A form rather than a run of prompts, deliberately. The menu stays the
+/// surface throughout, so an answer can be re-edited before anything is
+/// written — a questionnaire has already moved on by the time you notice the
+/// typo. It is also the mechanism the editor already has
+/// (`PendingTransientArgument` park/resume), rather than a second one org
+/// would have had to invent.
+///
+/// Field names are POSITIONAL (`q0`, `q1`, …) rather than the question text: a
+/// template may legitimately ask the same question twice (`%^{Line}` in a list
+/// template plainly means two different lines), and two rows sharing a state
+/// key would overwrite each other.
+fn fields_menu(
+    set: &capture_templates::ParsedSet,
+    key: &str,
+) -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientArgument, TransientGroup, TransientItem,
+        TransientItemKind, TransientSpec,
+    };
+
+    let template = set
+        .by_key(key)
+        .ok_or_else(|| format!("no capture template keyed `{key}`"))?;
+
+    let mut items: Vec<TransientItem> = Vec::new();
+    for (i, question) in capture_flow::questions(&template.body).iter().enumerate() {
+        items.push(TransientItem {
+            // `1`..`9` then letters would run out; the index IS the key for
+            // the first nine, which covers every real template.
+            key: vec![(i + 1).to_string()],
+            label: question.clone(),
+            description: String::new(),
+            kind: TransientItemKind::Argument(TransientArgument {
+                name: format!("q{i}"),
+                default: None,
+                prompt: question.clone(),
+            }),
+        });
+    }
+    // The body last, so `%?` is collected the same way every other field is.
+    // Its answer is the final one `capture-fields-submit` pops off.
+    items.push(TransientItem {
+        key: vec!["b".to_string()],
+        label: "body".to_string(),
+        description: "what `%?` becomes".to_string(),
+        kind: TransientItemKind::Argument(TransientArgument {
+            name: "body".to_string(),
+            default: None,
+            prompt: "Capture".to_string(),
+        }),
+    });
+    items.push(TransientItem {
+        key: vec!["c".to_string()],
+        label: "capture".to_string(),
+        description: format!("→ {}", template.target.file()),
+        kind: TransientItemKind::Action(TransientAction {
+            command: "org-capture-fields-submit".to_string(),
+            // The template this menu is collecting for. It arrives at the
+            // action ahead of the answers (TR.3b).
+            args: WitArgs::String(template.key.clone()),
+        }),
+    });
+    items.push(TransientItem {
+        key: vec!["q".to_string()],
+        label: "quit".to_string(),
+        description: String::new(),
+        kind: TransientItemKind::Dismiss,
+    });
+
+    Ok(TransientSpec {
+        title: format!("Capture: {}", template.description),
+        groups: vec![TransientGroup {
+            label: "Fields".to_string(),
+            items,
+        }],
+        footer: Some("c to capture, q to abandon".to_string()),
+    })
 }

@@ -22,11 +22,21 @@
 
 use crate::timestamp;
 
-/// Expand `template` with `entered` and today's date.
+/// Expand `template` with `entered` and today's date, no `%^{}` answers.
+pub fn expand(template: &str, entered: &str, today: i64) -> String {
+    expand_with(template, entered, &[], today)
+}
+
+/// Expand `template`, substituting `%^{…}` from `answers` in template order.
 ///
 /// `today` is passed in rather than read here so the expansion is a pure
 /// function — the same reason the agenda's `begin` captures its anchor once.
-pub fn expand(template: &str, entered: &str, today: i64) -> String {
+///
+/// **Answers are consumed positionally**, which is why a question that was
+/// never asked (an empty `%^{}`) is left verbatim rather than eating an
+/// answer: shifting the sequence would substitute every later answer one slot
+/// early, and the result would look plausible while being wrong.
+pub fn expand_with(template: &str, entered: &str, answers: &[String], today: i64) -> String {
     let (y, m, d) = crate::agenda::civil_from_epoch_day(today);
     let stamp = format!(
         "{y:04}-{m:02}-{d:02} {}",
@@ -35,11 +45,47 @@ pub fn expand(template: &str, entered: &str, today: i64) -> String {
 
     let mut out = String::with_capacity(template.len() + entered.len());
     let mut saw_placeholder = false;
+    let mut next_answer = 0usize;
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '%' {
             out.push(c);
             continue;
+        }
+        // OC.4: `%^{Question}` — the menu collected these as fields, in this
+        // order, so they are consumed in this order.
+        if chars.peek() == Some(&'^') {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if lookahead.peek() == Some(&'{') {
+                lookahead.next();
+                let mut question = String::new();
+                let mut closed = false;
+                for qc in lookahead.by_ref() {
+                    if qc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    question.push(qc);
+                }
+                if closed {
+                    chars = lookahead;
+                    if question.trim().is_empty() {
+                        // Never asked (`capture_flow::questions` skips it), so
+                        // it consumes no answer and stays visible.
+                        out.push_str("%^{");
+                        out.push_str(&question);
+                        out.push('}');
+                    } else {
+                        if let Some(a) = answers.get(next_answer) {
+                            out.push_str(a);
+                        }
+                        next_answer += 1;
+                    }
+                    continue;
+                }
+                // Unclosed: verbatim, like any other unknown placeholder.
+            }
         }
         match chars.next() {
             Some('?') => {
@@ -114,6 +160,68 @@ mod tests {
     #[test]
     fn an_unknown_placeholder_survives_verbatim() {
         assert_eq!(expand("%d %% %?", "x", today()), "%d % x\n");
+    }
+
+    /// OC.4: the questions are substituted in template order, each at its own
+    /// position — the property the whole fields menu exists to deliver.
+    #[test]
+    fn questions_substitute_in_order_at_their_own_positions() {
+        let answers = vec![
+            "chat".to_string(),
+            "le chat noir".to_string(),
+            "cat".to_string(),
+        ];
+        assert_eq!(
+            expand_with(
+                "* %^{Word} :fc:\n- Context: %^{Context}\n- T: %^{Translation}",
+                "",
+                &answers,
+                today()
+            ),
+            "* chat :fc:\n- Context: le chat noir\n- T: cat\n"
+        );
+    }
+
+    /// Questions and `%?` are independent: the body goes where `%?` is, the
+    /// answers where their own questions are.
+    #[test]
+    fn a_question_and_the_body_coexist() {
+        assert_eq!(
+            expand_with("* %^{Kind}: %?", "buy milk", &["TODO".to_string()], today()),
+            "* TODO: buy milk\n"
+        );
+    }
+
+    /// A missing answer leaves an empty slot rather than shifting every later
+    /// one up — a substitution that silently slid would look plausible and be
+    /// wrong.
+    #[test]
+    fn a_missing_answer_leaves_its_slot_empty_without_shifting_the_rest() {
+        assert_eq!(
+            expand_with("[%^{A}][%^{B}]", "", &["only".to_string()], today()),
+            "[only][]\n"
+        );
+    }
+
+    /// An empty question is never ASKED (`capture_flow::questions` skips it),
+    /// so it must consume no answer either — otherwise every answer after it
+    /// would land one slot early.
+    #[test]
+    fn an_empty_question_consumes_no_answer_and_stays_visible() {
+        assert_eq!(
+            expand_with("[%^{}][%^{Real}]", "", &["x".to_string()], today()),
+            "[%^{}][x]\n"
+        );
+    }
+
+    /// An unclosed `%^{` is a typo in user text: verbatim, like any other
+    /// unknown placeholder, and it consumes no answer.
+    #[test]
+    fn an_unclosed_question_survives_verbatim() {
+        assert_eq!(
+            expand_with("%^{Real} then %^{oops", "", &["a".to_string()], today()),
+            "a then %^{oops\n"
+        );
     }
 
     #[test]

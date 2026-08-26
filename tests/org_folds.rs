@@ -211,3 +211,84 @@ fn org_is_authoritative_for_its_own_folds() {
     );
     plugin_lang::unregister_plugin(plugin);
 }
+
+/// The real `highlights.scm` COMPILES against the real grammar, and produces
+/// spans for org's interactive structure.
+///
+/// Queries compile at registration, so a node or field name that does not
+/// exist is a load-time error naming the file — which means a typo here does
+/// not degrade highlighting, it takes the whole language registration down and
+/// with it the major mode, the folds and every org chord. Nothing else in this
+/// repo compiles this file: the fold tests register with `highlights: None`,
+/// and the component test does not reach the query pipeline.
+#[test]
+fn the_highlights_query_compiles_and_marks_the_interactive_bits() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let (name, ext, plugin) = (format!("lg5hl{n}"), format!("lg5hlx{n}"), 7_600_000 + n);
+    let Some(bytes) = org_grammar_wasm() else {
+        skip("the_highlights_query_compiles");
+        return;
+    };
+    let grammar = lattice_syntax::wasm_grammar::load("org", &bytes).expect("org grammar loads");
+    let root = repo_root();
+    let spec = GrammarSpec {
+        grammar,
+        highlights: Some(
+            std::fs::read_to_string(root.join("queries/highlights.scm"))
+                .expect("the reference plugin's highlights query ships in this repo"),
+        ),
+        folds: None,
+        injections: None,
+        indents: None,
+        textobjects: None,
+    };
+    // The assertion that matters most: this is where a bad node or field name
+    // surfaces, and it names `highlights.scm`.
+    let interned = plugin_lang::register_with_grammar(&name, &[&ext], &spec, plugin)
+        .expect("highlights.scm compiles — a failure here names the offending file");
+
+    let src = "\
+* TODO Ship it :work:urgent:
+SCHEDULED: <2026-08-27 Thu +1w>
+:PROPERTIES:
+:CUSTOM_ID: ship
+:END:
+- [X] done bit
+- [ ] todo bit
+#+BEGIN_SRC rust
+let x = 1;
+#+END_SRC
+";
+    let mut syntax = Syntax::for_language(Lang::Plugin(interned))
+        .expect("registry")
+        .expect("org has a grammar");
+    syntax.parse(src);
+
+    let lines = src.lines().count() as u32;
+    let styles: Vec<lattice_syntax::Style> = syntax
+        .highlight_lines(0, lines)
+        .expect("highlighting runs")
+        .into_iter()
+        .flatten()
+        .map(|s| s.style)
+        .collect();
+    assert!(
+        !styles.is_empty(),
+        "the query produced no spans at all — highlighting would be blank"
+    );
+    // Spot-check the structure org has and markdown does not, so this test
+    // fails if a future edit quietly drops a whole family of patterns.
+    for wanted in [
+        lattice_syntax::Style::Heading1,
+        lattice_syntax::Style::Keyword,
+        lattice_syntax::Style::Attribute,
+        lattice_syntax::Style::Constant,
+    ] {
+        assert!(
+            styles.contains(&wanted),
+            "no {wanted:?} span in a document that has a headline, a TODO \
+             keyword, tags and a timestamp; got {styles:?}"
+        );
+    }
+}

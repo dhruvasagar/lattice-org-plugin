@@ -71,6 +71,8 @@ vim's own do: `d]]` deletes to the next headline, `3]]` moves down three.
 | `<leader><CR>` | new headline at the same level, after this subtree |
 | `<leader>o*` | toggle the current line between headline and text |
 | `<leader>o$` | archive the subtree into `<this file>_archive` |
+| `<leader>or` | refile the subtree under a headline you pick |
+| `<leader>oc` | capture a note into your capture file |
 | `<Tab>` `<S-Tab>` | cycle this headline / the whole buffer |
 
 Each is one edit, so one `u` undoes it whole — demoting a subtree puts every
@@ -114,6 +116,49 @@ capabilities = ["fs:write:/home/you/org"]
 visibility, and anywhere else it means what it usually means. The
 `<leader>o` chords are org's alone, so when there is nothing to do they
 simply do nothing.
+
+### Refiling
+
+`<leader>or` opens a picker of every headline in the project's `.org` files —
+three levels deep by default — plus each file itself. Choose one and the
+subtree at the cursor moves there, landing *after* that headline's whole
+subtree rather than in front of its children.
+
+The list is shown as `notes.org  Work / Q3`, so two headings with the same
+title under different parents are told apart, and the query matches everything
+you can see — including a `TODO` keyword, which is a useful thing to type when
+you are looking for where unfinished work lives. `:picker org-refile 5` goes
+deeper for one invocation.
+
+You stay where you are. Refile files something; it does not navigate.
+
+### Capturing
+
+`<leader>oc` prompts for a line and appends it to your capture file through a
+template, from any buffer — capture is the one org verb whose input is what
+you type rather than what you are sitting in.
+
+```toml
+org.capture-file = "/home/you/org/inbox.org"
+org.capture-template = "* TODO %?\n  %U"
+```
+
+| | |
+|---|---|
+| `%?` | what you typed. A template without it appends your text on its own line. |
+| `%U` | today, inactive: `[2026-08-26 Wed]` |
+| `%T` | today, active: `<2026-08-26 Wed>` — the agenda sees this one |
+| `%%` | a literal `%` |
+
+Anything else is left alone, so a `%d` you meant as text stays a `%d`.
+
+`org.capture-file` has no default on purpose. A key that quietly created
+`capture.org` in whichever directory the editor happened to start in would
+scatter notes somewhere you would never think to look; unset, `<leader>oc`
+tells you to set it.
+
+Both refile and capture need the same `fs:write` grant archiving does, over
+the directory your org files live in.
 
 ## Tasks
 

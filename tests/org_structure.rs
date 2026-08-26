@@ -2155,3 +2155,147 @@ async fn an_ungranted_plugin_cannot_capture() {
         "the capture file was never even opened"
     );
 }
+
+/// OC.2 — a capture driven by `org.capture-templates` rather than the single
+/// `capture-file` / `capture-template` pair.
+///
+/// The option's value is TOML, which is forced rather than preferred: an option
+/// is `boolean | integer | string` and a template is a record, so an
+/// array-of-tables cannot reach an option at all. This is the test that proves
+/// the round trip actually survives — including a `"""` body's newlines, which
+/// is the property the whole arrangement rests on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_template_set_drives_the_capture() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n  %U\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "call the bank");
+
+    let written = text_of(&editor, &notes);
+    assert!(
+        written.starts_with("* TODO call the bank\n  ["),
+        "the body's newline survived the TOML-inside-an-option round trip: {written:?}"
+    );
+    assert_eq!(text(&editor), "* One\n", "capture MOVES nothing");
+}
+
+/// The set WINS over the legacy pair when both are set — otherwise upgrading a
+/// config would leave the old single template quietly in charge and the new
+/// templates doing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_template_set_takes_precedence_over_the_single_template() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let old = base.path().join("old.org");
+    let new = base.path().join("new.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", old.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* OLD %?");
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ntarget = {{ file = \"{}\" }}\nbody = \"* NEW %?\"\n",
+            new.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "a thought");
+
+    assert_eq!(text_of(&editor, &new), "* NEW a thought\n");
+    assert!(
+        !old.exists(),
+        "the legacy single-template path did not also fire"
+    );
+}
+
+/// A malformed set captures NOTHING and says why. Writing the note somewhere
+/// the user did not choose is the one outcome capture must not have, and an
+/// empty menu built from the half that parsed would be guessing at intent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_template_set_captures_nothing_and_echoes() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    // A legacy pair that WOULD have captured, so "nothing was written" is a
+    // real refusal rather than an unconfigured no-op.
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* %?");
+    set_org_option(&mut editor, "capture-templates", "[[template]\nkey = \"t\"");
+
+    submit_capture(&mut editor, "a thought");
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("capture-templates"),
+        "the echo names the option at fault: {msg:?}"
+    );
+    assert!(
+        !notes.exists(),
+        "a broken set refuses outright — it does not quietly fall back to the \
+         legacy single template, which would file the note somewhere the user \
+         thought they had stopped using"
+    );
+}
+
+/// Several templates and no way yet to choose between them: capture says which
+/// keys exist rather than silently picking one. OC.3's menu replaces this echo
+/// with the rows themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_template_set_names_its_keys_until_the_menu_exists() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{f}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"n\"\ndescription = \"note\"\n\
+             target = {{ file = \"{f}\" }}\nbody = \"* %?\"\n",
+            f = notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "a thought");
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("t todo") && msg.contains("n note"),
+        "the echo names every key and what it captures: {msg:?}"
+    );
+    assert!(
+        !notes.exists(),
+        "and nothing was captured to either of them"
+    );
+}

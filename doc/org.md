@@ -147,6 +147,50 @@ It comes at a price worth naming. **`<C-x>o` shadows the emacs-keys layer's
 native pane switch, so the cost falls only on that layer; rebind the prefix if
 you want it back.
 
+Templates live in **one option whose value is TOML**:
+
+```toml
+[org]
+capture-templates = '''
+[[template]]
+key = "t"
+description = "todo"
+target = { file = "/home/you/org/refile.org" }
+body = """
+* TODO %?
+%U
+"""
+
+[[template]]
+key = "m"
+description = "Meeting"
+target = { file = "/home/you/org/refile.org", headline = "Meetings" }
+body = """
+* MEETING with %? :meeting:
+%U
+"""
+'''
+```
+
+TOML inside a string option is not a style choice: an option can only be a
+boolean, an integer or a string, and a template is a record. The `'''` block
+carries the payload verbatim, so a `"""` body keeps its newlines. `init.rs`
+sets the identical string as a Rust raw literal — one format, both homes.
+
+`target` is either `{ file = "…" }` (append at the end) or
+`{ file = "…", headline = "…" }` (after that headline's subtree). A named
+headline that is absent appends and says so, rather than creating it or
+refusing: the note is not lost, and the echo tells you your target moved.
+
+A template that cannot be used — no `key`, no `target.file`, or a key another
+template already took — is skipped and the rest of the set still works. One
+typo should not cost you the feature. A set whose **TOML** does not parse
+refuses outright and names the option, because a menu built from the half that
+survived would be guessing at what you meant.
+
+The older single-template pair still works and is what runs when
+`capture-templates` is unset:
+
 ```toml
 org.capture-file = "/home/you/org/inbox.org"
 org.capture-template = "* TODO %?\n  %U"
@@ -161,7 +205,7 @@ org.capture-template = "* TODO %?\n  %U"
 
 Anything else is left alone, so a `%d` you meant as text stays a `%d`.
 
-`org.capture-file` has no default on purpose. A key that quietly created
+Neither option has a default on purpose. A key that quietly created
 `capture.org` in whichever directory the editor happened to start in would
 scatter notes somewhere you would never think to look; unset, `<C-x>oc`
 tells you to set it.

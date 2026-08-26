@@ -22,6 +22,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = "0.58"
+# OC.2: `org.capture-templates` is a string option whose VALUE is TOML —
+# forced, because an option is `boolean | integer | string` and capture
+# templates are records. The guest re-parses it, so the parser ships inside the
+# component. Hand-rolling one was rejected: `"""` blocks, escapes and inline
+# tables are exactly where a hand-rolled parser gets a user's template subtly
+# wrong, and a template that parses to the wrong thing is worse than one that
+# fails to parse.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 
 # The moved-from-lattice integration tests drive a REAL editor: they boot one,
 # load this plugin's component through the loader, and dispatch chords. That

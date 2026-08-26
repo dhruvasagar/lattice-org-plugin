@@ -68,6 +68,7 @@ wit_bindgen::generate!({
 mod agenda;
 mod archive;
 mod capture;
+mod capture_templates;
 mod checkbox;
 mod headline;
 mod links;
@@ -182,8 +183,8 @@ const REFILE_PICKER: &str = "org-refile";
 /// scannable; `:picker org-refile 5` overrides it per invocation.
 const DEFAULT_REFILE_MAX_LEVEL: usize = 3;
 
-/// `<leader>oc` (OM.11) — capture's two hops: the prompt, and what the host
-/// dispatches with the submitted text.
+/// `<C-x>oc` (OM.11, moved at OC.1) — capture's two hops: the prompt, and what
+/// the host dispatches with the submitted text.
 const CAPTURE: u32 = 35;
 const CAPTURE_SUBMIT: u32 = 36;
 
@@ -194,8 +195,15 @@ const CAPTURE_SUBMIT: u32 = 36;
 const DEFAULT_CAPTURE_FILE: &str = "";
 
 /// `org-capture-templates`, reduced to one. See `capture.rs` for the
-/// placeholders.
+/// placeholders. The single-template path OM.11 shipped; superseded by
+/// `capture-templates` and kept as the fallback while OC.3–OC.5 build the
+/// multi-template engine on top of it.
 const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
+
+/// OC.2: the template SET. Empty by default and deliberately so — the same
+/// reasoning as `DEFAULT_CAPTURE_FILE`. A default set would name files the
+/// user never chose, and capture would scatter notes into them.
+const DEFAULT_CAPTURE_TEMPLATES: &str = "";
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -279,20 +287,36 @@ impl Guest for Component {
             DEFAULT_HIGHEST_PRIORITY,
             "The last priority letter `<leader>o,` cycles to. `C` gives A, B, C.",
         );
+        // OC.2: the template SET, a string whose value is TOML. Forced, not
+        // preferred — an option is `boolean | integer | string` and a template
+        // is a record, so an array-of-tables cannot reach an option at all.
+        // The cost is stated in the design fragment: `:describe-option` shows a
+        // blob and `:set` cannot meaningfully edit it. If structured options
+        // ever land the declaration migrates and the template language does
+        // not change, which is why the language is defined by the parser here
+        // rather than by the option's shape.
+        let _ = register_option(
+            "capture-templates",
+            OptionType::String,
+            DEFAULT_CAPTURE_TEMPLATES,
+            "Your capture templates, as TOML: one `[[template]]` per entry with \
+             `key`, `description`, `target = { file = \"…\", headline = \"…\" }` \
+             and a `body`. Unset means `<C-x>oc` says so rather than guessing.",
+        );
         let _ = register_option(
             "capture-file",
             OptionType::String,
             DEFAULT_CAPTURE_FILE,
-            "Where `<leader>oc` files a capture. Absolute, or relative to the \
-             editor's working directory. Unset means capture says so rather \
-             than guessing a location.",
+            "Where `<C-x>oc` files a capture when `capture-templates` is unset. \
+             Absolute, or relative to the editor's working directory.",
         );
         let _ = register_option(
             "capture-template",
             OptionType::String,
             DEFAULT_CAPTURE_TEMPLATE,
-            "The template a capture expands. `%?` is what you typed, `%U` / \
-             `%T` today's date inactive / active, `%%` a literal percent.",
+            "The single template a capture expands when `capture-templates` is \
+             unset. `%?` is what you typed, `%U` / `%T` today's date inactive / \
+             active, `%%` a literal percent.",
         );
         let _ = register_option(
             "inline-images",
@@ -1229,26 +1253,133 @@ fn archive_subtree(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// `capture.org` in whichever directory the editor started in would scatter
 /// notes somewhere the user never named and would not think to look; being
 /// told to set the option once is the better trade.
+/// OC.2: which template a capture is using, read fresh from the options.
+///
+/// Parsed on read rather than cached: `:set org.capture-templates=…` must take
+/// effect on the NEXT capture, and a cache would need an `OptionChanged`
+/// subscription to stay honest (the `todo-keywords` precedent, OM.7). Capture
+/// is an explicit user action, so the parse is nowhere near a typing path.
+///
+/// `key` is the template to use. `None` means "the user did not choose", which
+/// is answerable only when there is exactly one to choose from — OC.3's menu
+/// is what supplies the key for a real set.
+///
+/// Falls back to the single `capture-file` / `capture-template` pair when
+/// `capture-templates` is unset, so an existing config keeps working unchanged.
+fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, Effect> {
+    let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
+    if source.trim().is_empty() {
+        // The OM.11 path. A capture file that was never set is the one thing
+        // capture refuses over: creating `capture.org` in whichever directory
+        // the editor started in scatters notes somewhere the user never named.
+        let file = option_or("capture-file", DEFAULT_CAPTURE_FILE);
+        if file.trim().is_empty() {
+            return Err(Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: "org: set org.capture-templates (or org.capture-file) before capturing"
+                    .to_string(),
+            }));
+        }
+        return Ok(capture_templates::Template {
+            key: String::new(),
+            description: "capture".to_string(),
+            target: capture_templates::Target::File { file },
+            body: option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE),
+        });
+    }
+
+    let set = capture_templates::parse(&source).map_err(|e| {
+        Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: e.message(),
+        })
+    })?;
+    // The skips are NOT surfaced here. They ride back on `ParsedSet` and
+    // OC.3's menu echoes them once, at open, which is where a missing row is
+    // actually noticeable; echoing on every capture would be noise.
+    //
+    // A guest `logging::log` was tried and reverted: calling it makes the
+    // component IMPORT `logging`, and org's multi-seam linker does not wire
+    // that import — the whole component then fails to instantiate. That is the
+    // fifth repeat of the TC.6 multi-seam-linker rule and it is a host fix, not
+    // something to work around here (noted in the slice plan).
+
+    match key {
+        Some(k) => set.by_key(k).cloned().ok_or_else(|| {
+            Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!("org: no capture template keyed `{k}`"),
+            })
+        }),
+        // No key and one template: there is nothing to choose. No key and
+        // several: say which keys exist. OC.3 replaces this echo with the
+        // menu that offers them, and the key argument stays exactly as it is.
+        None if set.templates.len() == 1 => Ok(set.templates[0].clone()),
+        None => Err(Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!(
+                "org: pick a template — {}",
+                set.templates
+                    .iter()
+                    .map(|t| format!("{} {}", t.key, t.description))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        })),
+    }
+}
+
+/// The first hop of `<C-x>oc`: resolve the template, then open the prompt.
+///
+/// Resolving BEFORE the prompt is what makes an unset or broken configuration
+/// say so at the keystroke rather than after the user has already typed a note
+/// — the one moment capture must not waste.
+///
+/// **No key is threaded through yet, and that is a real boundary rather than
+/// an omission.** A prompt submit hands the action `prompt_value` and nothing
+/// else; the chosen key would have to ride `buffer-name` and be read back off
+/// the prompt buffer, which is OC.4's `%^{Prompt}` chain. Until then a set with
+/// one template captures end to end and a set with several says which keys
+/// exist — which is exactly what OC.3's menu replaces.
+fn capture_open(_ctx: &ActionContext) -> Vec<Effect> {
+    let template = match selected_template(None) {
+        Ok(t) => t,
+        Err(effect) => return vec![effect],
+    };
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: if template.description.is_empty() {
+                "Capture: ".to_string()
+            } else {
+                format!("Capture ({}): ", template.description)
+            },
+            initial: String::new(),
+            on_submit_action: "org-capture-submit".to_string(),
+            buffer_name: None,
+        },
+    )]
+}
+
 fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
     let Some(entered) = submitted_text(&ctx.args) else {
         return vec![Effect::None];
     };
-    let target = option_or("capture-file", DEFAULT_CAPTURE_FILE);
-    if target.trim().is_empty() {
-        return vec![Effect::Echo(EchoPayload {
-            level: EchoLevel::Warn,
-            text: "org: set org.capture-file to a path before capturing".to_string(),
-        })];
-    }
-    let template = option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE);
-
+    // Re-resolved rather than carried: a submit hands the action its
+    // `prompt_value` and nothing else, so there is nowhere for the first hop's
+    // choice to ride yet (OC.4). Re-reading is also what makes a `:set` between
+    // the two hops take effect, which is the behaviour the option promises.
+    let template = match selected_template(None) {
+        Ok(t) => t,
+        Err(effect) => return vec![effect],
+    };
+    let target = template.target.file().to_string();
     vec![Effect::WriteToFile(WriteToFilePayload {
         path: target,
         // Append. A capture file is a log, and the newest note belonging at
         // the bottom is what makes it readable in order later — the same
         // reasoning as archive.
         anchor: FileAnchor::End,
-        text: capture::expand(&template, &entered, today_epoch_day()),
+        text: capture::expand(&template.body, &entered, today_epoch_day()),
         // Nothing is being MOVED, so nothing is cut. Capture is the one of the
         // three cross-file writes that only adds.
         cut: None,
@@ -1504,14 +1635,7 @@ impl GrammarCallbacks for Component {
                 },
             )]),
             REFILE_TO => Ok(refile_to(&ctx, doc)),
-            CAPTURE => Ok(vec![Effect::OpenPrompt(
-                lattice::plugin_host::types::OpenPromptPayload {
-                    prompt: "Capture: ".to_string(),
-                    initial: String::new(),
-                    on_submit_action: "org-capture-submit".to_string(),
-                    buffer_name: None,
-                },
-            )]),
+            CAPTURE => Ok(capture_open(&ctx)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),

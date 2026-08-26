@@ -48,6 +48,16 @@ wit_bindgen::generate!({
             // `Guest` trait as `register-languages` rather than behind an
             // interface — which is why they read differently below.
             include lattice:plugin-host/agenda-source-plugin@0.1.0;
+            // OM.11: refile's target list. NOT `include
+            // picker-source-plugin` — that world also imports `logging`, and
+            // a component's imports must ALL be satisfiable on EVERY seam's
+            // linker it is instantiated against, including the grammar seam's
+            // SYNC one. `logging` is deliberately absent there, so that the
+            // "no logging reachable from the grammar hot path" invariant is
+            // structural rather than a matter of discipline. Declaring only
+            // what the source actually uses keeps it that way.
+            import lattice:plugin-host/host-services@0.1.0;
+            export lattice:plugin-host/picker-source@0.1.0;
         }
     "#,
     path: "wit",
@@ -57,15 +67,18 @@ wit_bindgen::generate!({
 
 mod agenda;
 mod archive;
+mod capture;
 mod checkbox;
 mod headline;
 mod links;
+mod refile;
 mod table;
 mod timestamp;
 mod todo;
 
 use exports::lattice::plugin_host::grammar_callbacks::Guest as GrammarCallbacks;
 use exports::lattice::plugin_host::media::Guest as MediaProducer;
+use exports::lattice::plugin_host::picker_source::Guest as PickerSource;
 use lattice::plugin_host::buffer::Document;
 use lattice::plugin_host::config::{get_option, register_option, OptionType};
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
@@ -153,6 +166,37 @@ const TABLE_DELETE_COL: u32 = 31;
 /// file other than the one it fired in.
 const ARCHIVE_SUBTREE: u32 = 32;
 
+/// `<leader>or` (OM.11) — the two halves of refile. The first opens the
+/// target picker; the second is what the picker's accept invokes, with the
+/// chosen target as its args.
+const REFILE: u32 = 33;
+const REFILE_TO: u32 = 34;
+
+/// The picker source refile opens. Named once — the guest registers it under
+/// this id and the action names it in `Effect::OpenPicker`, and a typo between
+/// the two would be a chord that opens nothing.
+const REFILE_PICKER: &str = "org-refile";
+
+/// `org-refile-targets`' `:maxlevel`. Three is deep enough to reach the
+/// headings people actually file under and shallow enough that the list stays
+/// scannable; `:picker org-refile 5` overrides it per invocation.
+const DEFAULT_REFILE_MAX_LEVEL: usize = 3;
+
+/// `<leader>oc` (OM.11) — capture's two hops: the prompt, and what the host
+/// dispatches with the submitted text.
+const CAPTURE: u32 = 35;
+const CAPTURE_SUBMIT: u32 = 36;
+
+/// `org-default-notes-file`, with no default. A key that silently creates
+/// `capture.org` in whichever directory the editor happened to start in would
+/// scatter notes across the filesystem; being told to set it once is better
+/// than finding them later.
+const DEFAULT_CAPTURE_FILE: &str = "";
+
+/// `org-capture-templates`, reduced to one. See `capture.rs` for the
+/// placeholders.
+const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -188,6 +232,13 @@ fn inline_images_enabled() -> bool {
 /// `OptionChanged` subscription to stay honest. The read is one host call
 /// against an in-memory registry, which is far below the budget a chord has —
 /// and cheaper than the buffer reads the same action already does.
+/// An option's value, falling back to `default` when the config seam is
+/// unwired or the option was never registered. `get_option` answering `none`
+/// must degrade to something that works rather than to a dead key.
+fn option_or(name: &str, default: &str) -> String {
+    get_option(name).unwrap_or_else(|| default.to_string())
+}
+
 fn todo_keywords() -> Vec<String> {
     let spec = get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string());
     let parsed = todo::parse_keywords(&spec);
@@ -227,6 +278,21 @@ impl Guest for Component {
             OptionType::String,
             DEFAULT_HIGHEST_PRIORITY,
             "The last priority letter `<leader>o,` cycles to. `C` gives A, B, C.",
+        );
+        let _ = register_option(
+            "capture-file",
+            OptionType::String,
+            DEFAULT_CAPTURE_FILE,
+            "Where `<leader>oc` files a capture. Absolute, or relative to the \
+             editor's working directory. Unset means capture says so rather \
+             than guessing a location.",
+        );
+        let _ = register_option(
+            "capture-template",
+            OptionType::String,
+            DEFAULT_CAPTURE_TEMPLATE,
+            "The template a capture expands. `%?` is what you typed, `%U` / \
+             `%T` today's date inactive / active, `%%` a literal percent.",
         );
         let _ = register_option(
             "inline-images",
@@ -308,6 +374,13 @@ impl Guest for Component {
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
                 // nvim-orgmode spells it.
                 bind("<leader>o$", "org-archive-subtree"),
+                // OM.11: opens the target picker; `org-refile-to` is the
+                // second hop and is NOT bound — it is invoked by the picker's
+                // accept, never typed.
+                bind("<leader>or", "org-refile"),
+                // OM.11: org's `C-c c`. `org-capture-submit` is the second
+                // hop and is NOT bound — the host dispatches it on submit.
+                bind("<leader>oc", "org-capture"),
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
@@ -666,6 +739,30 @@ impl Guest for Component {
             "Move the subtree at the cursor into `<this file>_archive`",
             &spec(),
             ARCHIVE_SUBTREE,
+        );
+        register_action(
+            "org-capture",
+            "Capture a note into `org.capture-file`",
+            &spec(),
+            CAPTURE,
+        );
+        register_action(
+            "org-capture-submit",
+            "File the captured note (dispatched by the prompt on submit)",
+            &spec(),
+            CAPTURE_SUBMIT,
+        );
+        register_action(
+            "org-refile",
+            "Refile the subtree at the cursor under a headline you pick",
+            &spec(),
+            REFILE,
+        );
+        register_action(
+            "org-refile-to",
+            "Refile the subtree at the cursor to an already-chosen target",
+            &spec(),
+            REFILE_TO,
         );
         register_action(
             "org-toggle-heading",
@@ -1088,6 +1185,89 @@ fn archive_subtree(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     })]
 }
 
+/// The second hop of `<leader>oc`: expand the template around what was typed
+/// and append it to `org.capture-file`.
+///
+/// Reads no buffer at all — capture is the one org verb whose input is the
+/// prompt rather than the text you are sitting in, which is exactly why it can
+/// be fired from anywhere.
+///
+/// An unset `org.capture-file` ECHOES rather than guessing. Creating
+/// `capture.org` in whichever directory the editor started in would scatter
+/// notes somewhere the user never named and would not think to look; being
+/// told to set the option once is the better trade.
+fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
+    let Some(entered) = submitted_text(&ctx.args) else {
+        return vec![Effect::None];
+    };
+    let target = option_or("capture-file", DEFAULT_CAPTURE_FILE);
+    if target.trim().is_empty() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: set org.capture-file to a path before capturing".to_string(),
+        })];
+    }
+    let template = option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE);
+
+    vec![Effect::WriteToFile(WriteToFilePayload {
+        path: target,
+        // Append. A capture file is a log, and the newest note belonging at
+        // the bottom is what makes it readable in order later — the same
+        // reasoning as archive.
+        anchor: FileAnchor::End,
+        text: capture::expand(&template, &entered, today_epoch_day()),
+        // Nothing is being MOVED, so nothing is cut. Capture is the one of the
+        // three cross-file writes that only adds.
+        cut: None,
+    })]
+}
+
+/// The second hop of `<leader>or`: file the subtree at the cursor into the
+/// target the picker chose.
+///
+/// The target arrives in `ctx.args` as the token `refile::encode` produced,
+/// having crossed the boundary twice — out with the candidate, back with the
+/// accept — so it is decoded as untrusted input rather than trusted because
+/// this plugin emitted it. A malformed one refuses; refiling a subtree
+/// somewhere nobody chose is worse than refiling it nowhere.
+///
+/// Same single `write-to-file` as archive, and for the same reason: the cut
+/// runs only if the insert landed.
+///
+/// **The caret does not follow the subtree.** Org's refile leaves you where
+/// you were, and the target file may not even be open. Jumping would turn a
+/// filing action into a navigation one.
+fn refile_to(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let Some(token) = submitted_text(&ctx.args) else {
+        return vec![Effect::None];
+    };
+    let Some((path, before_line)) = refile::decode(&token) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: refile target could not be read".to_string(),
+        })];
+    };
+    let line = |n: u32| doc.line(n);
+    let Some((text, (sl, sb, el, eb))) =
+        archive::extract_subtree(line, ctx.cursor.line, doc.line_count())
+    else {
+        return vec![Effect::None];
+    };
+
+    vec![Effect::WriteToFile(WriteToFilePayload {
+        path,
+        anchor: match before_line {
+            Some(line) => FileAnchor::Line(line),
+            None => FileAnchor::End,
+        },
+        text,
+        cut: Some(Range {
+            start: Position { line: sl, byte: sb },
+            end: Position { line: el, byte: eb },
+        }),
+    })]
+}
+
 /// Insert a new sibling headline after the subtree at the cursor, and put the
 /// caret on it ready to type.
 ///
@@ -1284,6 +1464,22 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc)),
+            REFILE => Ok(vec![Effect::OpenPicker(
+                lattice::plugin_host::types::OpenPickerPayload {
+                    source: REFILE_PICKER.to_string(),
+                    args: Vec::new(),
+                },
+            )]),
+            REFILE_TO => Ok(refile_to(&ctx, doc)),
+            CAPTURE => Ok(vec![Effect::OpenPrompt(
+                lattice::plugin_host::types::OpenPromptPayload {
+                    prompt: "Capture: ".to_string(),
+                    initial: String::new(),
+                    on_submit_action: "org-capture-submit".to_string(),
+                    buffer_name: None,
+                },
+            )]),
+            CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
@@ -1521,6 +1717,103 @@ impl MediaProducer for Component {
                 fit: MediaFit::Contain,
             })
             .collect())
+    }
+}
+
+/// OM.11 — refile's target list, as a picker source.
+///
+/// A second seam for this plugin and a deliberately narrow one: it walks and
+/// reads the filesystem and never touches the buffer, which is the exact
+/// opposite of the grammar seam's shape. The two never meet — `init` runs off
+/// the keystroke path in the plugin's own task, and the only thing that
+/// crosses back into the editing path is an opaque token.
+///
+/// Why a source of its own rather than the native `files` picker: `files`
+/// accepts by OPENING the chosen file. Refile needs the choice routed back
+/// into org's own action, which is what `picker-accept-outcome::invoke-command`
+/// is for.
+impl PickerSource for Component {
+    fn spec() -> lattice::plugin_host::types::PickerSourceSpec {
+        lattice::plugin_host::types::PickerSourceSpec {
+            id: REFILE_PICKER.to_string(),
+            doc: "Org headlines a subtree can be refiled under".to_string(),
+            args_schema: Vec::new(),
+            args_hint: "[max-level]".to_string(),
+            // Not live: the target set is the files on disk, and re-walking
+            // them on every keystroke of the query would put a filesystem walk
+            // on the typing path for a list that does not change while the
+            // picker is open.
+            live: false,
+        }
+    }
+
+    fn init(
+        ctx: lattice::plugin_host::types::PickerContext,
+        args: Vec<String>,
+    ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
+        // `org-refile-targets`' `:maxlevel`, as a picker argument rather than
+        // an option: the picker world has no `config` seam, and an argument is
+        // per-invocation anyway — `:picker org-refile 5` when you know the
+        // heading is deep.
+        let max_level = args
+            .first()
+            .and_then(|a| a.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_REFILE_MAX_LEVEL);
+
+        let files = lattice::plugin_host::host_services::walk(&ctx.workspace_root)?;
+        let mut pairs = Vec::new();
+        for path in files {
+            if !path.ends_with(".org") {
+                continue;
+            }
+            // One unreadable file must not fail the picker — the agenda's rule
+            // (`scan` returns a `result` and an `err` skips that file), because
+            // it is the same failure class. A granted prefix that WASI refused
+            // to preopen lands here too, degraded rather than fatal.
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            for target in refile::targets_in(&path, &name, &text, max_level) {
+                pairs.push(
+                    exports::lattice::plugin_host::picker_source::CandidatePair {
+                        candidate: lattice::plugin_host::types::RawCandidate {
+                            text: target.label.clone(),
+                            display: target.label.clone(),
+                            source: Some(REFILE_PICKER.to_string()),
+                            kind: lattice::plugin_host::types::CandidateKind::Plain,
+                            data: lattice::plugin_host::types::CandidateData::Plain,
+                            annotations: Vec::new(),
+                        },
+                        // The routing token IS the invocation. The picker never
+                        // interprets it; it hands back whichever one the user
+                        // chose, and `accept` below only has to unwrap it.
+                        routing: lattice::plugin_host::types::RoutingPayload::InvokeCommand(
+                            lattice::plugin_host::types::CommandRef {
+                                id: "org-refile-to".to_string(),
+                                args: Args::String(refile::encode(&target)),
+                            },
+                        ),
+                    },
+                );
+            }
+        }
+        Ok(pairs)
+    }
+
+    fn accept(
+        _ctx: lattice::plugin_host::types::PickerContext,
+        routing: lattice::plugin_host::types::RoutingPayload,
+    ) -> Result<lattice::plugin_host::types::PickerAcceptOutcome, String> {
+        match routing {
+            lattice::plugin_host::types::RoutingPayload::InvokeCommand(cmd) => {
+                Ok(lattice::plugin_host::types::PickerAcceptOutcome::InvokeCommand(cmd))
+            }
+            // A routing token this source did not emit. Refusing is right:
+            // acting on someone else's token would refile a subtree somewhere
+            // nobody chose.
+            _ => Err("org: refile got a routing token it did not emit".to_string()),
+        }
     }
 }
 

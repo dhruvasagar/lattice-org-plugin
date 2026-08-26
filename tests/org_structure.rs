@@ -70,6 +70,9 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             media_registry: Some(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 lattice_mode::MediaSourceRegistry::new(),
             ))),
+            // OM.11: refile's target list is a picker source, so the loader
+            // needs somewhere to register it.
+            picker_registry: Some(editor.picker_registry.clone()),
             ..Default::default()
         },
     )
@@ -104,7 +107,7 @@ async fn org_editor_with_caps(
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\ncapabilities = [{caps}]\n"
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\"]\ndefault_mode = \"org-todo-mode\"\ncapabilities = [{caps}]\n"
         ),
     )
     .unwrap();
@@ -1739,5 +1742,382 @@ async fn archiving_the_preamble_does_nothing_and_does_not_run_dollar() {
     assert_eq!(
         editor.cursor.byte, 0,
         "and `$` did not run as a bare motion"
+    );
+}
+
+// ---- OM.11: refile -------------------------------------------------------
+//
+// **`<leader>or` is not pressed here, and that is a test-harness limit rather
+// than a gap in the feature.** The chord returns `Effect::OpenPicker`, which
+// the RENDERER applies (`lattice-ui-tui/src/app/dispatch.rs`), not `Editor` —
+// so at this level the chord surfaces as `Action::Invoke` with the effect
+// consumed inside it and no picker ever opens. Same wall `<leader>o:` hit at
+// OM.7, and now the fourth thing waiting on an app-layer test in
+// `lattice-ui-tui`.
+//
+// So the split is: `refile.rs`'s unit tests own the target arithmetic, the
+// binding test below owns the wiring, and everything from `open_picker`
+// onwards — the source, the candidates, the accept, the write and the cut —
+// is driven directly, because all of that IS reachable from `Editor`.
+
+/// The picker's candidate labels, in order, so a test can assert what the user
+/// would actually see rather than an index into an opaque list.
+fn picker_labels(editor: &Editor) -> Vec<String> {
+    editor
+        .picker
+        .as_ref()
+        .map(|p| p.candidates.iter().map(|c| c.raw.text.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Open refile's target picker the way the chord's effect would.
+/// Open refile's target picker the way the chord's effect would, and wait for
+/// it to seat.
+///
+/// A plugin picker source's `init` is ASYNC — it walks and reads the
+/// filesystem in the plugin's own task — so `open_picker` returns with the
+/// picker still `None` and a `(loading)` echo. `drain_pending_picker_init` is
+/// what seats it, and in production the renderer's tick calls it. A test that
+/// asserted straight after `open_picker` would see an empty list and read as a
+/// broken source.
+async fn open_refile(editor: &mut Editor) {
+    let _ = editor.open_picker("org-refile".to_string(), Vec::new());
+    for _ in 0..200 {
+        let _ = editor.drain_pending_picker_init();
+        if editor.picker.is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("refile's picker never seated: {:?}", editor.last_message);
+}
+
+/// Narrow the picker to one candidate the way the user does — by typing —
+/// then accept it.
+fn pick(editor: &mut Editor, query: &str) {
+    {
+        let picker = editor.picker.as_mut().expect("a picker is open");
+        for c in query.chars() {
+            picker.append_query(c);
+        }
+        picker.refilter();
+    }
+    let _ = editor.do_picker_accept();
+}
+
+/// Accept the highlighted candidate and wait for the outcome to land.
+///
+/// A plugin source's `accept` is ASYNC — it is a guest call — so
+/// `do_picker_accept` only spawns it and `drain_pending_picker_accept` is what
+/// applies the outcome. In production the actor's `async_landed` wake drives
+/// that; here the test does, because there is no keystroke coming.
+async fn settle_accept(editor: &mut Editor) {
+    for _ in 0..200 {
+        let _ = editor.drain_pending_picker_accept();
+        editor.run_tick_pending();
+        if editor.pending_picker_accept.is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn text_of(editor: &Editor, path: &std::path::Path) -> String {
+    let id = editor
+        .find_document_by_path(path)
+        .unwrap_or_else(|| panic!("{} was opened", path.display()));
+    editor
+        .buffers
+        .document_handle(id)
+        .unwrap()
+        .snapshot()
+        .text()
+        .to_string()
+}
+
+/// Lay out a project (a `.git` marker, since refile targets are the PROJECT's
+/// org files — the same scope the agenda walks) holding one target file.
+fn refile_project(base: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(base.join(".git")).unwrap();
+    let targets = base.join("targets.org");
+    std::fs::write(&targets, "* Work\n** Q3\n* Personal\n").unwrap();
+    targets
+}
+
+/// Both halves of the flow are registered: the chord the user presses, and the
+/// action the picker's accept names. A typo in either is a silent dead end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refile_chord_and_its_second_hop_are_both_wired() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    let seq = parse_chord_sequence(&editor.keymap.expand_leader("<leader>or")).unwrap();
+    assert!(
+        matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &seq,
+                &[ModeId::new("org-mode"), ModeId::new("org-todo-mode")]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<leader>or is bound in an org buffer"
+    );
+    assert!(
+        editor.registry.load().id_by_name("org-refile-to").is_some(),
+        "the action the picker's accept invokes is registered, so the host has \
+         something to dispatch when the user chooses a target"
+    );
+    assert!(
+        editor.picker_registry.load().entry("org-refile").is_some(),
+        "and the source the chord's effect names exists, so it opens something"
+    );
+}
+
+/// The whole feature: pick a headline in another file, and the subtree lands
+/// UNDER it rather than at the end of the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refiling_files_a_subtree_under_a_headline_in_another_file() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let targets = refile_project(base.path());
+    let mut editor =
+        org_editor_with_caps(base.path(), "* One\nbody\n* Two\n", &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 1);
+    open_refile(&mut editor).await;
+    assert!(
+        picker_labels(&editor)
+            .iter()
+            .any(|l| l == "targets.org  Work"),
+        "the headlines of the project's org files are the targets: {:?}",
+        picker_labels(&editor)
+    );
+
+    pick(&mut editor, "Work");
+    settle_accept(&mut editor).await;
+
+    assert_eq!(text(&editor), "* Two\n", "the subtree left the source");
+    assert_eq!(
+        text_of(&editor, &targets),
+        "* Work\n** Q3\n* One\nbody\n* Personal\n",
+        "and landed after Work's whole subtree, not in front of its children"
+    );
+}
+
+/// The file itself is a target, and it appends. That is the answer when none
+/// of the headlines is the right home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refiling_to_a_file_appends_at_the_end() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let targets = refile_project(base.path());
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 0);
+    open_refile(&mut editor).await;
+    // The bare file name is the file-level target; every headline row carries
+    // a heading after it.
+    pick(&mut editor, "targets.org");
+    settle_accept(&mut editor).await;
+
+    assert_eq!(
+        text_of(&editor, &targets),
+        "* Work\n** Q3\n* Personal\n* One\n"
+    );
+}
+
+/// Refile is a filing action, not a navigation one: we stay in the source file
+/// even though the target was opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refiling_does_not_follow_the_subtree() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let _targets = refile_project(base.path());
+    let mut editor =
+        org_editor_with_caps(base.path(), "* One\n* Two\n", &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 0);
+    open_refile(&mut editor).await;
+    pick(&mut editor, "Work");
+    settle_accept(&mut editor).await;
+
+    assert_eq!(text(&editor), "* Two\n", "we are still in the source file");
+}
+
+/// In the preamble there is no subtree to file, so nothing moves — the same
+/// refusal archive makes, reached through the picker instead of the chord.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refiling_from_the_preamble_does_nothing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let targets = refile_project(base.path());
+    let before = std::fs::read_to_string(&targets).unwrap();
+    let original = "intro text\n* One\n";
+    let mut editor = org_editor_with_caps(base.path(), original, &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 0);
+    open_refile(&mut editor).await;
+    pick(&mut editor, "Work");
+    settle_accept(&mut editor).await;
+
+    assert_eq!(text(&editor), original, "the source is untouched");
+    assert_eq!(
+        std::fs::read_to_string(&targets).unwrap(),
+        before,
+        "and nothing was filed"
+    );
+}
+
+// ---- OM.11: capture ------------------------------------------------------
+//
+// `<leader>oc` is not pressed here either, and for the same reason as refile:
+// the chord returns `Effect::OpenPrompt`, which the RENDERER applies. That is
+// the `<leader>o:` wall from OM.7 a third time. What IS reachable — and what
+// the feature actually is — is the submit hop: dispatch `org-capture-submit`
+// with the text the user typed, and assert where it landed.
+
+/// Set an org option the way `:set org.<name>=<value>` would.
+fn set_org_option(editor: &mut Editor, name: &str, value: &str) {
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!("org.{name}={value}"),
+    });
+}
+
+/// Dispatch the prompt's submit action with `text`, as the host does when the
+/// user hits `<CR>` on the capture line.
+fn submit_capture(editor: &mut Editor, text: &str) {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-capture-submit")
+        .expect("the submit action is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(
+        lattice_grammar::CommandInvocation::of(id)
+            .with_args(lattice_grammar::Args::String(text.to_string())),
+        &mut out,
+    );
+}
+
+/// Both halves of the flow are registered: the chord, and the action the
+/// `OpenPrompt` payload names for the host to dispatch on submit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    let seq = parse_chord_sequence(&editor.keymap.expand_leader("<leader>oc")).unwrap();
+    assert!(
+        matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &seq,
+                &[ModeId::new("org-mode"), ModeId::new("org-todo-mode")]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<leader>oc is bound in an org buffer"
+    );
+    assert!(
+        editor
+            .registry
+            .load()
+            .id_by_name("org-capture-submit")
+            .is_some(),
+        "the action the OpenPrompt payload names is registered"
+    );
+}
+
+/// The whole feature: what you type lands in the capture file, through the
+/// template — in a file the editor had never opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_lands_in_the_capture_file_through_the_template() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* TODO %?");
+
+    submit_capture(&mut editor, "call the bank");
+
+    assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
+    assert_eq!(text(&editor), "* One\n", "capture MOVES nothing");
+}
+
+/// Captures accumulate. The file is a log, so a second one goes below the
+/// first rather than over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_capture_appends_below_the_first() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* %?");
+
+    submit_capture(&mut editor, "first");
+    submit_capture(&mut editor, "second");
+
+    assert_eq!(text_of(&editor, &notes), "* first\n* second\n");
+}
+
+/// With `org.capture-file` unset the user is TOLD, not silently given a
+/// `capture.org` in whichever directory the editor started in — a note filed
+/// somewhere you never named is a note you will not find.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_capture_file_says_so() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    submit_capture(&mut editor, "a thought");
+
+    let msg = editor.last_message.as_ref().expect("the user is told");
+    assert!(
+        msg.text.contains("org.capture-file"),
+        "and told WHICH option to set: {}",
+        msg.text
+    );
+}
+
+/// The plugin needs `fs:write` over the capture file's directory, and without
+/// it the write is refused at the boundary — the same gate archive meets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ungranted_plugin_cannot_capture() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &[]).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+
+    submit_capture(&mut editor, "a thought");
+
+    assert!(
+        editor.find_document_by_path(&notes).is_none(),
+        "the capture file was never even opened"
     );
 }

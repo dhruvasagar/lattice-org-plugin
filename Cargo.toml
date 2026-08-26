@@ -53,6 +53,9 @@ lattice-runtime = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice
 lattice-protocol = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-protocol" }
 lattice-syntax = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-syntax" }
 lattice-multibuffer = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-multibuffer" }
+# OC.3: the tests reach the editor's transient registry to prove the capture
+# menu registered into it and builds through it.
+lattice-picker = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-picker" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 arc-swap = "1"

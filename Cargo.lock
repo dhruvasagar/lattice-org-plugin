@@ -3334,6 +3334,7 @@ dependencies = [
  "lattice-keymap",
  "lattice-mode",
  "lattice-multibuffer",
+ "lattice-picker",
  "lattice-plugin-host",
  "lattice-plugin-loader",
  "lattice-protocol",

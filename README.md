@@ -108,7 +108,7 @@ Point a plugin directory at it with a `plugin.toml`:
 
 ```toml
 id = "org"
-provides = ["language", "modes", "grammar", "config", "media", "agenda-source", "picker-source", "help"]
+provides = ["language", "modes", "grammar", "config", "media", "agenda-source", "picker-source", "transient-source", "help"]
 default_modes = ["org-todo-mode", "org-global-mode"]
 capabilities = ["fs:write:/home/you/org"]
 ```

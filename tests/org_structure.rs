@@ -73,6 +73,13 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             // OM.11: refile's target list is a picker source, so the loader
             // needs somewhere to register it.
             picker_registry: Some(editor.picker_registry.clone()),
+            // OC.3: the capture menu registers into the editor's OWN transient
+            // registry — the one TR.1 moved to `editor_boot` so a plugin menu
+            // does not depend on whether magit happened to load.
+            transient_registry: editor
+                .services
+                .get::<lattice_picker::TransientSourceRegistryHandle>()
+                .map(|h| (*h).clone()),
             ..Default::default()
         },
     )
@@ -107,7 +114,7 @@ async fn org_editor_with_caps(
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\"]\ndefault_mode = \"org-todo-mode\"\ncapabilities = [{caps}]\n"
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\ncapabilities = [{caps}]\n"
         ),
     )
     .unwrap();
@@ -210,6 +217,98 @@ fn press(editor: &mut Editor, keys: &str) {
     for c in seq {
         let _ = editor.dispatch_chord(c, &mut partial);
     }
+}
+
+/// OC.3 — press a chord and then apply the RENDERER-owned effects it produced,
+/// which is what both peers do after `dispatch_chord` returns.
+///
+/// `dispatch_chord` runs the action but discards its `DispatchOutcome`, so a
+/// headless test that only presses proves the chord resolved and nothing more.
+/// `Effect::OpenTransient` and `Effect::OpenPrompt` both live in that discarded
+/// tail — which is exactly how OC.3a's bug (a plugin's prompt submit never
+/// firing) survived every existing capture test.
+async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
+    for effect in out.effects {
+        match effect {
+            lattice_grammar::Effect::OpenTransient { source } => {
+                editor.open_named_transient(source);
+                // A PLUGIN menu builds off-thread — the seam calls the guest's
+                // `build` on its own actor task — so it parks and seats on the
+                // async-landed wake (TR.2a). In production the editor actor
+                // drains it; here the test does what that arm does.
+                settle_transient_build(editor).await;
+            }
+            lattice_grammar::Effect::OpenPrompt {
+                prompt,
+                initial,
+                on_submit_action,
+                buffer_name,
+            } => {
+                editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fire the action a chord is bound to, the way the renderer's dispatch
+/// wrapper does — run it, then apply the renderer-coupled effects.
+/// Drain a parked transient build until the menu seats.
+///
+/// A LOOP, not a single wait: `async_landed` is the editor's one shared wake
+/// and anything else that lands fires it too, so one `notified()` can return
+/// for an unrelated reason and leave the build still in flight — which is
+/// exactly what happened the first time this was written as a single await.
+async fn settle_transient_build(editor: &mut Editor) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while editor.pending_transient_build.is_some() && std::time::Instant::now() < deadline {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            editor.async_landed.notified(),
+        )
+        .await;
+        editor.drain_pending_transient_build();
+    }
+}
+
+async fn press_chord(editor: &mut Editor, keys: &str) {
+    let expanded = editor.keymap.expand_leader(keys);
+    let seq = parse_chord_sequence(&expanded).expect("parses");
+    let mut partial: Vec<KeyChord> = Vec::new();
+    let mut resolved = None;
+    for c in seq {
+        resolved = Some(editor.dispatch_chord(c, &mut partial));
+    }
+    // `dispatch_chord` already RAN the action; re-running it through
+    // `dispatch` would double-apply. Instead the effects are recovered by
+    // re-dispatching only when the resolved action is an invocation, which is
+    // the only shape that carries them here.
+    if let Some(lattice_host::action::Action::Invoke(inv)) = resolved {
+        let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
+        apply_renderer_effects(editor, out).await;
+    }
+}
+
+/// Press a key inside an open transient menu — the renderer's own call.
+async fn press_menu_key(editor: &mut Editor, key: &str) {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger(key.to_string(), &mut out);
+    apply_renderer_effects(editor, out).await;
+}
+
+/// Type `text` into the open prompt and submit it, the way `<CR>` does.
+fn submit_prompt(editor: &mut Editor, text: &str) {
+    let action = editor
+        .pending_prompt_submit_action
+        .clone()
+        .expect("a prompt is open");
+    let name = editor.pending_prompt_buffer_name.clone();
+    // Re-open with the text seeded: `open_prompt_line` writes `initial` into
+    // the prompt buffer and submit reads that buffer's first line, so this is
+    // the value the user would have typed.
+    editor.open_prompt_line("".to_string(), text.to_string(), action, name);
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_prompt_line_submit(&mut out);
 }
 
 /// Put the caret on `line`, column 0.
@@ -2014,11 +2113,16 @@ fn submit_capture(editor: &mut Editor, text: &str) {
 /// Both halves of the flow are registered: the chord, and the action the
 /// `OpenPrompt` payload names for the host to dispatch on submit.
 ///
-/// OC.1 moved the chord from `<leader>oc` on the org MAJOR to `<C-x>oc` on
-/// `org-global-mode`, a `Universal` minor — so the assertion is deliberately
-/// made with NO org mode in the active set. That is the whole point of the
-/// move: the thought you are trying not to lose arrives while you are reading
-/// code, and a capture chord that only fires inside an org file is backwards.
+/// OC.1 moved the chord off org's MAJOR keymap onto `org-global-mode`, a
+/// `Universal` minor — so the assertion is deliberately made with NO org mode
+/// but that one in the active set. That is the whole point of the move: the
+/// thought you are trying not to lose arrives while you are reading code, and
+/// a capture chord that only fires inside an org file is backwards.
+///
+/// OC.3 then moved it from `<C-x>oc` to `<leader>oc`, because `<C-x>` is
+/// already a TERMINAL binding on org's major (timestamp decrement) and a
+/// prefix in one layer beside a terminal binding in another cannot resolve
+/// without an ambiguous-chord timeout this editor does not have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
     if org_plugin_wasm().is_none() {
@@ -2027,46 +2131,42 @@ async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
     let base = tempfile::tempdir().unwrap();
     let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
 
-    let seq = parse_chord_sequence("<C-x>oc").unwrap();
-    assert!(
+    let bound = |chord: &str, modes: &[ModeId]| {
         matches!(
             editor.keymap.lookup_with_context(
                 lattice_keymap::BindingMode::Normal,
-                &seq,
-                // NOT an org buffer: only the universal minor is active.
-                &[ModeId::new("org-global-mode")]
+                &parse_chord_sequence(&editor.keymap.expand_leader(chord)).unwrap(),
+                modes
             ),
             LookupResult::Bound { .. }
-        ),
-        "<C-x>oc is bound wherever org-global-mode is, org file or not"
-    );
-    // And the prefix is a PREFIX — `<C-x>o` alone must not fire anything, or
-    // the second key would never arrive.
-    let prefix = parse_chord_sequence("<C-x>o").unwrap();
+        )
+    };
+
+    let global_only = [ModeId::new("org-global-mode")];
     assert!(
-        !matches!(
-            editor.keymap.lookup_with_context(
-                lattice_keymap::BindingMode::Normal,
-                &prefix,
-                &[ModeId::new("org-global-mode")]
-            ),
-            LookupResult::Bound { .. }
-        ),
-        "<C-x>o is a prefix, not a terminal binding"
+        bound("<leader>oc", &global_only),
+        "<leader>oc is bound wherever org-global-mode is, org file or not"
     );
-    // `oa` reaches the HOST's `:agenda` — org supplies the rows through the
-    // agenda-source seam; the view is the multibuffer provider's.
     assert!(
-        matches!(
-            editor.keymap.lookup_with_context(
-                lattice_keymap::BindingMode::Normal,
-                &parse_chord_sequence("<C-x>oa").unwrap(),
-                &[ModeId::new("org-global-mode")]
-            ),
-            LookupResult::Bound { .. }
-        ),
-        "<C-x>oa reaches the agenda"
+        bound("<leader>oa", &global_only),
+        "<leader>oa reaches the agenda from anywhere"
     );
+
+    // The property the prefix choice rests on: the universal minor's
+    // `<leader>oc` and the MAJOR's `<leader>oh` both resolve in an org buffer.
+    // Layered prefixes compose — which is exactly what `<C-x>` could not do,
+    // because the major binds it as a terminal chord.
+    let in_org = [
+        ModeId::new("org-mode"),
+        ModeId::new("org-todo-mode"),
+        ModeId::new("org-global-mode"),
+    ];
+    assert!(bound("<leader>oc", &in_org), "and still inside an org file");
+    assert!(
+        bound("<leader>oh", &in_org),
+        "without costing the major its own <leader>o chords"
+    );
+
     assert!(
         editor
             .registry
@@ -2297,5 +2397,162 @@ async fn a_multi_template_set_names_its_keys_until_the_menu_exists() {
     assert!(
         !notes.exists(),
         "and nothing was captured to either of them"
+    );
+}
+
+/// OC.3 — the capture menu, end to end through the real chord.
+///
+/// This is what makes a nine-template set usable: before it a chord carried no
+/// way to say WHICH template, so capture could offer exactly one. The menu is a
+/// plugin-contributed transient (TR.2b), its rows carry each template's key in
+/// their own args (TR.2a), and pressing a key fires org's own capture action
+/// with that key.
+///
+/// Driven through `press`, not by calling the builder: a menu that builds
+/// correctly and cannot be opened by its chord is the failure this catches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capture_menu_opens_on_the_chord_with_a_row_per_template() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{f}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"n\"\ndescription = \"note\"\n\
+             target = {{ file = \"{f}\" }}\nbody = \"* %?\"\n",
+            f = notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the menu opened; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    assert_eq!(spec.title, "Capture");
+    let keys: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.key[0].as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["t", "n", "q"],
+        "one row per template, in declaration order, plus a way out"
+    );
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert!(labels.contains(&"todo") && labels.contains(&"note"));
+}
+
+/// The key you press is what decides the template — the whole point of the
+/// per-row args slot. Two rows fire ONE action; only the argument differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_key_you_press_decides_which_template_captures() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let todos = base.path().join("todo-target.org");
+    let notes = base.path().join("note-target.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{t}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"n\"\ndescription = \"note\"\n\
+             target = {{ file = \"{n}\" }}\nbody = \"* NOTE %?\"\n",
+            t = todos.to_str().unwrap(),
+            n = notes.to_str().unwrap()
+        ),
+    );
+
+    // Open the menu and press `n` — the SECOND template, so a first-wins bug
+    // cannot pass this.
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "n").await;
+
+    // The row fired `org-capture n`, which opened the prompt for that
+    // template. Finish it the way the user would.
+    submit_prompt(&mut editor, "a thought");
+
+    assert_eq!(text_of(&editor, &notes), "* NOTE a thought\n");
+    assert!(
+        !todos.exists(),
+        "the other template's file was not written — the key chose, not the order"
+    );
+}
+
+/// And the whole chain through the REAL prompt rather than a direct dispatch:
+/// chord → menu → key → prompt → submit. Every org capture test before this one
+/// dispatched the submit action itself, which is how OC.3a's bug survived (a
+/// plugin's prompt submit never fired at all).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_prompt_the_menu_opens_actually_files_the_note() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+    assert!(
+        editor.pending_prompt_submit_action.is_some(),
+        "the row opened the capture prompt"
+    );
+    submit_prompt(&mut editor, "call the bank");
+
+    assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
+    assert_eq!(text(&editor), "* One\n", "capture MOVES nothing");
+}
+
+/// A broken template set means the menu does NOT open, and says why. An empty
+/// menu would tell the user nothing about what to fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_set_leaves_the_menu_closed_and_echoes() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-templates", "[[template]\nkey = \"t\"");
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    assert!(editor.picker.is_none(), "no menu opened");
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("capture-templates"),
+        "the echo names the option at fault: {msg:?}"
     );
 }

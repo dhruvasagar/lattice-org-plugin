@@ -58,6 +58,16 @@ wit_bindgen::generate!({
             // what the source actually uses keeps it that way.
             import lattice:plugin-host/host-services@0.1.0;
             export lattice:plugin-host/picker-source@0.1.0;
+            // OC.3: the capture menu. Exported bare for the SAME reason
+            // `picker-source` is — `transient-source-plugin` imports
+            // `logging` and `project`, and an import a component declares
+            // must be satisfiable on EVERY linker it is instantiated
+            // against, including the grammar seam's sync one where
+            // `logging` is deliberately absent. That is not a theoretical
+            // constraint: OC.2 added one `logging::log` call, the component
+            // started importing `logging`, and the WHOLE plugin stopped
+            // instantiating.
+            export lattice:plugin-host/transient-source@0.1.0;
         }
     "#,
     path: "wit",
@@ -187,6 +197,12 @@ const DEFAULT_REFILE_MAX_LEVEL: usize = 3;
 /// the host dispatches with the submitted text.
 const CAPTURE: u32 = 35;
 const CAPTURE_SUBMIT: u32 = 36;
+
+/// OC.3 — the chord's action now OPENS THE MENU rather than the prompt. It is
+/// its own action rather than a mode of `org-capture` because the menu's rows
+/// fire `org-capture` with a key, and one action that sometimes opens a menu
+/// and sometimes captures would make the row's own args ambiguous.
+const CAPTURE_MENU: u32 = 37;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -487,12 +503,20 @@ impl Guest for Component {
         // Every other org mode above is `Majors(["org-mode"])` or `Manual`
         // precisely because those verbs act ON an org file.
         //
-        // **`<C-x>o` shadows `action:next-pane`** — emacs's `other-window`,
-        // from the emacs-keys layer. Deliberate (org-capture.md §6): lattice
-        // is vim-first and `<C-w>w` is the native pane switch, so the cost
-        // falls only on the emacs-keys layer and a user who wants it back
-        // rebinds the prefix. Recorded here because a silently-shadowed emacs
-        // chord is exactly the kind of thing that reads as a bug later.
+        // **The prefix is `<leader>o`, not `<C-x>o`.** The design fragment
+        // proposed `<C-x>o` and it cannot work: org's MAJOR keymap already
+        // binds a TERMINAL `<C-x>` (timestamp decrement, OM.9), so inside an
+        // org buffer `<C-x>` fires that and never waits for the second key.
+        // A prefix in one layer and a terminal binding in another is the
+        // ambiguity vim resolves with `timeoutlen`, which this editor does
+        // not have.
+        //
+        // `<leader>o` costs nothing and breaks no muscle memory: it is where
+        // capture already lived, and the ONLY change is that these two now
+        // work outside an org file. It also drops the emacs `other-window`
+        // shadowing the fragment had accepted as a price. Layered prefixes
+        // compose — the major's `<leader>oh` and this minor's `<leader>oc`
+        // both resolve, which the tests pin.
         //
         // `oa` reaches the HOST's `:agenda` ex-command by name — the agenda
         // view is the multibuffer provider's, not this plugin's, and the
@@ -503,12 +527,12 @@ impl Guest for Component {
             activation_policy: ActivationPolicy::Universal,
             capabilities: ModeCapabilities::empty(),
             keymap: vec![
-                bind("<C-x>oa", "agenda"),
+                bind("<leader>oa", "agenda"),
                 // OM.11 bound this at `<leader>oc` on the org MAJOR, where it
                 // could only fire inside an org file. `org-capture-submit` is
                 // the second hop and is NOT bound — the host dispatches it on
                 // submit.
-                bind("<C-x>oc", "org-capture"),
+                bind("<leader>oc", "org-capture-menu"),
             ],
             target_language: None,
         });
@@ -798,8 +822,14 @@ impl Guest for Component {
             ARCHIVE_SUBTREE,
         );
         register_action(
+            "org-capture-menu",
+            "Open the capture menu: one key per template in `org.capture-templates`",
+            &spec(),
+            CAPTURE_MENU,
+        );
+        register_action(
             "org-capture",
-            "Capture a note into `org.capture-file`",
+            "Capture a note through one template (its key is the argument)",
             &spec(),
             CAPTURE,
         );
@@ -1335,14 +1365,22 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
 /// say so at the keystroke rather than after the user has already typed a note
 /// — the one moment capture must not waste.
 ///
-/// **No key is threaded through yet, and that is a real boundary rather than
-/// an omission.** A prompt submit hands the action `prompt_value` and nothing
-/// else; the chosen key would have to ride `buffer-name` and be read back off
-/// the prompt buffer, which is OC.4's `%^{Prompt}` chain. Until then a set with
-/// one template captures end to end and a set with several says which keys
-/// exist — which is exactly what OC.3's menu replaces.
-fn capture_open(_ctx: &ActionContext) -> Vec<Effect> {
-    let template = match selected_template(None) {
+/// The chosen template's key arrives in `ctx.args` — put there by the menu row
+/// the user pressed (OC.3) — and rides back out on `buffer_name`, which is what
+/// the WIT documents that field for. The host hands it to the submit action
+/// alongside the typed text (OC.3a), so the second hop knows which template it
+/// is finishing.
+///
+/// State on the payload rather than in guest memory, deliberately: `<Esc>`
+/// dispatches nothing at all, so a guest-side "current template" would never be
+/// told to clear and the next capture would inherit it.
+///
+/// A bare `org-capture` with no key still works when the set holds exactly one
+/// template — there is nothing to choose — which is what keeps `:org-capture`
+/// and a one-template config usable without going through the menu.
+fn capture_open(ctx: &ActionContext) -> Vec<Effect> {
+    let key = submitted_text(&ctx.args).filter(|k| !k.is_empty());
+    let template = match selected_template(key.as_deref()) {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
@@ -1355,20 +1393,45 @@ fn capture_open(_ctx: &ActionContext) -> Vec<Effect> {
             },
             initial: String::new(),
             on_submit_action: "org-capture-submit".to_string(),
-            buffer_name: None,
+            buffer_name: (!template.key.is_empty())
+                .then(|| format!("*org-capture:{}*", template.key)),
         },
     )]
+}
+
+/// The name the host smuggles back with a prompt submit, minus its wrapping.
+///
+/// `None` for a prompt that carried no state — a legacy single-template capture
+/// — which is distinct from an empty key and is why this is not just a trim.
+fn capture_key_from_prompt_name(name: &str) -> Option<&str> {
+    name.strip_prefix("*org-capture:")?.strip_suffix('*')
+}
+
+/// The smuggled state a prompt submit carries: `[typed-text, buffer-name]`
+/// (OC.3a). A submit with no state is a plain `Args::String`, so the second
+/// slot being absent is the ordinary case rather than an error.
+fn prompt_smuggled_state(args: &Args) -> Option<String> {
+    let Args::List(items) = args else {
+        return None;
+    };
+    match items.get(1)? {
+        lattice::plugin_host::types::ArgValue::String(s) => Some(s.clone()),
+        lattice::plugin_host::types::ArgValue::Raw(s) => Some(s.clone()),
+        _ => None,
+    }
 }
 
 fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
     let Some(entered) = submitted_text(&ctx.args) else {
         return vec![Effect::None];
     };
-    // Re-resolved rather than carried: a submit hands the action its
-    // `prompt_value` and nothing else, so there is nowhere for the first hop's
-    // choice to ride yet (OC.4). Re-reading is also what makes a `:set` between
-    // the two hops take effect, which is the behaviour the option promises.
-    let template = match selected_template(None) {
+    // The key the first hop chose, carried out on `buffer-name` and handed
+    // back by the host (OC.3a). Re-RESOLVED rather than carried whole, so a
+    // `:set org.capture-templates=…` between the two hops takes effect — which
+    // is the behaviour the option promises.
+    let key = prompt_smuggled_state(&ctx.args);
+    let key = key.as_deref().and_then(capture_key_from_prompt_name);
+    let template = match selected_template(key) {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
@@ -1635,6 +1698,10 @@ impl GrammarCallbacks for Component {
                 },
             )]),
             REFILE_TO => Ok(refile_to(&ctx, doc)),
+            // OC.3: names the menu the `transient-source` seam registered.
+            // The host resolves the name against the registry and calls this
+            // plugin's `build` for the place it was opened from.
+            CAPTURE_MENU => Ok(vec![Effect::OpenTransient(CAPTURE_TRANSIENT.to_string())]),
             CAPTURE => Ok(capture_open(&ctx)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
@@ -2327,4 +2394,88 @@ fn table_structure(ctx: &ActionContext, doc: &Document, action: u32) -> Vec<Effe
             byte,
         },
     )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OC.3 — the capture menu
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The name `Effect::OpenTransient` addresses this menu by, and what the host
+/// registers it under (it comes from `id()` below, so the host never learns it
+/// statically).
+const CAPTURE_TRANSIENT: &str = "org-capture";
+
+/// The capture menu: one row per template, keyed the way the template says.
+///
+/// This is what makes a nine-template set usable. Before it, capture could
+/// offer exactly one template, because a chord carries no way to say WHICH —
+/// the whole reason `plugin-transients.md` exists.
+///
+/// **Built per open, never cached.** A menu row's set comes from
+/// `org.capture-templates`, and `:set` must take effect on the next `<C-x>oc`.
+/// The seam calls `build` per open for exactly this reason.
+///
+/// **Each row carries the template's key in its own args** — the per-row slot
+/// TR.2a added. One action, N rows, and the key you pressed is what decides
+/// which template runs. Without it org would need one registered command per
+/// template, and templates are an option read at capture time, not at load.
+impl exports::lattice::plugin_host::transient_source::Guest for Component {
+    fn id() -> String {
+        CAPTURE_TRANSIENT.to_string()
+    }
+
+    fn build(
+        _ctx: lattice::plugin_host::types::TransientContext,
+    ) -> Result<lattice::plugin_host::types::TransientSpec, String> {
+        use lattice::plugin_host::types::{
+            Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+            TransientSpec,
+        };
+
+        // An `err` echoes with the plugin named and the menu does not open —
+        // which is right for every one of these: an unset option, a set whose
+        // TOML does not parse, and a set with nothing usable in it are all
+        // things the user must fix before a menu means anything. A menu that
+        // opens empty says none of that.
+        let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
+        let set = capture_templates::parse(&source).map_err(|e| e.message())?;
+
+        let mut items: Vec<TransientItem> = set
+            .templates
+            .iter()
+            .map(|t| TransientItem {
+                key: vec![t.key.clone()],
+                label: t.description.clone(),
+                description: format!("→ {}", t.target.file()),
+                kind: TransientItemKind::Action(TransientAction {
+                    command: "org-capture".to_string(),
+                    args: WitArgs::String(t.key.clone()),
+                }),
+            })
+            .collect();
+        // A menu with no way out is a trap. `q` is the transient's own
+        // convention and costs nothing.
+        items.push(TransientItem {
+            key: vec!["q".to_string()],
+            label: "quit".to_string(),
+            description: String::new(),
+            kind: TransientItemKind::Dismiss,
+        });
+
+        // The templates the set could not use are named in the FOOTER rather
+        // than dropped in silence. This is the one place a missing row is
+        // noticeable — the user is looking at the menu and counting — and it
+        // is once per open rather than once per capture.
+        let footer =
+            (!set.skipped.is_empty()).then(|| format!("skipped: {}", set.skipped.join("; ")));
+
+        Ok(TransientSpec {
+            title: "Capture".to_string(),
+            groups: vec![TransientGroup {
+                label: "Templates".to_string(),
+                items,
+            }],
+            footer,
+        })
+    }
 }

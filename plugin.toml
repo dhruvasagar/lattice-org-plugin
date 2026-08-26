@@ -17,6 +17,8 @@ provides = [
     "media",
     "agenda-source",
     "picker-source",
+    # OC.3: the capture menu, one key per template.
+    "transient-source",
     "help",
 ]
 

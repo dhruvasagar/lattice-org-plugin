@@ -1701,7 +1701,15 @@ impl GrammarCallbacks for Component {
             // OC.3: names the menu the `transient-source` seam registered.
             // The host resolves the name against the registry and calls this
             // plugin's `build` for the place it was opened from.
-            CAPTURE_MENU => Ok(vec![Effect::OpenTransient(CAPTURE_TRANSIENT.to_string())]),
+            CAPTURE_MENU => Ok(vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    // The template menu is opened for nothing in particular —
+                    // it IS the choice. TR.3a's args carry a subject when a
+                    // menu drills down, which is the fields menu (OC.4).
+                    args: Args::None,
+                },
+            )]),
             CAPTURE => Ok(capture_open(&ctx)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),

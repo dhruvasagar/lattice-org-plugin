@@ -230,8 +230,8 @@ fn press(editor: &mut Editor, keys: &str) {
 async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
     for effect in out.effects {
         match effect {
-            lattice_grammar::Effect::OpenTransient { source } => {
-                editor.open_named_transient(source);
+            lattice_grammar::Effect::OpenTransient { source, args } => {
+                editor.open_named_transient(source, args);
                 // A PLUGIN menu builds off-thread — the seam calls the guest's
                 // `build` on its own actor task — so it parks and seats on the
                 // async-landed wake (TR.2a). In production the editor actor

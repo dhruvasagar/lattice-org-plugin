@@ -78,12 +78,34 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
 /// Boot an editor, load the org plugin into its live registries, and open a
 /// `.org` file holding `text`. Returns the editor and the file path.
 async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
+    org_editor_with_caps(base, text, &[]).await
+}
+
+/// [`org_editor`], plus the OS capabilities the manifest declares.
+///
+/// OM.6b is the first slice that needs any: a cross-file write is refused at
+/// the boundary unless the plugin holds `fs:write` over the target, and the
+/// refusal is silent to the guest (the effect is replaced with an `Echo`
+/// before it reaches the editor). A test that forgot the grant would look
+/// exactly like a broken archive.
+async fn org_editor_with_caps(
+    base: &std::path::Path,
+    text: &str,
+    capabilities: &[String],
+) -> Editor {
     let plugins_dir = base.join("plugins");
     let dir = plugins_dir.join("org");
     std::fs::create_dir_all(&dir).unwrap();
+    let caps = capabilities
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
+        format!(
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\ncapabilities = [{caps}]\n"
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -1591,4 +1613,131 @@ async fn the_last_row_and_a_separator_refuse_to_be_destroyed() {
     assert_eq!(text(&editor), original, "the only row survives");
     press(&mut editor, "<leader>tdc");
     assert_eq!(text(&editor), original, "the only column survives");
+}
+
+// ---- OM.6b: archive ------------------------------------------------------
+//
+// The first chord in this plugin that writes to a file other than the one it
+// fired in. Everything below `<leader>o$` is ordinary plugin work; what made
+// it possible is two host primitives — `Effect::WriteToFile` (XF) and
+// `document.path()` (OM.6b), without which the guest could not name
+// `<file>_archive` at all.
+
+/// The `fs:write` grant an archiving org plugin needs: the directory its files
+/// live in. In production that is the user's org directory; here, the tempdir.
+fn fs_write(dir: &std::path::Path) -> Vec<String> {
+    vec![format!("fs:write:{}", dir.display())]
+}
+
+fn archive_text(editor: &Editor, base: &std::path::Path) -> String {
+    let path = base.join("notes.org_archive");
+    let id = editor
+        .find_document_by_path(&path)
+        .expect("the archive file was opened");
+    editor
+        .buffers
+        .document_handle(id)
+        .unwrap()
+        .snapshot()
+        .text()
+        .to_string()
+}
+
+/// The whole feature: a subtree leaves this file and lands in the one beside
+/// it, named from the source's own path — which is the part that needed
+/// `document.path()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_a_subtree_moves_it_beside_the_source_file() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(
+        base.path(),
+        "* One\nbody\n** Child\n* Two\n",
+        &fs_write(base.path()),
+    )
+    .await;
+
+    // From the body line, not the headline — archiving is something you do
+    // while reading a subtree, and `enclosing_headline` walks up to it.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>o$");
+
+    assert_eq!(
+        text(&editor),
+        "* Two\n",
+        "the subtree, its body and its child all left together"
+    );
+    assert_eq!(
+        archive_text(&editor, base.path()),
+        "* One\nbody\n** Child\n",
+        "and arrived intact"
+    );
+}
+
+/// The archive file is APPENDED to, so a second archive does not overwrite the
+/// first — the file is a log, and reading it top-to-bottom is chronological.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_archive_appends_below_the_first() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor =
+        org_editor_with_caps(base.path(), "* One\n* Two\n", &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>o$");
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>o$");
+
+    assert_eq!(text(&editor), "", "both left");
+    assert_eq!(archive_text(&editor, base.path()), "* One\n* Two\n");
+}
+
+/// **The capability, wired.** The same chord, the same buffer, no `fs:write` —
+/// and the subtree stays put. The gate runs at the boundary, so the guest
+/// cannot tell the difference and the plugin needs no code for this case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ungranted_org_plugin_cannot_archive() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* One\nbody\n";
+    let mut editor = org_editor_with_caps(base.path(), original, &[]).await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>o$");
+
+    assert_eq!(text(&editor), original, "nothing moved");
+    assert!(
+        editor
+            .find_document_by_path(&base.path().join("notes.org_archive"))
+            .is_none(),
+        "and no archive file was even opened"
+    );
+}
+
+/// In a file's preamble there is no subtree to archive. The chord CONSUMES
+/// rather than declining: `$` on its own is vim's end-of-line motion, so a
+/// decline would move the caret from a key that meant "archive" (OM.6's rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archiving_the_preamble_does_nothing_and_does_not_run_dollar() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "intro text\n* One\n";
+    let mut editor = org_editor_with_caps(base.path(), original, &fs_write(base.path())).await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>o$");
+
+    assert_eq!(text(&editor), original, "nothing archived");
+    assert_eq!(
+        editor.cursor.byte, 0,
+        "and `$` did not run as a bare motion"
+    );
 }

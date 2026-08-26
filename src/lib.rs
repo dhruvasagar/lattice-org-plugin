@@ -56,6 +56,7 @@ wit_bindgen::generate!({
 });
 
 mod agenda;
+mod archive;
 mod checkbox;
 mod headline;
 mod links;
@@ -76,9 +77,10 @@ use lattice::plugin_host::modes::{
 };
 use lattice::plugin_host::tree_sitter::TreeSnapshot;
 use lattice::plugin_host::types::{
-    ActionContext, ActionSpec, AppEffect, Args, DecorationContext, Edit, EditKind, Effect,
-    ExCommandContext, MediaBlock, MediaFit, MotionContext, MotionResult, MotionSpec,
-    OperatorContext, Position, Range, TextObjectContext, TextObjectSpec,
+    ActionContext, ActionSpec, AppEffect, Args, DecorationContext, EchoLevel, EchoPayload, Edit,
+    EditKind, Effect, ExCommandContext, FileAnchor, MediaBlock, MediaFit, MotionContext,
+    MotionResult, MotionSpec, OperatorContext, Position, Range, TextObjectContext, TextObjectSpec,
+    WriteToFilePayload,
 };
 
 /// Callback ids for `apply-action`. The guest chooses these; the host only
@@ -146,6 +148,10 @@ const TABLE_INSERT_ROW: u32 = 28;
 const TABLE_INSERT_COL: u32 = 29;
 const TABLE_DELETE_ROW: u32 = 30;
 const TABLE_DELETE_COL: u32 = 31;
+
+/// `<leader>o$` (OM.6b) — the first action in this plugin that writes to a
+/// file other than the one it fired in.
+const ARCHIVE_SUBTREE: u32 = 32;
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -299,6 +305,9 @@ impl Guest for Component {
                 bind("<leader>oJ", "org-move-subtree-down"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
+                // OM.6b: org's own `C-c C-x C-a`, spelled the way
+                // nvim-orgmode spells it.
+                bind("<leader>o$", "org-archive-subtree"),
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
@@ -651,6 +660,12 @@ impl Guest for Component {
             "Show or hide inline images for org buffers",
             &spec(),
             TOGGLE_INLINE_IMAGES,
+        );
+        register_action(
+            "org-archive-subtree",
+            "Move the subtree at the cursor into `<this file>_archive`",
+            &spec(),
+            ARCHIVE_SUBTREE,
         );
         register_action(
             "org-toggle-heading",
@@ -1022,6 +1037,57 @@ fn move_subtree(ctx: &ActionContext, doc: &Document, up: bool) -> Vec<Effect> {
     replace_lines(ctx, first, second_end, last_len, text, cursor)
 }
 
+/// Move the subtree at the cursor into `<this file>_archive`.
+///
+/// `<leader>o$`, org's `C-c C-x C-a`. One `Effect::WriteToFile`, not an insert
+/// plus a delete: the host inserts first and cuts ONLY if the insert landed,
+/// so a target that cannot be written leaves the subtree where it is. As two
+/// effects the failure modes are "the subtree exists twice" and "the subtree
+/// is gone", and an effect cannot report failure to the one that follows it
+/// (`cross-file-writes.md` §5).
+///
+/// ## Three refusals
+///
+/// **No enclosing headline** — the cursor is in the file's preamble. Consumes
+/// (`Effect::None`) rather than declining: `<leader>o$` sits behind a
+/// plugin-owned prefix with nothing underneath it, and a decline would re-run
+/// the trailing `$` on its own, which in vim is "go to end of line" — a
+/// cursor jump from a key that meant "archive" (OM.6).
+///
+/// **No file behind this buffer** — a scratch org buffer has no `_archive` to
+/// derive. Echoed rather than silently no-oped, because the user pressed a key
+/// that normally moves text and nothing visibly happened.
+///
+/// **Not granted `fs:write`** — refused at the boundary, before the effect
+/// reaches the editor, and the host does the echoing. Nothing to do here; the
+/// manifest is where that is answered.
+fn archive_subtree(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let Some(source) = doc.path() else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: this buffer has no file, so it has no archive".to_string(),
+        })];
+    };
+    let line = |n: u32| doc.line(n);
+    let Some((text, (sl, sb, el, eb))) =
+        archive::extract_subtree(line, ctx.cursor.line, doc.line_count())
+    else {
+        return vec![Effect::None];
+    };
+
+    vec![Effect::WriteToFile(WriteToFilePayload {
+        path: archive::archive_path(&source),
+        // Append. Org's archive file is a log, and the newest entry belonging
+        // at the bottom is what makes it readable top-to-bottom later.
+        anchor: FileAnchor::End,
+        text,
+        cut: Some(Range {
+            start: Position { line: sl, byte: sb },
+            end: Position { line: el, byte: eb },
+        }),
+    })]
+}
+
 /// Insert a new sibling headline after the subtree at the cursor, and put the
 /// caret on it ready to type.
 ///
@@ -1217,6 +1283,7 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
             META_RETURN => Ok(meta_return(&ctx, doc)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
+            ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),

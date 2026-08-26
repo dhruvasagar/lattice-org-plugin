@@ -1,0 +1,34 @@
+# The manifest the plugin manager stages beside the built component.
+#
+# It has to live HERE, at the source root, not only in the directory the
+# manager stages into: `build::stage` copies this file next to the artifact,
+# and a source with no `plugin.toml` fails the build outright ("source has no
+# plugin.toml") rather than staging half a plugin. A `require`d local or git
+# source without this file can never be installed.
+id = "org"
+
+# Every seam org contributes. The order is cosmetic — the loader sorts by real
+# registration dependency before draining.
+provides = [
+    "language",
+    "modes",
+    "grammar",
+    "config",
+    "media",
+    "agenda-source",
+    "picker-source",
+    "help",
+]
+
+# Publishes the enablement request for `org-todo-mode`. Without it the mode
+# registers correctly and simply never activates, and it also auto-registers
+# the `org.enabled` gate.
+default_mode = "org-todo-mode"
+
+# Archive (`<leader>o$`), refile (`<leader>or`) and capture (`<leader>oc`) all
+# write to a file other than the one you are in, and the host checks the target
+# against this grant at the plugin boundary. Point it at the directory your org
+# files live in; without it those three chords are refused and say so, and
+# everything else still works.
+#
+# capabilities = ["fs:write:/Users/you/org"]

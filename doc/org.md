@@ -70,6 +70,7 @@ vim's own do: `d]]` deletes to the next headline, `3]]` moves down three.
 | `<leader>oK` `<leader>oJ` | move the subtree up / down past a sibling |
 | `<leader><CR>` | new headline at the same level, after this subtree |
 | `<leader>o*` | toggle the current line between headline and text |
+| `<leader>o$` | archive the subtree into `<this file>_archive` |
 | `<Tab>` `<S-Tab>` | cycle this headline / the whole buffer |
 
 Each is one edit, so one `u` undoes it whole — demoting a subtree puts every
@@ -87,6 +88,27 @@ Three refusals are deliberate:
 - **`<leader><CR>` inserts after the whole subtree**, not on the next line.
   Inserting directly under a headline would put the new one in front of that
   headline's children and silently adopt them.
+
+### Archiving
+
+`<leader>o$` takes the subtree at the cursor out of this file and appends it
+to `<this file>_archive`, org's default `org-archive-location`. From inside a
+subtree it archives the one you are reading; from a child headline it archives
+the child, not its parent.
+
+The archive file is opened in the background and left **modified, not saved** —
+`u` undoes the whole move, and `:w` on the archive commits it. If the file did
+not exist it is created. The subtree leaves the source only once the write has
+landed, so a target that cannot be written leaves your text exactly where it
+was.
+
+The plugin needs `fs:write` over the directory your org files live in; without
+it the chord is refused at the boundary and says so. Add it to the plugin's
+`plugin.toml`:
+
+```toml
+capabilities = ["fs:write:/home/you/org"]
+```
 
 `<Tab>` is the one key here that falls through: on a headline it cycles
 visibility, and anywhere else it means what it usually means. The
@@ -327,11 +349,8 @@ Lattice itself contributes the walk, the ordering and the view — see
 ## What this plugin is not
 
 Code highlighting *inside* a source block is not here; it needs injection.
-Neither is anything that writes to a file other than the one you are in —
-archiving (`<leader>o$`), refile and capture all move a subtree to another
-file, and the plugin ABI has no effect that can do that yet. Export
-backends, babel, table formulas, column view and org-roam are out of scope
-rather than pending.
+Export backends, babel, table formulas, column view and org-roam are out of
+scope rather than pending.
 
 Everything above rides seams that already exist (`language`, `modes`,
 `grammar`, `config`, `media`, `agenda-source`, `help`) — nothing in lattice

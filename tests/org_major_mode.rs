@@ -235,3 +235,79 @@ async fn a_plugin_language_without_its_major_still_opens_in_text_mode() {
         "an unclaimed plugin language falls back to text-mode, not to nothing"
     );
 }
+
+/// OC.1 — `org-global-mode` is active in a buffer that has nothing to do with
+/// org, which is the entire reason it exists.
+///
+/// Capture and the agenda are the two org verbs whose value is that they work
+/// from wherever you are: the thought you are trying not to lose arrives while
+/// you are reading code. OM.11 bound capture on the org MAJOR, so it only fired
+/// inside an org file — backwards for the one verb meant to reach it from
+/// anywhere.
+///
+/// Asserted through ACTIVATION rather than a keymap lookup with the mode id
+/// handed in. A `lookup_with_context` that is told the mode is active proves
+/// the layer exists; it cannot prove the mode ever turns on, and the way this
+/// fails is precisely that it does not (a plugin minor is inert until enabled,
+/// and OC.1a had to make the manifest able to name two).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_global_mode_activates_in_a_buffer_that_is_not_org() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    let dir = plugins_dir.join("org");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The shipped manifest's spelling: BOTH modes on by default, one gate.
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "id = \"org\"\n\
+         provides = [\"modes\", \"language\", \"help\", \"config\", \"media\"]\n\
+         default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("component.wasm"), &wasm).unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    // Enablement first, then the buffer: the order is load-bearing. The
+    // enablement drain has to run BEFORE the major is entered, or activation
+    // reads the mode as still disabled and refuses it.
+    editor.run_tick_pending();
+
+    // A plain text file — no org anywhere near it.
+    let file = base.path().join("notes.txt");
+    std::fs::write(&file, "just some prose\n").unwrap();
+    editor.do_edit(Some(file), false);
+    editor.run_tick_pending();
+
+    let buffer = editor.document_buffer_id;
+    let active = editor
+        .active_modes
+        .get(&buffer)
+        .expect("the buffer has an active mode set");
+    assert_ne!(
+        active.major(),
+        Some(ModeId::new("org-mode")),
+        "sanity: this is NOT an org buffer"
+    );
+    assert!(
+        active.minors().contains(&ModeId::new("org-global-mode")),
+        "the universal minor is on, so <C-x>oc reaches capture from here; \
+         active minors were {:?}",
+        active.minors()
+    );
+    // And the org-file minor is correctly NOT on: `Majors(["org-mode"])` still
+    // means what it says, so this did not turn everything on.
+    assert!(
+        !active.minors().contains(&ModeId::new("org-todo-mode")),
+        "org-todo-mode stays scoped to org buffers"
+    );
+}

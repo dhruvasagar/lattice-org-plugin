@@ -1982,7 +1982,7 @@ async fn refiling_from_the_preamble_does_nothing() {
 
 // ---- OM.11: capture ------------------------------------------------------
 //
-// `<leader>oc` is not pressed here either, and for the same reason as refile:
+// `<C-x>oc` is not pressed here either, and for the same reason as refile:
 // the chord returns `Effect::OpenPrompt`, which the RENDERER applies. That is
 // the `<leader>o:` wall from OM.7 a third time. What IS reachable — and what
 // the feature actually is — is the submit hop: dispatch `org-capture-submit`
@@ -2013,6 +2013,12 @@ fn submit_capture(editor: &mut Editor, text: &str) {
 
 /// Both halves of the flow are registered: the chord, and the action the
 /// `OpenPrompt` payload names for the host to dispatch on submit.
+///
+/// OC.1 moved the chord from `<leader>oc` on the org MAJOR to `<C-x>oc` on
+/// `org-global-mode`, a `Universal` minor — so the assertion is deliberately
+/// made with NO org mode in the active set. That is the whole point of the
+/// move: the thought you are trying not to lose arrives while you are reading
+/// code, and a capture chord that only fires inside an org file is backwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
     if org_plugin_wasm().is_none() {
@@ -2021,17 +2027,45 @@ async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
     let base = tempfile::tempdir().unwrap();
     let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
 
-    let seq = parse_chord_sequence(&editor.keymap.expand_leader("<leader>oc")).unwrap();
+    let seq = parse_chord_sequence("<C-x>oc").unwrap();
     assert!(
         matches!(
             editor.keymap.lookup_with_context(
                 lattice_keymap::BindingMode::Normal,
                 &seq,
-                &[ModeId::new("org-mode"), ModeId::new("org-todo-mode")]
+                // NOT an org buffer: only the universal minor is active.
+                &[ModeId::new("org-global-mode")]
             ),
             LookupResult::Bound { .. }
         ),
-        "<leader>oc is bound in an org buffer"
+        "<C-x>oc is bound wherever org-global-mode is, org file or not"
+    );
+    // And the prefix is a PREFIX — `<C-x>o` alone must not fire anything, or
+    // the second key would never arrive.
+    let prefix = parse_chord_sequence("<C-x>o").unwrap();
+    assert!(
+        !matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &prefix,
+                &[ModeId::new("org-global-mode")]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<C-x>o is a prefix, not a terminal binding"
+    );
+    // `oa` reaches the HOST's `:agenda` — org supplies the rows through the
+    // agenda-source seam; the view is the multibuffer provider's.
+    assert!(
+        matches!(
+            editor.keymap.lookup_with_context(
+                lattice_keymap::BindingMode::Normal,
+                &parse_chord_sequence("<C-x>oa").unwrap(),
+                &[ModeId::new("org-global-mode")]
+            ),
+            LookupResult::Bound { .. }
+        ),
+        "<C-x>oa reaches the agenda"
     );
     assert!(
         editor

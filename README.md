@@ -109,7 +109,7 @@ Point a plugin directory at it with a `plugin.toml`:
 ```toml
 id = "org"
 provides = ["language", "modes", "grammar", "config", "media", "agenda-source", "picker-source", "help"]
-default_mode = "org-todo-mode"
+default_modes = ["org-todo-mode", "org-global-mode"]
 capabilities = ["fs:write:/home/you/org"]
 ```
 
@@ -124,10 +124,17 @@ grant at the plugin boundary before the effect reaches the editor. Point it at
 the directory your org files live in. Without it the outliner, tables and the
 agenda all still work and those three chords say they were refused.
 
-`default_mode` is load-bearing: it is what publishes the enablement request
-for `org-todo-mode`, and without it the mode registers correctly and simply
-never activates. It also auto-registers the `org.enabled` gate, so
-`:set org.enabled=false` turns the task layer off and leaves the outliner.
+`default_modes` is load-bearing: it is what publishes the enablement request
+for each mode named, and without it a mode registers correctly and simply never
+activates — the chords are silently dead. Two are named because they answer
+different questions: `org-todo-mode` is keyword cycling *inside org files*,
+`org-global-mode` is the `<C-x>o` prefix (capture, agenda) that has to work
+*wherever you are*. `org-table-mode` and `org-agenda-mode` are absent on
+purpose — the table minor rides the major, and the agenda view's minor is
+activated by the provider that builds the view.
+
+It also auto-registers the single `org.enabled` gate, so `:set org.enabled=false`
+turns both off together and leaves the outliner, tables and highlighting.
 
 In normal use the plugin manager does this for you from the git source
 (PM.5–PM.8) and caches the build under `~/.config/lattice/plugins/`.

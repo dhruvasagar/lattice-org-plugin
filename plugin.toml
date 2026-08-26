@@ -20,10 +20,17 @@ provides = [
     "help",
 ]
 
-# Publishes the enablement request for `org-todo-mode`. Without it the mode
-# registers correctly and simply never activates, and it also auto-registers
-# the `org.enabled` gate.
-default_mode = "org-todo-mode"
+# Publishes the enablement request for each mode named here. Without it a mode
+# registers correctly and simply never activates — `auto_activatable_minors`
+# filters on enablement — so the chords silently do nothing. This also
+# auto-registers the single `org.enabled` gate that turns all of them on or off.
+#
+# `org-global-mode` is the universal `<C-x>o` prefix (agenda + capture), which
+# has to be on wherever you are; `org-todo-mode` is keyword cycling inside org
+# files. `org-table-mode` and `org-agenda-mode` are NOT here: the table minor
+# activates with the major, and the agenda view's minor is activated by the
+# provider that builds the view.
+default_modes = ["org-todo-mode", "org-global-mode"]
 
 # Archive (`<leader>o$`), refile (`<leader>or`) and capture (`<leader>oc`) all
 # write to a file other than the one you are in, and the host checks the target

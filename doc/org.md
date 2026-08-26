@@ -72,7 +72,6 @@ vim's own do: `d]]` deletes to the next headline, `3]]` moves down three.
 | `<leader>o*` | toggle the current line between headline and text |
 | `<leader>o$` | archive the subtree into `<this file>_archive` |
 | `<leader>or` | refile the subtree under a headline you pick |
-| `<leader>oc` | capture a note into your capture file |
 | `<Tab>` `<S-Tab>` | cycle this headline / the whole buffer |
 
 Each is one edit, so one `u` undoes it whole — demoting a subtree puts every
@@ -134,9 +133,19 @@ You stay where you are. Refile files something; it does not navigate.
 
 ### Capturing
 
-`<leader>oc` prompts for a line and appends it to your capture file through a
+`<C-x>oc` prompts for a line and appends it to your capture file through a
 template, from any buffer — capture is the one org verb whose input is what
 you type rather than what you are sitting in.
+
+**`<C-x>o` is a global prefix, not an org-file one.** `<C-x>oc` captures and
+`<C-x>oa` opens the agenda, wherever you are — which is the point: the thought
+you are trying not to lose arrives while you are reading code, not while you
+already have an org file open.
+
+It comes at a price worth naming. **`<C-x>o` shadows the emacs-keys layer's
+`other-window`** (`action:next-pane`). Lattice is vim-first and `<C-w>w` is the
+native pane switch, so the cost falls only on that layer; rebind the prefix if
+you want it back.
 
 ```toml
 org.capture-file = "/home/you/org/inbox.org"
@@ -154,7 +163,7 @@ Anything else is left alone, so a `%d` you meant as text stays a `%d`.
 
 `org.capture-file` has no default on purpose. A key that quietly created
 `capture.org` in whichever directory the editor happened to start in would
-scatter notes somewhere you would never think to look; unset, `<leader>oc`
+scatter notes somewhere you would never think to look; unset, `<C-x>oc`
 tells you to set it.
 
 Both refile and capture need the same `fs:write` grant archiving does, over

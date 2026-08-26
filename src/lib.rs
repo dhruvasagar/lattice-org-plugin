@@ -378,9 +378,6 @@ impl Guest for Component {
                 // second hop and is NOT bound — it is invoked by the picker's
                 // accept, never typed.
                 bind("<leader>or", "org-refile"),
-                // OM.11: org's `C-c c`. `org-capture-submit` is the second
-                // hop and is NOT bound — the host dispatches it on submit.
-                bind("<leader>oc", "org-capture"),
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
@@ -452,6 +449,42 @@ impl Guest for Component {
                 bind("<leader>oT", "org-todo-cycle-back"),
                 bind("<leader>o,", "org-priority-cycle"),
                 bind("<leader>o:", "org-set-tags"),
+            ],
+            target_language: None,
+        });
+
+        // OC.1 — `org-global-mode`, the mode that is not about org FILES.
+        //
+        // `Universal`, and that is the whole point rather than a convenience.
+        // Capture and the agenda are the two org verbs whose value is that
+        // they work from wherever you happen to be: a capture chord that
+        // only fires inside an org buffer is backwards, because the thought
+        // you are trying not to lose arrives while you are reading code.
+        // Every other org mode above is `Majors(["org-mode"])` or `Manual`
+        // precisely because those verbs act ON an org file.
+        //
+        // **`<C-x>o` shadows `action:next-pane`** — emacs's `other-window`,
+        // from the emacs-keys layer. Deliberate (org-capture.md §6): lattice
+        // is vim-first and `<C-w>w` is the native pane switch, so the cost
+        // falls only on the emacs-keys layer and a user who wants it back
+        // rebinds the prefix. Recorded here because a silently-shadowed emacs
+        // chord is exactly the kind of thing that reads as a bug later.
+        //
+        // `oa` reaches the HOST's `:agenda` ex-command by name — the agenda
+        // view is the multibuffer provider's, not this plugin's, and the
+        // plugin only supplies its rows through the `agenda-source` seam.
+        register_mode(&ModeDeclaration {
+            id: "org-global-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Universal,
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![
+                bind("<C-x>oa", "agenda"),
+                // OM.11 bound this at `<leader>oc` on the org MAJOR, where it
+                // could only fire inside an org file. `org-capture-submit` is
+                // the second hop and is NOT bound — the host dispatches it on
+                // submit.
+                bind("<C-x>oc", "org-capture"),
             ],
             target_language: None,
         });

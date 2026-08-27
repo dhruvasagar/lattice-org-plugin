@@ -380,3 +380,77 @@ async fn opening_an_org_file_produces_highlight_spans() {
         "the headline is a heading; got {styles:?}"
     );
 }
+
+/// MO.3 — org buffers fold by syntax because `org-mode` says so, not because
+/// the user happened to configure it.
+///
+/// **This is the failure the whole option-override seam was built for.** Org's
+/// folding is structural: headline nesting IS the fold tree, and
+/// `foldmethod=syntax` is what produces it. Before the seam carried options,
+/// org could only hope the user had set that globally — so `<Tab>` cycling
+/// worked on the author's machine and silently did nothing on anyone else's,
+/// with no error to explain the difference. A native major would simply have
+/// declared it; MO.1/MO.2 let this one do the same.
+///
+/// The test asserts BOTH halves, and the second is what makes it about
+/// overrides rather than about folding:
+///   - in an org buffer `foldmethod` resolves to `syntax`,
+///   - the user's global `foldmethod` is still `manual` — untouched. A mode
+///     override is a resolution *layer*, so a plugin cannot quietly
+///     reconfigure the editor for every other buffer while it is at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_org_buffer_folds_by_syntax_without_the_user_setting_it() {
+    use lattice_config::FoldMethodOption;
+    use lattice_core::FoldMethod;
+
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+
+    let mut editor = boot_sealed_editor();
+
+    // The precondition that makes this test mean anything: nobody has set
+    // `foldmethod`. If the shipped default were already `syntax` the assertion
+    // below would pass on the broken version too.
+    assert_eq!(
+        *editor
+            .config
+            .get_typed::<FoldMethodOption>()
+            .expect("registered"),
+        FoldMethod::Manual,
+        "sanity: the global default is `manual`, so `syntax` can only come from the mode"
+    );
+
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let file = base.path().join("notes.org");
+    std::fs::write(&file, "* Top level\n** Second\nbody text\n").unwrap();
+    editor.do_edit(Some(file), false);
+    editor.run_tick_pending();
+
+    let buffer = editor.document_buffer_id;
+    assert_eq!(
+        *editor.resolved_option::<FoldMethodOption>(buffer),
+        FoldMethod::Syntax,
+        "the org buffer folds by syntax because org-mode declared it"
+    );
+
+    // A LAYER, not a write. A `foldmethod=indent` user must still get indent
+    // folds in every non-org buffer they open.
+    assert_eq!(
+        *editor
+            .config
+            .get_typed::<FoldMethodOption>()
+            .expect("registered"),
+        FoldMethod::Manual,
+        "and the user's global setting is untouched"
+    );
+}

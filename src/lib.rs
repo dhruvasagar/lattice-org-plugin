@@ -98,7 +98,7 @@ use lattice::plugin_host::help::register_topic;
 use lattice::plugin_host::language::{register_language, LanguageSpec};
 use lattice::plugin_host::modes::{
     register_mode, ActivationPolicy, BindingMode, ModeCapabilities, ModeDeclaration,
-    ModeKeymapBinding, ModeKind,
+    ModeKeymapBinding, ModeKind, ModeOptionOverride, OverridePriority,
 };
 use lattice::plugin_host::tree_sitter::TreeSnapshot;
 use lattice::plugin_host::types::{
@@ -473,6 +473,25 @@ impl Guest for Component {
                 bind("<S-Tab>", "org-global-cycle"),
             ],
             target_language: Some("org".to_string()),
+            // MO.3 — the reason mode option overrides exist.
+            //
+            // Org's folding is structural: headline nesting IS the fold tree,
+            // and `foldmethod=syntax` is what produces it. Until the seam
+            // carried options, org could only *hope* the user had set that
+            // globally — so `<Tab>` cycling worked on the author's machine and
+            // did nothing on anyone else's, with no error to explain it. A
+            // native major would simply have declared it; now this one can.
+            //
+            // A LAYER, not a write: it changes what `foldmethod` resolves to in
+            // org buffers and leaves the user's global setting alone, so a
+            // `foldmethod=indent` user still gets indent folds everywhere else.
+            // A `:setlocal` in an org buffer still wins over it, which is the
+            // right way round — the user gets the last word in their own buffer.
+            options: vec![ModeOptionOverride {
+                name: "foldmethod".to_string(),
+                value: "syntax".to_string(),
+                priority: OverridePriority::Normal,
+            }],
         });
 
         // OM.7 — `org-todo-mode`, a MINOR riding the major above.
@@ -501,6 +520,8 @@ impl Guest for Component {
                 bind("<leader>o:", "org-set-tags"),
             ],
             target_language: None,
+            // MO.1: this mode sets no options for its buffers.
+            options: vec![],
         });
 
         // OC.1 — `org-global-mode`, the mode that is not about org FILES.
@@ -545,6 +566,8 @@ impl Guest for Component {
                 bind("<leader>oc", "org-capture-menu"),
             ],
             target_language: None,
+            // MO.1: this mode sets no options for its buffers.
+            options: vec![],
         });
 
         // OM.A3 — `org-agenda-mode`, the fourth mode.
@@ -583,6 +606,8 @@ impl Guest for Component {
                 bind("<leader>o,", "org-priority-cycle"),
             ],
             target_language: None,
+            // MO.1: this mode sets no options for its buffers.
+            options: vec![],
         });
 
         // OM.12 — `org-table-mode`, the third mode.
@@ -615,6 +640,8 @@ impl Guest for Component {
                 bind("<leader>tdc", "org-table-delete-column"),
             ],
             target_language: None,
+            // MO.1: this mode sets no options for its buffers.
+            options: vec![],
         });
     }
 

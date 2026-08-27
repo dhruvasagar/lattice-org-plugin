@@ -23,8 +23,8 @@
 use crate::timestamp;
 
 /// Expand `template` with `entered` and today's date, no `%^{}` answers.
-pub fn expand(template: &str, entered: &str, today: i64) -> String {
-    expand_with(template, entered, &[], today)
+pub fn expand(template: &str, entered: &str, today: i64, annotation: &str) -> String {
+    expand_with(template, entered, &[], today, annotation)
 }
 
 /// Expand `template`, substituting `%^{…}` from `answers` in template order.
@@ -36,7 +36,13 @@ pub fn expand(template: &str, entered: &str, today: i64) -> String {
 /// never asked (an empty `%^{}`) is left verbatim rather than eating an
 /// answer: shifting the sequence would substitute every later answer one slot
 /// early, and the result would look plausible while being wrong.
-pub fn expand_with(template: &str, entered: &str, answers: &[String], today: i64) -> String {
+pub fn expand_with(
+    template: &str,
+    entered: &str,
+    answers: &[String],
+    today: i64,
+    annotation: &str,
+) -> String {
     let (y, m, d) = crate::agenda::civil_from_epoch_day(today);
     let stamp = format!(
         "{y:04}-{m:02}-{d:02} {}",
@@ -94,6 +100,23 @@ pub fn expand_with(template: &str, entered: &str, answers: &[String], today: i64
             }
             Some('U') => out.push_str(&format!("[{stamp}]")),
             Some('T') => out.push_str(&format!("<{stamp}>")),
+            // OC.5b: `%t` is the ACTIVE date-only stamp — an entry due on a day
+            // without claiming a time.
+            //
+            // **It renders identically to `%T` today, and that is a gap in `%T`
+            // rather than in `%t`.** In org proper `%T` carries a time of day;
+            // here it does not, because the only clock this plugin reads is
+            // `today_epoch_day` — whole days since the epoch. So both forms
+            // currently emit `<date Day>`. `%t` is still worth having: it is
+            // what a user writes when they mean a date, and it is already
+            // CORRECT — the day `%T` grows a time, templates using `%t` keep
+            // meaning what they meant, and only `%T` changes.
+            Some('t') => out.push_str(&format!("<{stamp}>")),
+            // OC.5b: `%a` — a link back to where the capture fired. Empty when
+            // the capture came from a buffer with no path (a scratch buffer, or
+            // the capture menu itself): an org link to nothing is worse than no
+            // link, because it looks followable and is not.
+            Some('a') => out.push_str(annotation),
             Some('%') => out.push('%'),
             // Unknown, or a trailing `%`: verbatim.
             Some(other) => {
@@ -131,7 +154,7 @@ mod tests {
     #[test]
     fn the_entered_text_lands_where_the_template_says() {
         assert_eq!(
-            expand("* TODO %?", "call the bank", today()),
+            expand("* TODO %?", "call the bank", today(), ""),
             "* TODO call the bank\n"
         );
     }
@@ -139,7 +162,7 @@ mod tests {
     #[test]
     fn both_timestamp_forms_carry_the_weekday() {
         assert_eq!(
-            expand("%U %T", "", today()),
+            expand("%U %T", "", today(), ""),
             "[2026-08-26 Wed] <2026-08-26 Wed>\n"
         );
     }
@@ -149,7 +172,7 @@ mod tests {
     #[test]
     fn a_template_without_a_placeholder_still_keeps_the_text() {
         assert_eq!(
-            expand("* Note", "the thought", today()),
+            expand("* Note", "the thought", today(), ""),
             "* Note\nthe thought\n"
         );
     }
@@ -157,9 +180,68 @@ mod tests {
     /// An unknown placeholder is left visible rather than dropped: a template
     /// is user text, and a `%d` that did not expand can be fixed, whereas one
     /// that vanished cannot be found.
+    /// OC.5b: `%t` is the active date-only stamp.
+    ///
+    /// It renders the same as `%T` today because `%T` carries no time of day
+    /// yet — a gap in `%T`, not in `%t`. Asserted against the literal form
+    /// rather than against `%T` so that when `%T` grows a time this test keeps
+    /// describing what `%t` means instead of quietly following it.
+    #[test]
+    fn the_active_date_stamp_is_bracketed_and_dated() {
+        let out = expand("%t", "", today(), "");
+        assert!(
+            out.starts_with('<') && out.trim_end().ends_with('>'),
+            "ACTIVE, so angle brackets — an inactive `[…]` stamp would never \
+             reach the agenda, and that is the whole difference: {out}"
+        );
+        assert!(out.contains("2026-08-26 Wed"), "{out}");
+        assert!(!out.contains(':'), "no time of day: {out}");
+    }
+
+    /// OC.5b: `%a` is the annotation the caller computed — expanded verbatim,
+    /// because building the link is the caller's job (it needs the buffer) and
+    /// re-deriving it here would need state this function deliberately has none
+    /// of.
+    #[test]
+    fn the_annotation_expands_where_it_is_asked_for() {
+        assert_eq!(
+            expand(
+                "* %?\n  from %a",
+                "note",
+                today(),
+                "[[file:/n.org::7][n.org]]"
+            ),
+            "* note\n  from [[file:/n.org::7][n.org]]\n"
+        );
+    }
+
+    /// A capture from a buffer with no path expands `%a` to nothing rather than
+    /// to a broken link. An org link to nowhere looks followable and is not,
+    /// which is worse than an absent one.
+    #[test]
+    fn an_empty_annotation_leaves_no_broken_link() {
+        assert_eq!(expand("* %?\n  %a", "note", today(), ""), "* note\n  \n");
+    }
+
+    /// `%a` and the timestamps coexist, and `%a` does not consume a `%^{}`
+    /// answer — it is not a question, it is a fact about the capture.
+    #[test]
+    fn the_annotation_does_not_consume_a_question_answer() {
+        assert_eq!(
+            expand_with(
+                "%^{Kind}: %? (%a)",
+                "buy milk",
+                &["TODO".to_string()],
+                today(),
+                "[[file:/n.org::1][n.org]]",
+            ),
+            "TODO: buy milk ([[file:/n.org::1][n.org]])\n"
+        );
+    }
+
     #[test]
     fn an_unknown_placeholder_survives_verbatim() {
-        assert_eq!(expand("%d %% %?", "x", today()), "%d % x\n");
+        assert_eq!(expand("%d %% %?", "x", today(), ""), "%d % x\n");
     }
 
     /// OC.4: the questions are substituted in template order, each at its own
@@ -176,7 +258,8 @@ mod tests {
                 "* %^{Word} :fc:\n- Context: %^{Context}\n- T: %^{Translation}",
                 "",
                 &answers,
-                today()
+                today(),
+                "",
             ),
             "* chat :fc:\n- Context: le chat noir\n- T: cat\n"
         );
@@ -187,7 +270,13 @@ mod tests {
     #[test]
     fn a_question_and_the_body_coexist() {
         assert_eq!(
-            expand_with("* %^{Kind}: %?", "buy milk", &["TODO".to_string()], today()),
+            expand_with(
+                "* %^{Kind}: %?",
+                "buy milk",
+                &["TODO".to_string()],
+                today(),
+                ""
+            ),
             "* TODO: buy milk\n"
         );
     }
@@ -198,7 +287,7 @@ mod tests {
     #[test]
     fn a_missing_answer_leaves_its_slot_empty_without_shifting_the_rest() {
         assert_eq!(
-            expand_with("[%^{A}][%^{B}]", "", &["only".to_string()], today()),
+            expand_with("[%^{A}][%^{B}]", "", &["only".to_string()], today(), ""),
             "[only][]\n"
         );
     }
@@ -209,7 +298,7 @@ mod tests {
     #[test]
     fn an_empty_question_consumes_no_answer_and_stays_visible() {
         assert_eq!(
-            expand_with("[%^{}][%^{Real}]", "", &["x".to_string()], today()),
+            expand_with("[%^{}][%^{Real}]", "", &["x".to_string()], today(), ""),
             "[%^{}][x]\n"
         );
     }
@@ -219,19 +308,19 @@ mod tests {
     #[test]
     fn an_unclosed_question_survives_verbatim() {
         assert_eq!(
-            expand_with("%^{Real} then %^{oops", "", &["a".to_string()], today()),
+            expand_with("%^{Real} then %^{oops", "", &["a".to_string()], today(), ""),
             "a then %^{oops\n"
         );
     }
 
     #[test]
     fn a_trailing_percent_is_not_an_error() {
-        assert_eq!(expand("* %", "", today()), "* %\n");
+        assert_eq!(expand("* %", "", today(), ""), "* %\n");
     }
 
     #[test]
     fn the_result_always_ends_a_line() {
-        assert_eq!(expand("* %?", "a", today()), "* a\n");
-        assert_eq!(expand("* %?\n", "a", today()), "* a\n");
+        assert_eq!(expand("* %?", "a", today(), ""), "* a\n");
+        assert_eq!(expand("* %?\n", "a", today(), ""), "* a\n");
     }
 }

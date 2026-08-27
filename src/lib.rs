@@ -1035,6 +1035,47 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// OC.5b: where the capture in flight was fired from, for `%a`.
+    ///
+    /// **The origin is gone by the time the note is written.** Opening the
+    /// prompt focuses a synthetic prompt buffer, so the `document` handed to
+    /// `capture_submit` is the prompt — not the file the user was reading when
+    /// they pressed the chord. The fields menu has the same shape. So the
+    /// annotation is computed in `capture_open`, while the source buffer is
+    /// still the current one, and read back at submit.
+    ///
+    /// Guest-side rather than smuggled across the seam because the alternatives
+    /// are worse: the prompt hop's only spare slot is `buffer-name`, which is
+    /// shown to the user and would grow a file path, and the fields hop's is
+    /// `args`, already carrying the template key. Both would need an encoding
+    /// for something neither the host nor the menu has any use for. This is
+    /// state whose lifetime is exactly one capture flow, and it lives with the
+    /// flow — the `SCAN` precedent directly above.
+    ///
+    /// Always written by `capture_open`, including to `None`, so an abandoned
+    /// capture cannot leave an annotation for the next one to pick up.
+    static CAPTURE_ORIGIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Format `%a`: an org link back to the file and line a capture fired from.
+///
+/// `[[file:PATH::LINE][NAME]]` — the shape org itself writes, so following it
+/// works in emacs too and the description is the basename a user recognises
+/// rather than a path that wraps.
+///
+/// `None` for a buffer with no path: a scratch buffer, or the capture menu
+/// itself. `%a` then expands to nothing, which is deliberate — a link to
+/// nowhere is worse than no link, because it looks followable and is not.
+fn origin_annotation(doc: &Document, line: u32) -> Option<String> {
+    let path = doc.path()?;
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    // 1-based: `%a` is read by humans and followed by editors, both of which
+    // count a file's first line as line 1.
+    Some(format!("[[file:{path}::{}][{name}]]", line + 1))
+}
+
 /// Today, as days since the Unix epoch, from the host clock.
 ///
 /// `SystemTime` in a wasip2 component resolves through `wasi:clocks`, which
@@ -1422,7 +1463,13 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
 /// A bare `org-capture` with no key still works when the set holds exactly one
 /// template — there is nothing to choose — which is what keeps `:org-capture`
 /// and a one-template config usable without going through the menu.
-fn capture_open(ctx: &ActionContext) -> Vec<Effect> {
+fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    // OC.5b: recorded HERE, because this is the last moment the buffer the user
+    // fired from is still the current one. Written unconditionally — including
+    // the `None` — so an abandoned capture leaves nothing behind for the next.
+    let origin = origin_annotation(doc, ctx.cursor.line);
+    CAPTURE_ORIGIN.with(|c| *c.borrow_mut() = origin);
+
     let key = submitted_text(&ctx.args).filter(|k| !k.is_empty());
     let template = match selected_template(key.as_deref()) {
         Ok(t) => t,
@@ -1493,6 +1540,18 @@ fn prompt_smuggled_state(args: &Args) -> Option<String> {
 /// menu's `Argument` rows in declaration order (TR.3b). The LAST answer is the
 /// body — the fields menu appends a body row after the questions, so `%?` is
 /// collected the same way everything else is rather than being a special case
+/// OC.5b: consume the origin recorded at `capture_open`.
+///
+/// Consuming rather than peeking: one origin belongs to one capture, and a note
+/// filed later carrying the previous capture's `%a` would be a link that looks
+/// right and points somewhere the user was not. Empty when the capture came from
+/// a buffer with no path.
+fn taken_origin() -> String {
+    CAPTURE_ORIGIN
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
 /// OC.5a — turn a template's target into the effect that files the note.
 ///
 /// A `file` target appends. A `file+headline` target reads the file and inserts
@@ -1587,7 +1646,13 @@ fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
     // writes the template — losing it would be worse than writing it bare.
     let entered = answers.pop().unwrap_or_default();
 
-    let text = capture::expand_with(&template.body, &entered, &answers, today_epoch_day());
+    let text = capture::expand_with(
+        &template.body,
+        &entered,
+        &answers,
+        today_epoch_day(),
+        &taken_origin(),
+    );
     capture_effects(&template, text)
 }
 
@@ -1605,7 +1670,7 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
-    let text = capture::expand(&template.body, &entered, today_epoch_day());
+    let text = capture::expand(&template.body, &entered, today_epoch_day(), &taken_origin());
     capture_effects(&template, text)
 }
 
@@ -1870,7 +1935,7 @@ impl GrammarCallbacks for Component {
                     args: Args::None,
                 },
             )]),
-            CAPTURE => Ok(capture_open(&ctx)),
+            CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),

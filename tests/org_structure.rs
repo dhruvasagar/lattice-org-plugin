@@ -2113,6 +2113,19 @@ fn set_org_option(editor: &mut Editor, name: &str, value: &str) {
 
 /// Dispatch the prompt's submit action with `text`, as the host does when the
 /// user hits `<CR>` on the capture line.
+/// OC.5b: fire the capture's FIRST hop — the one that records where it was
+/// fired from. Separate from `submit_capture` because `%a` only means anything
+/// when the two are distinct dispatches.
+fn open_capture(editor: &mut Editor) {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-capture")
+        .expect("the capture action is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
+}
+
 fn submit_capture(editor: &mut Editor, text: &str) {
     let id = editor
         .registry
@@ -2870,5 +2883,98 @@ async fn a_plain_file_target_still_appends() {
             .is_none_or(|m| !m.text.contains("appended at the end")),
         "and no fallback is reported — a plain `file` target appends by design, \
          not because a headline was missing"
+    );
+}
+
+/// OC.5b — `%a` links back to where the capture fired from.
+///
+/// **The origin is gone by the time the note is written**, which is the whole
+/// difficulty. Opening the prompt focuses a synthetic prompt buffer, so the
+/// document reaching the submit action is the prompt — not the file the user
+/// was reading when they pressed the chord. The annotation therefore has to be
+/// taken at `capture_open`, while the source buffer is still current, and held
+/// until submit.
+///
+/// This drives both hops for real, because a unit test of the expander proves
+/// only that `%a` substitutes a string someone handed it — not that the string
+/// still describes the right buffer two dispatches later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_annotation_names_the_buffer_the_capture_fired_from() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let target = base.path().join("tasks.org");
+
+    // The editor opens `notes.org` — that is the buffer `%a` must name.
+    let mut editor =
+        org_editor_with_caps(base.path(), "* One\n* Two\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n  from %a\n\"\"\"\n",
+            target.to_str().unwrap()
+        ),
+    );
+
+    // Open the capture from the org buffer, then submit — two dispatches, and
+    // the buffer changes underneath between them.
+    // Dispatched by name, like `submit_capture` beside it. What matters for
+    // `%a` is that these are two SEPARATE dispatches with the focused buffer
+    // changing in between — which is exactly the shape that loses the origin —
+    // and going through the keymap would not make that any more true.
+    open_capture(&mut editor);
+    submit_capture(&mut editor, "check the roof");
+
+    let written = text_of(&editor, &target);
+    assert!(
+        written.contains("[[file:"),
+        "the annotation is an org link: {written:?}"
+    );
+    assert!(
+        written.contains("notes.org"),
+        "naming the buffer the capture fired FROM, not the prompt and not the \
+         capture target: {written:?}"
+    );
+    assert!(
+        !written.contains("tasks.org"),
+        "the target is not the origin: {written:?}"
+    );
+}
+
+/// A second capture must not inherit the first one's `%a`. The origin is
+/// consumed on use, so a link that looks right and points at the previous
+/// capture's buffer cannot happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_annotation_is_not_reused_by_the_next_capture() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let target = base.path().join("tasks.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %? [%a]\n\"\"\"\n",
+            target.to_str().unwrap()
+        ),
+    );
+
+    open_capture(&mut editor);
+    submit_capture(&mut editor, "first");
+    // No `capture_open` this time — submitting directly is the abandoned-flow
+    // shape, and it must not pick up the previous capture's origin.
+    submit_capture(&mut editor, "second");
+
+    let written = text_of(&editor, &target);
+    let with_link = written.lines().filter(|l| l.contains("[[file:")).count();
+    assert_eq!(
+        with_link, 1,
+        "only the capture that recorded an origin carries one: {written:?}"
     );
 }

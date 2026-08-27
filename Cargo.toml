@@ -41,6 +41,17 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # lattice tag whose `wit/` is vendored here) before anyone else needs to run
 # them; the vendored WIT and these deps must describe the SAME lattice, or the
 # component builds against one ABI and is tested against another.
+[build-dependencies]
+# WT.2: the lattice plugin API package. Writing it into `wit/` at build time is
+# what stops this repo's copy drifting behind the editor's — which is exactly
+# what happened, three ABI changes in one day, with the only symptom being that
+# org silently stopped loading.
+#
+# A path dep while lattice is unreleased, matching the dev-dependencies below.
+# Once `lattice-wit` is published this becomes a version pin, and a plugin then
+# declares the ABI it targets the way it declares everything else.
+lattice-wit = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-wit" }
+
 [dev-dependencies]
 lattice-core = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-core" }
 lattice-grammar = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-grammar" }

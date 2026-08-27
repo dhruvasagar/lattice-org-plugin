@@ -3,3 +3,6 @@
 # vendored — see README.md.
 /target
 /grammar-src
+# WT.2: written by build.rs from the `lattice-wit` dependency. Vendoring it is
+# what let it drift behind the editor's ABI.
+/wit

@@ -3340,6 +3340,7 @@ dependencies = [
  "lattice-protocol",
  "lattice-runtime",
  "lattice-syntax",
+ "lattice-wit",
  "serde",
  "tempfile",
  "tokio",
@@ -3584,6 +3585,10 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "lattice-wit"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"

@@ -15,6 +15,18 @@ use std::path::PathBuf;
 const REPO: &str = "https://github.com/nvim-orgmode/tree-sitter-org";
 
 fn main() {
+    // WT.2: the lattice API package is GENERATED, not vendored.
+    //
+    // `wit_bindgen::generate!` resolves its `path` when the macro expands, so
+    // the files have to be on disk beside this crate — but that is a
+    // build-time need, and the build is what should meet it. Copying by hand is
+    // how this repo's `wit/` silently drifted behind three ABI changes in one
+    // day and left the plugin unloadable with nothing said anywhere.
+    //
+    // `wit/` is gitignored: which ABI this plugin targets is now the pinned
+    // `lattice-wit` dependency rather than the state of a folder.
+    lattice_wit::write_to("wit").expect("write the lattice WIT API package");
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=queries");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));

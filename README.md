@@ -22,7 +22,7 @@ reached the network.
 | `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
 | `modes` | four modes — `org-mode` (major), `org-todo-mode`, `org-table-mode`, `org-agenda-mode` |
 | `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, archive / refile / capture |
-| `config` | `org.todo-keywords`, `org.highest-priority`, `org.inline-images`, `org.capture-file`, `org.capture-template` |
+| `config` | `org.todo-keywords`, `org.highest-priority`, `org.inline-images`, `org.capture-templates` (and the older `org.capture-file` / `org.capture-template` pair) |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
 | `agenda-source` | dated rows for `:agenda` — what a row is, when it falls, how it sorts |
 | `picker-source` | `org-refile`'s target list: every headline in the project's org files |
@@ -121,7 +121,9 @@ plugin it would have bitten.
 `capabilities` is what archiving, refile and capture need: all three write to a
 file other than the one you are in, and the host checks the target against this
 grant at the plugin boundary before the effect reaches the editor. Point it at
-the directory your org files live in. Without it the outliner, tables and the
+the directory your org files live in. The same grant also covers the *read* a
+`headline` capture target needs to find its insertion point — a write grant
+implies read over the same directory, so there is no second thing to declare. Without it the outliner, tables and the
 agenda all still work and those three chords say they were refused.
 
 `default_modes` is load-bearing: it is what publishes the enablement request

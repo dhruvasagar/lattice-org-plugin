@@ -198,9 +198,26 @@ org.capture-template = "* TODO %?\n  %U"
 | `%?` | what you typed. A template without it appends your text on its own line. |
 | `%U` | today, inactive: `[2026-08-26 Wed]` |
 | `%T` | today, active: `<2026-08-26 Wed>` — the agenda sees this one |
+| `%t` | today, active, date only. Same as `%T` for now — `%T` will grow a time of day, `%t` never will |
+| `%^{Question}` | asks for a named value. Several become a **fields menu**, not a run of prompts |
+| `%a` | a link back to where you fired the capture: `[[file:/path/notes.org::42][notes.org]]` |
 | `%%` | a literal `%` |
 
 Anything else is left alone, so a `%d` you meant as text stays a `%d`.
+
+`%a` is what makes capture-while-reading-code useful: the note remembers the
+file and line you were looking at, and the link is the shape org itself writes
+so following it works in emacs too. A capture fired from a buffer with no file
+— a scratch buffer, or the capture menu — expands it to nothing rather than to
+a link with an empty target, which would look followable and not be.
+
+A headline target files the note **after that headline's whole subtree**, not
+directly under the headline. Filing at the top would put each new note in front
+of everything already there, so the subtree would read newest-first while the
+file around it reads oldest-first. The headline is matched ignoring case, extra
+spacing, a leading TODO keyword and trailing `:tags:` — so adding `:drill:` to
+a headline months later does not silently send every future capture to the
+bottom of the file.
 
 Neither option has a default on purpose. A key that quietly created
 `capture.org` in whichever directory the editor happened to start in would

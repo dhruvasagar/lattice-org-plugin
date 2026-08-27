@@ -79,6 +79,7 @@ mod agenda;
 mod archive;
 mod capture;
 mod capture_flow;
+mod capture_target;
 mod capture_templates;
 mod checkbox;
 mod headline;
@@ -1492,6 +1493,71 @@ fn prompt_smuggled_state(args: &Args) -> Option<String> {
 /// menu's `Argument` rows in declaration order (TR.3b). The LAST answer is the
 /// body — the fields menu appends a body row after the questions, so `%?` is
 /// collected the same way everything else is rather than being a special case
+/// OC.5a — turn a template's target into the effect that files the note.
+///
+/// A `file` target appends. A `file+headline` target reads the file and inserts
+/// after that headline's whole subtree; a headline that is not there appends
+/// **and echoes**, because the note has already been typed and losing it is the
+/// one outcome capture must never produce.
+///
+/// The read is a plain `std::fs::read_to_string` inside the WASI sandbox — an
+/// `fs:write` grant preopens the directory with `READ | MUTATE`, so the
+/// capability the write already needs is the capability this read needs too. A
+/// file that cannot be read (absent, or outside the grant) resolves to an
+/// append: absent is the ordinary "first capture into a new file" case, and the
+/// host rejects an ungranted path at the boundary anyway with its own message.
+fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<Effect> {
+    let path = template.target.file().to_string();
+    let headline = match &template.target {
+        capture_templates::Target::File { .. } => None,
+        capture_templates::Target::FileHeadline { headline, .. } => Some(headline.clone()),
+    };
+    let Some(headline) = headline else {
+        return vec![write_at(path, FileAnchor::End, text)];
+    };
+
+    // OC.5a: the HOST reads it, not the guest.
+    //
+    // `std::fs::read_to_string` here does not read a file — it panics. A
+    // grammar action runs on the host's synchronous linker so the trampoline can
+    // call it on the dispatch thread, and `wasmtime-wasi`'s sync filesystem shim
+    // blocks on a runtime internally, which is a panic on a thread already
+    // inside one. The picker source above CAN use `std::fs` because it runs on
+    // the async linker; this path cannot, and the difference is invisible until
+    // it takes the plugin down.
+    //
+    // An `Err` is the ordinary first-capture case (the file does not exist yet)
+    // as often as it is a real problem, and both resolve to the same answer
+    // here: nothing to search, so append.
+    let on_disk = lattice::plugin_host::host_services::read_file(&path).unwrap_or_default();
+    match capture_target::resolve(&on_disk, &headline) {
+        capture_target::Insertion::AtLine(line) => {
+            vec![write_at(path, FileAnchor::Line(line), text)]
+        }
+        // Warn, not Info: the note did not go where the user's config says it
+        // should, and a silent append is how someone loses track of where their
+        // captures are landing.
+        capture_target::Insertion::Append => vec![
+            write_at(path.clone(), FileAnchor::End, text),
+            Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!("org: no headline `{headline}` in {path}; appended at the end"),
+            }),
+        ],
+    }
+}
+
+/// One capture write. Nothing is being MOVED, so nothing is cut — capture is
+/// the one of org's three cross-file writes that only adds.
+fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
+    Effect::WriteToFile(WriteToFilePayload {
+        path,
+        anchor,
+        text,
+        cut: None,
+    })
+}
+
 /// the user reaches by another route.
 fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
     let Args::List(values) = &ctx.args else {
@@ -1521,12 +1587,8 @@ fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
     // writes the template — losing it would be worse than writing it bare.
     let entered = answers.pop().unwrap_or_default();
 
-    vec![Effect::WriteToFile(WriteToFilePayload {
-        path: template.target.file().to_string(),
-        anchor: FileAnchor::End,
-        text: capture::expand_with(&template.body, &entered, &answers, today_epoch_day()),
-        cut: None,
-    })]
+    let text = capture::expand_with(&template.body, &entered, &answers, today_epoch_day());
+    capture_effects(&template, text)
 }
 
 fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
@@ -1543,18 +1605,8 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
-    let target = template.target.file().to_string();
-    vec![Effect::WriteToFile(WriteToFilePayload {
-        path: target,
-        // Append. A capture file is a log, and the newest note belonging at
-        // the bottom is what makes it readable in order later — the same
-        // reasoning as archive.
-        anchor: FileAnchor::End,
-        text: capture::expand(&template.body, &entered, today_epoch_day()),
-        // Nothing is being MOVED, so nothing is cut. Capture is the one of the
-        // three cross-file writes that only adds.
-        cut: None,
-    })]
+    let text = capture::expand(&template.body, &entered, today_epoch_day());
+    capture_effects(&template, text)
 }
 
 /// The second hop of `<leader>or`: file the subtree at the cursor into the

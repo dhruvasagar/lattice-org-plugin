@@ -2708,3 +2708,167 @@ async fn abandoning_the_fields_menu_writes_nothing() {
         "the new menu started empty — the abandoned answer did not survive"
     );
 }
+
+/// OC.5a — a `file+headline` target files the note under that headline.
+///
+/// **The behaviour this slice makes honest.** `Target::FileHeadline` has parsed
+/// since OC.2 and been ignored ever since: both submit paths called
+/// `Target::file()` and passed `FileAnchor::End`, so a template that said
+/// "under Tasks" appended at the bottom of the file. The menu row even printed
+/// the target, so it looked configured and behaved as if it were not.
+///
+/// It lands after the whole subtree, not right under the headline — otherwise
+/// each new capture would sit in front of everything already filed there, and
+/// the subtree would read newest-first while the file around it reads
+/// oldest-first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_headline_target_files_the_note_under_that_headline() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("tasks.org");
+    // On disk BEFORE the capture — the resolution reads the file, so a target
+    // that does not exist yet is a different (append) case.
+    std::fs::write(
+        &notes,
+        "* Inbox\nsomething\n* Tasks\n** Existing\nold\n* Archive\ndone\n",
+    )
+    .unwrap();
+
+    // A DIFFERENT file from the one the editor opens: `org_editor_with_caps`
+    // writes `base/notes.org` itself, so a capture target sharing that name is
+    // silently overwritten by the fixture and the test measures nothing.
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\", headline = \"Tasks\" }}\n\
+             body = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "water the plants");
+
+    let written = text_of(&editor, &notes);
+    let lines: Vec<&str> = written.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("water the plants"))
+        .unwrap_or_else(|| panic!("the note was filed somewhere: {written:?}"));
+    let tasks = lines.iter().position(|l| *l == "* Tasks").expect("Tasks");
+    let archive = lines
+        .iter()
+        .position(|l| *l == "* Archive")
+        .expect("Archive");
+
+    assert!(
+        at > tasks,
+        "the note is under Tasks, not above it: {written:?}"
+    );
+    assert!(
+        at < archive,
+        "and inside Tasks' subtree rather than at the end of the file: {written:?}"
+    );
+    assert!(
+        lines[at - 1] == "old",
+        "after the WHOLE subtree — behind `** Existing`'s body, not in front of it: {written:?}"
+    );
+}
+
+/// OC.5a — a headline that is not there appends **and says so**.
+///
+/// Not "creates it" and not "refuses". Creating invents structure in a file the
+/// user may not have opened in months; refusing loses a note they have already
+/// typed, which is the one outcome capture must never produce. So the note
+/// survives, somewhere findable, and the echo is what tells them their target
+/// moved. `Warn`, not `Info`: a silent append is how someone loses track of
+/// where their captures are going.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_whose_headline_is_gone_appends_and_says_so() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("tasks.org");
+    std::fs::write(&notes, "* Inbox\nsomething\n").unwrap();
+
+    // A DIFFERENT file from the one the editor opens: `org_editor_with_caps`
+    // writes `base/notes.org` itself, so a capture target sharing that name is
+    // silently overwritten by the fixture and the test measures nothing.
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\", headline = \"Renamed Away\" }}\n\
+             body = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "still important");
+
+    let written = text_of(&editor, &notes);
+    assert!(
+        written.contains("still important"),
+        "the note is not lost: {written:?}"
+    );
+    assert!(
+        written.trim_end().ends_with("still important"),
+        "it appended at the end: {written:?}"
+    );
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .expect("the user is told their target moved");
+    assert!(
+        msg.text.contains("Renamed Away"),
+        "and told WHICH headline could not be found: {}",
+        msg.text
+    );
+}
+
+/// A plain `file` target is untouched by OC.5a — it still appends, and it does
+/// so without reading the file at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_file_target_still_appends() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("tasks.org");
+    std::fs::write(&notes, "* Inbox\nsomething\n").unwrap();
+
+    // A DIFFERENT file from the one the editor opens: `org_editor_with_caps`
+    // writes `base/notes.org` itself, so a capture target sharing that name is
+    // silently overwritten by the fixture and the test measures nothing.
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "at the bottom");
+
+    let written = text_of(&editor, &notes);
+    assert!(written.trim_end().ends_with("at the bottom"), "{written:?}");
+    assert!(
+        editor
+            .last_message
+            .as_ref()
+            .is_none_or(|m| !m.text.contains("appended at the end")),
+        "and no fallback is reported — a plain `file` target appends by design, \
+         not because a headline was missing"
+    );
+}

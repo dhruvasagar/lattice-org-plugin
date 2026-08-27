@@ -311,3 +311,72 @@ async fn the_global_mode_activates_in_a_buffer_that_is_not_org() {
         "org-todo-mode stays scoped to org buffers"
     );
 }
+
+/// Opening a `.org` file in a real editor produces HIGHLIGHT SPANS.
+///
+/// The gap this closes is the one a user actually reports: "org files are not
+/// coloured". Everything around it was green — the language seam registers
+/// (`org_highlight_from_component`), the queries compile and match
+/// (`org_folds`), the major mode activates (above) — because every one of
+/// those goes through the process-wide registry.
+///
+/// The EDITOR did not. `Editor::lang_registry` is a snapshot taken at boot,
+/// and a plugin language RCUs its compiled grammar into the global registry
+/// when the plugin loads, which is always after boot. So `.org` resolved by
+/// name, the major activated, and then the grammar lookup missed and the
+/// buffer got no syntax at all: blank highlighting, folds fallen back to the
+/// generic provider, and nothing anywhere saying why.
+///
+/// So this asserts on `editor.syntax` after a real `do_edit`, which is the
+/// only thing that would have caught it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_an_org_file_produces_highlight_spans() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1,
+        "the org component loads"
+    );
+
+    let file = base.path().join("notes.org");
+    std::fs::write(
+        &file,
+        "* TODO Ship it :work:\nSCHEDULED: <2026-08-27 Thu>\n- [X] done\n- [ ] todo\n",
+    )
+    .unwrap();
+    editor.do_edit(Some(file), false);
+    editor.run_tick_pending();
+
+    let syntax = editor.syntax.as_ref().expect(
+        "the buffer has a syntax — a plugin language registered AFTER boot must still be found",
+    );
+    let styles: Vec<lattice_syntax::Style> = syntax.with_snapshot(|snap| {
+        snap.highlight_lines(0, 4)
+            .expect("highlighting runs")
+            .into_iter()
+            .flatten()
+            .map(|s| s.style)
+            .collect()
+    });
+    assert!(
+        !styles.is_empty(),
+        "org files are coloured — this is the user-visible assertion"
+    );
+    // And it is ORG colouring, not something incidental: a headline, its TODO
+    // keyword and its tag all come from `highlights.scm`.
+    assert!(
+        styles.contains(&lattice_syntax::Style::Heading1),
+        "the headline is a heading; got {styles:?}"
+    );
+}

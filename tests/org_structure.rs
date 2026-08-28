@@ -3320,3 +3320,80 @@ async fn alignment_stops_at_the_table_the_caret_is_in() {
          different node and must be untouched"
     );
 }
+
+// ── OT.8: capture and refile read structure from `parse-file` ─────────
+
+/// OT.8 — a capture target must not match a headline written as an example.
+///
+/// The file has `* Vocabulary` in exactly one place: inside a `#+BEGIN_SRC org`
+/// block, where it is sample text.
+///
+/// The text scan matches it. It does not file INSIDE the block — `subtree_end`
+/// stops at the next real headline — it files just past `#+END_SRC`, attributed
+/// to a heading that is not there, and reports success. That is wrong in a
+/// quieter way than filing into the block would be, and quieter is worse: the
+/// note sits somewhere the user has no reason to look. Pinned exactly in
+/// `capture_target::tests::the_text_outline_matches_a_headline_written_inside_a_block`.
+///
+/// The tree has no section there, so the target is absent — and absent means
+/// append WITH a warning, which is OC.5a's contract and exists for this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_target_inside_a_block_is_not_a_target() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("tasks.org");
+    std::fs::write(
+        &notes,
+        "* Inbox\n\
+         #+BEGIN_SRC org\n\
+         * Vocabulary\n\
+         example content\n\
+         #+END_SRC\n\
+         * Later\n\
+         tail\n",
+    )
+    .unwrap();
+
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"task\"\n\
+             target = {{ file = \"{}\", headline = \"Vocabulary\" }}\n\
+             body = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "learn a word");
+
+    let written = text_of(&editor, &notes);
+    let lines: Vec<&str> = written.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("learn a word"))
+        .unwrap_or_else(|| panic!("the note survived somewhere: {written:?}"));
+    let end_src = lines
+        .iter()
+        .position(|l| *l == "#+END_SRC")
+        .expect("the block is intact");
+
+    assert!(
+        at > end_src,
+        "the note must land after the block: {written:?}"
+    );
+    assert_eq!(
+        at,
+        lines.len() - 1,
+        "with no real `* Vocabulary` the target is absent, so capture appends \
+         (and warns): {written:?}"
+    );
+    assert!(
+        written.contains("#+BEGIN_SRC org\n* Vocabulary\nexample content\n#+END_SRC"),
+        "and the block is left exactly as written: {written:?}"
+    );
+}

@@ -711,6 +711,75 @@ fn next_sibling_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
     headline_line(&next_sibling_section(&enclosing_section(tree, from)?)?)
 }
 
+/// One headline in a file's outline: where it starts, how deep it is, and where
+/// its subtree ends.
+///
+/// Carries no title. The two consumers want different text from the same line —
+/// refile keeps the TODO keyword and the tags because you type them into a
+/// picker, capture strips both because a template names its target in config and
+/// must not stop matching the day someone adds `:drill:`. So the entry is
+/// structure and each caller reads `lines[entry.line]` for characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entry {
+    /// 0-based line the headline is on.
+    pub line: u32,
+    /// Star count.
+    pub level: usize,
+    /// 0-based last line of the subtree rooted here, inclusive.
+    pub end_line: u32,
+}
+
+/// Every headline in a parsed file, in document order (OT.8).
+///
+/// The off-buffer peer of [`Headlines`]: `tree-sitter.parse-file` hands back a
+/// root for a file that is not an open buffer, and this walks it. Recursion is
+/// required rather than tidy — a `section` holds its subsections as children, so
+/// a flat pass over the root sees only top-level headlines and silently drops
+/// every nested one.
+pub fn outline(root: &Node, out: &mut Vec<Entry>) {
+    for child in tree::children_of_kind(root, SECTION) {
+        if let Some((line, level)) = headline_of(&child) {
+            out.push(Entry {
+                line,
+                level,
+                end_line: tree::last_content_line(&child.byte_range()),
+            });
+        }
+        outline(&child, out);
+    }
+    // A file may open with content before its first headline, so top-level
+    // sections are not always direct children of the root. Anything that is not
+    // a section is descended into for that reason.
+    for i in 0..root.named_child_count() {
+        if let Some(child) = root.named_child(i) {
+            if child.kind() != SECTION {
+                outline(&child, out);
+            }
+        }
+    }
+}
+
+/// [`outline`] over text, for a file with no grammar behind it.
+///
+/// The same shape, so both consumers have one body and only their structure
+/// source differs — which is what stops refile's insertion point and capture's
+/// from drifting apart (`org-capture.md` §4 makes the point about
+/// `subtree_end`; it is more true, not less, once one of them is a tree walk).
+pub fn outline_text(lines: &[&str]) -> Vec<Entry> {
+    let count = lines.len() as u32;
+    let line = |n: u32| lines.get(n as usize).map(|s| s.to_string());
+    (0..count)
+        .filter_map(|n| {
+            let level = lines.get(n as usize).and_then(|l| headline_level(l))?;
+            Some(Entry {
+                line: n,
+                level,
+                end_line: subtree_end(line, n, count),
+            })
+        })
+        .collect()
+}
+
 /// Every headline question a caller can ask, resolved from the tree when there
 /// is one and from the line logic when there is not.
 ///

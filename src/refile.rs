@@ -48,11 +48,34 @@ pub struct Target {
 /// `max_level` bounds the read the way org's `org-refile-targets` `:maxlevel`
 /// does: without it every leaf in a large tree becomes a row, and the list
 /// stops being scannable long before it stops being correct.
+/// `#[cfg(test)]`, for the reason `capture_target::resolve` gives: production
+/// builds the outline at the call site, where it knows whether `parse-file`
+/// answered.
+#[cfg(test)]
 pub fn targets_in(file: &str, display_name: &str, text: &str, max_level: usize) -> Vec<Target> {
     let lines: Vec<&str> = text.lines().collect();
-    let line_count = lines.len() as u32;
-    let line = |n: u32| lines.get(n as usize).map(|s| s.to_string());
+    let outline = headline::outline_text(&lines);
+    targets_from(file, display_name, &lines, &outline, max_level)
+}
 
+/// [`targets_in`] over an outline someone else produced (OT.8).
+///
+/// The picker calls this with `tree-sitter.parse-file`'s walk, so a headline
+/// written inside `#+BEGIN_SRC` in a project file is not offered as a refile
+/// destination — and, worse than merely being offered, is not offered with an
+/// insertion line pointing into the middle of a code block.
+///
+/// One body for both structure sources on purpose. `org-capture.md` §4 says
+/// refile's insertion point and capture's "cannot drift apart"; they share
+/// `headline::Entry` now rather than sharing only `subtree_end`, which is the
+/// same argument one level up.
+pub fn targets_from(
+    file: &str,
+    display_name: &str,
+    lines: &[&str],
+    outline: &[headline::Entry],
+    max_level: usize,
+) -> Vec<Target> {
     let mut out = vec![Target {
         file: file.to_string(),
         before_line: None,
@@ -63,21 +86,18 @@ pub fn targets_in(file: &str, display_name: &str, text: &str, max_level: usize) 
     // path — two headings called `Notes` under different parents are a real
     // and common case, and indistinguishable by title alone.
     let mut stack: Vec<String> = Vec::new();
-    for n in 0..line_count {
-        let Some(level) = lines
-            .get(n as usize)
-            .and_then(|l| headline::headline_level(l))
-        else {
+    for entry in outline {
+        let Some(text) = lines.get(entry.line as usize) else {
             continue;
         };
-        stack.truncate(level - 1);
-        stack.push(title_of(lines[n as usize], level));
-        if level > max_level {
+        stack.truncate(entry.level - 1);
+        stack.push(title_of(text, entry.level));
+        if entry.level > max_level {
             continue;
         }
         out.push(Target {
             file: file.to_string(),
-            before_line: Some(headline::subtree_end(line, n, line_count) + 1),
+            before_line: Some(entry.end_line + 1),
             label: format!("{display_name}  {}", stack.join(" / ")),
         });
     }

@@ -1638,7 +1638,28 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
     // as often as it is a real problem, and both resolve to the same answer
     // here: nothing to search, so append.
     let on_disk = lattice::plugin_host::host_services::read_file(&path).unwrap_or_default();
-    match capture_target::resolve(&on_disk, &headline) {
+    // OT.8: structure from `parse-file`, characters from the read above.
+    //
+    // Both cross the same grant (`parse-file` makes the identical check
+    // `read-file` does), so nothing becomes reachable that was not — what
+    // changes is that a `* Vocabulary` line written as an example inside a
+    // `#+BEGIN_SRC` block stops matching a template's `headline = "Vocabulary"`
+    // and filing the note into the middle of a code block.
+    //
+    // `none` from `parse-file` is the ordinary first-capture case (no file yet)
+    // as much as it is a missing grammar, and both mean the same thing here:
+    // fall back to the text outline over whatever was read, which for an absent
+    // file is empty and appends.
+    let lines: Vec<&str> = on_disk.lines().collect();
+    let outline = match lattice::plugin_host::tree_sitter::parse_file(&path) {
+        Some(snapshot) => {
+            let mut out = Vec::new();
+            headline::outline(&snapshot.root(), &mut out);
+            out
+        }
+        None => headline::outline_text(&lines),
+    };
+    match capture_target::resolve_in(&lines, &outline, &headline) {
         capture_target::Insertion::AtLine(line) => {
             vec![write_at(path, FileAnchor::Line(line), text)]
         }
@@ -2314,8 +2335,29 @@ impl PickerSource for Component {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            // OT.8: the outline comes from `parse-file`, so a headline written
+            // as an example inside a `#+BEGIN_SRC` block is not offered as a
+            // refile destination — and, worse than being offered, is not
+            // offered with an insertion line pointing into a code block.
+            //
+            // The text is still read here. `parse-file` returns structure and
+            // no node text, and the labels are headline titles — the same
+            // "structure from the tree, characters from the text" split the
+            // agenda seam settled with a benchmark (D3).
+            //
+            // One unparseable file must not fail the picker, so `none` falls
+            // back to the text outline rather than skipping the file.
+            let lines: Vec<&str> = text.lines().collect();
+            let outline = match lattice::plugin_host::tree_sitter::parse_file(&path) {
+                Some(snapshot) => {
+                    let mut out = Vec::new();
+                    headline::outline(&snapshot.root(), &mut out);
+                    out
+                }
+                None => headline::outline_text(&lines),
+            };
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            for target in refile::targets_in(&path, &name, &text, max_level) {
+            for target in refile::targets_from(&path, &name, &lines, &outline, max_level) {
                 pairs.push(
                     exports::lattice::plugin_host::picker_source::CandidatePair {
                         candidate: lattice::plugin_host::types::RawCandidate {

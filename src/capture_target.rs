@@ -33,8 +33,6 @@
 //! Appending keeps the note and moves it somewhere findable; the echo is what
 //! tells them the target moved.
 
-use crate::headline::{headline_level, subtree_end};
-
 /// Where a capture should be written, resolved against the file's current text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Insertion {
@@ -51,27 +49,44 @@ pub enum Insertion {
 /// Pure over the file's text so the interesting behaviour — which line, and what
 /// happens when the headline is missing — is testable without a filesystem, a
 /// capability grant or a running editor.
+/// `#[cfg(test)]`: production resolves the outline at the call site, because
+/// only there is it known whether `parse-file` answered. This keeps the text
+/// path's own behaviour — which line, and what happens when the headline is
+/// missing — testable without a filesystem, a capability grant or an editor.
+#[cfg(test)]
 pub fn resolve(text: &str, headline: &str) -> Insertion {
+    let lines: Vec<&str> = text.lines().collect();
+    let outline = crate::headline::outline_text(&lines);
+    resolve_in(&lines, &outline, headline)
+}
+
+/// [`resolve`] over an outline someone else produced (OT.8).
+///
+/// The capture action calls this with `tree-sitter.parse-file`'s walk, so a
+/// template naming `headline = "Vocabulary"` cannot match a `* Vocabulary` line
+/// written as an example inside a `#+BEGIN_SRC` block — which would file the
+/// note into the middle of a code block and report success.
+///
+/// Shares [`crate::headline::Entry`] with `refile::targets_from`, one level up
+/// from the `subtree_end` sharing this module's header describes, and for the
+/// same reason: the two insertion points must not drift.
+pub fn resolve_in(lines: &[&str], outline: &[crate::headline::Entry], headline: &str) -> Insertion {
     let wanted = normalise(headline);
     if wanted.is_empty() {
         return Insertion::Append;
     }
-    let lines: Vec<&str> = text.lines().collect();
-    let line_count = lines.len() as u32;
-    let at = |n: u32| lines.get(n as usize).map(|s| s.to_string());
-
     // First match wins. A file with two headlines of the same name is already
     // ambiguous to a human reading it; picking the first is the answer that
     // matches how the user's eye finds it, and it is stable across edits below.
-    let found = (0..line_count).find(|i| {
+    let found = outline.iter().find(|entry| {
         lines
-            .get(*i as usize)
-            .and_then(|l| headline_level(l).map(|lvl| (l, lvl)))
-            .is_some_and(|(l, lvl)| normalise(&strip_tags(&l[lvl..])) == wanted)
+            .get(entry.line as usize)
+            .and_then(|l| l.get(entry.level..))
+            .is_some_and(|rest| normalise(&strip_tags(rest)) == wanted)
     });
 
     match found {
-        Some(start) => Insertion::AtLine(subtree_end(at, start, line_count) + 1),
+        Some(entry) => Insertion::AtLine(entry.end_line + 1),
         None => Insertion::Append,
     }
 }
@@ -139,6 +154,31 @@ fn strip_tags(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OT.8's twin: what the TEXT outline answers for a headline that exists
+    /// only as an example inside a `#+BEGIN_SRC` block.
+    ///
+    /// Not "it files into the block" — it does not. `subtree_end` stops at the
+    /// next real headline, so the note lands just after `#+END_SRC`, attributed
+    /// to a heading that is not there. Wrong in a quieter way than filing into
+    /// the block would be, and quieter is worse: the note is somewhere the user
+    /// has no reason to look, and capture reported success.
+    ///
+    /// The tree answers `Append` for the same input, which is OC.5a's
+    /// missing-target contract and comes with the warning that says so.
+    /// `a_capture_target_inside_a_block_is_not_a_target` in
+    /// `tests/org_structure.rs` is the other half.
+    #[test]
+    fn the_text_outline_matches_a_headline_written_inside_a_block() {
+        let text =
+            "* Inbox\n#+BEGIN_SRC org\n* Vocabulary\nexample content\n#+END_SRC\n* Later\ntail\n";
+        assert_eq!(
+            resolve(text, "Vocabulary"),
+            Insertion::AtLine(5),
+            "the text scan takes the block's example as a real headline and \
+             files just past the block's end"
+        );
+    }
 
     const FILE: &str = "\
 #+TITLE: Notes

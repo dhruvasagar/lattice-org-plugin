@@ -989,7 +989,7 @@ impl Guest for Component {
     /// would change what counts as done halfway through the project, and an
     /// agenda that hides an entry in one file and shows its twin in another
     /// is not a stale answer, it is an incoherent one.
-    fn begin() {
+    fn begin() -> u64 {
         let today = today_epoch_day();
         let keywords = agenda::Keywords::from_spec(
             &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
@@ -998,7 +998,26 @@ impl Guest for Component {
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host
         // guarantee rather than something the guest has to defend.
+        // OT.3b: the generation key the host caches results under. Derived from
+        // everything scan-wide that changes what a row would SAY — the day the
+        // scan is anchored to (every label is relative to it: "tomorrow",
+        // "overdue by 2 day(s)") and the keyword set (which decides what counts
+        // as done, and so which headlines are rows at all).
+        //
+        // Both are captured immediately above for the same reason they matter
+        // here: a scan must be coherent against ONE anchor. Hashing them means
+        // the host discards yesterday's cached rows the moment the day rolls,
+        // without the host knowing that days or keywords exist.
+        let generation = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            today.hash(&mut h);
+            keywords.all.hash(&mut h);
+            keywords.done.hash(&mut h);
+            h.finish()
+        };
         SCAN.set(Some(ScanState { today, keywords }));
+        generation
     }
 
     fn scan(

@@ -624,3 +624,112 @@ async fn a_deadline_outranks_a_scheduled_written_before_it() {
     );
     assert_eq!(excerpts[1].start_line, 2);
 }
+
+/// AF.3 — `org.agenda-files` decides which files the agenda scans.
+///
+/// The editor opens with NO argument, so without the option the scan would use
+/// the project root (the tempdir's cwd-derived root) and find nothing useful.
+/// The option names a directory AND a single file outside it, which is the
+/// shape every real org config has — Dhruva's `org-agenda-files` is
+/// `(list org-directory)` plus an `anniversaries.org` picked out by name.
+///
+/// Asserts on which SOURCES the excerpts came from, not just the count: a
+/// count would pass if both rows came from the directory and the loose file
+/// were silently ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_files_option_decides_what_is_scanned() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+
+    // Two configured places…
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        format!("* TODO from the directory\n  SCHEDULED: {}\n", stamp(1)),
+    )
+    .unwrap();
+    let loose = base.path().join("anniversaries.org");
+    std::fs::write(
+        &loose,
+        format!("* TODO from the named file\n  SCHEDULED: {}\n", stamp(2)),
+    )
+    .unwrap();
+
+    // …and one that is NOT configured, to prove the option is a decision and
+    // not merely an addition to whatever the walk would have found anyway.
+    let unlisted = base.path().join("unlisted");
+    std::fs::create_dir_all(&unlisted).unwrap();
+    std::fs::write(
+        unlisted.join("ignore-me.org"),
+        format!("* TODO must not appear\n  SCHEDULED: {}\n", stamp(1)),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!(
+            "org.agenda-files={}\n# a comment the option must ignore\n{}",
+            notes.display(),
+            loose.display()
+        ),
+    });
+
+    // No argument: the roots must come from the option, through `roots()`.
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::None,
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+
+    let mut files: Vec<String> = excerpts
+        .iter()
+        .filter_map(|e| handle.source_path(e.source))
+        .map(|p| p.display().to_string())
+        .collect();
+    files.sort();
+    files.dedup();
+
+    assert_eq!(
+        files.len(),
+        2,
+        "one row from the configured directory and one from the configured \
+         file; got {status:?} files={files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("work.org")),
+        "the directory root was walked: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("anniversaries.org")),
+        "the file root was taken as given: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("unlisted")),
+        "an unconfigured directory must not be scanned: {files:?}"
+    );
+}

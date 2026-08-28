@@ -240,6 +240,12 @@ const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
 /// user never chose, and capture would scatter notes into them.
 const DEFAULT_CAPTURE_TEMPLATES: &str = "";
 
+/// AF.3: `org-agenda-files`, and empty by default for the reason
+/// `DEFAULT_CAPTURE_FILE` gives — a default would name files the user never
+/// chose. Empty means "no opinion", and the host then scans the project root
+/// exactly as it did before this option existed.
+const DEFAULT_AGENDA_FILES: &str = "";
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -280,6 +286,22 @@ fn inline_images_enabled() -> bool {
 /// must degrade to something that works rather than to a dead key.
 fn option_or(name: &str, default: &str) -> String {
     get_option(name).unwrap_or_else(|| default.to_string())
+}
+
+/// Split `org.agenda-files` into paths.
+///
+/// One per line. Blank lines and `#` comments are dropped so the option can be
+/// annotated — a list of file paths is the kind of configuration people explain
+/// to themselves in six months.
+///
+/// Free of the WIT and of any host type, so the parsing is unit-testable
+/// without a running editor.
+fn agenda_files(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn todo_keywords() -> Vec<String> {
@@ -352,6 +374,25 @@ impl Guest for Component {
             "The single template a capture expands when `capture-templates` is \
              unset. `%?` is what you typed, `%U` / `%T` today's date inactive / \
              active, `%%` a literal percent.",
+        );
+        // AF.3: `org-agenda-files`, one path per line.
+        //
+        // Newline-separated and not `:`- or `,`-separated because a path may
+        // contain either; not TOML-inside-a-string (`capture-templates`' shape)
+        // because a list of paths is not a record and does not need one. The
+        // cost is `capture-templates`' cost: options are
+        // `boolean | integer | string` and there is no list kind, so
+        // `:describe-option` shows a blob and `:set` cannot edit a multi-line
+        // value meaningfully. If a list kind ever lands, this declaration
+        // migrates and the meaning does not change.
+        let _ = register_option(
+            "agenda-files",
+            OptionType::String,
+            DEFAULT_AGENDA_FILES,
+            "Files and directories the agenda scans, one path per line. A \
+             directory is walked; a file is scanned whatever its extension. \
+             `~` is expanded. Blank lines and `#` comments are ignored. Unset \
+             scans the project root, as before.",
         );
         let _ = register_option(
             "inline-images",
@@ -1013,12 +1054,21 @@ impl Guest for Component {
         vec!["org".to_string(), "org_archive".to_string()]
     }
 
-    /// AF.1: the paths this source wants scanned.
+    /// AF.3: `org.agenda-files`, one path per line.
     ///
-    /// Wired in AF.3. Empty means "no opinion", so the host keeps using the
-    /// root it would have used and nothing about today's behaviour moves.
+    /// Read here rather than cached, because the host calls this per scan for
+    /// exactly that reason: the answer is user configuration and has to follow
+    /// a `:set` without a reload.
+    ///
+    /// Empty — unset, or nothing but blanks and comments — means "no opinion",
+    /// and the host scans the project root as it did before this option
+    /// existed. That is what keeps an org user who has configured nothing on
+    /// precisely today's behaviour.
+    ///
+    /// `~` is NOT expanded here. The host expands, so one implementation serves
+    /// every source and a guest cannot get it wrong per-plugin.
     fn roots() -> Vec<String> {
-        Vec::new()
+        agenda_files(&option_or("agenda-files", DEFAULT_AGENDA_FILES))
     }
 
     /// OM.A3: the mode the host activates on the agenda view, so org's TODO
@@ -3023,4 +3073,53 @@ fn fields_menu(
         }],
         footer: Some("c to capture, q to abandon".to_string()),
     })
+}
+
+#[cfg(test)]
+mod agenda_files_tests {
+    use super::agenda_files;
+
+    /// The two shapes one list carries — a directory and a single file — plus
+    /// the annotation people add to configuration they will re-read in six
+    /// months. This is Dhruva's own emacs config, transcribed: `org-directory`
+    /// as a directory, `anniversaries.org` as a file.
+    #[test]
+    fn one_path_per_line_with_comments_and_blanks_ignored() {
+        let raw = "\n\
+            # everything I keep\n\
+            ~/src/dhruvasagar/org-files\n\
+            \n\
+            # and the one that lives elsewhere\n\
+            ~/src/dhruvasagar/org-files/anniversaries.org\n";
+        assert_eq!(
+            agenda_files(raw),
+            vec![
+                "~/src/dhruvasagar/org-files".to_string(),
+                "~/src/dhruvasagar/org-files/anniversaries.org".to_string(),
+            ]
+        );
+    }
+
+    /// Unset, or nothing but blanks and comments, is "no opinion" — NOT "scan
+    /// nothing". The host falls back to the project root, which is what keeps
+    /// a user who has configured nothing on exactly the old behaviour.
+    #[test]
+    fn an_empty_option_is_no_opinion() {
+        assert!(agenda_files("").is_empty());
+        assert!(agenda_files("   \n\n  # only a note\n").is_empty());
+    }
+
+    /// A path may contain a colon or a comma, which is why the separator is a
+    /// newline. Splitting on either would have silently cut these in half.
+    #[test]
+    fn a_path_may_contain_separators_other_formats_would_have_used() {
+        let raw = "/tmp/notes: drafts\n/tmp/a,b/notes.org\n";
+        assert_eq!(
+            agenda_files(raw),
+            vec![
+                "/tmp/notes: drafts".to_string(),
+                "/tmp/a,b/notes.org".to_string()
+            ]
+        );
+    }
 }

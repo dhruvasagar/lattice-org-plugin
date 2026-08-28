@@ -1,27 +1,48 @@
-//! Org headline structure, as pure line logic.
+//! Org headline structure: asked of the parse tree, with the line logic behind
+//! it as the fallback.
 //!
-//! ## Why text and not the parse tree
+//! ## Two answers to every question, and which one wins
 //!
-//! `apply-action` receives `option<borrow<tree-snapshot>>` — this plugin's own
-//! org tree — so walking it for `(headline (stars))` was the obvious route. It
-//! is the wrong one here, for two reasons that are both paramount-goal
-//! arguments rather than convenience ones:
+//! Everything in the first half of this file resolves a headline by matching
+//! `*` at the start of a line. [`Headlines`], at the bottom, asks the same
+//! questions of the org grammar and falls back to the line logic only when
+//! there is no tree to ask.
 //!
-//! * **The tree can be absent.** `none` when the parse is pending. A chord that
-//!   silently no-ops right after a paste, and works a moment later, is the
-//!   worst kind of bug to report. Line logic has no such state (goal #2).
-//! * **A query on the keystroke path costs more than the answer.** Recognising
-//!   a headline is `^\*+\s` on one line. Compiling and running a query to learn
-//!   the same fact is strictly more work inside the grammar seam's budget
-//!   (goal #1).
+//! ### Why the tree is the primary answer (OT.4)
 //!
-//! And it is not an approximation: a line whose first non-`*` character is a
-//! space, at column 0, **is** a headline in org — including inside
-//! `#+BEGIN_SRC`, which is precisely why org makes you escape such lines as
-//! `,*`. Matching on text matches org's own rule.
+//! This module's doc-comment used to argue the opposite — that a line whose
+//! first non-`*` character is a space, at column 0, **is** a headline in org
+//! "including inside `#+BEGIN_SRC`, which is precisely why org makes you escape
+//! such lines as `,*`". That is a claim about org's *escaping convention*, and
+//! it does not survive contact with org's own grammar: `grammar.js` puts
+//! `block` inside `body`, so a `* TODO` line between `#+BEGIN_SRC` and
+//! `#+END_SRC` parses as block content and is not a `section`. The text matcher
+//! sees a headline there; the grammar does not, and the grammar is what
+//! highlights, folds and (since OT.3) scans the file.
 //!
-//! The tree stays valuable for what it is actually better at — tables, links,
-//! blocks — and later slices use it there.
+//! The consequence is not cosmetic. `ar` resolves a span from the phantom
+//! headline to the "end of its subtree", which is a span that is not a subtree —
+//! `dar` inside a source block deletes across the block's boundary. No care in
+//! the line matcher fixes it, because the fact that decides it is not on the
+//! line.
+//!
+//! That is the whole argument for OT.x in one case: **a bespoke parser must
+//! agree with a grammar it never consults, and it does not.**
+//!
+//! ### Why the line logic stays
+//!
+//! Two of the three objections the old doc-comment raised were real, and both
+//! are answered by keeping the text path as the fallback rather than deleting
+//! it:
+//!
+//! * **The tree can be absent.** `none` when the parse is pending, or when the
+//!   host has no org grammar registered at all. A chord that silently no-ops
+//!   right after a paste is the worst kind of bug to report, so every method on
+//!   [`Headlines`] degrades to the line answer instead of to nothing (goal #2).
+//! * **Cost on the keystroke path.** Answered by *not* using a query: every walk
+//!   here is `enclosing` plus a handful of `parent` / sibling steps, which is
+//!   O(nesting depth) — a fixed handful of host calls whatever the file size,
+//!   against the text path's "read lines until you find one" (goal #1).
 //!
 //! ## Why these take a line accessor and not a `&[String]`
 //!
@@ -516,5 +537,308 @@ mod tests {
             "read {} lines to hit the parent one line up",
             reads.get()
         );
+    }
+}
+
+// --- OT.4: the same questions, asked of the parse tree ---------------------
+//
+// The shape of org's grammar is what makes every one of these a few steps
+// rather than a query (`grammar-src/grammar.js`):
+//
+//     document: optional(body), repeat(section)
+//     section:  headline, optional(plan), optional(property_drawer),
+//               optional(body), repeat(subsection: section)
+//
+// So a `section` node IS a subtree — headline plus everything beneath it,
+// nested sections included — and the questions the line logic reconstructs by
+// scanning become node navigation: "which subtree am I in" is `enclosing`,
+// "where does it end" is that node's extent, "who is my parent" is the nearest
+// `section` ancestor, and siblings are sibling nodes.
+//
+// A section's named children are at most `headline`, `plan`, `property_drawer`,
+// `body` and its subsections — `body` collapses a whole run of paragraphs,
+// lists and blocks into ONE node — so scanning a section's children is a
+// handful of steps and not proportional to its text.
+
+use crate::lattice::plugin_host::tree_sitter::{Node, TreeSnapshot};
+use crate::lattice::plugin_host::types::{Position, Range};
+
+const SECTION: &str = "section";
+
+/// The last line a node has content on — a node's end position is exclusive,
+/// and org's rules swallow their trailing newline, so a node ending at byte 0
+/// of a line really ended on the line before.
+fn last_content_line(range: &Range) -> u32 {
+    if range.end.byte == 0 {
+        range.end.line.saturating_sub(1)
+    } else {
+        range.end.line
+    }
+}
+
+/// The `section` node enclosing `line`, if the cursor is inside one.
+fn enclosing_section(tree: &TreeSnapshot, line: u32) -> Option<Node> {
+    tree.enclosing(Position { line, byte: 0 }, &[SECTION.to_string()])
+}
+
+/// A section's headline line and level, read from the grammar.
+///
+/// The level is the WIDTH of the `stars` node rather than a re-count of `*`
+/// characters: the grammar already decided where the stars end, and counting
+/// again is how the two drift apart.
+fn headline_of(section: &Node) -> Option<(u32, usize)> {
+    let headline = section.child_by_field("headline")?;
+    let line = headline.byte_range().start.line;
+    let stars = headline.child_by_field("stars")?.byte_range();
+    let level = stars.end.byte.saturating_sub(stars.start.byte) as usize;
+    (level > 0).then_some((line, level))
+}
+
+/// Just the line a section's headline sits on.
+fn headline_line(section: &Node) -> Option<u32> {
+    headline_of(section).map(|(line, _)| line)
+}
+
+/// The section's first nested subsection, or `None` for a leaf.
+fn first_subsection(node: &Node) -> Option<Node> {
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .find(|c| c.kind() == SECTION)
+}
+
+/// The section's last nested subsection, or `None` for a leaf.
+fn last_subsection(node: &Node) -> Option<Node> {
+    (0..node.named_child_count())
+        .rev()
+        .filter_map(|i| node.named_child(i))
+        .find(|c| c.kind() == SECTION)
+}
+
+/// The next sibling that is a section, skipping a parent's non-section children.
+fn next_sibling_section(node: &Node) -> Option<Node> {
+    let mut cur = node.next_named_sibling();
+    while let Some(n) = cur {
+        if n.kind() == SECTION {
+            return Some(n);
+        }
+        cur = n.next_named_sibling();
+    }
+    None
+}
+
+/// [`next_sibling_section`] backwards.
+fn prev_sibling_section(node: &Node) -> Option<Node> {
+    let mut cur = node.prev_named_sibling();
+    while let Some(n) = cur {
+        if n.kind() == SECTION {
+            return Some(n);
+        }
+        cur = n.prev_named_sibling();
+    }
+    None
+}
+
+/// The nearest `section` ancestor. `None` at a top-level section, whose parent
+/// is the `document`.
+fn parent_section(node: &Node) -> Option<Node> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == SECTION {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// The last headline *inside* `section` in document order: its last subsection's
+/// last subsection, all the way down. The pre-order predecessor of whatever
+/// follows `section`.
+fn deepest_last_subsection(section: Node) -> Node {
+    let mut node = section;
+    while let Some(deeper) = last_subsection(&node) {
+        node = deeper;
+    }
+    node
+}
+
+/// [`enclosing_headline`], asked of the tree.
+///
+/// `None` when the cursor is in a file's preamble — and, unlike the text path,
+/// also when it is inside a source block, which is the point.
+fn enclosing_headline_tree(tree: &TreeSnapshot, from: u32) -> Option<(u32, usize)> {
+    headline_of(&enclosing_section(tree, from)?)
+}
+
+/// [`subtree_end`], asked of the tree.
+///
+/// A `section` spans its headline plus everything beneath it *including nested
+/// sections* — the definition `subtree_end` reconstructs by scanning for the
+/// next headline of the same level or shallower. Here it is the node's extent.
+fn subtree_end_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    Some(last_content_line(
+        &enclosing_section(tree, from)?.byte_range(),
+    ))
+}
+
+/// [`next_headline`], asked of the tree: the pre-order successor section.
+///
+/// Nested first, then siblings, then the siblings of ancestors — which is
+/// exactly what "the next headline at any level" means in document order, and
+/// why `]]` walks into a subtree rather than over it.
+fn next_headline_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    let Some(start) = enclosing_section(tree, from) else {
+        // The preamble before the first headline: the successor is the
+        // document's first section.
+        return headline_line(&first_subsection(&tree.root())?);
+    };
+    if let Some(line) = first_subsection(&start).as_ref().and_then(headline_line) {
+        if line > from {
+            return Some(line);
+        }
+    }
+    let mut cur = start;
+    loop {
+        if let Some(line) = next_sibling_section(&cur).as_ref().and_then(headline_line) {
+            if line > from {
+                return Some(line);
+            }
+        }
+        cur = parent_section(&cur)?;
+    }
+}
+
+/// [`prev_headline`], asked of the tree.
+///
+/// From body text the answer is the enclosing headline itself — the cursor is
+/// already past it. From a headline line it is the pre-order predecessor: the
+/// previous sibling's deepest last descendant, or failing that the parent.
+fn prev_headline_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    let start = enclosing_section(tree, from)?;
+    let head = headline_line(&start)?;
+    if head < from {
+        return Some(head);
+    }
+    if let Some(prev) = prev_sibling_section(&start) {
+        return headline_line(&deepest_last_subsection(prev));
+    }
+    headline_line(&parent_section(&start)?)
+}
+
+/// [`parent_headline`], asked of the tree.
+fn parent_headline_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    headline_line(&parent_section(&enclosing_section(tree, from)?)?)
+}
+
+/// [`prev_sibling`], asked of the tree — and note it needs no `level` argument.
+///
+/// The text version takes one because it has to reconstruct "same parent" from
+/// star counts, stopping the scan at a shallower headline. A sibling node is
+/// a sibling; there is nothing to reconstruct.
+fn prev_sibling_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    headline_line(&prev_sibling_section(&enclosing_section(tree, from)?)?)
+}
+
+/// [`next_sibling`], asked of the tree. See [`prev_sibling_tree`].
+fn next_sibling_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
+    headline_line(&next_sibling_section(&enclosing_section(tree, from)?)?)
+}
+
+/// Every headline question a caller can ask, resolved from the tree when there
+/// is one and from the line logic when there is not.
+///
+/// Callers hold one of these instead of a bare line accessor, so the
+/// tree-or-text decision is made in ONE place. The three-way `match tree
+/// { Some => …, None => … }` was written out at three call sites before this
+/// existed, and a fourth site that forgot it would silently be the only one
+/// still hand-parsing — which is the divergence OT.x is about, reproduced
+/// inside the plugin.
+pub struct Headlines<'a> {
+    tree: Option<&'a TreeSnapshot>,
+    line: &'a dyn Fn(u32) -> Option<String>,
+    line_count: u32,
+}
+
+impl<'a> Headlines<'a> {
+    pub fn new(
+        tree: Option<&'a TreeSnapshot>,
+        line: &'a dyn Fn(u32) -> Option<String>,
+        line_count: u32,
+    ) -> Self {
+        Self {
+            tree,
+            line,
+            line_count,
+        }
+    }
+
+    /// Read one line through the accessor the caller supplied.
+    pub fn text(&self, n: u32) -> Option<String> {
+        (self.line)(n)
+    }
+
+    /// Whether `n` is a headline line — the tree's answer being "a section
+    /// starts here", which a `* TODO` line inside a source block does not.
+    pub fn is_headline(&self, n: u32) -> bool {
+        match self.tree {
+            Some(tree) => enclosing_headline_tree(tree, n).is_some_and(|(line, _)| line == n),
+            None => self.text(n).as_deref().and_then(headline_level).is_some(),
+        }
+    }
+
+    /// See [`enclosing_headline`].
+    pub fn enclosing(&self, from: u32) -> Option<(u32, usize)> {
+        match self.tree {
+            Some(tree) => enclosing_headline_tree(tree, from),
+            None => enclosing_headline(self.line, from),
+        }
+    }
+
+    /// See [`subtree_end`]. `start` is the subtree's headline line.
+    pub fn subtree_end(&self, start: u32) -> u32 {
+        self.tree
+            .and_then(|tree| subtree_end_tree(tree, start))
+            .unwrap_or_else(|| subtree_end(self.line, start, self.line_count))
+    }
+
+    /// See [`next_headline`].
+    pub fn next(&self, from: u32) -> Option<u32> {
+        match self.tree {
+            Some(tree) => next_headline_tree(tree, from),
+            None => next_headline(self.line, from, self.line_count),
+        }
+    }
+
+    /// See [`prev_headline`].
+    pub fn prev(&self, from: u32) -> Option<u32> {
+        match self.tree {
+            Some(tree) => prev_headline_tree(tree, from),
+            None => prev_headline(self.line, from),
+        }
+    }
+
+    /// See [`parent_headline`].
+    pub fn parent(&self, from: u32) -> Option<u32> {
+        match self.tree {
+            Some(tree) => parent_headline_tree(tree, from),
+            None => parent_headline(self.line, from),
+        }
+    }
+
+    /// See [`prev_sibling`]. `start` is the subtree's headline line and `level`
+    /// its star count — both only used by the text fallback.
+    pub fn prev_sibling(&self, start: u32, level: usize) -> Option<u32> {
+        match self.tree {
+            Some(tree) => prev_sibling_tree(tree, start),
+            None => prev_sibling(self.line, start, level),
+        }
+    }
+
+    /// See [`next_sibling`].
+    pub fn next_sibling(&self, start: u32, level: usize) -> Option<u32> {
+        match self.tree {
+            Some(tree) => next_sibling_tree(tree, start),
+            None => next_sibling(self.line, start, level, self.line_count),
+        }
     }
 }

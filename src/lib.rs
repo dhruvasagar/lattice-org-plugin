@@ -1146,13 +1146,20 @@ fn today_epoch_day() -> i64 {
 /// doing nothing — invisible in a text assertion, which is why it survived
 /// OM.3. `<leader>oJ`'s trailing `J` joined two lines and was caught at OM.6;
 /// this is the same shape with a quieter symptom.
-fn shift(ctx: &ActionContext, doc: &Document, delta: isize, whole_subtree: bool) -> Vec<Effect> {
+fn shift(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    delta: isize,
+    whole_subtree: bool,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
-    let Some((start, _level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, _level)) = hl.enclosing(ctx.cursor.line) else {
         return vec![Effect::None];
     };
     let end = if whole_subtree {
-        headline::subtree_end(line, start, doc.line_count())
+        hl.subtree_end(start)
     } else {
         start
     };
@@ -1286,27 +1293,33 @@ fn read_lines(doc: &Document, from: u32, to: u32) -> Option<Vec<String>> {
 /// The distinction is whether the chord is org's alone. `<Tab>` is shared, so
 /// it declines. Everything behind the `<leader>o` prefix is org's, has nothing
 /// underneath it, and so CONSUMES the key and does nothing.
-fn move_subtree(ctx: &ActionContext, doc: &Document, up: bool) -> Vec<Effect> {
+fn move_subtree(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    up: bool,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let count = doc.line_count();
-    let Some((start, level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+    let hl = headline::Headlines::new(tree, &line, count);
+    let Some((start, level)) = hl.enclosing(ctx.cursor.line) else {
         return vec![Effect::None];
     };
-    let end = headline::subtree_end(line, start, count);
+    let end = hl.subtree_end(start);
 
     // `first` and `second` are the two spans in DOCUMENT order; the edit
     // rewrites them swapped. Naming them by position rather than by
     // "mine"/"theirs" is what lets one body serve both directions.
     let (first, first_end, second, second_end) = if up {
-        let Some(prev) = headline::prev_sibling(line, start, level) else {
+        let Some(prev) = hl.prev_sibling(start, level) else {
             return vec![Effect::None];
         };
         (prev, start - 1, start, end)
     } else {
-        let Some(next) = headline::next_sibling(line, start, level, count) else {
+        let Some(next) = hl.next_sibling(start, level) else {
             return vec![Effect::None];
         };
-        (start, end, next, headline::subtree_end(line, next, count))
+        (start, end, next, hl.subtree_end(next))
     };
 
     let (Some(head), Some(tail)) = (
@@ -1362,7 +1375,11 @@ fn move_subtree(ctx: &ActionContext, doc: &Document, up: bool) -> Vec<Effect> {
 /// **Not granted `fs:write`** — refused at the boundary, before the effect
 /// reaches the editor, and the host does the echoing. Nothing to do here; the
 /// manifest is where that is answered.
-fn archive_subtree(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn archive_subtree(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
     let Some(source) = doc.path() else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
@@ -1370,9 +1387,8 @@ fn archive_subtree(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         })];
     };
     let line = |n: u32| doc.line(n);
-    let Some((text, (sl, sb, el, eb))) =
-        archive::extract_subtree(line, ctx.cursor.line, doc.line_count())
-    else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((text, (sl, sb, el, eb))) = archive::extract_subtree(&hl, ctx.cursor.line) else {
         return vec![Effect::None];
     };
 
@@ -1721,7 +1737,7 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
 /// **The caret does not follow the subtree.** Org's refile leaves you where
 /// you were, and the target file may not even be open. Jumping would turn a
 /// filing action into a navigation one.
-fn refile_to(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let Some(token) = submitted_text(&ctx.args) else {
         return vec![Effect::None];
     };
@@ -1732,9 +1748,8 @@ fn refile_to(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         })];
     };
     let line = |n: u32| doc.line(n);
-    let Some((text, (sl, sb, el, eb))) =
-        archive::extract_subtree(line, ctx.cursor.line, doc.line_count())
-    else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((text, (sl, sb, el, eb))) = archive::extract_subtree(&hl, ctx.cursor.line) else {
         return vec![Effect::None];
     };
 
@@ -1769,12 +1784,13 @@ fn refile_to(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// Declines in a file's preamble: with no enclosing headline there is no level
 /// to inherit, and guessing level 1 would make `<leader><CR>` mean something
 /// different depending on where the cursor happens to be.
-fn meta_return(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
-    let Some((start, level)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, level)) = hl.enclosing(ctx.cursor.line) else {
         return vec![Effect::None];
     };
-    let end = headline::subtree_end(line, start, doc.line_count());
+    let end = hl.subtree_end(start);
     let Some(last) = doc.line(end) else {
         return vec![Effect::None];
     };
@@ -1803,13 +1819,14 @@ fn meta_return(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// is not what the key means. With no enclosing headline it becomes level 1.
 ///
 /// Declines on a blank line: there is nothing to promote and no stars to strip.
-fn toggle_heading(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn toggle_heading(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
     let at = ctx.cursor.line;
     let Some(text) = doc.line(at) else {
         return vec![Effect::None];
     };
-    let level = headline::enclosing_headline(line, at).map_or(1, |(_, lvl)| lvl);
+    let level = hl.enclosing(at).map_or(1, |(_, lvl)| lvl);
     let Some(new) = headline::toggle_heading(&text, level) else {
         return vec![Effect::None];
     };
@@ -1832,10 +1849,12 @@ fn toggle_heading(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 fn rewrite_headline(
     ctx: &ActionContext,
     doc: &Document,
+    tree: Option<&TreeSnapshot>,
     f: impl FnOnce(&str, &[String]) -> Option<String>,
 ) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
-    let Some((start, _)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, _)) = hl.enclosing(ctx.cursor.line) else {
         return vec![Effect::None];
     };
     let (Some(text), keywords) = (doc.line(start), todo_keywords()) else {
@@ -1868,9 +1887,14 @@ fn rewrite_headline(
 /// returns `OpenPrompt` naming `org-set-tags-submit`, the host runs the
 /// minibuffer, and on submit dispatches that action with the typed string in
 /// `ctx.args`. Escape dispatches nothing, so dismissing leaves the line alone.
-fn set_tags_prompt(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn set_tags_prompt(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
-    let Some((start, _)) = headline::enclosing_headline(line, ctx.cursor.line) else {
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, _)) = hl.enclosing(ctx.cursor.line) else {
         return vec![Effect::None];
     };
     let keywords = todo_keywords();
@@ -1912,13 +1936,17 @@ impl GrammarCallbacks for Component {
         callback: u32,
         ctx: ActionContext,
         doc: &Document,
-        _tree: Option<&TreeSnapshot>,
+        // OT.4: the headline actions locate through the tree now — see
+        // `headline::Headlines`. Everything that asks "which subtree am I in"
+        // takes it; the ones that only rewrite a line the caller already
+        // located (`restar`, `toggle_heading`'s rewrite half) do not.
+        tree: Option<&TreeSnapshot>,
     ) -> Result<Vec<Effect>, String> {
         match callback {
-            PROMOTE_HEADLINE => Ok(shift(&ctx, doc, -1, false)),
-            DEMOTE_HEADLINE => Ok(shift(&ctx, doc, 1, false)),
-            PROMOTE_SUBTREE => Ok(shift(&ctx, doc, -1, true)),
-            DEMOTE_SUBTREE => Ok(shift(&ctx, doc, 1, true)),
+            PROMOTE_HEADLINE => Ok(shift(&ctx, doc, tree, -1, false)),
+            DEMOTE_HEADLINE => Ok(shift(&ctx, doc, tree, 1, false)),
+            PROMOTE_SUBTREE => Ok(shift(&ctx, doc, tree, -1, true)),
+            DEMOTE_SUBTREE => Ok(shift(&ctx, doc, tree, 1, true)),
             // OM.5: `<Tab>` is org's most overloaded key, and `Declined` is
             // what makes it composable rather than a host special case. On a
             // headline it cycles; anywhere else it DECLINES, and the
@@ -1929,11 +1957,11 @@ impl GrammarCallbacks for Component {
             // hops with no change here.
             CYCLE => {
                 let line = |n: u32| doc.line(n);
-                let on_headline = line(ctx.cursor.line)
-                    .as_deref()
-                    .and_then(headline::headline_level)
-                    .is_some();
-                if on_headline {
+                // OT.4: "is a section headline here", not "does this line start
+                // with stars" — so `<Tab>` inside a source block declines to
+                // the native meaning instead of cycling a fold that is not one.
+                let hl = headline::Headlines::new(tree, &line, doc.line_count());
+                if hl.is_headline(ctx.cursor.line) {
                     Ok(vec![Effect::AppAction(AppEffect::CycleFoldAtCursor)])
                 } else {
                     Ok(vec![Effect::Declined])
@@ -1943,18 +1971,18 @@ impl GrammarCallbacks for Component {
             // cycle is meaningful wherever the cursor is.
             CYCLE_GLOBAL => Ok(vec![Effect::AppAction(AppEffect::CycleFoldsGlobal)]),
             // OM.6.
-            MOVE_SUBTREE_UP => Ok(move_subtree(&ctx, doc, true)),
-            MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, false)),
-            META_RETURN => Ok(meta_return(&ctx, doc)),
-            TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc)),
-            ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc)),
+            MOVE_SUBTREE_UP => Ok(move_subtree(&ctx, doc, tree, true)),
+            MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, tree, false)),
+            META_RETURN => Ok(meta_return(&ctx, doc, tree)),
+            TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
+            ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),
             REFILE => Ok(vec![Effect::OpenPicker(
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: REFILE_PICKER.to_string(),
                     args: Vec::new(),
                 },
             )]),
-            REFILE_TO => Ok(refile_to(&ctx, doc)),
+            REFILE_TO => Ok(refile_to(&ctx, doc, tree)),
             // OC.3: names the menu the `transient-source` seam registered.
             // The host resolves the name against the registry and calls this
             // plugin's `build` for the place it was opened from.
@@ -2001,24 +2029,24 @@ impl GrammarCallbacks for Component {
                 )])
             }
             // OM.7.
-            TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, |line, kw| {
+            TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
                 todo::cycle_keyword(line, kw, true)
             })),
-            TODO_CYCLE_BACK => Ok(rewrite_headline(&ctx, doc, |line, kw| {
+            TODO_CYCLE_BACK => Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
                 todo::cycle_keyword(line, kw, false)
             })),
             PRIORITY_CYCLE => {
                 let highest = highest_priority();
-                Ok(rewrite_headline(&ctx, doc, move |line, kw| {
+                Ok(rewrite_headline(&ctx, doc, tree, move |line, kw| {
                     todo::cycle_priority(line, kw, highest, true)
                 }))
             }
-            SET_TAGS => Ok(set_tags_prompt(&ctx, doc)),
+            SET_TAGS => Ok(set_tags_prompt(&ctx, doc, tree)),
             SET_TAGS_SUBMIT => {
                 let Some(tags) = submitted_text(&ctx.args) else {
                     return Ok(vec![Effect::None]);
                 };
-                Ok(rewrite_headline(&ctx, doc, move |line, kw| {
+                Ok(rewrite_headline(&ctx, doc, tree, move |line, kw| {
                     todo::set_tags(line, kw, &tags)
                 }))
             }
@@ -2044,18 +2072,21 @@ impl GrammarCallbacks for Component {
         callback: u32,
         ctx: MotionContext,
         doc: &Document,
-        // OT.1: the tree reaches motions now. `headline.rs` still resolves from
-        // lines; OT.4 is the slice that moves it onto this handle.
-        _tree: Option<&TreeSnapshot>,
+        // OT.4: `]]` / `[[` / `g{` walk the tree's sections — so they step over
+        // a `* TODO` line inside a source block rather than landing on it, and
+        // `g{` finds the parent as a node's ancestor instead of re-deriving
+        // "the nearest shallower headline" from star counts.
+        tree: Option<&TreeSnapshot>,
     ) -> Result<MotionResult, String> {
         let line = |n: u32| doc.line(n);
+        let hl = headline::Headlines::new(tree, &line, doc.line_count());
         let count = ctx.count.max(1);
         let mut at = ctx.from.line;
         for _ in 0..count {
             let next = match callback {
-                NEXT_HEADLINE => headline::next_headline(line, at, doc.line_count()),
-                PREV_HEADLINE => headline::prev_headline(line, at),
-                PARENT_HEADLINE => headline::parent_headline(line, at),
+                NEXT_HEADLINE => hl.next(at),
+                PREV_HEADLINE => hl.prev(at),
+                PARENT_HEADLINE => hl.parent(at),
                 other => return Err(format!("org: unknown motion callback {other}")),
             };
             match next {
@@ -2090,14 +2121,22 @@ impl GrammarCallbacks for Component {
         callback: u32,
         ctx: TextObjectContext,
         doc: &Document,
-        // OT.1, as on `apply_motion`: available here, consumed at OT.4.
-        _tree: Option<&TreeSnapshot>,
+        tree: Option<&TreeSnapshot>,
     ) -> Result<Range, String> {
         let line = |n: u32| doc.line(n);
-        let (start, _level) = headline::enclosing_headline(line, ctx.at.line)
+        // OT.4: ask the grammar which section the cursor is in. The text path
+        // matches `*` at the start of a line, so a headline written as example
+        // inside a `#+BEGIN_SRC` block resolves as real and `dar` deletes a span
+        // that is not a subtree. Whether a line is inside a block is not on the
+        // line, so no line matcher can fix that — the tree simply knows.
+        let hl = headline::Headlines::new(tree, &line, doc.line_count());
+        let (start, stars) = hl
+            .enclosing(ctx.at.line)
             .ok_or("org: no headline at or above the cursor")?;
+        // The headline's own text, needed for the end-of-line byte on several
+        // of the objects below. Read once, after the locator has agreed which
+        // line it is.
         let head = line(start).ok_or("org: headline vanished mid-read")?;
-        let stars = headline::headline_level(&head).ok_or("org: not a headline")?;
 
         let range = match callback {
             // The headline's title: after the stars and their space, to the
@@ -2126,7 +2165,10 @@ impl GrammarCallbacks for Component {
             // The subtree's BODY — everything under the headline, the
             // headline itself left standing. `dir` empties a section.
             INNER_SUBTREE => {
-                let end = headline::subtree_end(line, start, doc.line_count());
+                // OT.4: the section node's own extent IS the subtree, so the
+                // tree answers directly where the text path reconstructs it by
+                // scanning for the next same-or-shallower headline.
+                let end = hl.subtree_end(start);
                 if end == start {
                     // A childless headline has no inner subtree; an empty
                     // range at its end is the honest answer, and `dir` on it
@@ -2156,7 +2198,10 @@ impl GrammarCallbacks for Component {
             }
             // The whole subtree, headline and all. `dar` removes a section.
             AROUND_SUBTREE => {
-                let end = headline::subtree_end(line, start, doc.line_count());
+                // OT.4: the section node's own extent IS the subtree, so the
+                // tree answers directly where the text path reconstructs it by
+                // scanning for the next same-or-shallower headline.
+                let end = hl.subtree_end(start);
                 Range {
                     start: Position {
                         line: start,

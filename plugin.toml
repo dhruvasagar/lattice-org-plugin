@@ -41,3 +41,12 @@ default_modes = ["org-todo-mode", "org-global-mode"]
 # everything else still works.
 #
 # capabilities = ["fs:write:/Users/you/org"]
+
+# OT.4: the grammar seam is capability-gated, and without this grant it hands
+# every motion, text object and action a `none` tree handle. Org then falls back
+# to matching `*` at the start of a line — silently, and only in the built
+# editor, which is exactly the divergence the tree migration exists to end. A
+# plugin that registers an org grammar and then cannot read the tree it
+# registered is the half-wiring this gate is meant to make visible, so it is
+# declared here rather than assumed from `provides = ["language"]`.
+editor_capabilities = ["tree-sitter"]

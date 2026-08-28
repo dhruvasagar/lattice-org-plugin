@@ -114,7 +114,12 @@ async fn org_editor_with_caps(
     std::fs::write(
         dir.join("plugin.toml"),
         format!(
-            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\ncapabilities = [{caps}]\n"
+            // OT.4: `editor_capabilities` mirrors the shipped manifest. Without
+            // the `tree-sitter` grant the trampoline hands every seam a `none`
+            // tree and the guest falls back to line matching — so a harness
+            // that omitted it would test the text path while claiming to test
+            // the tree one.
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\neditor_capabilities = [\"tree-sitter\"]\ncapabilities = [{caps}]\n"
         ),
     )
     .unwrap();
@@ -2976,5 +2981,213 @@ async fn an_annotation_is_not_reused_by_the_next_capture() {
     assert_eq!(
         with_link, 1,
         "only the capture that recorded an origin carries one: {written:?}"
+    );
+}
+
+// ── OT.4: headlines resolve through the parse tree ────────────────────
+//
+// The line matcher and the grammar disagree about exactly one thing, and it is
+// not a corner case: a `* TODO` line between `#+BEGIN_SRC` and `#+END_SRC` is
+// example text to the grammar and a headline to `^\*+ `. Every test below is
+// that one disagreement, seen through a different chord.
+//
+// They dispatch through the REAL editor rather than calling `headline.rs`,
+// because the thing that broke was never the walk — it was the tree not
+// arriving. `DispatchEnv` carried no snapshot until OT.4, so every motion and
+// text object got `none` on every keystroke while the guest-side code, its unit
+// tests, and the WIT all looked correct. A test that hands the guest a tree it
+// built itself passes on that broken version.
+
+/// The invocation the App's operator-pending state builds for `dar` / `dir`.
+///
+/// Built directly because that state lives above `Editor::dispatch_chord` (see
+/// the OM.4b note further up), so `press(editor, "dar")` types `d`, `a`, `r`
+/// as three separate Normal chords and never composes the operator.
+fn delete_with_object(editor: &mut Editor, object: &str) {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name(object)
+        .unwrap_or_else(|| panic!("`{object}` is registered"));
+    let inv = lattice_grammar::CommandInvocation::of(editor.builtins.delete.0).with_target(
+        lattice_grammar::Target::TextObject(
+            lattice_grammar::TextObjectId(id),
+            lattice_grammar::args::Args::None,
+        ),
+    );
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(inv, &mut out);
+}
+
+/// A file whose only headline-looking line inside the block is not one.
+const BLOCK_FILE: &str = "\
+* Real
+body
+#+BEGIN_SRC org
+* Fake heading in a block
+example body
+#+END_SRC
+tail of Real
+* Second
+";
+
+/// `dar` with the caret inside a source block must not delete a "subtree"
+/// starting at a line that is not a headline.
+///
+/// On the text path the caret at the `* Fake` line resolves an enclosing
+/// headline there, and the subtree runs to just before `* Second` — so `dar`
+/// eats the rest of the block INCLUDING `#+END_SRC` and the tail of the real
+/// section, splitting a block in half. The grammar has no section there, so the
+/// object resolves the enclosing REAL one instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dar_inside_a_source_block_does_not_split_the_block() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), BLOCK_FILE).await;
+
+    goto_line(&mut editor, 3); // `* Fake heading in a block`
+    delete_with_object(&mut editor, "org-around-subtree");
+
+    let after = text(&editor);
+    assert!(
+        !after.contains("* Fake heading in a block"),
+        "the enclosing REAL subtree is what `dar` takes, and the block is \
+         inside it: {after:?}"
+    );
+    assert!(
+        after.contains("* Second"),
+        "`* Second` is a different subtree and must survive: {after:?}"
+    );
+    // The tell-tale of the text path: it deletes from the example line to just
+    // before `* Second`, so the block's OPENER survives with nothing after it.
+    // BOTH paths remove `#+END_SRC`, which is why asserting on the opener is
+    // what actually tells them apart — the first draft of this test asserted on
+    // the closer and passed against the unmigrated guest.
+    assert!(
+        !after.contains("#+BEGIN_SRC"),
+        "a `#+BEGIN_SRC` with no body and no `#+END_SRC` means the object \
+         resolved a span STARTING inside the block — the line matcher's \
+         answer, not the grammar's: {after:?}"
+    );
+    // The whole of `* Real` went and only it — plus the blank line `ar` has
+    // always left behind. The object's range runs to the END of the subtree's
+    // last line and stops short of its newline, so `d` over it empties the
+    // lines without closing the gap. That is unchanged by this slice (the text
+    // path leaves exactly the same blank), and it is a separate question from
+    // where the subtree ENDS: `archive.rs` already works out which line break
+    // travels with a subtree, and `ar` does not consult it. Pinned here so the
+    // difference is recorded rather than discovered again.
+    assert_eq!(after, "\n* Second\n");
+}
+
+/// The same disagreement seen by `]]`: the motion walks sections, so it steps
+/// from `* Real` to `* Second` without stopping on the block's example line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_headline_motion_steps_over_a_block_heading() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), BLOCK_FILE).await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "]]");
+    assert_eq!(
+        cursor_line(&editor),
+        7,
+        "`]]` from `* Real` lands on `* Second`; line 3 is inside a block"
+    );
+}
+
+/// `dar` on a real headline still takes exactly its subtree — the whole point
+/// of routing through the tree is that the ordinary case is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dar_on_a_headline_takes_its_subtree_and_stops() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* One\nbody\n** Child\nkid body\n* Two\ntail\n",
+    )
+    .await;
+
+    // From inside the child's body: the CHILD is the subtree at point.
+    goto_line(&mut editor, 3);
+    delete_with_object(&mut editor, "org-around-subtree");
+    let after = text(&editor);
+    assert!(
+        !after.contains("** Child") && !after.contains("kid body"),
+        "the child subtree went: {after:?}"
+    );
+    assert!(
+        after.contains("* One") && after.contains("body") && after.contains("* Two"),
+        "its parent and its sibling stayed: {after:?}"
+    );
+}
+
+/// `g{` climbs to the parent section. The text path re-derives "the nearest
+/// shallower headline" from star counts; the tree walks to the ancestor node,
+/// which is the same answer for well-formed org and the honest one when a
+/// block sits in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_parent_motion_climbs_one_section() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Two\n*** A\n*** B\nbody under B\n").await;
+
+    goto_line(&mut editor, 3); // `*** B`
+    press(&mut editor, "g{");
+    assert_eq!(
+        cursor_line(&editor),
+        1,
+        "the parent of `*** B` is `** Two`, not its `*** A` sibling"
+    );
+
+    goto_line(&mut editor, 4); // body under B
+    press(&mut editor, "g{");
+    assert_eq!(
+        cursor_line(&editor),
+        1,
+        "same answer from the body under it"
+    );
+}
+
+/// Demoting from inside a source block re-stars the enclosing REAL headline,
+/// not the example line the caret is on.
+///
+/// `<leader>ol` has always acted on the section at point rather than the
+/// cursor's own line — that is what makes it usable from body text. The block
+/// is body text of `* Real`, so `* Real` is what moves. The text path instead
+/// resolves the example line as the headline and rewrites a line inside
+/// someone's code block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demote_inside_a_block_leaves_the_example_alone() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), BLOCK_FILE).await;
+
+    goto_line(&mut editor, 3);
+    press(&mut editor, "<leader>ol"); // demote headline
+    let after = text(&editor);
+    assert!(
+        after.contains("\n* Fake heading in a block\n"),
+        "the example line inside the block kept its single star: {after:?}"
+    );
+    assert!(
+        after.starts_with("** Real\n"),
+        "the enclosing section is what demoted: {after:?}"
     );
 }

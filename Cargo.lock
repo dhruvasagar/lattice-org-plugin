@@ -3396,6 +3396,7 @@ dependencies = [
  "lattice-theme",
  "linkme",
  "serde",
+ "serde_json",
  "streaming-iterator",
  "thiserror 2.0.18",
  "toml 0.8.23",

@@ -15,9 +15,10 @@
 //!
 //! Getting (2) wrong is invisible in a test that only checks the archive file
 //! and shows up in the source as a growing run of blank lines, one per archive.
-//! So it is computed once, here, over a line accessor — the same shape
-//! `headline` uses and for the same reason (`headline.rs`, "Why these take a
-//! line accessor").
+//! So it is computed once, here, over a [`headline::Headlines`] — which locates
+//! the subtree through the parse tree when there is one and through the line
+//! logic when there is not (OT.4), and reads lines one at a time either way for
+//! the reason `headline.rs` gives under "Why these take a line accessor".
 
 use crate::headline;
 
@@ -43,12 +44,12 @@ pub fn archive_path(source: &str) -> String {
 /// to become a `range`. The text ends in a newline: the target file is a list
 /// of lines, and a headline spliced onto whatever was there before is not one.
 pub fn extract_subtree(
-    line: impl Fn(u32) -> Option<String>,
+    hl: &headline::Headlines,
     cursor_line: u32,
-    line_count: u32,
 ) -> Option<(String, (u32, u32, u32, u32))> {
-    let (start, _) = headline::enclosing_headline(&line, cursor_line)?;
-    let end = headline::subtree_end(&line, start, line_count);
+    let line = |n: u32| hl.text(n);
+    let (start, _) = hl.enclosing(cursor_line)?;
+    let end = hl.subtree_end(start);
 
     let lines: Vec<String> = (start..=end).map(&line).collect::<Option<_>>()?;
     let text = format!("{}\n", lines.join("\n"));
@@ -110,9 +111,10 @@ mod tests {
     #[test]
     fn a_subtree_takes_its_children_with_it() {
         let (line, count) = accessor("* One\nbody\n** Child\n* Two\n");
+        let hl = headline::Headlines::new(None, &line, count);
         // From the body line, which belongs to `* One` — the enclosing
         // headline is what moves, children included.
-        let (text, _) = extract_subtree(line, 1, count).unwrap();
+        let (text, _) = extract_subtree(&hl, 1).unwrap();
         assert_eq!(text, "* One\nbody\n** Child\n");
     }
 
@@ -122,7 +124,8 @@ mod tests {
     #[test]
     fn from_a_child_headline_only_the_child_moves() {
         let (line, count) = accessor("* One\n** Child\nbody\n* Two\n");
-        let (text, _) = extract_subtree(line, 2, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (text, _) = extract_subtree(&hl, 2).unwrap();
         assert_eq!(text, "** Child\nbody\n");
     }
 
@@ -131,7 +134,8 @@ mod tests {
     #[test]
     fn a_middle_subtree_leaves_no_blank_line() {
         let (line, count) = accessor("* One\nbody\n* Two\n");
-        let (_, span) = extract_subtree(line, 0, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (_, span) = extract_subtree(&hl, 0).unwrap();
         assert_eq!(span, (0, 0, 2, 0));
     }
 
@@ -141,7 +145,8 @@ mod tests {
     #[test]
     fn the_last_subtree_takes_its_own_terminator() {
         let (line, count) = accessor("* One\n* Two\nbody\n");
-        let (_, span) = extract_subtree(line, 1, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (_, span) = extract_subtree(&hl, 1).unwrap();
         assert_eq!(span, (1, 0, 3, 0));
     }
 
@@ -152,7 +157,8 @@ mod tests {
     #[test]
     fn archiving_the_whole_file_leaves_nothing() {
         let (line, count) = accessor("* Only\nbody\n");
-        let (text, span) = extract_subtree(line, 0, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (text, span) = extract_subtree(&hl, 0).unwrap();
         assert_eq!(text, "* Only\nbody\n");
         assert_eq!(span, (0, 0, 2, 0));
     }
@@ -162,7 +168,8 @@ mod tests {
     #[test]
     fn an_unterminated_last_subtree_takes_the_break_above_it() {
         let (line, count) = accessor("* One\n* Two\nbody");
-        let (_, span) = extract_subtree(line, 1, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (_, span) = extract_subtree(&hl, 1).unwrap();
         // From the end of `* One` to the end of `body`.
         assert_eq!(span, (0, 5, 2, 4));
     }
@@ -171,13 +178,15 @@ mod tests {
     #[test]
     fn an_unterminated_whole_file_subtree_takes_neither_break() {
         let (line, count) = accessor("* Only\nbody");
-        let (_, span) = extract_subtree(line, 0, count).unwrap();
+        let hl = headline::Headlines::new(None, &line, count);
+        let (_, span) = extract_subtree(&hl, 0).unwrap();
         assert_eq!(span, (0, 0, 1, 4));
     }
 
     #[test]
     fn the_preamble_has_no_subtree_to_archive() {
         let (line, count) = accessor("intro text\n* One\n");
-        assert!(extract_subtree(line, 0, count).is_none());
+        let hl = headline::Headlines::new(None, &line, count);
+        assert!(extract_subtree(&hl, 0).is_none());
     }
 }

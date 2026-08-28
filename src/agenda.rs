@@ -4,14 +4,39 @@
 //! is here. Given one file's text it answers: which headlines are dated, on
 //! what day, in what order, and under which date heading.
 //!
-//! ## Text, again, and for a third reason
+//! ## The tree, and why that argument stopped holding (OT.3)
 //!
-//! `headline.rs` and `todo.rs` both argue for line logic over the parse tree.
-//! The agenda adds one the others do not have: **the host hands `scan` a
-//! `string`, not a `borrow<document>` and not a tree.** There is no parse of
-//! another project's file to consult — it has never been opened, and parsing
-//! every org file in a project to build an agenda would be the most expensive
-//! thing the plugin does.
+//! This section used to justify line logic over the parse tree: "the host
+//! hands `scan` a `string`, not a `borrow<document>` and not a tree. There is
+//! no parse of another project's file to consult — it has never been opened,
+//! and parsing every org file in a project to build an agenda would be the
+//! most expensive thing the plugin does."
+//!
+//! The premise is now false — `scan` receives `option<borrow<tree-snapshot>>`
+//! beside the text. The cost claim stays true: parsing IS the expensive part
+//! (~1–2 ms per file against a 217 ns text copy,
+//! `benches/agenda_scan_input.rs`). OT.3 pays it for one thing the line logic
+//! cannot do at any price.
+//!
+//! **What that thing is, stated precisely, because the first three guesses were
+//! wrong.** A `:PROPERTIES:` drawer between a headline and its `SCHEDULED:`
+//! line is NOT a counterexample — org's grammar puts `plan` before
+//! `property_drawer`, so the planning line genuinely does come first.
+//! `DEADLINE:` and `SCHEDULED:` on separate lines is NOT one either — org's
+//! planning info is a single line. The old `lines[i + 1]` assumption matches
+//! org's real grammar.
+//!
+//! What it cannot match is **context**: `* TODO ` at the start of a line inside
+//! a `#+BEGIN_SRC` block is example text, not a headline, and no line matcher
+//! can tell, because the fact is not on the line. The text scan invents a
+//! phantom agenda row there; the tree does not. That is the win, and it is
+//! narrower than "the line logic was buggy" — it is "the line logic cannot see
+//! structure, and one day the structure will matter".
+//!
+//! Structure now comes from the tree, characters from the text. [`scan_file`]
+//! survives for a host with no grammar for the file, and carries the phantom
+//! with it — pinned by
+//! `the_text_fallback_cannot_tell_a_source_block_from_a_headline`.
 //!
 //! ## What counts as a row
 //!
@@ -37,6 +62,7 @@
 //! user has to jump to the source to date. This is the one place OM.A1's
 //! trivial guest left `end_line == line` and the real semantics do not.
 
+use crate::lattice::plugin_host::tree_sitter::Node;
 use crate::timestamp::{self, Stamp};
 use crate::todo;
 
@@ -97,7 +123,113 @@ impl Keywords {
     }
 }
 
-/// Every agenda row in one file's text.
+/// Every agenda row in one file, resolved from its **parse tree**.
+///
+/// OT.3. `plan` is a **field on the section**, so this asks the grammar which
+/// plan belongs to this headline rather than assuming it is the next line —
+/// and, more importantly, it only ever sees real sections, so example org
+/// inside a `#+BEGIN_SRC` block cannot become a row. See the module header for
+/// why that context case is the actual win and the more obvious candidates are
+/// not.
+///
+/// Structure comes from the tree; characters come from `text`. The seam
+/// exposes node kinds and ranges but no node text, and reading a TODO keyword
+/// through one boundary crossing per headline would cost far more than the
+/// whole-file string the host already hands over — see `agenda-source.wit`.
+pub fn scan_tree(root: &Node, text: &str, keywords: &Keywords) -> Vec<Row> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut rows = Vec::new();
+    walk_sections(root, &lines, keywords, &mut rows);
+    rows
+}
+
+/// Recurse through `(section)` nodes, which nest: a subsection is a `section`
+/// child of its parent, so a flat pass over the root's children would see only
+/// top-level headlines and quietly drop every nested one.
+fn walk_sections(node: &Node, lines: &[&str], keywords: &Keywords, rows: &mut Vec<Row>) {
+    for i in 0..node.named_child_count() {
+        let Some(child) = node.named_child(i) else {
+            continue;
+        };
+        if child.kind() == "section" {
+            if let Some(row) = row_for_section(&child, lines, keywords) {
+                rows.push(row);
+            }
+        }
+        // Recurse either way: a `section` holds its subsections, and a file may
+        // open with leading content before the first headline, so sections are
+        // not always direct children of the root.
+        walk_sections(&child, lines, keywords, rows);
+    }
+}
+
+/// The last line a node actually has content on.
+///
+/// A tree-sitter node's end position is **exclusive**, and org's `plan` rule is
+/// `seq(repeat1($.entry), $._eol)` — it swallows the newline, so a one-line plan
+/// reports an end on the line *after* it. Taken literally that makes every
+/// scheduled row's excerpt one line too tall, which is how this was caught: the
+/// row spanned 2 lines where org means 1.
+///
+/// A node ending at byte 0 of a line ended at the previous line's boundary; any
+/// other end byte is a genuine position on its own line.
+fn last_content_line(range: &crate::lattice::plugin_host::types::Range) -> u32 {
+    if range.end.byte == 0 {
+        range.end.line.saturating_sub(1)
+    } else {
+        range.end.line
+    }
+}
+
+/// The agenda row one section contributes, if it contributes one.
+fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Option<Row> {
+    let headline = section.child_by_field("headline")?;
+    let headline_line = headline.byte_range().start.line;
+    let headline_text = lines.get(headline_line as usize).copied()?;
+
+    let parsed = todo::parse(headline_text, &keywords.all)?;
+    if keywords.is_done(parsed.keyword) {
+        return None;
+    }
+
+    // The section's OWN plan, by field — not "the next line", which is the
+    // assumption this migration exists to delete.
+    let plan_span = section
+        .child_by_field("plan")
+        .map(|p| p.byte_range())
+        .map(|range| (range.start.line, last_content_line(&range)));
+    let plan_text: String = match plan_span {
+        Some((first, last)) => {
+            let last = (last as usize).min(lines.len().saturating_sub(1));
+            lines.get(first as usize..=last).unwrap_or(&[]).join("\n")
+        }
+        None => String::new(),
+    };
+
+    let (kind, stamp, from_plan) = date_for(headline_text, &plan_text)?;
+    Some(Row {
+        line: headline_line,
+        // When the date came from the plan the excerpt spans down to it, so the
+        // row shows `SCHEDULED: <…>` under its headline. Taken from the plan
+        // node's own extent rather than assumed to be one line — a plan
+        // carrying both DEADLINE and SCHEDULED spans two.
+        end_line: match (from_plan, plan_span) {
+            (true, Some((_, last))) => last,
+            _ => headline_line,
+        },
+        day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
+        kind,
+        priority: parsed.priority,
+    })
+}
+
+/// Every agenda row in one file's text, without a parse tree.
+///
+/// The fallback for a host that had no grammar for this file
+/// (`agenda-source.wit` keeps a source independent of the `language` seam). For
+/// org itself [`scan_tree`] is the real path — this one carries the old
+/// line-offset assumption, and its bug, and is reached only when there is
+/// nothing better.
 pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
@@ -132,18 +264,25 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
 }
 
 /// The date a headline carries, and whether it came from the planning line.
+///
+/// `planning` is one line on the text path and the whole `plan` node's text on
+/// the tree path — a plan may carry `DEADLINE:` and `SCHEDULED:` on separate
+/// lines, and org allows both. So each line is tried rather than only the
+/// first, which is why this scans lines instead of prefix-matching once.
 fn date_for(headline: &str, planning: &str) -> Option<(Kind, Stamp, bool)> {
-    let trimmed = planning.trim_start();
-    // DEADLINE first: a headline with both is a deadline that happens to be
-    // scheduled, and org sorts it as the deadline.
+    // DEADLINE first, across the WHOLE plan before falling back to SCHEDULED:
+    // an entry with both is a deadline that happens to be scheduled, and org
+    // sorts it as the deadline — which stays true when they are on two lines.
     for (keyword, kind) in [
         ("DEADLINE:", Kind::Deadline),
         ("SCHEDULED:", Kind::Scheduled),
     ] {
-        if let Some(rest) = trimmed.strip_prefix(keyword) {
-            if let Some(stamp) = timestamp::first_stamp(rest) {
-                if stamp.active {
-                    return Some((kind, stamp, true));
+        for line in planning.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix(keyword) {
+                if let Some(stamp) = timestamp::first_stamp(rest) {
+                    if stamp.active {
+                        return Some((kind, stamp, true));
+                    }
                 }
             }
         }
@@ -441,6 +580,33 @@ mod tests {
         assert_eq!(
             scan_file("* SHIPPED It\n  SCHEDULED: <2026-08-25 Tue>\n", &k).len(),
             1
+        );
+    }
+
+    /// OT.3, the half that is a LIMITATION rather than a feature.
+    ///
+    /// The text fallback matches `* TODO ` at the start of any line, so example
+    /// org inside a `#+BEGIN_SRC` block becomes a phantom agenda row. No care in
+    /// the line matcher can fix it — whether a line sits inside a block is not
+    /// information the line carries.
+    ///
+    /// `scan_tree` gets it right (pinned end-to-end by
+    /// `a_headline_inside_a_source_block_is_not_a_row` in `tests/org_agenda.rs`,
+    /// which returns ONE row for this same corpus). This test exists so the pair
+    /// documents the difference rather than only asserting the good half — and
+    /// so that if someone ever "fixes" the fallback, they find out here that the
+    /// tree path is the one that matters.
+    #[test]
+    fn the_text_fallback_cannot_tell_a_source_block_from_a_headline() {
+        let k = Keywords::from_spec("TODO | DONE");
+        let corpus = "* TODO Real task\n  SCHEDULED: <2026-08-25 Tue>\n\
+                      #+BEGIN_SRC org\n\
+                      * TODO Fake task inside a block\n  SCHEDULED: <2026-08-25 Tue>\n\
+                      #+END_SRC\n";
+        assert_eq!(
+            scan_file(corpus, &k).len(),
+            2,
+            "the text scan cannot see the block, so it invents a second row"
         );
     }
 }

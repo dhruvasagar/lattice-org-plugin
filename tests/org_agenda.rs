@@ -462,3 +462,86 @@ async fn changing_a_todo_state_in_the_agenda_writes_the_source_document() {
         "…and only the keyword changed"
     );
 }
+
+/// OT.3: a headline inside a `#+BEGIN_SRC` block is not an agenda row.
+///
+/// This is the divergence the tree migration actually buys, and it took three
+/// wrong guesses to find — recorded here so the next reader does not repeat
+/// them. A `:PROPERTIES:` drawer between a headline and its `SCHEDULED:` line
+/// is NOT a counterexample (org's grammar puts `plan` before `property_drawer`,
+/// so the planning line genuinely must come first), and `DEADLINE:` /
+/// `SCHEDULED:` on separate lines is NOT one either (org's planning info is a
+/// single line).
+///
+/// What the text scan cannot do is know it is inside a block. It matches
+/// `* TODO ` at the start of any line, so example org inside a source block
+/// becomes a phantom agenda row that no amount of care in the line matcher can
+/// remove — the information simply is not on the line. The grammar has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_headline_inside_a_source_block_is_not_a_row() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("blocks.org"),
+        format!(
+            "* TODO Real task\n  SCHEDULED: {}\n\
+             #+BEGIN_SRC org\n\
+             * TODO Fake task inside a block\n  SCHEDULED: {}\n\
+             #+END_SRC\n",
+            stamp(1),
+            stamp(1),
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+
+    // ONE row. `agenda::scan_file`, the text fallback, returns TWO for this
+    // same corpus — pinned as a unit test in `src/agenda.rs`, so the pair
+    // documents the difference rather than just asserting the good half.
+    assert_eq!(
+        excerpts.len(),
+        1,
+        "the block's example headline must not become a row; got {status:?} rows={:?}",
+        excerpts
+            .iter()
+            .map(|e| (e.start_line, e.end_line))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(excerpts[0].start_line, 0, "the real task is the row");
+    assert_eq!(
+        excerpts[0].end_line, 1,
+        "and its excerpt spans down to its planning line"
+    );
+}

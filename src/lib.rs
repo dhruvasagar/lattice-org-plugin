@@ -101,7 +101,6 @@ use lattice::plugin_host::modes::{
     register_mode, ActivationPolicy, BindingMode, ModeCapabilities, ModeDeclaration,
     ModeKeymapBinding, ModeKind, ModeOptionOverride, OverridePriority,
 };
-use lattice::plugin_host::tree_sitter::TreeSnapshot;
 use lattice::plugin_host::types::{
     ActionContext, ActionSpec, AppEffect, Args, DecorationContext, EchoLevel, EchoPayload, Edit,
     EditKind, Effect, ExCommandContext, FileAnchor, MediaBlock, MediaFit, MotionContext,
@@ -1002,7 +1001,11 @@ impl Guest for Component {
         SCAN.set(Some(ScanState { today, keywords }));
     }
 
-    fn scan(_path: String, text: String) -> Result<Vec<Entry>, String> {
+    fn scan(
+        _path: String,
+        text: String,
+        tree: Option<&TreeSnapshot>,
+    ) -> Result<Vec<Entry>, String> {
         // `begin` is contractually called first. Refusing rather than
         // defaulting makes a host that stops calling it fail loudly on the
         // first file instead of producing a silently mis-dated agenda.
@@ -1010,7 +1013,17 @@ impl Guest for Component {
             let Some(state) = state.as_ref() else {
                 return Err("org: scan before begin".to_string());
             };
-            Ok(agenda::scan_file(&text, &state.keywords)
+            // OT.3: structure from the tree when the host had a grammar for
+            // this file, characters from the text either way. The text path is
+            // the fallback for a host with no org grammar loaded, and it still
+            // carries the "planning line is the next line" assumption — which
+            // is the bug the tree path exists to fix, so it is a fallback and
+            // not a peer.
+            let rows = match tree {
+                Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, &state.keywords),
+                None => agenda::scan_file(&text, &state.keywords),
+            };
+            Ok(rows
                 .into_iter()
                 .map(|row| Entry {
                     line: row.line,
@@ -2012,6 +2025,9 @@ impl GrammarCallbacks for Component {
         callback: u32,
         ctx: MotionContext,
         doc: &Document,
+        // OT.1: the tree reaches motions now. `headline.rs` still resolves from
+        // lines; OT.4 is the slice that moves it onto this handle.
+        _tree: Option<&TreeSnapshot>,
     ) -> Result<MotionResult, String> {
         let line = |n: u32| doc.line(n);
         let count = ctx.count.max(1);
@@ -2055,6 +2071,8 @@ impl GrammarCallbacks for Component {
         callback: u32,
         ctx: TextObjectContext,
         doc: &Document,
+        // OT.1, as on `apply_motion`: available here, consumed at OT.4.
+        _tree: Option<&TreeSnapshot>,
     ) -> Result<Range, String> {
         let line = |n: u32| doc.line(n);
         let (start, _level) = headline::enclosing_headline(line, ctx.at.line)

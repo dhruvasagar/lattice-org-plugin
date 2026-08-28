@@ -194,19 +194,26 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
 
     // The section's OWN plan, by field — not "the next line", which is the
     // assumption this migration exists to delete.
-    let plan_span = section
-        .child_by_field("plan")
+    let plan = section.child_by_field("plan");
+    let plan_span = plan
+        .as_ref()
         .map(|p| p.byte_range())
         .map(|range| (range.start.line, last_content_line(&range)));
-    let plan_text: String = match plan_span {
-        Some((first, last)) => {
-            let last = (last as usize).min(lines.len().saturating_sub(1));
-            lines.get(first as usize..=last).unwrap_or(&[]).join("\n")
-        }
-        None => String::new(),
-    };
 
-    let (kind, stamp, from_plan) = date_for(headline_text, &plan_text)?;
+    // OT.5: the plan's entries, read as nodes. See `plan_date`.
+    let from_plan = plan.as_ref().and_then(|p| plan_date(p, lines));
+    let (kind, stamp, from_plan) = match from_plan {
+        Some((kind, stamp)) => (kind, stamp, true),
+        // No dated plan entry: the headline's own inline timestamp, which the
+        // grammar does NOT model — see `plan_date`.
+        None => {
+            let stamp = timestamp::first_stamp(headline_text)?;
+            if !stamp.active {
+                return None;
+            }
+            (Kind::Timestamp, stamp, false)
+        }
+    };
     Some(Row {
         line: headline_line,
         // When the date came from the plan the excerpt spans down to it, so the
@@ -221,6 +228,99 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
         kind,
         priority: parsed.priority,
     })
+}
+
+/// The text a node covers, when it lies on one line.
+///
+/// Every node this module reads — `entry_name`, `timestamp` — is within a
+/// planning line by construction, so the single-line case is the only one, and
+/// a multi-line node returning `None` is the honest refusal rather than a
+/// silent truncation.
+fn node_text<'a>(lines: &[&'a str], node: &Node) -> Option<&'a str> {
+    let range = node.byte_range();
+    if range.start.line != range.end.line {
+        return None;
+    }
+    let line = lines.get(range.start.line as usize).copied()?;
+    line.get(range.start.byte as usize..range.end.byte as usize)
+}
+
+/// The date a section's `plan` carries, from the plan's own nodes.
+///
+/// ## What the tree gives here, and what it does not (OT.5)
+///
+/// `grammar.js` models a planning line as `plan: repeat1(entry)` where an
+/// `entry` is `name?: entry_name, ':', timestamp: timestamp`. So the keyword and
+/// the stamp are both named nodes, and neither has to be found by scanning: the
+/// old path did `line.trim_start().strip_prefix("SCHEDULED:")` and then walked
+/// bytes looking for a `<` or `[`.
+///
+/// **The timestamp node exists ONLY here.** A stamp in a headline
+/// (`* TODO Task <2026-09-05 Sat>`) parses as `item: (item (expr) (expr) …)`,
+/// and one in body text as `(paragraph (expr) …)` — undifferentiated tokens in
+/// both cases. That is why the headline's inline date, and `timestamp.rs`'s
+/// whole `<C-a>` / `<C-x>` stepping path, stay on the text scanner: there is no
+/// node to migrate them to, and half-migrating would leave two parsers of one
+/// construct where there is now one.
+///
+/// **A plan is one line.** `plan` is `seq(repeat1(entry), _eol)`, so several
+/// entries on one line are several `entry` nodes and a `SCHEDULED:` written on a
+/// SECOND line is body text, not a plan. That matches org: `org-element` parses
+/// a single planning element from the line following the headline.
+///
+/// DEADLINE outranks SCHEDULED, as before — an entry with both is a deadline
+/// that happens to be scheduled, and org sorts it as the deadline.
+///
+/// Names are matched case-sensitively because org's are: the grammar accepts
+/// `scheduled:` as an `entry_name` and org does not treat it as one.
+/// `CLOSED:` is deliberately unreachable — it is inactive, and a record of the
+/// past rather than a plan.
+fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
+    let mut best: Option<(Kind, Stamp)> = None;
+    for i in 0..plan.named_child_count() {
+        let Some(entry) = plan.named_child(i) else {
+            continue;
+        };
+        if entry.kind() != "entry" {
+            continue;
+        }
+        // An entry with no name is a bare timestamp on the planning line. org
+        // gives it no planning meaning, and neither did the prefix match this
+        // replaces, so it contributes nothing rather than a guessed kind.
+        let Some(name) = entry
+            .child_by_field("name")
+            .as_ref()
+            .and_then(|n| node_text(lines, n))
+        else {
+            continue;
+        };
+        let kind = match name {
+            "DEADLINE" => Kind::Deadline,
+            "SCHEDULED" => Kind::Scheduled,
+            _ => continue,
+        };
+        let Some(stamp) = entry
+            .child_by_field("timestamp")
+            .as_ref()
+            .and_then(|n| node_text(lines, n))
+            // Characters from the text: the node says where the stamp is, and
+            // `first_stamp` reads what it says. The seam exposes no node text,
+            // and the date's own `date` / `time` fields would still need
+            // parsing — so one parse of a bounded slice is the cheap answer.
+            .and_then(timestamp::first_stamp)
+        else {
+            continue;
+        };
+        if !stamp.active {
+            continue;
+        }
+        // Lower `Kind` wins, which is the same precedence `Kind`'s `Ord`
+        // already encodes for the cross-file sort.
+        if best.as_ref().is_none_or(|(k, _)| kind < *k) {
+            best = Some((kind, stamp));
+        }
+    }
+    best
 }
 
 /// Every agenda row in one file's text, without a parse tree.
@@ -263,12 +363,20 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
     rows
 }
 
-/// The date a headline carries, and whether it came from the planning line.
+/// The date a headline carries, and whether it came from the planning line —
+/// the TEXT path's answer. [`plan_date`] is the tree's.
 ///
-/// `planning` is one line on the text path and the whole `plan` node's text on
-/// the tree path — a plan may carry `DEADLINE:` and `SCHEDULED:` on separate
-/// lines, and org allows both. So each line is tried rather than only the
-/// first, which is why this scans lines instead of prefix-matching once.
+/// `planning` is the single line below the headline. Both keywords are tried
+/// against it because org allows both on one line, and DEADLINE first because
+/// an entry with both is a deadline that happens to be scheduled.
+///
+/// This is where the prefix match survives, and with it the flaw OT.5 removed
+/// from the tree path: `strip_prefix` requires the keyword at the START of the
+/// line, so `SCHEDULED: <b> DEADLINE: <a>` reports the SCHEDULED date. The
+/// grammar sees two `entry` nodes and does not care which came first. Left
+/// alone here because this path runs only when there is no grammar for the
+/// file at all, and a second parser fixed to agree with a tree it cannot see is
+/// the thing this phase exists to stop writing.
 fn date_for(headline: &str, planning: &str) -> Option<(Kind, Stamp, bool)> {
     // DEADLINE first, across the WHOLE plan before falling back to SCHEDULED:
     // an entry with both is a deadline that happens to be scheduled, and org
@@ -368,6 +476,32 @@ mod tests {
 
     fn scan(text: &str) -> Vec<Row> {
         scan_file(text, &keywords())
+    }
+
+    /// OT.5's twin: what the TEXT path answers for the same input the tree
+    /// path gets right, so the difference is documented rather than only the
+    /// good half asserted (`a_deadline_outranks_a_scheduled_written_before_it`
+    /// in `tests/org_agenda.rs` is the other half).
+    ///
+    /// `strip_prefix` requires the keyword at the start of the trimmed line, so
+    /// with SCHEDULED written first the deadline is never seen and the entry is
+    /// filed on the later date. The grammar sees two `entry` nodes and has no
+    /// opinion about their order.
+    #[test]
+    fn the_text_path_reads_the_first_keyword_on_the_plan_line_not_the_strongest() {
+        let rows =
+            scan("* TODO Ship it\n  SCHEDULED: <2026-08-30 Sun> DEADLINE: <2026-08-26 Wed>\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].kind,
+            Kind::Scheduled,
+            "the text path takes the keyword it finds first"
+        );
+        assert_eq!(
+            rows[0].day,
+            timestamp::epoch_day(2026, 8, 30),
+            "...and with it the later date"
+        );
     }
 
     // ── the calendar ────────────────────────────────────────────────────

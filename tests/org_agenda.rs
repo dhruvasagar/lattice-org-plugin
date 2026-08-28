@@ -545,3 +545,82 @@ async fn a_headline_inside_a_source_block_is_not_a_row() {
         "and its excerpt spans down to its planning line"
     );
 }
+
+/// OT.5: two planning entries on one line, and which of them dates the row is
+/// decided by org's precedence, not by which was typed first.
+///
+/// `plan` is `repeat1(entry)` and an `entry` is `name?: entry_name, ':',
+/// timestamp: timestamp`, so `SCHEDULED: <…> DEADLINE: <…>` is two nodes and
+/// the tree has no opinion about their order. The text path reads the line with
+/// `line.trim_start().strip_prefix("DEADLINE:")`, which requires the keyword to
+/// come FIRST — so it reports the SCHEDULED date here and files the entry five
+/// days late.
+///
+/// Observed through the sort rather than by reading a date off a row: the view
+/// orders by day, so "which date won" is "which headline came out first".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deadline_outranks_a_scheduled_written_before_it() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("plan.org"),
+        format!(
+            // SCHEDULED first on the line, DEADLINE second. The deadline is
+            // sooner, so a correct agenda puts this entry ahead of the one
+            // below it.
+            "* TODO Ship it\n  SCHEDULED: {} DEADLINE: {}\n\
+             * TODO Something else\n  SCHEDULED: {}\n",
+            stamp(5),
+            stamp(1),
+            stamp(3),
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+
+    assert_eq!(excerpts.len(), 2, "both entries are rows: {status:?}");
+    assert_eq!(
+        excerpts[0].start_line,
+        0,
+        "`Ship it` is dated by its DEADLINE (+1 day), so it sorts first; \
+         reading the line's FIRST keyword instead dates it +5 and swaps these \
+         two. rows={:?}",
+        excerpts
+            .iter()
+            .map(|e| (e.start_line, e.end_line))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(excerpts[1].start_line, 2);
+}

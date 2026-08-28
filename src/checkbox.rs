@@ -176,49 +176,328 @@ pub fn update_cookie(line: &str, done: usize, total: usize) -> Option<String> {
     Some(out)
 }
 
-/// Tally the direct children of the item or headline at `parent`.
+// --- OT.6: the list's shape comes from the tree ---------------------------
+//
+// `grammar.js` gives a checkbox list real structure:
+//
+//     list:     listitem+
+//     listitem: bullet: bullet, checkbox: checkbox?, contents: (paragraph | list)*
+//     checkbox: '[', status: expr?, ']'
+//
+// A nested list is a `contents` child of the item it belongs to, so "the direct
+// children of this item" is a node walk. The line logic above reconstructs the
+// same fact from leading whitespace, which works for well-formed org and cannot
+// see the one thing that decides it: a `- [ ] example` line between
+// `#+BEGIN_SRC` and `#+END_SRC` is block text, and indentation does not say so.
+// The text path counts it into the parent's cookie and lets `<C-Space>` rewrite
+// it; the tree has no `listitem` there at all.
+//
+// Cookies stay text. `* Shopping [1/3]` parses as `item: (item (expr) (expr))` —
+// the grammar does not model a statistics cookie, so `find_cookie` /
+// `update_cookie` have no node to migrate to, exactly as OT.5 found for stamps.
+
+use crate::lattice::plugin_host::tree_sitter::{Node, TreeSnapshot};
+use crate::lattice::plugin_host::types::Position;
+
+const LIST: &str = "list";
+const LISTITEM: &str = "listitem";
+
+/// Something whose statistics cookie a toggle may have to update: a checkbox
+/// item that owns a nested list, or the headline that owns a top-level one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parent {
+    /// A list item, with the indent its text carries (read by the fallback).
+    Item { line: u32, indent: usize },
+    /// A headline. It owns every list beneath it whatever their indent.
+    Headline { line: u32 },
+}
+
+impl Parent {
+    pub fn line(self) -> u32 {
+        match self {
+            Parent::Item { line, .. } | Parent::Headline { line } => line,
+        }
+    }
+}
+
+/// The list structure a toggle needs, from the tree when there is one and from
+/// indentation when there is not.
 ///
-/// Only DIRECT children — items indented more than the parent, stopping at
-/// the first line indented at or below it. A grandchild's state is already
-/// reflected in its own parent's box, so counting it again would double-count
-/// deep lists.
-pub fn tally(
-    line: impl Fn(u32) -> Option<String>,
-    parent: u32,
-    parent_indent: usize,
+/// Both halves answer only STRUCTURE — which lines are items, which items are
+/// whose children. The state in each box is read from the caller's text, and
+/// that split is load-bearing rather than stylistic: the cookie must be
+/// recomputed against the buffer as it will be AFTER the toggle, and the tree
+/// describes the buffer as it is BEFORE it. Asking the tree for a tick would
+/// leave every cookie one keypress behind.
+pub struct Checkboxes<'a> {
+    tree: Option<&'a TreeSnapshot>,
+    line: &'a dyn Fn(u32) -> Option<String>,
     line_count: u32,
-) -> (usize, usize) {
+}
+
+impl<'a> Checkboxes<'a> {
+    pub fn new(
+        tree: Option<&'a TreeSnapshot>,
+        line: &'a dyn Fn(u32) -> Option<String>,
+        line_count: u32,
+    ) -> Self {
+        Self {
+            tree,
+            line,
+            line_count,
+        }
+    }
+
+    pub fn text(&self, n: u32) -> Option<String> {
+        (self.line)(n)
+    }
+
+    /// The checkbox item whose box sits on line `n`.
+    ///
+    /// The box, not the item: a `listitem` spans its continuation lines too,
+    /// and toggling from the middle of a wrapped item is not what `<C-Space>`
+    /// means. `box_at` still comes from the text, because the caller rewrites
+    /// the line and needs a byte offset into it.
+    pub fn item_at(&self, n: u32) -> Option<Item> {
+        let text = self.text(n)?;
+        let item = parse_item(&text)?;
+        match self.tree {
+            // The tree is the veto: it says whether this line is a list item at
+            // all. What the box CONTAINS is still read from the text.
+            Some(tree) => {
+                let node = enclosing_listitem(tree, n, item.box_at as u32)?;
+                (checkbox_start_line(&node) == Some(n)).then_some(item)
+            }
+            None => Some(item),
+        }
+    }
+
+    /// The cookie-bearing ancestors of the item on line `n`, innermost first,
+    /// ending at the enclosing headline.
+    pub fn ancestors(&self, n: u32) -> Vec<Parent> {
+        match self.tree {
+            Some(tree) => self.tree_ancestors(tree, n),
+            None => self.text_ancestors(n),
+        }
+    }
+
+    /// The lines carrying `parent`'s DIRECT child checkboxes.
+    ///
+    /// Direct only — a grandchild's state is already reflected in its own
+    /// parent's box, so counting it again double-counts a deep list.
+    pub fn child_item_lines(&self, parent: Parent) -> Vec<u32> {
+        match self.tree {
+            Some(tree) => self.tree_children(tree, parent),
+            None => self.text_children(parent),
+        }
+    }
+
+    // ── the tree ──
+
+    fn tree_ancestors(&self, tree: &TreeSnapshot, n: u32) -> Vec<Parent> {
+        let mut out = Vec::new();
+        let Some(item) = self.listitem_on(tree, n) else {
+            return out;
+        };
+        let mut node = item;
+        while let Some(ancestor) = enclosing_ancestor(&node, LISTITEM) {
+            if let Some(line) = checkbox_start_line(&ancestor) {
+                out.push(Parent::Item {
+                    line,
+                    indent: self.indent_of(line),
+                });
+            }
+            node = ancestor;
+        }
+        // The section that owns the outermost list. A list in a file's
+        // preamble has none, and then there is no cookie above it.
+        if let Some(headline) = enclosing_ancestor(&node, "section")
+            .and_then(|section| section.child_by_field("headline"))
+        {
+            out.push(Parent::Headline {
+                line: headline.byte_range().start.line,
+            });
+        }
+        out
+    }
+
+    fn tree_children(&self, tree: &TreeSnapshot, parent: Parent) -> Vec<u32> {
+        let node = match parent {
+            // The lists directly under the headline's section — every one of
+            // them, not only those at the first indent the text path locks on
+            // to. A section holding a `-` list and a `1.` list holds two `list`
+            // nodes and org counts both.
+            // A headline starts at column 0, so this needs no indent probe.
+            Parent::Headline { line } => {
+                let Some(section) =
+                    tree.enclosing(Position { line, byte: 0 }, &["section".to_string()])
+                else {
+                    return Vec::new();
+                };
+                match section.child_by_field("body") {
+                    Some(body) => body,
+                    None => return Vec::new(),
+                }
+            }
+            Parent::Item { line, .. } => match self.listitem_on(tree, line) {
+                Some(item) => item,
+                None => return Vec::new(),
+            },
+        };
+        let mut out = Vec::new();
+        for list in named_children_of_kind(&node, LIST) {
+            for item in named_children_of_kind(&list, LISTITEM) {
+                if let Some(line) = checkbox_start_line(&item) {
+                    out.push(line);
+                }
+            }
+        }
+        out
+    }
+
+    // ── the fallback ──
+
+    /// The `listitem` whose checkbox is on line `n`.
+    ///
+    /// Probes at the box's own column, NOT at byte 0. An indented item's
+    /// `listitem` node starts at its bullet, so a point at column 0 is in the
+    /// enclosing `list` (or `body`) and the ancestor walk from there never
+    /// finds a `listitem` at all — which showed up as `<C-Space>` silently
+    /// doing nothing on every indented list in the suite.
+    fn listitem_on(&self, tree: &TreeSnapshot, n: u32) -> Option<Node> {
+        let col = self.text(n).as_deref().and_then(parse_item)?.box_at as u32;
+        let node = enclosing_listitem(tree, n, col)?;
+        (checkbox_start_line(&node) == Some(n)).then_some(node)
+    }
+
+    fn indent_of(&self, n: u32) -> usize {
+        self.text(n)
+            .map(|t| t.len() - t.trim_start().len())
+            .unwrap_or(0)
+    }
+
+    fn text_ancestors(&self, n: u32) -> Vec<Parent> {
+        let mut out = Vec::new();
+        let Some(mut current_indent) = self
+            .text(n)
+            .as_deref()
+            .and_then(parse_item)
+            .map(|i| i.indent)
+        else {
+            return out;
+        };
+        let mut scan = n;
+        while scan > 0 {
+            scan -= 1;
+            let Some(above) = self.text(scan) else { break };
+            if above.trim().is_empty() {
+                continue;
+            }
+            let indent = above.len() - above.trim_start().len();
+            // A headline owns the whole list beneath it whatever its indent,
+            // and is the top: nothing above it carries this list's cookie.
+            if crate::headline::headline_level(&above).is_some() {
+                out.push(Parent::Headline { line: scan });
+                break;
+            }
+            if indent >= current_indent {
+                continue;
+            }
+            out.push(Parent::Item { line: scan, indent });
+            current_indent = indent;
+        }
+        out
+    }
+
+    /// The fallback's children, by indentation — and it is weaker than the
+    /// tree's in a way worth naming rather than discovering.
+    ///
+    /// A child must be indented MORE than its parent, and a headline's indent
+    /// is 0. So a list written flush at column 0 under a headline — which is
+    /// ordinary org — has no children by this rule and its cookie never moves.
+    /// The tree has no such problem: a `list` is a child of the section's
+    /// `body` whatever its column. Left as-is because this path runs only when
+    /// there is no grammar for the buffer at all, and the fix is the tree.
+    fn text_children(&self, parent: Parent) -> Vec<u32> {
+        let parent_indent = match parent {
+            Parent::Headline { .. } => 0,
+            Parent::Item { indent, .. } => indent,
+        };
+        let mut out = Vec::new();
+        let mut child_indent: Option<usize> = None;
+        for i in (parent.line() + 1)..self.line_count {
+            let Some(text) = self.text(i) else { break };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let indent = text.len() - text.trim_start().len();
+            if crate::headline::headline_level(&text).is_some() {
+                break;
+            }
+            if indent <= parent_indent {
+                break;
+            }
+            let Some(item) = parse_item(&text) else {
+                continue;
+            };
+            // Lock on to the FIRST child level seen; deeper items belong to a
+            // nested list and are counted by their own parent.
+            let level = *child_indent.get_or_insert(item.indent);
+            if item.indent == level {
+                out.push(i);
+            }
+        }
+        out
+    }
+}
+
+/// Count `lines` as ticked-of-total, reading each box's state from `state_of`.
+///
+/// Separate from [`Checkboxes`] because the caller supplies an accessor
+/// overlaying the edit it is about to make — see the type's doc-comment.
+pub fn tally_lines(lines: &[u32], state_of: impl Fn(u32) -> Option<String>) -> (usize, usize) {
     let mut done = 0;
     let mut total = 0;
-    let mut child_indent: Option<usize> = None;
-    for i in (parent + 1)..line_count {
-        let Some(text) = line(i) else { break };
-        if text.trim().is_empty() {
-            continue;
-        }
-        let indent = text.len() - text.trim_start().len();
-        // A headline always ends the region, whatever its indent.
-        if crate::headline::headline_level(&text).is_some() {
-            break;
-        }
-        if indent <= parent_indent {
-            break;
-        }
-        let Some(item) = parse_item(&text) else {
+    for &n in lines {
+        let Some(item) = state_of(n).as_deref().and_then(parse_item) else {
             continue;
         };
-        // Lock on to the FIRST child level seen; deeper items belong to a
-        // nested list and are counted by their own parent.
-        let level = *child_indent.get_or_insert(item.indent);
-        if item.indent != level {
-            continue;
-        }
         total += 1;
         if item.state == Check::On {
             done += 1;
         }
     }
     (done, total)
+}
+
+/// The innermost `listitem` covering `(line, byte)`.
+fn enclosing_listitem(tree: &TreeSnapshot, line: u32, byte: u32) -> Option<Node> {
+    tree.enclosing(Position { line, byte }, &[LISTITEM.to_string()])
+}
+
+/// The line a `listitem`'s checkbox sits on. `None` for an item with no box —
+/// a plain bullet is not part of any tally.
+fn checkbox_start_line(item: &Node) -> Option<u32> {
+    Some(item.child_by_field("checkbox")?.byte_range().start.line)
+}
+
+/// The nearest STRICT ancestor of `node` with kind `kind`.
+fn enclosing_ancestor(node: &Node, kind: &str) -> Option<Node> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == kind {
+            return Some(n);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+fn named_children_of_kind(node: &Node, kind: &str) -> Vec<Node> {
+    (0..node.named_child_count())
+        .filter_map(|i| node.named_child(i))
+        .filter(|c| c.kind() == kind)
+        .collect()
 }
 
 #[cfg(test)]
@@ -312,10 +591,34 @@ mod tests {
         (move |i: u32| lines.get(i as usize).cloned(), n)
     }
 
+    /// The tally, over the INDENT fallback — `Checkboxes::new(None, ..)`.
+    ///
+    /// The tree half cannot be unit-tested here (a `TreeSnapshot` is a host
+    /// resource), so it is covered by dispatch through a real editor in
+    /// `tests/org_structure.rs`. These keep the fallback honest, which matters
+    /// because it is what runs when a buffer's parse is pending.
+    fn tally(
+        l: &dyn Fn(u32) -> Option<String>,
+        n: u32,
+        parent: Parent,
+        count: u32,
+    ) -> (usize, usize) {
+        let cb = Checkboxes::new(None, l, count);
+        tally_lines(&cb.child_item_lines(parent), |i| cb.text(i))
+    }
+
+    fn headline(line: u32) -> Parent {
+        Parent::Headline { line }
+    }
+
+    fn item(line: u32, indent: usize) -> Parent {
+        Parent::Item { line, indent }
+    }
+
     #[test]
     fn tallies_the_direct_children_of_a_headline() {
         let (l, n) = buf("* Shop [0/0]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n");
-        assert_eq!(tally(&l, 0, 0, n), (1, 3));
+        assert_eq!(tally(&l, 0, headline(0), n), (1, 3));
     }
 
     /// A grandchild's state is already reflected in its own parent's box, so
@@ -323,9 +626,9 @@ mod tests {
     #[test]
     fn nested_items_are_counted_by_their_own_parent_only() {
         let (l, n) = buf("* Top [0/0]\n  - [-] a\n    - [X] a1\n    - [ ] a2\n  - [ ] b\n");
-        assert_eq!(tally(&l, 0, 0, n), (0, 2), "only `a` and `b`");
+        assert_eq!(tally(&l, 0, headline(0), n), (0, 2), "only `a` and `b`");
         // `a`'s own children are two, one done.
-        assert_eq!(tally(&l, 1, 2, n), (1, 2));
+        assert_eq!(tally(&l, 1, item(1, 2), n), (1, 2));
     }
 
     /// A following headline ends the region even when it is not indented
@@ -333,12 +636,24 @@ mod tests {
     #[test]
     fn a_following_headline_ends_the_tally() {
         let (l, n) = buf("* One [0/0]\n  - [X] a\n* Two\n  - [X] b\n");
-        assert_eq!(tally(&l, 0, 0, n), (1, 1));
+        assert_eq!(tally(&l, 0, headline(0), n), (1, 1));
     }
 
     #[test]
     fn blank_lines_do_not_end_a_list() {
         let (l, n) = buf("* One [0/0]\n  - [X] a\n\n  - [ ] b\n");
-        assert_eq!(tally(&l, 0, 0, n), (1, 2));
+        assert_eq!(tally(&l, 0, headline(0), n), (1, 2));
+    }
+
+    /// The ancestor chain the fallback walks: innermost item first, then the
+    /// headline that owns the whole list. The tree half answers the same
+    /// question by walking `listitem` parents to the enclosing `section`.
+    #[test]
+    fn the_fallback_walks_out_to_the_headline() {
+        let (l, n) = buf("* Top [0/0]\n  - [-] a [0/2]\n    - [X] a1\n    - [ ] a2\n");
+        let cb = Checkboxes::new(None, &l, n);
+        assert_eq!(cb.ancestors(2), vec![item(1, 2), headline(0)]);
+        // From the outer item there is only the headline above it.
+        assert_eq!(cb.ancestors(1), vec![headline(0)]);
     }
 }

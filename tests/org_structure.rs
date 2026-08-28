@@ -3191,3 +3191,77 @@ async fn a_demote_inside_a_block_leaves_the_example_alone() {
         "the enclosing section is what demoted: {after:?}"
     );
 }
+
+// ── OT.6: the list's shape comes from the tree ────────────────────────
+
+/// A checkbox drawn inside a `#+BEGIN_SRC` block is example text, not an item.
+///
+/// `<C-Space>` on it must do nothing, and — the part that is invisible until
+/// you look — it must not be counted into the enclosing cookie either. The
+/// indent walk sees `- [ ] example` at column 0 and cannot tell it from a real
+/// item, because nothing on the line says which side of `#+BEGIN_SRC` it is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkbox_inside_a_block_is_neither_toggled_nor_counted() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Shopping [0/1]\n- [ ] milk\n#+BEGIN_SRC org\n- [ ] example\n#+END_SRC\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    // On the block's example line: nothing happens at all.
+    goto_line(&mut editor, 3);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        original,
+        "`<C-Space>` inside a source block must leave the example alone"
+    );
+
+    // On the real item: it ticks, and the cookie counts ONE item — not the
+    // two the indent walk finds.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* Shopping [1/1]\n- [X] milk\n#+BEGIN_SRC org\n- [ ] example\n#+END_SRC\n",
+        "the cookie counts the one real item; `[1/2]` means the block's \
+         example was tallied"
+    );
+}
+
+/// The ordinary nesting case, unchanged: a nested list is counted by its own
+/// parent, and the parent's box is not what the grandparent counts twice.
+///
+/// Structure comes from `listitem` / `list` nodes now rather than from leading
+/// whitespace, so this is the regression guard that the switch did not move
+/// any of the well-formed answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Top [0/2]\n- [ ] a [0/2]\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    // Tick a grandchild: `a`'s cookie moves, `Top`'s does not — `a` is still
+    // unticked, and `Top` counts boxes, not descendants.
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* Top [0/2]\n- [ ] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
+        "the nested cookie moved and the outer one did not"
+    );
+
+    // Tick the outer item itself: now `Top` moves.
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* Top [1/2]\n- [X] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
+    );
+}

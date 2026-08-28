@@ -1998,7 +1998,7 @@ impl GrammarCallbacks for Component {
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
-            TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc)),
+            TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
             TABLE_ALIGN => Ok(table_move(&ctx, doc, 0)),
@@ -2367,42 +2367,39 @@ impl PickerSource for Component {
 ///
 /// Consumes the key rather than declining when there is no checkbox:
 /// `<C-Space>` is org's here and has nothing to fall through to.
-fn toggle_checkbox(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn toggle_checkbox(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let at = ctx.cursor.line;
+    // OT.6: the tree decides what is a list item. A `- [ ] example` line
+    // between `#+BEGIN_SRC` and `#+END_SRC` is block text, and indentation
+    // cannot say so — the text path both toggles it and counts it into the
+    // enclosing cookie.
+    let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
     let Some(text) = doc.line(at) else {
         return vec![Effect::None];
     };
-    let Some(item) = checkbox::parse_item(&text) else {
+    let Some(item) = cb.item_at(at) else {
         return vec![Effect::None];
     };
     let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) else {
         return vec![Effect::None];
     };
 
-    let count = doc.line_count();
     // Rewrite from the toggled line down to itself, then extend upward for
     // each ancestor whose cookie changes. The span is contiguous because an
     // ancestor is always above its children.
     let mut rewritten: Vec<(u32, String)> = vec![(at, flipped)];
-    let mut current_indent = item.indent;
-    let mut scan = at;
-    while scan > 0 {
-        scan -= 1;
-        let Some(above) = line(scan) else { break };
-        if above.trim().is_empty() {
+    for parent in cb.ancestors(at) {
+        let Some(above) = line(parent.line()) else {
             continue;
-        }
-        let indent = above.len() - above.trim_start().len();
-        let is_headline = headline::headline_level(&above).is_some();
-        // An ancestor is a shallower item, or a headline (which owns the
-        // whole list beneath it whatever its indent).
-        if !is_headline && indent >= current_indent {
-            continue;
-        }
-        let parent_indent = if is_headline { 0 } else { indent };
-        // Tally against the buffer AS IT WILL BE — the toggled line included —
-        // or the cookie would lag one keypress behind the box.
+        };
+        // Structure from the locator, state from the buffer AS IT WILL BE —
+        // the toggled line included, or the cookie lags one keypress behind
+        // the box it is counting.
         let after = |n: u32| -> Option<String> {
             rewritten
                 .iter()
@@ -2410,18 +2407,12 @@ fn toggle_checkbox(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
                 .map(|(_, t)| t.clone())
                 .or_else(|| line(n))
         };
-        let (done, total) = checkbox::tally(after, scan, parent_indent, count);
+        let (done, total) = checkbox::tally_lines(&cb.child_item_lines(parent), after);
         if let Some(updated) = checkbox::update_cookie(&above, done, total) {
             if updated != above {
-                rewritten.push((scan, updated));
+                rewritten.push((parent.line(), updated));
             }
         }
-        // A parent item may itself be a child of something shallower; a
-        // headline is the top, so stop there.
-        if is_headline {
-            break;
-        }
-        current_indent = indent;
     }
 
     let top = rewritten.iter().map(|(i, _)| *i).min().unwrap_or(at);

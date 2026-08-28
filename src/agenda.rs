@@ -65,6 +65,7 @@
 use crate::lattice::plugin_host::tree_sitter::Node;
 use crate::timestamp::{self, Stamp};
 use crate::todo;
+use crate::tree;
 
 /// Where a row's date came from. Also its within-day order: a deadline
 /// outranks a scheduled item on the same day, which outranks a bare
@@ -163,24 +164,6 @@ fn walk_sections(node: &Node, lines: &[&str], keywords: &Keywords, rows: &mut Ve
     }
 }
 
-/// The last line a node actually has content on.
-///
-/// A tree-sitter node's end position is **exclusive**, and org's `plan` rule is
-/// `seq(repeat1($.entry), $._eol)` — it swallows the newline, so a one-line plan
-/// reports an end on the line *after* it. Taken literally that makes every
-/// scheduled row's excerpt one line too tall, which is how this was caught: the
-/// row spanned 2 lines where org means 1.
-///
-/// A node ending at byte 0 of a line ended at the previous line's boundary; any
-/// other end byte is a genuine position on its own line.
-fn last_content_line(range: &crate::lattice::plugin_host::types::Range) -> u32 {
-    if range.end.byte == 0 {
-        range.end.line.saturating_sub(1)
-    } else {
-        range.end.line
-    }
-}
-
 /// The agenda row one section contributes, if it contributes one.
 fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Option<Row> {
     let headline = section.child_by_field("headline")?;
@@ -198,7 +181,7 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
     let plan_span = plan
         .as_ref()
         .map(|p| p.byte_range())
-        .map(|range| (range.start.line, last_content_line(&range)));
+        .map(|range| (range.start.line, tree::last_content_line(&range)));
 
     // OT.5: the plan's entries, read as nodes. See `plan_date`.
     let from_plan = plan.as_ref().and_then(|p| plan_date(p, lines));
@@ -228,21 +211,6 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
         kind,
         priority: parsed.priority,
     })
-}
-
-/// The text a node covers, when it lies on one line.
-///
-/// Every node this module reads — `entry_name`, `timestamp` — is within a
-/// planning line by construction, so the single-line case is the only one, and
-/// a multi-line node returning `None` is the honest refusal rather than a
-/// silent truncation.
-fn node_text<'a>(lines: &[&'a str], node: &Node) -> Option<&'a str> {
-    let range = node.byte_range();
-    if range.start.line != range.end.line {
-        return None;
-    }
-    let line = lines.get(range.start.line as usize).copied()?;
-    line.get(range.start.byte as usize..range.end.byte as usize)
 }
 
 /// The date a section's `plan` carries, from the plan's own nodes.
@@ -290,7 +258,7 @@ fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
         let Some(name) = entry
             .child_by_field("name")
             .as_ref()
-            .and_then(|n| node_text(lines, n))
+            .and_then(|n| tree::node_text(lines, n))
         else {
             continue;
         };
@@ -302,7 +270,7 @@ fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
         let Some(stamp) = entry
             .child_by_field("timestamp")
             .as_ref()
-            .and_then(|n| node_text(lines, n))
+            .and_then(|n| tree::node_text(lines, n))
             // Characters from the text: the node says where the stamp is, and
             // `first_stamp` reads what it says. The seam exposes no node text,
             // and the date's own `date` / `time` fields would still need

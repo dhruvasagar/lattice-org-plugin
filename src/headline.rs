@@ -561,24 +561,17 @@ mod tests {
 // handful of steps and not proportional to its text.
 
 use crate::lattice::plugin_host::tree_sitter::{Node, TreeSnapshot};
-use crate::lattice::plugin_host::types::{Position, Range};
+use crate::tree;
 
 const SECTION: &str = "section";
 
-/// The last line a node has content on — a node's end position is exclusive,
-/// and org's rules swallow their trailing newline, so a node ending at byte 0
-/// of a line really ended on the line before.
-fn last_content_line(range: &Range) -> u32 {
-    if range.end.byte == 0 {
-        range.end.line.saturating_sub(1)
-    } else {
-        range.end.line
-    }
-}
-
 /// The `section` node enclosing `line`, if the cursor is inside one.
+///
+/// Column 0 is the right probe here and only here: a `section` starts at its
+/// headline's first star, which is column 0 by definition. See
+/// [`tree::enclosing`] for why that is not the default assumption.
 fn enclosing_section(tree: &TreeSnapshot, line: u32) -> Option<Node> {
-    tree.enclosing(Position { line, byte: 0 }, &[SECTION.to_string()])
+    tree::enclosing(tree, line, 0, SECTION)
 }
 
 /// A section's headline line and level, read from the grammar.
@@ -601,54 +594,28 @@ fn headline_line(section: &Node) -> Option<u32> {
 
 /// The section's first nested subsection, or `None` for a leaf.
 fn first_subsection(node: &Node) -> Option<Node> {
-    (0..node.named_child_count())
-        .filter_map(|i| node.named_child(i))
-        .find(|c| c.kind() == SECTION)
+    tree::first_child_of_kind(node, SECTION)
 }
 
 /// The section's last nested subsection, or `None` for a leaf.
 fn last_subsection(node: &Node) -> Option<Node> {
-    (0..node.named_child_count())
-        .rev()
-        .filter_map(|i| node.named_child(i))
-        .find(|c| c.kind() == SECTION)
+    tree::last_child_of_kind(node, SECTION)
 }
 
 /// The next sibling that is a section, skipping a parent's non-section children.
 fn next_sibling_section(node: &Node) -> Option<Node> {
-    let mut cur = node.next_named_sibling();
-    while let Some(n) = cur {
-        if n.kind() == SECTION {
-            return Some(n);
-        }
-        cur = n.next_named_sibling();
-    }
-    None
+    tree::next_sibling_of_kind(node, SECTION)
 }
 
 /// [`next_sibling_section`] backwards.
 fn prev_sibling_section(node: &Node) -> Option<Node> {
-    let mut cur = node.prev_named_sibling();
-    while let Some(n) = cur {
-        if n.kind() == SECTION {
-            return Some(n);
-        }
-        cur = n.prev_named_sibling();
-    }
-    None
+    tree::prev_sibling_of_kind(node, SECTION)
 }
 
 /// The nearest `section` ancestor. `None` at a top-level section, whose parent
 /// is the `document`.
 fn parent_section(node: &Node) -> Option<Node> {
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        if n.kind() == SECTION {
-            return Some(n);
-        }
-        cur = n.parent();
-    }
-    None
+    tree::ancestor(node, SECTION)
 }
 
 /// The last headline *inside* `section` in document order: its last subsection's
@@ -676,7 +643,7 @@ fn enclosing_headline_tree(tree: &TreeSnapshot, from: u32) -> Option<(u32, usize
 /// sections* — the definition `subtree_end` reconstructs by scanning for the
 /// next headline of the same level or shallower. Here it is the node's extent.
 fn subtree_end_tree(tree: &TreeSnapshot, from: u32) -> Option<u32> {
-    Some(last_content_line(
+    Some(tree::last_content_line(
         &enclosing_section(tree, from)?.byte_range(),
     ))
 }

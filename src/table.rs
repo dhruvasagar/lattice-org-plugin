@@ -21,6 +21,9 @@
 //! covers most org tables and is honestly wrong for CJK — recorded rather than
 //! silently approximated.
 
+use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
+use crate::tree;
+
 /// A row's cells, or a separator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
@@ -56,7 +59,8 @@ pub fn parse_row(line: &str) -> Option<Row> {
     ))
 }
 
-/// The contiguous run of table lines containing `at`, as `(first, last)`.
+/// The contiguous run of table lines containing `at`, as `(first, last)` —
+/// the TEXT answer. [`Tables::bounds`] is the tree's.
 pub fn table_bounds(
     line: impl Fn(u32) -> Option<String>,
     at: u32,
@@ -74,6 +78,68 @@ pub fn table_bounds(
         last += 1;
     }
     Some((first, last))
+}
+
+// --- OT.7: a table is a node, and a table drawn in a block is not -----------
+
+/// Where a table starts and stops, from the tree when there is one.
+///
+/// `grammar.js` gives `table: (row | hr)+`, so a `table` node IS the contiguous
+/// run [`table_bounds`] reconstructs by walking outward while lines still start
+/// with `|`. Same answer for well-formed org, and a different one for the case
+/// the line test cannot see:
+///
+/// ```org
+/// #+BEGIN_SRC org
+/// | fake | tbl |
+/// #+END_SRC
+/// ```
+///
+/// That line parses as `block contents:`, not a table. The line test finds a
+/// table there and `<Tab>` realigns example content inside someone's code
+/// block — the same class of error as OT.4's `dar` and OT.6's cookie, in the
+/// third construct.
+///
+/// **Only the bounds move.** `parse_row`, `align`, `cell_at` and `cell_start`
+/// stay text: alignment REWRITES the table, so the cell offsets the caret needs
+/// are offsets into a line that is not in the buffer yet, and no tree can
+/// describe a buffer that does not exist. Structure from the tree, characters
+/// from the text.
+pub struct Tables<'a> {
+    tree: Option<&'a TreeSnapshot>,
+    line: &'a dyn Fn(u32) -> Option<String>,
+    line_count: u32,
+}
+
+impl<'a> Tables<'a> {
+    pub fn new(
+        tree: Option<&'a TreeSnapshot>,
+        line: &'a dyn Fn(u32) -> Option<String>,
+        line_count: u32,
+    ) -> Self {
+        Self {
+            tree,
+            line,
+            line_count,
+        }
+    }
+
+    /// The table containing `at`, as inclusive `(first, last)` lines.
+    pub fn bounds(&self, at: u32) -> Option<(u32, u32)> {
+        match self.tree {
+            Some(snapshot) => {
+                // The `|` column, not column 0: an indented table's node starts
+                // at its first pipe, and probing left of it lands outside
+                // (OT.6's lesson, applied before it could bite again).
+                let text = (self.line)(at)?;
+                let col = text.len() - text.trim_start().len();
+                let node = tree::enclosing(snapshot, at, col as u32, "table")?;
+                let range = node.byte_range();
+                Some((range.start.line, tree::last_content_line(&range)))
+            }
+            None => table_bounds(self.line, at, self.line_count),
+        }
+    }
 }
 
 /// Align a table's rows, returning one rendered line per input row.

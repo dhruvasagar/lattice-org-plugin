@@ -3265,3 +3265,58 @@ async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
         "* Top [1/2]\n- [X] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
     );
 }
+
+// ── OT.7: a table is a node, and one drawn in a block is not ──────────
+
+/// `<leader>o|` on a table written inside `#+BEGIN_SRC` must not realign it.
+///
+/// `is_table_line` is `trim_start().starts_with('|')`, which is true of example
+/// content in a code block, so the line test finds a table there and aligns
+/// someone's sample. The grammar parses the block as `block contents:` with no
+/// `table` node in it at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_table_inside_a_block_is_not_aligned() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // Deliberately ragged, so an alignment pass would be visible.
+    let original = "* T\n#+BEGIN_SRC org\n|a|bb|\n|ccc|d|\n#+END_SRC\n";
+    let mut editor = org_editor(base.path(), original).await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<leader>o|");
+    assert_eq!(
+        text(&editor),
+        original,
+        "the example table inside the block must be left exactly as written"
+    );
+}
+
+/// The ordinary table still aligns, and the bounds still stop at a blank line.
+///
+/// The bounds come from the `table` node's extent now rather than from walking
+/// outward while lines start with `|`. Two tables separated by a blank line are
+/// two `table` nodes, which is the same answer the walk gave — asserted so the
+/// switch is known not to have merged them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alignment_stops_at_the_table_the_caret_is_in() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* T\n|a|bb|\n|ccc|d|\n\n|x|y|\n").await;
+    enable_minor(&mut editor, "org-table-mode");
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<leader>o|");
+    assert_eq!(
+        text(&editor),
+        "* T\n| a   | bb |\n| ccc | d  |\n\n|x|y|\n",
+        "the caret's table aligned; the one below the blank line is a \
+         different node and must be untouched"
+    );
+}

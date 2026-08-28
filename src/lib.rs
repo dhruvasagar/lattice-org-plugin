@@ -88,6 +88,7 @@ mod refile;
 mod table;
 mod timestamp;
 mod todo;
+mod tree;
 
 use exports::lattice::plugin_host::grammar_callbacks::Guest as GrammarCallbacks;
 use exports::lattice::plugin_host::media::Guest as MediaProducer;
@@ -1999,10 +2000,10 @@ impl GrammarCallbacks for Component {
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
-            TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, 1)),
-            TABLE_PREV_CELL => Ok(table_move(&ctx, doc, -1)),
-            TABLE_ALIGN => Ok(table_move(&ctx, doc, 0)),
-            TABLE_ROW_UP..=TABLE_DELETE_COL => Ok(table_structure(&ctx, doc, callback)),
+            TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, tree, 1)),
+            TABLE_PREV_CELL => Ok(table_move(&ctx, doc, tree, -1)),
+            TABLE_ALIGN => Ok(table_move(&ctx, doc, tree, 0)),
+            TABLE_ROW_UP..=TABLE_DELETE_COL => Ok(table_structure(&ctx, doc, tree, callback)),
             OPEN_LINK => Ok(open_link(&ctx, doc)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
             TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
@@ -2534,10 +2535,19 @@ fn open_link(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// Alignment is whole-table and lands as ONE edit: a column's width is the
 /// widest cell in it, so touching one cell can change every row, and a
 /// half-aligned table is a worse state than either end.
-fn table_move(ctx: &ActionContext, doc: &Document, delta: i32) -> Vec<Effect> {
+fn table_move(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    delta: i32,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let count = doc.line_count();
-    let Some((first, last)) = table::table_bounds(line, ctx.cursor.line, count) else {
+    // OT.7: a `| a | b |` line inside a `#+BEGIN_SRC` block is block content,
+    // and `is_table_line` cannot tell. Declining there is what leaves `<Tab>`
+    // to fall through to org's headline cycle and then to its native meaning.
+    let tables = table::Tables::new(tree, &line, count);
+    let Some((first, last)) = tables.bounds(ctx.cursor.line) else {
         return vec![Effect::Declined];
     };
 
@@ -2602,10 +2612,17 @@ fn table_move(ctx: &ActionContext, doc: &Document, delta: i32) -> Vec<Effect> {
 ///
 /// Declines off a table, so the `<leader>t…` chords stay available to
 /// anything else that wants them outside one.
-fn table_structure(ctx: &ActionContext, doc: &Document, action: u32) -> Vec<Effect> {
+fn table_structure(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    action: u32,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let count = doc.line_count();
-    let Some((first, last)) = table::table_bounds(line, ctx.cursor.line, count) else {
+    // OT.7, as on `table_move`.
+    let tables = table::Tables::new(tree, &line, count);
+    let Some((first, last)) = tables.bounds(ctx.cursor.line) else {
         return vec![Effect::Declined];
     };
     let mut rows: Vec<table::Row> = (first..=last)

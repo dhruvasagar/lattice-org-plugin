@@ -61,6 +61,56 @@ the code *inside* it in its own language is injection, and is not wired yet.
 These are **motions**, so they compose with operators and take counts the way
 vim's own do: `d]]` deletes to the next headline, `3]]` moves down three.
 
+## Text objects
+
+Four, in two pairs — `h` is the headline **line**, `r` is the whole
+**subtree**. As everywhere in vim, `i` is *inner* and `a` is *around*: around
+takes the structural marker with it, inner leaves it.
+
+| | |
+|---|---|
+| `ih` | the headline's title, without its stars |
+| `ah` | the whole headline line, stars included |
+| `ir` | the subtree's body — everything under the headline, headline left standing |
+| `ar` | the whole subtree: the headline and everything under it |
+
+They compose with any operator, so `dar` / `yar` / `car` all act on a subtree
+and `viw`-style visual selection works too (`var` selects one).
+
+On this file, with the cursor anywhere in `* One` or its body:
+
+```org
+* One
+body of one
+** Child
+kid body
+* Two
+```
+
+| | |
+|---|---|
+| `dih` | leaves `* ` — the stars stay, the title goes |
+| `dah` | the `* One` line empties; `body of one`, `** Child` and `kid body` stay |
+| `dir` | `* One` stays; the three lines under it empty |
+| `dar` | all four lines empty, `* Two` onward untouched |
+
+**"Empties", not "removes"** — a known wart. The linewise objects resolve to the
+end of their last line and stop short of its newline, so deleting one leaves a
+blank line where it was. `dd`-style behaviour would close the gap; these do not
+yet. Follow it with `dd` if it bothers you.
+
+**`ar` includes nested children**, because that is what a subtree is — the same
+definition folding uses (`ar` on `* One` takes `** Child` with it). To act on a
+child alone, put the cursor in the child: `dar` on `** Child` takes only the
+child and its body.
+
+**They resolve from the parse tree**, so a headline written as an example
+inside a `#+BEGIN_SRC` block is not one: `dar` there acts on the real enclosing
+subtree rather than on the sample.
+
+`:describe-key ar` and `:describe-command org-around-subtree` will tell you the
+same thing without leaving the editor.
+
 ## Structure
 
 | | |

@@ -103,10 +103,11 @@ use lattice::plugin_host::modes::{
     ModeKeymapBinding, ModeKind, ModeOptionOverride, OverridePriority,
 };
 use lattice::plugin_host::types::{
-    ActionContext, ActionSpec, AppEffect, Args, DecorationContext, EchoLevel, EchoPayload, Edit,
-    EditKind, Effect, ExCommandContext, FileAnchor, MediaBlock, MediaFit, MotionContext,
-    MotionResult, MotionSpec, OperatorContext, Position, Range, TextObjectContext, TextObjectSpec,
-    WriteToFilePayload,
+    ActionContext, ActionSpec, AppEffect, ArgDefault, ArgKind, ArgSpec, Args, DecorationContext,
+    EchoLevel, EchoPayload, Edit, EditKind, Effect, ExCommandContext, ExCommandSpec, FileAnchor,
+    LatencyClass, MediaBlock, MediaFit, MotionContext, MotionResult, MotionSpec,
+    OpenProviderViewPayload, OperatorContext, Position, Range, SurfaceForm, TextObjectContext,
+    TextObjectSpec, WriteToFilePayload,
 };
 
 /// Callback ids for `apply-action`. The guest chooses these; the host only
@@ -205,6 +206,13 @@ const CAPTURE_SUBMIT: u32 = 36;
 /// fire `org-capture` with a key, and one action that sometimes opens a menu
 /// and sometimes captures would make the row's own args ambiguous.
 const CAPTURE_MENU: u32 = 37;
+
+/// AG.1 — `:org-agenda`, this plugin's first ex-command.
+///
+/// TWO ids because `register-ex-command` takes two callbacks: the `:` line's
+/// rest is parsed by one and the effect produced by the other.
+const AGENDA_PARSE: u32 = 39;
+const AGENDA_APPLY: u32 = 40;
 
 /// OC.4 — the fields menu's own submit, distinct from the prompt's.
 ///
@@ -550,16 +558,19 @@ impl Guest for Component {
         // compose — the major's `<leader>oh` and this minor's `<leader>oc`
         // both resolve, which the tests pin.
         //
-        // `oa` reaches the HOST's `:agenda` ex-command by name — the agenda
-        // view is the multibuffer provider's, not this plugin's, and the
-        // plugin only supplies its rows through the `agenda-source` seam.
+        // AG.1: `oa` reaches THIS plugin's `:org-agenda`. The agenda VIEW is
+        // still the multibuffer provider's and this plugin still only supplies
+        // rows through the `agenda-source` seam — what changed is who owns the
+        // trigger. A host-registered `:agenda` meant a feature every user calls
+        // `org-agenda` shipped under a generic name that the plugin had no way
+        // to correct from its own side.
         register_mode(&ModeDeclaration {
             id: "org-global-mode".to_string(),
             kind: ModeKind::Minor,
             activation_policy: ActivationPolicy::Universal,
             capabilities: ModeCapabilities::empty(),
             keymap: vec![
-                bind("<leader>oa", "agenda"),
+                bind("<leader>oa", "org-agenda"),
                 // OM.11 bound this at `<leader>oc` on the org MAJOR, where it
                 // could only fire inside an org file. `org-capture-submit` is
                 // the second hop and is NOT bound — the host dispatches it on
@@ -713,6 +724,41 @@ impl Guest for Component {
             "A whole subtree: the headline and everything under it",
             &tobj(),
             AROUND_SUBTREE,
+        );
+        // AG.1: `:org-agenda`. Every command this plugin ships is `org-`
+        // prefixed; this is the one that was not, because it was the host's.
+        //
+        // The name is chosen here rather than derived by the host from the
+        // plugin id, so the convention is the plugin's to keep. That is the
+        // looser of the two arrangements and it is the deliberate one: a
+        // source's users have a name for this in whatever ecosystem the source
+        // came from, and only the source knows it.
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-agenda",
+            "Open the agenda: every dated row an agenda-source finds under the \
+             configured files, grouped and ordered by the source, as editable \
+             excerpts. Pass a path to scan somewhere else instead.",
+            &ExCommandSpec {
+                latency_class: LatencyClass::Reflex,
+                accepts_bang: false,
+                accepts_range: false,
+                args_schema: vec![ArgSpec {
+                    name: "root".to_string(),
+                    kind: ArgKind::String,
+                    doc: "directory or file to scan; defaults to the configured \
+                          agenda files"
+                        .to_string(),
+                    prompt: "Agenda root: ".to_string(),
+                    // Optional: a bare `:org-agenda` is the common call and
+                    // must not prompt for a path the configuration already has.
+                    default: ArgDefault::None,
+                    completion: None,
+                    picker: None,
+                }],
+                surface_form: SurfaceForm::Keyword,
+            },
+            AGENDA_PARSE,
+            AGENDA_APPLY,
         );
         register_action(
             "org-cycle",
@@ -965,6 +1011,14 @@ impl Guest for Component {
     /// language, so it cannot read the answer off one.
     fn extensions() -> Vec<String> {
         vec!["org".to_string(), "org_archive".to_string()]
+    }
+
+    /// AF.1: the paths this source wants scanned.
+    ///
+    /// Wired in AF.3. Empty means "no opinion", so the host keeps using the
+    /// root it would have used and nothing about today's behaviour moves.
+    fn roots() -> Vec<String> {
+        Vec::new()
     }
 
     /// OM.A3: the mode the host activates on the agenda view, so org's TODO
@@ -2239,11 +2293,43 @@ impl GrammarCallbacks for Component {
         };
         Ok(range)
     }
-    fn parse_ex_args(_c: u32, _rest: String, _bang: bool) -> Result<Args, String> {
-        Err("org: no ex-commands".into())
+    /// AG.1: `:org-agenda [root]`.
+    ///
+    /// The root rides as a plain string so the PROVIDER owns the parse — the
+    /// ex-command must not learn the provider's vocabulary, which is the same
+    /// split the host's `:agenda` kept before this moved.
+    fn parse_ex_args(callback: u32, rest: String, _bang: bool) -> Result<Args, String> {
+        match callback {
+            AGENDA_PARSE => {
+                let trimmed = rest.trim();
+                Ok(if trimmed.is_empty() {
+                    Args::None
+                } else {
+                    Args::String(trimmed.to_string())
+                })
+            }
+            other => Err(format!("org: unknown ex-command parse callback {other}")),
+        }
     }
-    fn apply_ex_command(_c: u32, _ctx: ExCommandContext) -> Result<Vec<Effect>, String> {
-        Err("org: no ex-commands".into())
+
+    fn apply_ex_command(callback: u32, ctx: ExCommandContext) -> Result<Vec<Effect>, String> {
+        match callback {
+            // The agenda view is generic host machinery: it builds the
+            // multibuffer, walks the files and asks every registered
+            // `agenda-source` for rows. This plugin does not open it — it rings
+            // the doorbell by the provider's name and supplies its own rows
+            // through the seam, exactly as before. Only the trigger moved.
+            AGENDA_APPLY => Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                OpenProviderViewPayload {
+                    provider: "agenda".to_string(),
+                    argument: match &ctx.args {
+                        Args::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                        _ => None,
+                    },
+                },
+            ))]),
+            other => Err(format!("org: unknown ex-command callback {other}")),
+        }
     }
 }
 

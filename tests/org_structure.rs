@@ -3397,3 +3397,50 @@ async fn a_capture_target_inside_a_block_is_not_a_target() {
         "and the block is left exactly as written: {written:?}"
     );
 }
+
+// ── AG.1: org owns its agenda trigger ─────────────────────────────────
+
+/// The agenda's ex-command is `:org-agenda`, and this plugin registers it.
+///
+/// It was `:agenda`, registered by `lattice-multibuffer` beside the provider,
+/// because a plugin had no way to open a provider view — `OpenProviderView` was
+/// withheld from the WIT surface. So a feature every user calls `org-agenda`
+/// shipped under a generic name that org could not correct from its own side.
+///
+/// The VIEW is still generic host machinery and this plugin still supplies rows
+/// only through the `agenda-source` seam. What moved is the trigger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_command_is_org_agenda_and_org_registers_it() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor(base.path(), "* One\n").await;
+    let commands = editor.registry.load();
+
+    assert!(
+        commands.id_by_name("org-agenda").is_some(),
+        "the plugin registers `:org-agenda`"
+    );
+    // The generic name is GONE, not aliased. CLAUDE.md's ex-command rule is
+    // explicit that a generic name implies the command works regardless of the
+    // subsystem behind it, and no back-compat aliases pre-1.0.
+    assert!(
+        commands.id_by_name("agenda").is_none(),
+        "`:agenda` must not survive as an alias"
+    );
+
+    // Every command this plugin ships carries the `org-` prefix. Asserted as a
+    // property rather than a list, so a new command cannot quietly break the
+    // convention by being added without anyone updating a fixture.
+    let stray: Vec<String> = commands
+        .names()
+        .filter(|n| n.starts_with("org") && !n.starts_with("org-"))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "org commands must be `org-` prefixed: {stray:?}"
+    );
+}

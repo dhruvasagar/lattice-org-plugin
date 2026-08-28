@@ -24,7 +24,7 @@ reached the network.
 | `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, archive / refile / capture |
 | `config` | `org.todo-keywords`, `org.highest-priority`, `org.inline-images`, `org.capture-templates` (and the older `org.capture-file` / `org.capture-template` pair) |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
-| `agenda-source` | dated rows for `:agenda` — what a row is, when it falls, how it sorts |
+| `agenda-source` | dated rows for `:org-agenda` — what a row is, when it falls, how it sorts, and which files to scan |
 | `picker-source` | `org-refile`'s target list: every headline in the project's org files |
 | `help` | `doc/org.md`, shipped inside the component; `:help org` |
 

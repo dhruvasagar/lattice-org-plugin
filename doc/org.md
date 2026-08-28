@@ -406,16 +406,41 @@ network traffic you did not ask for.
 
 ## Agenda
 
-`:agenda` collects every dated headline across your org files into one view,
-ordered by date and grouped by day.
+`:org-agenda` collects every dated headline across your org files into one
+view, ordered by date and grouped by day.
 
 | | |
 |---|---|
-| `:agenda` | build it over the current project |
-| `:agenda ~/notes` | build it over somewhere else |
+| `:org-agenda` | build it over your configured agenda files |
+| `:org-agenda ~/notes` | build it over somewhere else instead |
+| `<leader>oa` | the same, from any buffer |
 | `<CR>` | jump to the entry's file and line |
 | `gr` | re-scan |
 | `<leader>ot` `<leader>oT` `<leader>o,` | change the TODO state or priority, **from the agenda** |
+
+### Which files it scans
+
+Set `org.agenda-files`, one path per line. An entry is a **directory** (walked)
+or a **file** (scanned as given, whatever its extension):
+
+```toml
+[org]
+agenda-files = """
+# everything I keep
+~/src/dhruvasagar/org-files
+# and the one that lives elsewhere
+~/src/dhruvasagar/org-files/anniversaries.org
+"""
+```
+
+`~` is expanded; blank lines and `#` comments are ignored. A path that does not
+exist is skipped and the rest still scan — one bad entry must not cost you the
+whole agenda.
+
+**Unset, it scans the current project.** That is the old behaviour and it is
+still the right one for a repo with org files in it; the option is for the
+agenda that follows you between checkouts, which is what org means by an
+agenda. `:org-agenda ~/notes` overrides the option for one invocation.
 
 A row is an **open** headline carrying a date:
 
@@ -450,7 +475,7 @@ rather than urgent. Days you have missed are labelled as such, because a
 deadline the view stays quiet about is the failure the tool exists to prevent.
 
 The scan runs off the UI thread and reads only the files this plugin claims,
-so `:agenda` in a source checkout with no org files in it costs a directory
+so `:org-agenda` in a source checkout with no org files in it costs a directory
 walk. One malformed file is skipped and the scan continues; if the plugin
 stops answering entirely the view keeps the rows it collected and the
 headerline says it is partial.

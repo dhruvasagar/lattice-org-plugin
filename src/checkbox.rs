@@ -584,12 +584,7 @@ mod tests {
     /// resource), so it is covered by dispatch through a real editor in
     /// `tests/org_structure.rs`. These keep the fallback honest, which matters
     /// because it is what runs when a buffer's parse is pending.
-    fn tally(
-        l: &dyn Fn(u32) -> Option<String>,
-        n: u32,
-        parent: Parent,
-        count: u32,
-    ) -> (usize, usize) {
+    fn tally(l: &dyn Fn(u32) -> Option<String>, parent: Parent, count: u32) -> (usize, usize) {
         let cb = Checkboxes::new(None, l, count);
         tally_lines(&cb.child_item_lines(parent), |i| cb.text(i))
     }
@@ -605,7 +600,7 @@ mod tests {
     #[test]
     fn tallies_the_direct_children_of_a_headline() {
         let (l, n) = buf("* Shop [0/0]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n");
-        assert_eq!(tally(&l, 0, headline(0), n), (1, 3));
+        assert_eq!(tally(&l, headline(0), n), (1, 3));
     }
 
     /// A grandchild's state is already reflected in its own parent's box, so
@@ -613,9 +608,9 @@ mod tests {
     #[test]
     fn nested_items_are_counted_by_their_own_parent_only() {
         let (l, n) = buf("* Top [0/0]\n  - [-] a\n    - [X] a1\n    - [ ] a2\n  - [ ] b\n");
-        assert_eq!(tally(&l, 0, headline(0), n), (0, 2), "only `a` and `b`");
+        assert_eq!(tally(&l, headline(0), n), (0, 2), "only `a` and `b`");
         // `a`'s own children are two, one done.
-        assert_eq!(tally(&l, 1, item(1, 2), n), (1, 2));
+        assert_eq!(tally(&l, item(1, 2), n), (1, 2));
     }
 
     /// A following headline ends the region even when it is not indented
@@ -623,13 +618,13 @@ mod tests {
     #[test]
     fn a_following_headline_ends_the_tally() {
         let (l, n) = buf("* One [0/0]\n  - [X] a\n* Two\n  - [X] b\n");
-        assert_eq!(tally(&l, 0, headline(0), n), (1, 1));
+        assert_eq!(tally(&l, headline(0), n), (1, 1));
     }
 
     #[test]
     fn blank_lines_do_not_end_a_list() {
         let (l, n) = buf("* One [0/0]\n  - [X] a\n\n  - [ ] b\n");
-        assert_eq!(tally(&l, 0, headline(0), n), (1, 2));
+        assert_eq!(tally(&l, headline(0), n), (1, 2));
     }
 
     /// The headline case the indent rule used to lose: a list flush at column
@@ -638,7 +633,7 @@ mod tests {
     #[test]
     fn a_headline_owns_a_list_written_at_column_zero() {
         let (l, n) = buf("* Shop [0/0]\n- [X] bread\n- [ ] milk\n");
-        assert_eq!(tally(&l, 0, headline(0), n), (1, 2));
+        assert_eq!(tally(&l, headline(0), n), (1, 2));
     }
 
     /// An ITEM parent still requires a deeper indent — that is what tells its
@@ -646,8 +641,8 @@ mod tests {
     #[test]
     fn an_item_only_owns_what_is_indented_under_it() {
         let (l, n) = buf("* Top [0/0]\n- [ ] a [0/0]\n  - [X] a1\n- [ ] b\n");
-        assert_eq!(tally(&l, 0, item(1, 0), n), (1, 1), "just `a1`");
-        assert_eq!(tally(&l, 0, headline(0), n), (0, 2), "`a` and `b`");
+        assert_eq!(tally(&l, item(1, 0), n), (1, 1), "just `a1`");
+        assert_eq!(tally(&l, headline(0), n), (0, 2), "`a` and `b`");
     }
 
     /// The ancestor chain the fallback walks: innermost item first, then the

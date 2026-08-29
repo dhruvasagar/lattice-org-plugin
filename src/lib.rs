@@ -252,6 +252,8 @@ const AGENDA_APPLY: u32 = 40;
 /// EVENTS store (design D6) and are reached from here by emitting a plugin
 /// event — the two are separate `Store`s of this same component, with separate
 /// linear memories, so the bus is the only bridge between them.
+/// Shared parse callback: these four take no arguments, so one is enough.
+const CLOCK_PARSE: u32 = 45;
 const CLOCK_IN: u32 = 41;
 const CLOCK_OUT: u32 = 42;
 const CLOCK_CANCEL: u32 = 43;
@@ -1089,28 +1091,55 @@ impl Guest for Component {
         );
         // OC.6 — the clock. Four chords, each doing exactly one buffer edit and
         // then telling org's own async side what happened.
-        register_action(
+        // OC.7: EX-COMMANDS, not actions — so `:org-clock-in` works as well as
+        // `<leader>oi`. One registration serves both surfaces: a mode keymap
+        // binding resolves a command by NAME and does not care about its kind,
+        // while `:` resolves only ex-commands (`excommand.rs` answers `Unknown`
+        // for an action, and there is no `action:` kind-prefix). Registering as
+        // an action would have given the chord and nothing else.
+        //
+        // That is design §5.2.1's unification made real rather than restated:
+        // the `:` line is a parser front-end onto the one dispatcher, so the
+        // same entry is reachable both ways with one body behind it.
+        //
+        // Reachable at all only because of OC.10 — before it an ex-command got
+        // no cursor and no buffer id, so three of these four could not have been
+        // written in this form.
+        let clock_ex = || ExCommandSpec {
+            latency_class: LatencyClass::Reflex,
+            accepts_bang: false,
+            accepts_range: false,
+            args_schema: Vec::new(),
+            surface_form: SurfaceForm::Keyword,
+        };
+        lattice::plugin_host::grammar::register_ex_command(
             "org-clock-in",
-            "Start a clock on the entry at the cursor",
-            &spec(),
+            "Start a clock on the entry at the cursor.",
+            &clock_ex(),
+            CLOCK_PARSE,
             CLOCK_IN,
         );
-        register_action(
+        lattice::plugin_host::grammar::register_ex_command(
             "org-clock-out",
-            "Stop the running clock on the entry at the cursor",
-            &spec(),
+            "Stop the running clock on the entry at the cursor, writing its end \
+             stamp and elapsed time.",
+            &clock_ex(),
+            CLOCK_PARSE,
             CLOCK_OUT,
         );
-        register_action(
+        lattice::plugin_host::grammar::register_ex_command(
             "org-clock-cancel",
-            "Discard the running clock on the entry at the cursor",
-            &spec(),
+            "Discard the running clock on the entry at the cursor, leaving no \
+             trace of it.",
+            &clock_ex(),
+            CLOCK_PARSE,
             CLOCK_CANCEL,
         );
-        register_action(
+        lattice::plugin_host::grammar::register_ex_command(
             "org-clock-goto",
-            "Jump to the entry the running clock is on",
-            &spec(),
+            "Jump to the entry the running clock is on.",
+            &clock_ex(),
+            CLOCK_PARSE,
             CLOCK_GOTO,
         );
         register_action(
@@ -1511,6 +1540,37 @@ fn clamped_cursor(
 /// through here. The range ends at the last line's end and NOT at its newline,
 /// which is what keeps a whole-subtree rewrite from eating the blank line after
 /// it — the same rule `shift` follows.
+/// [`replace_lines`] against a buffer id rather than an action context.
+///
+/// OC.7 needed it: the clock's bodies are reached from the EX-COMMAND seam as
+/// well as from a chord, and the two contexts are different types carrying the
+/// same two fields. Taking the id keeps one body serving both.
+fn replace_lines_at(
+    buffer_id: u32,
+    from: u32,
+    to: u32,
+    to_len: u32,
+    text: String,
+    cursor: Position,
+) -> Vec<Effect> {
+    vec![Effect::ApplyEdit(
+        lattice::plugin_host::types::ApplyEditPayload {
+            target: buffer_id,
+            edit: Edit {
+                range: Range {
+                    start: Position { line: from, byte: 0 },
+                    end: Position {
+                        line: to,
+                        byte: to_len,
+                    },
+                },
+                kind: EditKind::Replace(text),
+            },
+            cursor: Some(cursor),
+        },
+    )]
+}
+
 fn replace_lines(
     ctx: &ActionContext,
     from: u32,
@@ -1687,7 +1747,16 @@ fn clock_title(text: &str) -> String {
 }
 
 /// `<leader>oi` — start a clock on the entry at the cursor.
-fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+/// `cursor` and `buffer_id` rather than a context type, because since OC.10 the
+/// action and ex-command contexts both carry exactly these two and the body
+/// cares about nothing else. Naming the fields keeps it usable from either
+/// surface without a conversion in between.
+fn clock_in(
+    cursor: Position,
+    buffer_id: u32,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let hl = headline::Headlines::new(tree, &line, doc.line_count());
     let lb = clock::Logbook::new(&hl);
@@ -1696,20 +1765,20 @@ fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) ->
     // treats that as an error, and silently writing one would make the drawer's
     // first line stop being the running clock — which is what makes finding it
     // a single-line look rather than a scan.
-    if lb.running(ctx.cursor.line).is_some() {
+    if lb.running(cursor.line).is_some() {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org: this entry already has a running clock".to_string(),
         })];
     }
     let now = clock_now();
-    let Some(ins) = lb.clock_in(ctx.cursor.line, now) else {
+    let Some(ins) = lb.clock_in(cursor.line, now) else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org: no entry here to clock into".to_string(),
         })];
     };
-    let Some((headline_line, _)) = hl.enclosing(ctx.cursor.line) else {
+    let Some((headline_line, _)) = hl.enclosing(cursor.line) else {
         return vec![Effect::None];
     };
     let title = hl.text(headline_line).map(|t| clock_title(&t)).unwrap_or_default();
@@ -1727,7 +1796,7 @@ fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) ->
     // replace, so nothing that was there is touched.
     vec![
         Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
-            target: ctx.buffer_id,
+            target: buffer_id,
             edit: Edit {
                 range: Range {
                     start: Position { line: ins.line, byte: 0 },
@@ -1735,7 +1804,7 @@ fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) ->
                 },
                 kind: EditKind::Replace(ins.text),
             },
-            cursor: Some(ctx.cursor),
+            cursor: Some(cursor),
         }),
     ]
 }
@@ -1748,7 +1817,8 @@ fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) ->
 /// the async side to stop) is identical. Two copies would be two chances for
 /// the "tell the async side" half to be forgotten in one of them.
 fn clock_stop(
-    ctx: &ActionContext,
+    cursor: Position,
+    buffer_id: u32,
     doc: &Document,
     tree: Option<&TreeSnapshot>,
     discard: bool,
@@ -1759,7 +1829,7 @@ fn clock_stop(
 
     // Re-derived from the buffer, never from the session (design D4) — which is
     // exactly why this works after a restart, when there is no session at all.
-    let Some(running) = lb.running(ctx.cursor.line) else {
+    let Some(running) = lb.running(cursor.line) else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org: no running clock on this entry".to_string(),
@@ -1776,7 +1846,7 @@ fn clock_stop(
         // and no blank line is left behind.
         return vec![
             Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
-                target: ctx.buffer_id,
+                target: buffer_id,
                 edit: Edit {
                     range: Range {
                         start: Position { line: from, byte: 0 },
@@ -1795,13 +1865,13 @@ fn clock_stop(
     let Some(closed) = clock::close(&text, clock_now()) else {
         return vec![Effect::None];
     };
-    replace_lines(
-        ctx,
+    replace_lines_at(
+        buffer_id,
         running.line,
         running.line,
         text.len() as u32,
         closed,
-        ctx.cursor,
+        cursor,
     )
 }
 
@@ -2527,10 +2597,6 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),
-            CLOCK_IN => Ok(clock_in(&ctx, doc, tree)),
-            CLOCK_OUT => Ok(clock_stop(&ctx, doc, tree, false)),
-            CLOCK_CANCEL => Ok(clock_stop(&ctx, doc, tree, true)),
-            CLOCK_GOTO => Ok(clock_goto()),
             REFILE => Ok(vec![Effect::OpenPicker(
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: REFILE_PICKER.to_string(),
@@ -2779,6 +2845,15 @@ impl GrammarCallbacks for Component {
     /// split the host's `:agenda` kept before this moved.
     fn parse_ex_args(callback: u32, rest: String, _bang: bool) -> Result<Args, String> {
         match callback {
+            // OC.7: the clock's four take nothing. Anything typed after the
+            // command is a mistake worth naming rather than ignoring.
+            CLOCK_PARSE => {
+                if rest.trim().is_empty() {
+                    Ok(Args::None)
+                } else {
+                    Err("org: this command takes no arguments".to_string())
+                }
+            }
             AGENDA_PARSE => {
                 let trimmed = rest.trim();
                 Ok(if trimmed.is_empty() {
@@ -2794,10 +2869,17 @@ impl GrammarCallbacks for Component {
     fn apply_ex_command(
         callback: u32,
         ctx: ExCommandContext,
-        _doc: &Document,
-        _tree: Option<&TreeSnapshot>,
+        doc: &Document,
+        tree: Option<&TreeSnapshot>,
     ) -> Result<Vec<Effect>, String> {
         match callback {
+            // OC.7: the clock. `ctx` carries the cursor and the buffer id since
+            // OC.10, and `doc` / `tree` arrived with them — which is the whole
+            // reason these can be ex-commands at all.
+            CLOCK_IN => Ok(clock_in(ctx.cursor, ctx.buffer_id, doc, tree)),
+            CLOCK_OUT => Ok(clock_stop(ctx.cursor, ctx.buffer_id, doc, tree, false)),
+            CLOCK_CANCEL => Ok(clock_stop(ctx.cursor, ctx.buffer_id, doc, tree, true)),
+            CLOCK_GOTO => Ok(clock_goto()),
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered
             // `agenda-source` for rows. This plugin does not open it — it rings

@@ -54,6 +54,42 @@ Only `src` blocks inject. `#+begin_example`, `#+begin_quote` and the rest are
 verbatim or prose by definition, and stay that way even when they name a
 language.
 
+## Clocking
+
+Track time against an entry. The clock line lives in a `:LOGBOOK:` drawer under
+the headline, newest first, and the file is the only record — nothing is kept
+elsewhere, so a clock survives a restart and can be closed by any editor.
+
+| chord | command | what it does |
+|---|---|---|
+| `<leader>oi` | `:org-clock-in` | start a clock on the entry at the cursor |
+| `<leader>oO` | `:org-clock-out` | close it, writing the end stamp and elapsed time |
+| `<leader>oq` | `:org-clock-cancel` | discard it, leaving no trace |
+| `<leader>oj` | `:org-clock-goto` | jump to the entry the clock is on |
+
+Each is one registration reachable two ways — the chord and the `:` line run the
+same code.
+
+```org
+* TODO Write the clocking slice
+:LOGBOOK:
+CLOCK: [2026-08-29 Sat 10:45]--[2026-08-29 Sat 12:15] =>  1:30
+:END:
+```
+
+While a clock runs the modeline shows `◷ 0:14` and the entry's headline, updated
+once a minute off the keystroke path — typing is never delayed by it.
+
+Times are **local**, not UTC, and the drawer is created for you if the entry has
+none. The clock line goes below any `SCHEDULED:`/`DEADLINE:` line and any
+`:PROPERTIES:` drawer, which is where org puts it.
+
+Clocking in on an entry that already has a running clock is refused rather than
+stacking a second one. Clocking out re-reads the buffer rather than trusting
+anything remembered, so it works on a clock started before the editor was last
+closed. `<leader>oj` is the one thing that does need this session's memory — it
+has nowhere to jump to after a restart, and says so.
+
 ## Folding
 
 `za` toggles, `zR` opens everything, `zM` closes everything — the ordinary

@@ -144,6 +144,22 @@ fn press(editor: &mut Editor, keys: &str) {
     }
 }
 
+/// Submit a `:` line the way the renderer does.
+///
+/// `execute_ex_line` dispatches and leaves its effects in the `DispatchOutcome`
+/// for the caller to drain — `dispatch_chord` (behind `press`) drains its own,
+/// which is why a chord "just works" in a test and a `:` line does not. Missing
+/// this reads exactly like a broken command: the guest ran, produced the right
+/// edit, and nothing applied it.
+fn ex(editor: &mut Editor, line: &str) {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line(line, &mut out);
+    for action in out.next_actions {
+        let _ = editor.dispatch(action);
+    }
+    editor.run_tick_pending();
+}
+
 fn goto_line(editor: &mut Editor, line: u32) {
     editor.cursor.line = line;
     editor.cursor.byte = 0;
@@ -355,5 +371,91 @@ async fn there_is_nothing_to_clock_into_in_the_preamble() {
         text(&editor),
         "#+TITLE: Notes\n\n* Task\n",
         "the buffer is untouched"
+    );
+}
+
+/// OC.7 — the four are `:` commands as well as chords, from ONE registration.
+///
+/// This is design §5.2.1's unification, and it is the assertion that would have
+/// failed silently: OC.6 registered them with `register_action`, and
+/// `excommand.rs` answers `Unknown` for an action kind (there is no `action:`
+/// prefix either), so `:org-clock-in` reported "unknown command" while
+/// `<leader>oi` worked perfectly. Nothing in a chord-driven test can see that.
+///
+/// It is reachable at all only because of OC.10: before it an ex-command was
+/// handed no cursor and no buffer id, so it could locate no entry and name no
+/// edit target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_clock_is_reachable_from_the_ex_line() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+
+    goto_line(&mut editor, 1);
+    ex(&mut editor, "org-clock-in");
+
+    let got = text(&editor);
+    let lines: Vec<&str> = got.lines().collect();
+    assert_eq!(
+        lines[1], ":LOGBOOK:",
+        "`:org-clock-in` must do what `<leader>oi` does; got {got:?}"
+    );
+    assert!(lines[2].starts_with("CLOCK: ["));
+
+    // …and out again, so the pair is proven rather than just the entry point.
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-clock-out");
+    assert!(
+        text(&editor).lines().nth(2).unwrap().contains("=>"),
+        "`:org-clock-out` closed the line"
+    );
+}
+
+/// The chord and the `:` line reach the SAME registration, so the chord did not
+/// quietly stop working when the four became ex-commands.
+///
+/// A mode keymap binding resolves a command by NAME and does not filter on its
+/// kind — which is what makes one registration serve both surfaces — but that is
+/// a property of the host worth pinning from here, since org is what depends on
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_chord_still_works_now_that_it_binds_an_ex_command() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>oi");
+
+    assert_eq!(
+        text(&editor).lines().nth(1),
+        Some(":LOGBOOK:"),
+        "the chord binds the ex-command by name and dispatches it"
+    );
+}
+
+/// These take no arguments, and saying so beats ignoring what was typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_clock_commands_refuse_arguments() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-clock-in nonsense");
+
+    assert_eq!(
+        text(&editor),
+        "* Task\nbody\n",
+        "a refused parse must not edit the buffer"
     );
 }

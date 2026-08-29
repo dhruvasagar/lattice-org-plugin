@@ -465,8 +465,17 @@ impl Guest for Component {
             "todo-keywords",
             OptionType::String,
             DEFAULT_TODO_KEYWORDS,
-            "TODO keywords `<leader>ot` cycles through, in order. `|` separates \
-             not-done from done states and is ignored when cycling.",
+            "TODO keywords, one sequence per line, in emacs' \
+             `org-todo-keywords` syntax:\n\n\
+             \x20 sequence: TODO(t) NEXT(n) | DONE(d)\n\
+             \x20 type: PROJECT TO-READ READING(!/!)\n\n\
+             `|` separates not-done from done. `(t)` is a fast-select key. \
+             `(@)` / `(!)` / `(@/!)` are logging specs \u{2014} parsed, not yet \
+             acted on. A bare list with no `sequence:` / `type:` prefix is a \
+             sequence, so the old flat spelling still means what it meant. \
+             Cycling follows this option live; the per-keyword COLOURS resolve \
+             at load, so a change needs a reload to recolour (emacs is the \
+             same).",
         );
         let _ = register_option(
             "highest-priority",

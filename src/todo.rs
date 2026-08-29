@@ -36,6 +36,247 @@ pub struct Headline<'a> {
     pub tags: Vec<&'a str>,
 }
 
+// ── TK.2: the `org-todo-keywords` grammar ────────────────────────────────────
+
+/// What a sequence line declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceKind {
+    /// `sequence:` — a workflow, cycled in order.
+    Sequence,
+    /// `type:` — a set of alternatives rather than a progression.
+    Type,
+}
+
+/// What org logs when a state is entered or left.
+///
+/// **Parsed and deliberately inert.** Acting on these means writing
+/// `:LOGBOOK:` notes and timestamps on every state change, which is its own
+/// slice with its own tests. Parsing them now is what lets an emacs
+/// configuration be pasted with nothing silently misread — the failure this
+/// replaces is `WAITING(w@/!)` becoming a keyword whose *name* is
+/// `WAITING(w@/!)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Logging {
+    /// `@` — prompt for a note when the state is entered.
+    pub note_on_entry: bool,
+    /// `!` — record a timestamp when the state is entered.
+    pub stamp_on_entry: bool,
+    /// `/@` — prompt for a note when the state is left.
+    pub note_on_exit: bool,
+    /// `/!` — record a timestamp when the state is left.
+    pub stamp_on_exit: bool,
+}
+
+impl Logging {
+    fn is_empty(self) -> bool {
+        self == Logging::default()
+    }
+}
+
+/// One TODO state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyword {
+    /// The bare word as it appears on a headline — `WAITING`.
+    pub name: String,
+    /// The fast-select key from `(w)`, if any (TK.6).
+    pub key: Option<char>,
+    /// The logging spec from `(@/!)`.
+    pub logging: Logging,
+    /// Right of the `|` in its sequence.
+    pub done: bool,
+    /// Which declaration line it came from, and of what kind.
+    pub kind: SequenceKind,
+    /// 0-based index of the sequence that declared it.
+    pub sequence: usize,
+}
+
+/// A parsed `org.todo-keywords`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Keywords {
+    pub all: Vec<Keyword>,
+    /// One message per refused line or keyword, for a one-shot `warn` at
+    /// load. Never fatal: one bad line must not cost a user every keyword.
+    pub problems: Vec<String>,
+}
+
+impl Keywords {
+    pub fn names(&self) -> Vec<String> {
+        self.all.iter().map(|k| k.name.clone()).collect()
+    }
+
+    /// `(not_done, done)` names, in declaration order.
+    pub fn split(&self) -> (Vec<String>, Vec<String>) {
+        let mut nd = Vec::new();
+        let mut d = Vec::new();
+        for k in &self.all {
+            if k.done { &mut d } else { &mut nd }.push(k.name.clone());
+        }
+        (nd, d)
+    }
+}
+
+/// Parse emacs' `org-todo-keywords`, one sequence per line.
+///
+/// ```text
+/// sequence: TODO(t) NEXT(n) | DONE(d)
+/// sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING
+/// type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)
+/// ```
+///
+/// A line with no `sequence:` / `type:` prefix is a `sequence:`, so the old
+/// flat `"TODO | DONE"` spelling still parses to exactly what it always meant.
+/// That is what lets this replace the old option rather than sit beside it.
+pub fn parse_todo_keywords(spec: &str) -> Keywords {
+    let mut out = Keywords::default();
+    let mut seen_keys: Vec<(char, String)> = Vec::new();
+
+    for (line_no, raw) in spec.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (kind, body) = match line.split_once(':') {
+            Some((head, rest)) if head.trim().eq_ignore_ascii_case("sequence") => {
+                (SequenceKind::Sequence, rest)
+            }
+            Some((head, rest)) if head.trim().eq_ignore_ascii_case("type") => {
+                (SequenceKind::Type, rest)
+            }
+            // A bare list is a sequence — the old flat spelling.
+            _ => (SequenceKind::Sequence, line),
+        };
+
+        let seq = out.all.last().map(|k| k.sequence + 1).unwrap_or(0);
+        let mut past_bar = false;
+        let mut any = false;
+        for word in body.split_whitespace() {
+            if word == "|" {
+                past_bar = true;
+                continue;
+            }
+            match parse_keyword(word, past_bar, kind, seq) {
+                Ok(kw) => {
+                    if out.all.iter().any(|k| k.name == kw.name) {
+                        out.problems.push(format!(
+                            "line {}: duplicate keyword `{}` — keeping the first",
+                            line_no + 1,
+                            kw.name
+                        ));
+                        continue;
+                    }
+                    let clash = kw.key.and_then(|key| {
+                        seen_keys
+                            .iter()
+                            .find(|(k, _)| *k == key)
+                            .map(|(_, owner)| (key, owner.clone()))
+                    });
+                    let mut kw = kw;
+                    if let Some((key, owner)) = clash {
+                        out.problems.push(format!(
+                            "line {}: fast-select key `{}` already belongs to `{}` — \
+                             `{}` keeps its state but loses the shortcut",
+                            line_no + 1,
+                            key,
+                            owner,
+                            kw.name
+                        ));
+                        kw.key = None;
+                    } else if let Some(key) = kw.key {
+                        seen_keys.push((key, kw.name.clone()));
+                    }
+                    out.all.push(kw);
+                    any = true;
+                }
+                Err(why) => out.problems.push(format!("line {}: {why}", line_no + 1)),
+            }
+        }
+        if !any {
+            out.problems
+                .push(format!("line {}: no keywords", line_no + 1));
+        }
+    }
+    out
+}
+
+/// One `WORD`, `WORD(k)`, `WORD(@/!)` or `WORD(k@/!)`.
+fn parse_keyword(
+    word: &str,
+    done: bool,
+    kind: SequenceKind,
+    sequence: usize,
+) -> Result<Keyword, String> {
+    let (name, spec) = match word.split_once('(') {
+        Some((n, rest)) => match rest.strip_suffix(')') {
+            Some(inner) => (n, Some(inner)),
+            None => return Err(format!("`{word}`: unclosed `(`")),
+        },
+        None => (word, None),
+    };
+    if name.is_empty() {
+        return Err(format!("`{word}`: no keyword before `(`"));
+    }
+    // A keyword has to be able to match a headline's first expr, so it is a
+    // plain word. Refusing here is also what keeps TK.4's generated query
+    // from ever interpolating something that needs escaping.
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!(
+            "`{name}`: a keyword must be letters, digits, `_` or `-` — it has to \
+             match the first word of a headline"
+        ));
+    }
+
+    let mut key = None;
+    let mut logging = Logging::default();
+    if let Some(spec) = spec {
+        let (entry, exit) = match spec.split_once('/') {
+            Some((a, b)) => (a, Some(b)),
+            None => (spec, None),
+        };
+        // The fast-select key is a leading char that is not a log marker.
+        let mut entry_chars = entry.chars().peekable();
+        let leading = entry_chars.peek().copied();
+        if let Some(c) = leading {
+            if c != '@' && c != '!' {
+                key = Some(c);
+                entry_chars.next();
+            }
+        }
+        for c in entry_chars {
+            match c {
+                '@' => logging.note_on_entry = true,
+                '!' => logging.stamp_on_entry = true,
+                other => {
+                    return Err(format!("`{word}`: `{other}` is not `@`, `!` or `/`"));
+                }
+            }
+        }
+        for c in exit.unwrap_or("").chars() {
+            match c {
+                '@' => logging.note_on_exit = true,
+                '!' => logging.stamp_on_exit = true,
+                other => {
+                    return Err(format!("`{word}`: `{other}` is not `@` or `!` after `/`"));
+                }
+            }
+        }
+        if key.is_none() && logging.is_empty() {
+            return Err(format!("`{word}`: `()` declares nothing"));
+        }
+    }
+
+    Ok(Keyword {
+        name: name.to_string(),
+        key,
+        logging,
+        done,
+        kind,
+        sequence,
+    })
+}
+
 /// The configured keyword list, e.g. `"TODO NEXT | DONE"`.
 ///
 /// The `|` is org's separator between "not done" and "done" states. It matters
@@ -48,25 +289,17 @@ pub struct Headline<'a> {
 /// means "the keyword is on the right of the bar". A spec with no `|` has no
 /// done states at all, which is org's rule and not a degradation: the user
 /// who writes `#+TODO: A B C` meant three open states.
+///
+/// TK.2: a thin accessor over [`parse_todo_keywords`] rather than a second
+/// parser. Two implementations of "what is a keyword" is exactly the drift
+/// this file's header warns about for the parse tree, one layer down.
 pub fn split_keywords(spec: &str) -> (Vec<String>, Vec<String>) {
-    let mut not_done = Vec::new();
-    let mut done = Vec::new();
-    let mut past_bar = false;
-    for word in spec.split_whitespace() {
-        if word == "|" {
-            past_bar = true;
-            continue;
-        }
-        if past_bar { &mut done } else { &mut not_done }.push(word.to_string());
-    }
-    (not_done, done)
+    parse_todo_keywords(spec).split()
 }
 
+/// Every keyword's name, in declaration order. See [`split_keywords`].
 pub fn parse_keywords(spec: &str) -> Vec<String> {
-    spec.split_whitespace()
-        .filter(|w| *w != "|")
-        .map(str::to_string)
-        .collect()
+    parse_todo_keywords(spec).names()
 }
 
 /// Split a headline into its parts, or `None` if `line` is not a headline.
@@ -241,6 +474,171 @@ mod tests {
 
     fn kw() -> Vec<String> {
         parse_keywords("TODO NEXT | DONE")
+    }
+
+    // ---- TK.2: the `org-todo-keywords` grammar ----
+
+    /// Dhruva's own emacs configuration, transcribed one sequence per
+    /// line. This is the fixture because it is the thing that did not
+    /// work: pasted into the old flat option, `WAITING(w@/!)` became a
+    /// keyword whose NAME was `WAITING(w@/!)` and matched nothing.
+    const REAL: &str = "\
+sequence: TODO(t) NEXT(n) | DONE(d)
+sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING
+type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)";
+
+    #[test]
+    fn tk2_the_real_configuration_parses_whole() {
+        let k = parse_todo_keywords(REAL);
+        assert!(k.problems.is_empty(), "{:?}", k.problems);
+        assert_eq!(
+            k.names(),
+            [
+                "TODO",
+                "NEXT",
+                "DONE",
+                "WAITING",
+                "HOLD",
+                "CANCELLED",
+                "PHONE",
+                "MEETING",
+                "PROJECT",
+                "TO-READ",
+                "READING",
+                "TO-WATCH",
+                "WATCHING"
+            ]
+        );
+    }
+
+    #[test]
+    fn tk2_the_bar_decides_done() {
+        let (not_done, done) = parse_todo_keywords(REAL).split();
+        assert_eq!(done, ["DONE", "CANCELLED", "PHONE", "MEETING"]);
+        assert!(not_done.contains(&"TODO".to_string()));
+        assert!(not_done.contains(&"WAITING".to_string()));
+        // A `type:` line has no bar, so nothing on it is done.
+        assert!(not_done.contains(&"PROJECT".to_string()));
+        assert!(not_done.contains(&"WATCHING".to_string()));
+    }
+
+    #[test]
+    fn tk2_type_is_distinguished_from_sequence() {
+        let k = parse_todo_keywords(REAL);
+        let by = |n: &str| k.all.iter().find(|x| x.name == n).unwrap().kind;
+        assert_eq!(by("TODO"), SequenceKind::Sequence);
+        assert_eq!(by("PROJECT"), SequenceKind::Type);
+    }
+
+    #[test]
+    fn tk2_fast_select_keys_are_recovered() {
+        let k = parse_todo_keywords(REAL);
+        let key = |n: &str| k.all.iter().find(|x| x.name == n).unwrap().key;
+        assert_eq!(key("TODO"), Some('t'));
+        assert_eq!(key("NEXT"), Some('n'));
+        assert_eq!(key("DONE"), Some('d'));
+        assert_eq!(key("WAITING"), Some('w'));
+        assert_eq!(key("CANCELLED"), Some('c'));
+        // No `(k)` at all, and `(!/!)` which is logging only.
+        assert_eq!(key("PHONE"), None);
+        assert_eq!(key("READING"), None);
+    }
+
+    /// The specific failure TK.2 exists to end: the logging spec must
+    /// not end up part of the keyword's name.
+    #[test]
+    fn tk2_logging_specs_are_parsed_and_not_part_of_the_name() {
+        let k = parse_todo_keywords(REAL);
+        let w = k.all.iter().find(|x| x.name == "WAITING").unwrap();
+        assert_eq!(w.name, "WAITING", "not `WAITING(w@/!)`");
+        assert_eq!(
+            w.logging,
+            Logging {
+                note_on_entry: true,
+                stamp_on_exit: true,
+                ..Default::default()
+            }
+        );
+        let r = k.all.iter().find(|x| x.name == "READING").unwrap();
+        assert_eq!(
+            r.logging,
+            Logging {
+                stamp_on_entry: true,
+                stamp_on_exit: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// The old flat spelling still means exactly what it meant, which
+    /// is what lets this replace the option rather than sit beside it.
+    #[test]
+    fn tk2_the_old_flat_spelling_is_unchanged() {
+        assert_eq!(parse_keywords("TODO NEXT | DONE"), ["TODO", "NEXT", "DONE"]);
+        assert_eq!(
+            split_keywords("TODO NEXT | DONE"),
+            (
+                vec!["TODO".to_string(), "NEXT".to_string()],
+                vec!["DONE".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn tk2_a_bad_keyword_costs_only_itself() {
+        let k = parse_todo_keywords("sequence: TODO BAD(unclosed NEXT | DONE");
+        assert_eq!(k.names(), ["TODO", "NEXT", "DONE"]);
+        assert_eq!(k.problems.len(), 1);
+        assert!(k.problems[0].contains("unclosed"), "{:?}", k.problems);
+    }
+
+    #[test]
+    fn tk2_a_keyword_that_could_never_match_a_headline_is_refused() {
+        let k = parse_todo_keywords("sequence: TODO IN[PROGRESS] | DONE");
+        assert_eq!(k.names(), ["TODO", "DONE"]);
+        assert_eq!(k.problems.len(), 1);
+    }
+
+    #[test]
+    fn tk2_a_duplicate_keyword_keeps_the_first() {
+        let k = parse_todo_keywords("sequence: TODO | DONE\nsequence: TODO NEXT | DONE");
+        assert_eq!(k.names(), ["TODO", "DONE", "NEXT"]);
+        assert_eq!(k.problems.len(), 2, "{:?}", k.problems);
+        assert!(k.problems.iter().all(|p| p.contains("duplicate")));
+    }
+
+    /// A key clash costs the shortcut, never the state — a keyword the
+    /// file already contains must stay reachable.
+    #[test]
+    fn tk2_a_duplicate_fast_select_key_keeps_the_state() {
+        let k = parse_todo_keywords("sequence: TODO(t) TASK(t) | DONE(d)");
+        assert_eq!(k.names(), ["TODO", "TASK", "DONE"]);
+        let key = |n: &str| k.all.iter().find(|x| x.name == n).unwrap().key;
+        assert_eq!(key("TODO"), Some('t'));
+        assert_eq!(key("TASK"), None, "loses the shortcut, keeps the state");
+        assert_eq!(k.problems.len(), 1);
+    }
+
+    #[test]
+    fn tk2_blank_and_comment_lines_are_ignored() {
+        let k = parse_todo_keywords("\n# my states\nsequence: TODO | DONE\n\n");
+        assert_eq!(k.names(), ["TODO", "DONE"]);
+        assert!(k.problems.is_empty(), "{:?}", k.problems);
+    }
+
+    #[test]
+    fn tk2_an_empty_parens_declares_nothing_and_says_so() {
+        let k = parse_todo_keywords("sequence: TODO() | DONE");
+        assert_eq!(k.names(), ["DONE"]);
+        assert_eq!(k.problems.len(), 1);
+    }
+
+    #[test]
+    fn tk2_a_sequence_with_no_bar_has_no_done_states() {
+        // org's rule, not a degradation: `A B C` means three open states.
+        let (not_done, done) = parse_todo_keywords("type: A B C").split();
+        assert_eq!(not_done, ["A", "B", "C"]);
+        assert!(done.is_empty());
     }
 
     #[test]

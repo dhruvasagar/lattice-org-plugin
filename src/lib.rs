@@ -125,7 +125,7 @@ use lattice::plugin_host::events;
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
 use lattice::plugin_host::help::register_topic;
 use lattice::plugin_host::host_services;
-use lattice::plugin_host::language::{register_language, LanguageSpec};
+use lattice::plugin_host::language::{register_language, ConcealRule, LanguageSpec};
 use lattice::plugin_host::modes::{
     register_mode, ActivationPolicy, BindingMode, ModeCapabilities, ModeDeclaration,
     ModeKeymapBinding, ModeKind, ModeOptionOverride, OverridePriority,
@@ -384,6 +384,61 @@ fn highest_priority() -> char {
         .unwrap_or('C')
 }
 
+/// OL.2 — what org hides when it renders.
+///
+/// Two rules and nothing else: the mechanism, the coordinate maths and
+/// the mode scoping are all the host's (`conceal.md`). Org contributes
+/// patterns; it does not learn how concealment works, and the host does
+/// not learn what an org link is.
+///
+/// ## Why patterns and not the tree
+///
+/// Everything else in this plugin was migrated ONTO the tree in OT.x,
+/// so this looks like a regression and is not. `tree-sitter-org` has no
+/// `link` rule at all — `[[id:X][Title]]` is undifferentiated `expr`
+/// tokens inside `item` or `paragraph`, so there is nothing to capture.
+/// And the tree is absent during a reparse, so tree-driven conceal
+/// would flicker between concealed and raw while the user types: a
+/// pixel change to content they did not edit. `links.rs` already
+/// recorded that second reason for its own text scanning.
+///
+/// This is "structure from the tree, characters from the text" applied
+/// honestly rather than abandoned: a link has no structure in this
+/// grammar, so there is none to read.
+///
+/// ## The bare rule keeps its target visible
+///
+/// `[[https://example.com]]` renders as `https://example.com`, not as
+/// nothing. Emacs draws the same line, and the reason is not deference:
+/// a link whose only text IS its target has nothing left to show once
+/// the target is hidden, and an invisible activatable region is worse
+/// than visible markup.
+///
+/// ## Declaration order does not matter
+///
+/// An earlier revision of the design said the described rule had to be
+/// declared first or a described link would be matched as a bare one.
+/// It was wrong twice: the host UNIONS every rule's hidden spans, so no
+/// rule consumes text before another sees it; and independently the
+/// bare pattern's `[^]]+` stops at the first `]`, so it never reaches a
+/// described link's closing `]]` and cannot match it at all. The two
+/// patterns are disjoint by construction — a property of how they are
+/// written, which is why the host-side tests assert it.
+fn conceal_rules() -> Vec<ConcealRule> {
+    vec![
+        // `[[target][description]]` → `description`.
+        ConcealRule {
+            pattern: r"(\[\[[^]]+\]\[)[^]]+(\]\])".to_string(),
+            hide: vec![1, 2],
+        },
+        // `[[target]]` → `target`.
+        ConcealRule {
+            pattern: r"(\[\[)([^]]+)(\]\])".to_string(),
+            hide: vec![1, 3],
+        },
+    ]
+}
+
 impl Guest for Component {
     /// OM.7's options. Auto-namespaced by the host to `org.*`, so these are
     /// `org.todo-keywords` and `org.highest-priority` to the user.
@@ -478,10 +533,7 @@ impl Guest for Component {
             injections: Some(include_str!("../queries/injections.scm").to_string()),
             indents: None,
             textobjects: None,
-            // OL.2 fills this in. Empty here so OL.1 lands on its own:
-            // the WIT field is required, so `Target::Id` could not be
-            // added without it.
-            conceal_rules: vec![],
+            conceal_rules: conceal_rules(),
         });
     }
 
@@ -3789,6 +3841,144 @@ fn fields_menu(
         }],
         footer: Some("c to capture, q to abandon".to_string()),
     })
+}
+
+#[cfg(test)]
+mod conceal_rule_tests {
+    use super::conceal_rules;
+    use lattice_syntax::conceal::{compile_rules, conceal_spans};
+
+    /// Compile org's declared rules through the HOST's own compiler.
+    ///
+    /// `lattice-syntax` is already a dev-dependency, so these tests run
+    /// the real evaluator rather than a re-implementation of it. That
+    /// matters more than convenience: a hand-rolled union in this crate
+    /// could agree with itself forever while disagreeing with the thing
+    /// that actually renders the buffer.
+    fn compiled() -> Vec<lattice_syntax::conceal::ConcealRule> {
+        let declared: Vec<(String, Vec<u32>)> = conceal_rules()
+            .into_iter()
+            .map(|r| (r.pattern, r.hide))
+            .collect();
+        let (ok, errs) = compile_rules(&declared);
+        assert!(
+            errs.is_empty(),
+            "org must ship rules the host accepts: {errs:?}"
+        );
+        assert_eq!(ok.len(), declared.len());
+        ok
+    }
+
+    /// What the user actually sees, via the host's span union.
+    fn rendered(line: &str) -> String {
+        let rules = compiled();
+        let mut out = String::new();
+        let mut at = 0usize;
+        for (s, e) in conceal_spans(&rules, line) {
+            out.push_str(&line[at..s as usize]);
+            at = e as usize;
+        }
+        out.push_str(&line[at..]);
+        out
+    }
+
+    /// The registration gate, asserted here rather than discovered as a
+    /// `warn` in someone's editor: every rule org ships must compile,
+    /// name only groups its pattern has, and hide at least one that is
+    /// not group 0.
+    #[test]
+    fn every_rule_org_ships_is_one_the_host_accepts() {
+        let _ = compiled();
+        for r in conceal_rules() {
+            assert!(!r.hide.is_empty(), "{}", r.pattern);
+            assert!(!r.hide.contains(&0), "{}", r.pattern);
+        }
+    }
+
+    #[test]
+    fn a_described_link_collapses_to_its_description() {
+        assert_eq!(
+            rendered("* See [[id:6F398E54][Project Kickoff]] before Friday."),
+            "* See Project Kickoff before Friday."
+        );
+    }
+
+    /// A link whose only text IS its target has nothing left to show
+    /// once the target is hidden, so the target stays. Emacs draws the
+    /// same line.
+    #[test]
+    fn a_bare_link_keeps_its_target() {
+        assert_eq!(
+            rendered("see [[https://example.com]] ok"),
+            "see https://example.com ok"
+        );
+    }
+
+    #[test]
+    fn two_links_on_one_line_both_collapse() {
+        assert_eq!(rendered("[[id:A][one]] and [[id:B][two]]"), "one and two");
+    }
+
+    #[test]
+    fn a_file_link_collapses_like_any_other() {
+        assert_eq!(
+            rendered("[[file:img/diagram.png][a wiring diagram]]"),
+            "a wiring diagram"
+        );
+    }
+
+    #[test]
+    fn a_malformed_link_is_left_entirely_alone() {
+        let line = "[[id:6F39][unterminated";
+        assert_eq!(rendered(line), line);
+    }
+
+    /// The property the retracted "declaration order matters" claim was
+    /// actually worried about, asserted as what is true: the two
+    /// patterns cannot both match one link. `[^]]+` stops at the first
+    /// `]`, so the bare pattern never reaches a described link's closing
+    /// `]]`.
+    ///
+    /// Pinned in the crate that OWNS the patterns, because it is a
+    /// property of how they are written — a future edit that made them
+    /// overlap would reintroduce exactly the failure the old rule
+    /// feared, and nothing else would catch it.
+    #[test]
+    fn the_two_patterns_are_disjoint_by_construction() {
+        let rules = compiled();
+        let with_desc = "[[id:6F39][Project Kickoff]]";
+        assert!(rules[0].pattern().find(with_desc).is_some());
+        assert!(
+            rules[1].pattern().find(with_desc).is_none(),
+            "the bare pattern must not match a described link"
+        );
+
+        let plain = "[[https://example.com]]";
+        assert!(rules[1].pattern().find(plain).is_some());
+        assert!(rules[0].pattern().find(plain).is_none());
+    }
+
+    /// Order-independence, from the side that declares the rules.
+    #[test]
+    fn declaring_them_the_other_way_round_renders_the_same() {
+        let mut declared: Vec<(String, Vec<u32>)> = conceal_rules()
+            .into_iter()
+            .map(|r| (r.pattern, r.hide))
+            .collect();
+        declared.reverse();
+        let (reversed, _) = compile_rules(&declared);
+        for line in [
+            "[[id:6F39][Project Kickoff]]",
+            "see [[https://example.com]] ok",
+            "[[id:A][one]] and [[id:B][two]]",
+        ] {
+            assert_eq!(
+                conceal_spans(&compiled(), line),
+                conceal_spans(&reversed, line),
+                "{line}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

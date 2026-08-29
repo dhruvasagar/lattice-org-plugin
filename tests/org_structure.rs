@@ -119,7 +119,7 @@ async fn org_editor_with_caps(
             // tree and the guest falls back to line matching — so a harness
             // that omitted it would test the text path while claiming to test
             // the tree one.
-            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\neditor_capabilities = [\"tree-sitter\"]\ncapabilities = [{caps}]\n"
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\", \"events\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\neditor_capabilities = [\"tree-sitter\"]\ncapabilities = [{caps}]\n"
         ),
     )
     .unwrap();

@@ -68,6 +68,27 @@ wit_bindgen::generate!({
             // started importing `logging`, and the WHOLE plugin stopped
             // instantiating.
             export lattice:plugin-host/transient-source@0.1.0;
+            // OC.6: the clock's async side. NOT `include events-plugin` — that
+            // world also imports `logging` and `project`, and every import a
+            // component declares must be satisfiable on EVERY linker it is
+            // instantiated against, including the grammar seam's sync one where
+            // `logging` is deliberately absent. Same reasoning, and the same
+            // scar, as `picker-source` and `transient-source` above.
+            //
+            // `events` gives the clock `wake-every` (the minute tick) and
+            // `subscribe`; `ui` gives it the modeline segment. Both are on the
+            // sync grammar linker too, for the reason just stated — and both
+            // REFUSE there, because the store the grammar seam runs in carries
+            // neither a wake nor a modeline context. That is where "the clock's
+            // session is off the keystroke path" (design D6) is actually
+            // enforced.
+            import lattice:plugin-host/events@0.1.0;
+            import lattice:plugin-host/ui@0.1.0;
+            use lattice:plugin-host/types@0.1.0.{event};
+            use lattice:plugin-host/events@0.1.0.{wake-id};
+            export register-events: func();
+            export on-event: func(handler: u32, ev: event);
+            export on-wake: func(id: wake-id);
         }
     "#,
     path: "wit",
@@ -82,6 +103,7 @@ mod capture_flow;
 mod capture_target;
 mod capture_templates;
 mod checkbox;
+mod clock;
 mod headline;
 mod links;
 mod refile;
@@ -95,6 +117,13 @@ use exports::lattice::plugin_host::media::Guest as MediaProducer;
 use exports::lattice::plugin_host::picker_source::Guest as PickerSource;
 use lattice::plugin_host::buffer::Document;
 use lattice::plugin_host::config::{get_option, register_option, OptionType};
+// OC.6: the clock's async side — `events` for the minute wake, `ui` for the
+// modeline segment. Both are also on the sync grammar linker (a component's
+// imports must resolve on every linker it instantiates against) and both refuse
+// there, which is where "off the keystroke path" is actually enforced.
+use lattice::plugin_host::events;
+use lattice::plugin_host::host_services;
+use lattice::plugin_host::ui;
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
 use lattice::plugin_host::help::register_topic;
 use lattice::plugin_host::language::{register_language, LanguageSpec};
@@ -104,10 +133,10 @@ use lattice::plugin_host::modes::{
 };
 use lattice::plugin_host::types::{
     ActionContext, ActionSpec, AppEffect, ArgDefault, ArgKind, ArgSpec, Args, DecorationContext,
-    EchoLevel, EchoPayload, Edit, EditKind, Effect, ExCommandContext, ExCommandSpec, FileAnchor,
-    LatencyClass, MediaBlock, MediaFit, MotionContext, MotionResult, MotionSpec,
-    OpenProviderViewPayload, OperatorContext, Position, Range, SurfaceForm, TextObjectContext,
-    TextObjectSpec, WriteToFilePayload,
+    EchoLevel, EchoPayload, Edit, EditKind, Effect, EventFilter, EventKind, ExCommandContext,
+    ExCommandSpec, FileAnchor, LatencyClass, MediaBlock, MediaFit, MotionContext, MotionResult,
+    MotionSpec, OpenProviderViewPayload, OperatorContext, Position, Range, SurfaceForm,
+    TextObjectContext, TextObjectSpec, UiZone, WriteToFilePayload,
 };
 
 /// Callback ids for `apply-action`. The guest chooses these; the host only
@@ -213,6 +242,30 @@ const CAPTURE_MENU: u32 = 37;
 /// rest is parsed by one and the effect produced by the other.
 const AGENDA_PARSE: u32 = 39;
 const AGENDA_APPLY: u32 = 40;
+
+/// OC.6 — the clock's four chords. `<leader>oi` / `oO` / `oq` / `oj`, org's own
+/// `C-c C-x C-i` / `C-o` / `C-q` / `C-j` spelled the way nvim-orgmode spells
+/// them.
+///
+/// All four run in the GRAMMAR store, which is the only one that can edit a
+/// buffer. The session, the minute wake and the modeline segment live in the
+/// EVENTS store (design D6) and are reached from here by emitting a plugin
+/// event — the two are separate `Store`s of this same component, with separate
+/// linear memories, so the bus is the only bridge between them.
+const CLOCK_IN: u32 = 41;
+const CLOCK_OUT: u32 = 42;
+const CLOCK_CANCEL: u32 = 43;
+const CLOCK_GOTO: u32 = 44;
+
+/// OC.6 — the events handler ids. The guest picks these; the host hands them
+/// back to `on-event`.
+const ON_CLOCK_EVENT: u32 = 1;
+
+/// The plugin events the grammar store emits and the events store consumes.
+/// Private to this plugin: both ends are org, so the payload is org's own
+/// business and the host moves the bytes without reading them.
+const EV_CLOCK_STARTED: &str = "org/clock-started";
+const EV_CLOCK_STOPPED: &str = "org/clock-stopped";
 
 /// OC.4 — the fields menu's own submit, distinct from the prompt's.
 ///
@@ -448,6 +501,89 @@ impl Guest for Component {
     /// `>ap` and `ciw`, which is a bad trade for one filetype (org-mode.md
     /// §5.1). The letters are evil-org's directional `h`/`l`, so the mnemonic
     /// survives the move.
+    // ── OC.6: the clock's async side ──────────────────────────────────────
+    //
+    // These three run in the EVENTS store — a different `Store`, with a
+    // different linear memory, from the grammar store the chords run in. That
+    // separation is the design (D6): the buffer edit must be synchronous, and
+    // the session, the minute wake and the modeline must not be.
+
+    /// Subscribe to org's own clock events, and declare the modeline element
+    /// this plugin owns.
+    ///
+    /// The descriptor is registered here rather than on first use because
+    /// `modeline.md` §6 says an owner registers on load — and because
+    /// registering it lazily would mean the very first `emit-segment` lands in
+    /// the content store keyed by an id no descriptor names, and renders
+    /// nothing. Priority 8 puts it right of `lsp` (5) and `claude-code` (6) and
+    /// left of `core.position` (10).
+    fn register_events() {
+        events::subscribe(
+            &EventFilter {
+                kinds: Some(vec![EventKind::Plugin]),
+                path_globs: None,
+                major_modes: None,
+            },
+            ON_CLOCK_EVENT,
+        );
+        ui::register_segment(CLOCK_SEGMENT, UiZone::Right, 8);
+    }
+
+    /// The grammar store told us a clock started or stopped.
+    ///
+    /// The payload is org's own — both ends are this plugin, and the host moves
+    /// the bytes without reading them — so it is a tab-separated string rather
+    /// than MessagePack, which would have cost a dependency for two fields.
+    fn on_event(handler: u32, ev: Event) {
+        if handler != ON_CLOCK_EVENT {
+            return;
+        }
+        let Event::Plugin(p) = ev else { return };
+        match p.name.as_str() {
+            EV_CLOCK_STARTED => {
+                let payload = String::from_utf8_lossy(&p.payload).into_owned();
+                let (started, title) = match payload.split_once('\t') {
+                    Some((s, t)) => (s.parse::<i64>().unwrap_or(0), t.to_string()),
+                    None => return,
+                };
+                // Replace rather than stack: a second start cancels the first
+                // wake, so a clock-in that somehow raced a clock-out cannot
+                // leave an orphan timer ticking for the rest of the session.
+                SESSION.with(|s| {
+                    if let Some(old) = s.borrow_mut().take() {
+                        events::cancel_wake(old.wake);
+                    }
+                    // Every 60s. `on-wake` is a full guest call, so this is the
+                    // rate the segment can change at — a clock reads in whole
+                    // minutes, so a faster tick would buy nothing visible.
+                    let wake = events::wake_every(60_000);
+                    *s.borrow_mut() = Some(ClockSession { started, title, wake });
+                });
+                // Immediately, not on the first wake — otherwise `◷ 0:00` takes
+                // up to a minute to appear and the chord looks like it failed.
+                publish_clock_segment();
+            }
+            EV_CLOCK_STOPPED => {
+                SESSION.with(|s| {
+                    if let Some(old) = s.borrow_mut().take() {
+                        events::cancel_wake(old.wake);
+                    }
+                });
+                publish_clock_segment();
+            }
+            _ => {}
+        }
+    }
+
+    /// A minute passed. Re-render the segment.
+    ///
+    /// Deliberately re-reads the clock rather than counting wakes: a wake fires
+    /// no *sooner* than its interval and may be late under load, so a counter
+    /// would drift behind the real elapsed time and never catch up.
+    fn on_wake(_id: u32) {
+        publish_clock_segment();
+    }
+
     fn register_modes() {
         let bind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Normal,
@@ -474,6 +610,14 @@ impl Guest for Component {
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
                 // nvim-orgmode spells it.
                 bind("<leader>o$", "org-archive-subtree"),
+                // OC.6 — org's `C-c C-x C-i` / `C-o` / `C-q` / `C-j`, in
+                // nvim-orgmode's spelling. `i`, `O`, `q` and `j` were all free
+                // under the `<leader>o` prefix; `J` is taken (move subtree
+                // down) and is a different key from `j`.
+                bind("<leader>oi", "org-clock-in"),
+                bind("<leader>oO", "org-clock-out"),
+                bind("<leader>oq", "org-clock-cancel"),
+                bind("<leader>oj", "org-clock-goto"),
                 // OM.11: opens the target picker; `org-refile-to` is the
                 // second hop and is NOT bound — it is invoked by the picker's
                 // accept, never typed.
@@ -939,6 +1083,32 @@ impl Guest for Component {
             "Show or hide inline images for org buffers",
             &spec(),
             TOGGLE_INLINE_IMAGES,
+        );
+        // OC.6 — the clock. Four chords, each doing exactly one buffer edit and
+        // then telling org's own async side what happened.
+        register_action(
+            "org-clock-in",
+            "Start a clock on the entry at the cursor",
+            &spec(),
+            CLOCK_IN,
+        );
+        register_action(
+            "org-clock-out",
+            "Stop the running clock on the entry at the cursor",
+            &spec(),
+            CLOCK_OUT,
+        );
+        register_action(
+            "org-clock-cancel",
+            "Discard the running clock on the entry at the cursor",
+            &spec(),
+            CLOCK_CANCEL,
+        );
+        register_action(
+            "org-clock-goto",
+            "Jump to the entry the running clock is on",
+            &spec(),
+            CLOCK_GOTO,
         );
         register_action(
             "org-archive-subtree",
@@ -1454,6 +1624,258 @@ fn move_subtree(
         byte: ctx.cursor.byte,
     };
     replace_lines(ctx, first, second_end, last_len, text, cursor)
+}
+
+// ── OC.6: the clock ───────────────────────────────────────────────────────
+//
+// Two stores, and knowing which is which is the whole design.
+//
+// The GRAMMAR store (below) edits the buffer. It is synchronous, on the
+// keystroke path, and stateless apart from one jump target. The EVENTS store
+// (further down) holds the session, arms the minute wake and pushes the
+// modeline segment — off the keystroke path by construction (design D6).
+//
+// They are separate `wasmtime::Store`s of this same component, so they have
+// separate linear memories: a `thread_local` here is invisible there. The event
+// bus is the only bridge, which is why `emit-event` had to start working from
+// the grammar seam before any of this could be built (host slice OC.1).
+
+thread_local! {
+    /// The one piece of state the grammar store keeps: where to jump for
+    /// `org-clock-goto`.
+    ///
+    /// It lives here rather than in the events store because `clock-goto` is a
+    /// grammar action — it returns an `Effect`, and the events store cannot
+    /// (`on-event` returns nothing). Design D6 puts the *session* on the events
+    /// seam for a stated reason: the wake and the modeline must be off the
+    /// keystroke path. A jump target is neither, so this does not contradict it.
+    ///
+    /// It does not survive a restart, exactly as the modeline does not (design D4).
+    /// The buffer remains the durable record: after a restart `<leader>oj` says it
+    /// has nowhere to go, and clocking out on the entry still works because that is
+    /// re-derived from the file.
+    static CLOCK_GOTO_TARGET: std::cell::RefCell<Option<(String, u32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The current local wall-clock instant.
+///
+/// `wasi:clocks` is UTC and a plugin's environment carries no `TZ`, so the
+/// offset has to come from the host (`local-utc-offset-seconds`, host slice
+/// OC.4). Without it every clock line would be wrong by the user's offset and,
+/// near midnight, wrong by a day.
+fn clock_now() -> clock::Now {
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let offset = i64::from(host_services::local_utc_offset_seconds());
+    clock::Now::from_local_secs(utc + offset)
+}
+
+/// The headline text, trimmed of its stars and TODO keyword, for the modeline.
+fn clock_title(text: &str) -> String {
+    let rest = text.trim_start_matches('*').trim();
+    let keywords = todo_keywords();
+    match rest.split_once(' ') {
+        Some((first, tail)) if keywords.iter().any(|k| k == first) => tail.trim().to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// `<leader>oi` — start a clock on the entry at the cursor.
+fn clock_in(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let lb = clock::Logbook::new(&hl);
+
+    // Refuse rather than stack a second running clock on the same entry: org
+    // treats that as an error, and silently writing one would make the drawer's
+    // first line stop being the running clock — which is what makes finding it
+    // a single-line look rather than a scan.
+    if lb.running(ctx.cursor.line).is_some() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: this entry already has a running clock".to_string(),
+        })];
+    }
+    let now = clock_now();
+    let Some(ins) = lb.clock_in(ctx.cursor.line, now) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: no entry here to clock into".to_string(),
+        })];
+    };
+    let Some((headline_line, _)) = hl.enclosing(ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let title = hl.text(headline_line).map(|t| clock_title(&t)).unwrap_or_default();
+
+    // Remember where to jump back to, and tell the async side to start ticking.
+    if let Some(path) = doc.path() {
+        CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = Some((path, headline_line)));
+    }
+    host_services::emit_event(
+        EV_CLOCK_STARTED,
+        format!("{}\t{title}", now.epoch_minutes()).as_bytes(),
+    );
+
+    // A zero-width range at the insertion line's column 0 — an insert, not a
+    // replace, so nothing that was there is touched.
+    vec![
+        Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
+            target: ctx.buffer_id,
+            edit: Edit {
+                range: Range {
+                    start: Position { line: ins.line, byte: 0 },
+                    end: Position { line: ins.line, byte: 0 },
+                },
+                kind: EditKind::Replace(ins.text),
+            },
+            cursor: Some(ctx.cursor),
+        }),
+    ]
+}
+
+/// `<leader>oO` (close it) and `<leader>oq` (discard it).
+///
+/// One body for both because they differ in exactly one way — whether the line
+/// is rewritten with an end stamp or removed — and everything around that
+/// (locate the entry, find the running clock, refuse when there is none, tell
+/// the async side to stop) is identical. Two copies would be two chances for
+/// the "tell the async side" half to be forgotten in one of them.
+fn clock_stop(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    discard: bool,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let lb = clock::Logbook::new(&hl);
+
+    // Re-derived from the buffer, never from the session (design D4) — which is
+    // exactly why this works after a restart, when there is no session at all.
+    let Some(running) = lb.running(ctx.cursor.line) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: no running clock on this entry".to_string(),
+        })];
+    };
+
+    CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = None);
+    host_services::emit_event(EV_CLOCK_STOPPED, &[]);
+
+    if discard {
+        let (from, to) = clock::cancel_span(&lb, running);
+        // Delete whole lines: the range runs from the first line's column 0 to
+        // the START of the line after the last, so the newline goes with them
+        // and no blank line is left behind.
+        return vec![
+            Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
+                target: ctx.buffer_id,
+                edit: Edit {
+                    range: Range {
+                        start: Position { line: from, byte: 0 },
+                        end: Position { line: to + 1, byte: 0 },
+                    },
+                    kind: EditKind::Replace(String::new()),
+                },
+                cursor: Some(Position { line: from, byte: 0 }),
+            }),
+        ];
+    }
+
+    let Some(text) = hl.text(running.line) else {
+        return vec![Effect::None];
+    };
+    let Some(closed) = clock::close(&text, clock_now()) else {
+        return vec![Effect::None];
+    };
+    replace_lines(
+        ctx,
+        running.line,
+        running.line,
+        text.len() as u32,
+        closed,
+        ctx.cursor,
+    )
+}
+
+/// `<leader>oj` — jump to the entry the running clock is on.
+///
+/// Reads the grammar store's own target (see [`CLOCK_GOTO_TARGET`]), so it
+/// crosses buffers and reopens a file that was closed. Nothing recorded means
+/// nothing is running *in this session*; saying so beats jumping somewhere
+/// plausible.
+fn clock_goto() -> Vec<Effect> {
+    let target = CLOCK_GOTO_TARGET.with(|c| c.borrow().clone());
+    match target {
+        Some((path, line)) => vec![Effect::OpenBufferAt(
+            lattice::plugin_host::types::OpenBufferAtPayload {
+                path: Some(path),
+                position: Position { line, byte: 0 },
+                force: false,
+            },
+        )],
+        None => vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: "org: no clock is running".to_string(),
+        })],
+    }
+}
+
+// ── OC.6: the events store — session, wake, modeline ──────────────────────
+
+/// The modeline element this plugin owns. Namespaced by the host to
+/// `org.clock`, so it can neither shadow a built-in nor another plugin.
+const CLOCK_SEGMENT: &str = "clock";
+
+/// What the events store remembers between wakes. `None` when no clock is
+/// running, which is also the state after a restart (design D4 — the modeline
+/// is empty, the file is still right).
+struct ClockSession {
+    /// Minutes since the epoch, local, when the clock started.
+    started: i64,
+    /// The entry's headline, for the segment.
+    title: String,
+    /// The armed minute wake, so stopping can cancel it.
+    wake: u32,
+}
+
+thread_local! {
+    static SESSION: std::cell::RefCell<Option<ClockSession>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running segment, e.g. `◷ 0:14 Write the clocking slice`.
+///
+/// `◷` is U+25F7, Geometric Shapes — the BMP fallback that renders in every
+/// terminal font. A Nerd Font clock replaces it when `ui.nerd_fonts=on`, at the
+/// same cell width so the modeline's geometry does not shift on toggle (the
+/// icon-degradation rule).
+fn clock_segment_text(session: &ClockSession, now_minutes: i64) -> String {
+    let icon = match get_option("ui.nerd_fonts").as_deref() {
+        Some("true") | Some("on") => "\u{f017}",
+        _ => "\u{25f7}",
+    };
+    let elapsed = clock::duration(now_minutes - session.started);
+    // Trimmed, because the duration is the part that must always be readable —
+    // a long headline must not push it off a narrow modeline.
+    let title: String = session.title.chars().take(24).collect();
+    let ellipsis = if session.title.chars().count() > 24 { "…" } else { "" };
+    format!("{icon}{} {title}{ellipsis}", elapsed.trim_start())
+}
+
+/// Push the segment for the running clock, or clear it when none is running.
+fn publish_clock_segment() {
+    SESSION.with(|s| match s.borrow().as_ref() {
+        Some(session) => {
+            let text = clock_segment_text(session, clock_now().epoch_minutes());
+            ui::emit_segment(CLOCK_SEGMENT, &text);
+        }
+        None => ui::clear_segment(CLOCK_SEGMENT),
+    });
 }
 
 /// Move the subtree at the cursor into `<this file>_archive`.
@@ -2102,6 +2524,10 @@ impl GrammarCallbacks for Component {
             META_RETURN => Ok(meta_return(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),
+            CLOCK_IN => Ok(clock_in(&ctx, doc, tree)),
+            CLOCK_OUT => Ok(clock_stop(&ctx, doc, tree, false)),
+            CLOCK_CANCEL => Ok(clock_stop(&ctx, doc, tree, true)),
+            CLOCK_GOTO => Ok(clock_goto()),
             REFILE => Ok(vec![Effect::OpenPicker(
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: REFILE_PICKER.to_string(),

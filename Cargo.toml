@@ -73,6 +73,10 @@ lattice-picker = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 arc-swap = "1"
+# OC.6: `lattice_plugin_host::Sleeper` returns a `BoxFuture`, so the test's
+# tokio-backed impl of it names the type. The plugin host owns no runtime by
+# design, which is why the timer is the caller's to supply — here, the test's.
+futures = "0.3"
 
 [profile.release]
 opt-level = "s"

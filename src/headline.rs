@@ -813,6 +813,19 @@ impl<'a> Headlines<'a> {
         (self.line)(n)
     }
 
+    /// The tree this was built with, for a sibling module that has to make the
+    /// same tree-or-text decision about a **different** node kind.
+    ///
+    /// `clock.rs` is the case: entry location is a headline question and belongs
+    /// here, but finding the `:LOGBOOK:` drawer inside that entry is a `(drawer)`
+    /// question and belongs there. Handing the tree out beats making the caller
+    /// pass `(&Headlines, Option<&TreeSnapshot>)` as two arguments — that pair
+    /// can be mismatched, and a clock reading a tree its headline lookup did not
+    /// use is exactly the divergence this struct exists to prevent.
+    pub fn tree(&self) -> Option<&'a TreeSnapshot> {
+        self.tree
+    }
+
     /// Whether `n` is a headline line — the tree's answer being "a section
     /// starts here", which a `* TODO` line inside a source block does not.
     pub fn is_headline(&self, n: u32) -> bool {

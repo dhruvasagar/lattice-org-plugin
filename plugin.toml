@@ -20,6 +20,11 @@ provides = [
     # OC.3: the capture menu, one key per template.
     "transient-source",
     "help",
+    # OC.6: the clock's session, its minute wake and its modeline segment all
+    # live on the event actor (design D6) — off the keystroke path by
+    # construction. Without this seam the four clock chords still edit the
+    # buffer correctly and the modeline simply never appears.
+    "events",
 ]
 
 # Publishes the enablement request for each mode named here. Without it a mode

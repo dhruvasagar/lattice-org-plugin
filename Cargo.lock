@@ -3328,6 +3328,7 @@ name = "lattice-org-plugin"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "futures",
  "lattice-config",
  "lattice-core",
  "lattice-grammar",
@@ -3378,6 +3379,7 @@ name = "lattice-plugin-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "futures",
  "lattice-cells",
@@ -3411,6 +3413,7 @@ name = "lattice-plugin-loader"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "futures",
  "lattice-compilation",
  "lattice-completion",
  "lattice-config",

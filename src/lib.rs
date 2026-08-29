@@ -126,7 +126,7 @@ use exports::lattice::plugin_host::picker_source::Guest as PickerSource;
 use lattice::plugin_host::buffer::Document;
 use lattice::plugin_host::config::{get_option, register_option, OptionType};
 use lattice::plugin_host::theme::{
-    register_element, ColorRef, ModifierSet, StyleSpec as ThemeStyleSpec,
+    register_element, set_element_override, ColorRef, ModifierSet, StyleSpec as ThemeStyleSpec,
 };
 // OC.6: the clock's async side — `events` for the minute wake, `ui` for the
 // modeline segment. Both are also on the sync grammar linker (a component's
@@ -598,6 +598,55 @@ mod todo_theme {
             let _ = register_element(&format!("todo.{}", k.name), "A TODO state.", &s);
         }
     }
+
+    /// TK.5 — the user's own per-keyword styles, as OVERRIDES.
+    ///
+    /// Deliberately not element defaults. A default sits BELOW the active
+    /// theme in the resolution stack, so a theme that styled
+    /// `org.todo.WAITING` would beat the user's configuration — backwards
+    /// from what `org-todo-keyword-faces` means. An override sits above it.
+    ///
+    /// A style naming a keyword that is not configured is refused by the
+    /// host (the element does not exist) and skipped here: the alternative
+    /// is an override that lands nowhere and reads as the feature not
+    /// working.
+    pub fn apply_overrides(styles: &[(String, crate::todo::KeywordStyle)]) {
+        for (name, st) in styles {
+            let spec = ThemeStyleSpec {
+                inherit: None,
+                fg: st.fg.as_deref().map(colour),
+                bg: st.bg.as_deref().map(colour),
+                modifiers: ModifierSet {
+                    bold: st.bold,
+                    italic: st.italic,
+                    underline: st.underline,
+                    dim: st.dim,
+                    reverse: None,
+                },
+                scale: None,
+            };
+            let _ = set_element_override(&format!("todo.{name}"), &spec);
+        }
+    }
+
+    /// A palette key, or a literal `#rrggbb`.
+    ///
+    /// A palette key is the path that survives a colourscheme swap, so it is
+    /// the default reading; `#rrggbb` is the escape hatch for a colour no
+    /// key expresses. An unparseable `#…` falls back to being treated as a
+    /// key, where an unknown key resolves through the inherit chain — the
+    /// forgiving resolution the seam documents, so a typo is "looks
+    /// inherited" rather than a crash.
+    fn colour(v: &str) -> ColorRef {
+        if let Some(hex) = v.strip_prefix('#') {
+            if hex.len() == 6 {
+                if let Ok(rgb) = u32::from_str_radix(hex, 16) {
+                    return ColorRef::LiteralRgb(rgb);
+                }
+            }
+        }
+        ColorRef::Palette(v.to_string())
+    }
 }
 
 /// TK.4 — the TODO-keyword highlight rules, generated from the option.
@@ -660,6 +709,13 @@ impl Guest for Component {
         todo_theme::register(&todo::parse_todo_keywords(
             &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
         ));
+        // TK.5: the user's own per-keyword styles, applied as overrides so
+        // they sit ABOVE the theme. Applied here rather than anywhere else
+        // because this is the one export where the `theme` import is live —
+        // the seam's store is dropped when this returns.
+        let (styles, _problems) =
+            todo::parse_keyword_styles(&get_option("todo-keyword-styles").unwrap_or_default());
+        todo_theme::apply_overrides(&styles);
     }
 
     fn register_options() {
@@ -678,6 +734,23 @@ impl Guest for Component {
              Cycling follows this option live; the per-keyword COLOURS resolve \
              at load, so a change needs a reload to recolour (emacs is the \
              same).",
+        );
+        let _ = register_option(
+            "todo-keyword-styles",
+            OptionType::String,
+            "",
+            "Per-keyword colours, one per line \u{2014} the org-shaped spelling of \
+             `org-todo-keyword-faces`:\n\n\
+             \x20 TODO: fg=red bold\n\
+             \x20 WAITING: fg=orange italic\n\
+             \x20 CANCELLED: fg=overlay dim\n\n\
+             `fg=` / `bg=` take a palette key (which follows a colourscheme \
+             swap) or a literal `#rrggbb`. Modifiers are `bold`, `italic`, \
+             `underline`, `dim`, and `no-bold` and friends to CLEAR one \
+             inherited from the state's default. These are applied as theme \
+             OVERRIDES, so they beat the active colourscheme \u{2014} but \
+             `:colorscheme` replaces the override set, so a swap drops them \
+             until the next reload.",
         );
         let _ = register_option(
             "highest-priority",

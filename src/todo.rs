@@ -277,6 +277,95 @@ fn parse_keyword(
     })
 }
 
+// ── TK.5: `org.todo-keyword-styles` ──────────────────────────────────────────
+
+/// One user-declared per-keyword style.
+///
+/// The emacs shape this spells is
+/// `("WAITING" :foreground "orange" :weight bold)`; here it is
+/// `WAITING: fg=orange bold`, one keyword per line, matching how
+/// `org.todo-keywords` is written rather than importing elisp's punctuation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeywordStyle {
+    /// A palette key (`orange`) or a literal `#rrggbb`.
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    /// `Some(true)` sets, `Some(false)` CLEARS an inherited one, `None`
+    /// leaves it alone — the three-way distinction the theme seam needs so a
+    /// keyword inheriting a bold parent can turn bold off.
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub underline: Option<bool>,
+    pub dim: Option<bool>,
+}
+
+/// Parse `org.todo-keyword-styles`.
+///
+/// ```text
+/// TODO: fg=red bold
+/// WAITING: fg=orange italic
+/// CANCELLED: fg=overlay dim no-bold
+/// ```
+///
+/// Returns `(keyword, style)` pairs plus one message per refused line. A bad
+/// line costs itself and nothing else, for the same proportionality reason a
+/// bad conceal rule does: this is cosmetic configuration, and losing every
+/// colour over one typo is the disproportionate answer.
+pub fn parse_keyword_styles(spec: &str) -> (Vec<(String, KeywordStyle)>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut problems = Vec::new();
+    for (i, raw) in spec.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once(':') else {
+            problems.push(format!("line {}: expected `KEYWORD: …`", i + 1));
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            problems.push(format!("line {}: no keyword before `:`", i + 1));
+            continue;
+        }
+        let mut st = KeywordStyle::default();
+        let mut bad = None;
+        for word in rest.split_whitespace() {
+            match word {
+                "bold" => st.bold = Some(true),
+                "no-bold" => st.bold = Some(false),
+                "italic" => st.italic = Some(true),
+                "no-italic" => st.italic = Some(false),
+                "underline" => st.underline = Some(true),
+                "no-underline" => st.underline = Some(false),
+                "dim" => st.dim = Some(true),
+                "no-dim" => st.dim = Some(false),
+                _ => match word.split_once('=') {
+                    Some(("fg", v)) if !v.is_empty() => st.fg = Some(v.to_string()),
+                    Some(("bg", v)) if !v.is_empty() => st.bg = Some(v.to_string()),
+                    _ => {
+                        bad = Some(word.to_string());
+                        break;
+                    }
+                },
+            }
+        }
+        if let Some(w) = bad {
+            problems.push(format!(
+                "line {}: `{w}` is not `fg=…`, `bg=…` or a modifier",
+                i + 1
+            ));
+            continue;
+        }
+        if st == KeywordStyle::default() {
+            problems.push(format!("line {}: `{name}` declares no style", i + 1));
+            continue;
+        }
+        out.push((name.to_string(), st));
+    }
+    (out, problems)
+}
+
 /// The configured keyword list, e.g. `"TODO NEXT | DONE"`.
 ///
 /// The `|` is org's separator between "not done" and "done" states. It matters
@@ -474,6 +563,80 @@ mod tests {
 
     fn kw() -> Vec<String> {
         parse_keywords("TODO NEXT | DONE")
+    }
+
+    // ---- TK.5: `org.todo-keyword-styles` ----
+
+    #[test]
+    fn tk5_the_emacs_config_transcribes_line_by_line() {
+        // Dhruva's own org-todo-keyword-faces, in this spelling.
+        let (styles, problems) = parse_keyword_styles(
+            "TODO: fg=red bold\n\
+             NEXT: fg=blue bold\n\
+             DONE: fg=green bold\n\
+             WAITING: fg=orange bold\n\
+             CANCELLED: fg=overlay dim",
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(styles.len(), 5);
+        let get = |n: &str| styles.iter().find(|(k, _)| k == n).unwrap().1.clone();
+        assert_eq!(get("TODO").fg.as_deref(), Some("red"));
+        assert_eq!(get("TODO").bold, Some(true));
+        assert_eq!(get("CANCELLED").dim, Some(true));
+        assert_eq!(get("CANCELLED").fg.as_deref(), Some("overlay"));
+    }
+
+    /// The three-way modifier matters: a keyword inheriting a bold parent
+    /// must be able to turn bold OFF, which a plain bool cannot express.
+    #[test]
+    fn tk5_a_modifier_can_be_cleared_not_just_set() {
+        let (styles, _) = parse_keyword_styles("DONE: no-bold no-dim italic");
+        let st = &styles[0].1;
+        assert_eq!(st.bold, Some(false), "cleared, not merely unset");
+        assert_eq!(st.dim, Some(false));
+        assert_eq!(st.italic, Some(true));
+        assert_eq!(st.underline, None, "untouched stays None");
+    }
+
+    #[test]
+    fn tk5_a_literal_colour_is_allowed_beside_palette_keys() {
+        let (styles, problems) = parse_keyword_styles("TODO: fg=#ff8800\nNEXT: fg=blue");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(styles[0].1.fg.as_deref(), Some("#ff8800"));
+        assert_eq!(styles[1].1.fg.as_deref(), Some("blue"));
+    }
+
+    #[test]
+    fn tk5_a_bad_line_costs_only_itself() {
+        let (styles, problems) =
+            parse_keyword_styles("TODO: fg=red\nNEXT: sparkly\nDONE: fg=green");
+        assert_eq!(
+            styles.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            ["TODO", "DONE"]
+        );
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("sparkly"), "{problems:?}");
+    }
+
+    #[test]
+    fn tk5_a_line_that_declares_nothing_is_refused() {
+        let (styles, problems) = parse_keyword_styles("TODO:");
+        assert!(styles.is_empty());
+        assert_eq!(problems.len(), 1);
+    }
+
+    #[test]
+    fn tk5_blank_and_comment_lines_are_ignored() {
+        let (styles, problems) = parse_keyword_styles("\n# my colours\nTODO: fg=red\n\n");
+        assert_eq!(styles.len(), 1);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn tk5_an_unset_option_is_no_styles_and_no_complaints() {
+        let (styles, problems) = parse_keyword_styles("");
+        assert!(styles.is_empty());
+        assert!(problems.is_empty());
     }
 
     // ---- TK.2: the `org-todo-keywords` grammar ----

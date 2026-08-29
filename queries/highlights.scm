@@ -49,24 +49,25 @@
 
 ; ── TODO keywords ────────────────────────────────────────────────────────────
 ;
-; The FIRST word of a headline, and only there — `.` anchors the expr to the
-; start of the item, so a "TODO" in the middle of a title is prose and stays
-; prose.
+; NOT HERE ANY MORE (TK.4). The rules that used to sit at this point were a
+; hardcoded `#any-of?` word list with a comment admitting the problem: "the
+; keyword set is `org.todo-keywords`, which is user-configurable, and a static
+; query cannot read an option". Against a real three-sequence configuration
+; nine of thirteen keywords were in neither list and rendered as plain title
+; text, and the four that did match borrowed `@keyword` / `@comment` — a TODO
+; painted as whatever the theme paints `if` and `return`.
 ;
-; The keyword set is `org.todo-keywords`, which is user-configurable, and a
-; static query cannot read an option. These are the defaults (`TODO | DONE`)
-; plus the conventional extras a user is likely to add, so the common
-; configurations light up without one. A keyword not listed here still cycles
-; and still drives the agenda — it simply renders as ordinary title text, which
-; is the right way for this to degrade.
+; The rules are now GENERATED from the parsed option and appended to this file
+; at `register-language` (`todo_query::rules` in `src/lib.rs`), one per
+; keyword, each capturing to that keyword's own theme element
+; (`org.todo.WAITING`). The structure is unchanged and still the grammar's:
+; `.` anchors the expr to the start of the item, so a "TODO" in the middle of
+; a title is prose, and a headline inside a `#+BEGIN_SRC` block is not a
+; headline.
 ;
-; Not-done reads as a keyword (the theme's attention colour); done reads as a
-; comment, because a finished item should recede rather than compete with the
-; work that is left.
-(headline (item . (expr) @keyword)
-  (#any-of? @keyword "TODO" "NEXT" "STARTED" "WAITING" "HOLD" "PROJ"))
-(headline (item . (expr) @comment)
-  (#any-of? @comment "DONE" "CANCELLED" "CANCELED" "KILL"))
+; A keyword the option does not name still cycles and still drives the agenda;
+; it simply renders as ordinary title text, which is the degradation the old
+; comment promised and the hardcoded list could not actually deliver.
 
 ; Tags: `:work:urgent:` at the end of a headline.
 (headline (tag_list) @attribute)

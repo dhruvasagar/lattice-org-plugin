@@ -232,3 +232,112 @@ fn body_text_is_not_a_headline() {
     }
     plugin_lang::unregister_plugin(plugin);
 }
+
+// ── TK.4: the generated TODO rules, isolated from the theme ──
+
+/// Does the GENERATED rule match at all?
+///
+/// Split from the component test on purpose: that one asserts the whole
+/// chain (element registered → capture resolves → span painted), so a
+/// failure there could be the query or the theme. This one registers the
+/// same generated rule with a plain builtin capture name, so it can only
+/// fail if the QUERY is wrong.
+#[test]
+fn tk4_the_generated_rule_shape_matches_a_headline_keyword() {
+    let Some(bytes) = org_grammar_wasm() else {
+        eprintln!("skipping: org grammar not built");
+        return;
+    };
+    let (name, ext, plugin) = unique("tk4-shape");
+    let grammar = lattice_syntax::wasm_grammar::load("org", &bytes).expect("org grammar loads");
+    // Same shape the plugin generates, with `@keyword` standing in for the
+    // element capture so the theme is out of the picture.
+    let q = format!(
+        "{}\n(headline (item . (expr) @keyword)\n  (#eq? @keyword \"TODO\"))\n",
+        org_highlights()
+    );
+    let spec = GrammarSpec {
+        grammar,
+        highlights: Some(q),
+        folds: None,
+        injections: None,
+        indents: None,
+        textobjects: None,
+        conceal_rules: vec![],
+    };
+    let interned = plugin_lang::register_with_grammar(&name, &[&ext], &spec, plugin)
+        .expect("the generated rule compiles");
+    let mut syntax = lattice_syntax::Syntax::for_language(Lang::Plugin(interned))
+        .expect("registry")
+        .expect("registered");
+    syntax.parse("* TODO ship it\n");
+    let rows = syntax.highlight_lines_native(0, 1).expect("highlights");
+    assert!(
+        rows[0]
+            .iter()
+            .any(|s| s.style == lattice_syntax::Style::Keyword),
+        "the generated rule must match the first expr of a headline: {:?}",
+        rows[0]
+    );
+    plugin_lang::unregister_plugin(plugin);
+}
+
+/// Does an ELEMENT capture resolve, given a registry?
+///
+/// The other half of the split. Same rule, but the capture names a
+/// registered theme element and the registry is handed to the compiler
+/// exactly as the loader hands it over.
+#[test]
+fn tk4_an_element_capture_resolves_when_the_registry_is_supplied() {
+    let Some(bytes) = org_grammar_wasm() else {
+        return;
+    };
+    let (name, ext, plugin) = unique("tk4-element");
+    let grammar = lattice_syntax::wasm_grammar::load("org", &bytes).expect("org grammar loads");
+    let theme: lattice_theme::ThemeRegistryHandle = std::sync::Arc::new(
+        lattice_theme::InMemoryThemeRegistry::new(lattice_theme::default_palette()),
+    );
+    let id = theme.register(
+        lattice_theme::ElementName::from("org.todo.TODO".to_string()),
+        lattice_theme::ElementOwner::Plugin("org".into()),
+        lattice_theme::StyleSpec {
+            fg: Some(lattice_theme::ColorRef::Palette("red".into())),
+            ..Default::default()
+        },
+        "a TODO state",
+    );
+    let q = format!(
+        "{}\n(headline (item . (expr) @org.todo.TODO)\n  (#eq? @org.todo.TODO \"TODO\"))\n",
+        org_highlights()
+    );
+    let spec = GrammarSpec {
+        grammar,
+        highlights: Some(q),
+        folds: None,
+        injections: None,
+        indents: None,
+        textobjects: None,
+        conceal_rules: vec![],
+    };
+    let interned = plugin_lang::register_with_grammar_themed(
+        &name,
+        &[&ext],
+        &spec,
+        plugin,
+        Some(theme.as_ref()),
+    )
+    .expect("compiles");
+    let mut syntax = lattice_syntax::Syntax::for_language(Lang::Plugin(interned))
+        .expect("registry")
+        .expect("registered");
+    syntax.parse("* TODO ship it\n");
+    let rows = syntax.highlight_lines_native(0, 1).expect("highlights");
+    assert!(
+        rows[0]
+            .iter()
+            .any(|s| s.style == lattice_syntax::Style::Element(id)),
+        "an element capture must resolve to that element: {:?}",
+        rows[0]
+    );
+    plugin_lang::unregister_plugin(plugin);
+}

@@ -600,6 +600,54 @@ mod todo_theme {
     }
 }
 
+/// TK.4 — the TODO-keyword highlight rules, generated from the option.
+///
+/// The static query cannot carry these: which words are keywords is
+/// configuration, and a `#any-of?` list compiled into a file is a guess at it.
+/// What the query CAN carry — and does — is the structure, which is the part
+/// the grammar actually knows.
+mod todo_query {
+    use super::todo::Keywords;
+
+    /// One rule per keyword, each capturing to that keyword's own element.
+    ///
+    /// ```scheme
+    /// (headline (item . (expr) @org.todo.WAITING)
+    ///   (#eq? @org.todo.WAITING "WAITING"))
+    /// ```
+    ///
+    /// `.` anchors the expr to the start of the item, so a `TODO` in the
+    /// middle of a title stays prose and a headline written inside a
+    /// `#+BEGIN_SRC` block is not a headline — the case a regex over lines
+    /// cannot get right, which is most of why this stayed on the tree.
+    ///
+    /// The capture name IS the element name, because that is exactly what
+    /// TK.1 made resolvable: a capture the host does not recognise as a
+    /// builtin category, but which names a registered theme element, becomes
+    /// `Style::Element`.
+    pub fn rules(kws: &Keywords) -> String {
+        let mut out = String::new();
+        for k in &kws.all {
+            // `parse_keyword` refuses anything that is not letters, digits,
+            // `_` or `-`, so nothing here needs escaping. That refusal is the
+            // only thing standing between a config value and a query
+            // compiler, which is why it is a hard error there rather than a
+            // normalisation.
+            debug_assert!(
+                k.name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+                "TK.2 must have refused this keyword"
+            );
+            out.push_str(&format!(
+                "(headline (item . (expr) @org.todo.{kw})\n  (#eq? @org.todo.{kw} \"{kw}\"))\n",
+                kw = k.name
+            ));
+        }
+        out
+    }
+}
+
 impl Guest for Component {
     /// OM.7's options. Auto-namespaced by the host to `org.*`, so these are
     /// `org.todo-keywords` and `org.highest-priority` to the user.
@@ -706,7 +754,19 @@ impl Guest for Component {
             grammar_name: None,
             extensions: vec!["org".to_string(), "org_archive".to_string()],
             grammar: GRAMMAR.to_vec(),
-            highlights: Some(include_str!("../queries/highlights.scm").to_string()),
+            // TK.4: the static structure, plus one generated rule per
+            // configured keyword. Generated rather than compiled in because
+            // which words are keywords is configuration — the hardcoded
+            // `#any-of?` list this replaces could only ever guess, and
+            // against a real config it missed nine of thirteen.
+            highlights: Some(format!(
+                "{}\n{}",
+                include_str!("../queries/highlights.scm"),
+                todo_query::rules(&todo::parse_todo_keywords(
+                    &get_option("todo-keywords")
+                        .unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string())
+                ))
+            )),
             folds: Some(include_str!("../queries/folds.scm").to_string()),
             // The language a `#+begin_src` block names, so its body is
             // highlighted by that language's own grammar (the markdown

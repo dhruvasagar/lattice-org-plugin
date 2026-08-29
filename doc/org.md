@@ -376,26 +376,95 @@ off — the outliner above is unaffected either way.
 | | |
 |---|---|
 | `<leader>ot` `<leader>oT` | cycle the TODO keyword forward / back |
+| `<leader>os` | choose a state from a menu |
 | `<leader>o,` | cycle the priority |
 | `<leader>o:` | set tags, prompting with the current ones |
 
-The empty state is part of both cycles, so a keyword or priority can always be
+Cycling is the faster move when the next state is the one you want; the menu
+is faster when it is not. `<leader>os` lists every configured state under the
+key its own declaration gives it, plus a row that clears the state — a menu
+that could set every keyword but never remove one would be a one-way door. A
+state you declared without a key still appears, with one derived from its
+letters, so the menu can always reach a state your file can contain.
+
+The empty state is part of both cycles too, so a keyword or priority can be
 cleared by cycling past the end rather than deleting it by hand.
 
 Each key acts on the headline you are *under*, so you can mark a task from
-anywhere in its body without navigating to it first. Cycling a keyword leaves
-the priority and tags exactly where they were.
+anywhere in its body without navigating to it first. Setting or cycling a
+keyword leaves the priority and tags exactly where they were.
 
-### Options
+### Declaring your states
+
+`org.todo-keywords` takes emacs' `org-todo-keywords` syntax, one sequence per
+line:
+
+```
+sequence: TODO(t) NEXT(n) | DONE(d)
+sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING
+type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)
+```
 
 | | |
 |---|---|
-| `org.todo-keywords` | the sequence, default `TODO \| DONE` |
-| `org.highest-priority` | last priority letter, default `C` (so A, B, C) |
+| `sequence:` | a workflow, cycled in order |
+| `type:` | a set of alternatives rather than a progression |
+| `\|` | separates not-done from done; a line without one has no done states |
+| `(t)` | the key this state gets in the `<leader>os` menu |
+| `(@)` `(!)` `(@/!)` | logging specs — **accepted and not yet acted on** |
 
-`\|` separates not-done from done states, as in org's `#+TODO:` line. It is
-ignored when cycling. Both options are read on each keypress, so
-`:set org.todo-keywords=PROPOSED ACCEPTED REJECTED` takes effect immediately.
+A bare list with no `sequence:` or `type:` prefix is a sequence, so the old
+flat `TODO | DONE` spelling still means what it always did.
+
+Logging specs are parsed rather than rejected so that an emacs configuration
+can be pasted whole with nothing silently misread — before, `WAITING(w@/!)`
+became a state whose *name* was `WAITING(w@/!)`, and it matched nothing.
+Writing the `:LOGBOOK:` notes they ask for is separate work.
+
+A line that cannot be understood is skipped and the rest still loads. A
+duplicate state keeps the first; a duplicate key costs the shortcut and never
+the state.
+
+### Colours
+
+Every state is a theme element — `org.todo.TODO`, `org.todo.WAITING` — so a
+colourscheme can style them and you can override any of them. Org's
+conventional vocabulary comes coloured out of the box: `TODO` red, `NEXT`
+blue, `WAITING` and `HOLD` amber, `DONE` green, `CANCELLED` receded. A state
+org does not recognise inherits `org.todo.active` or `org.todo.done`, so it is
+never unstyled.
+
+`CANCELLED` is deliberately not `DONE`'s green. Emacs' own default paints both
+green; achieved and abandoned are the distinction you actually want when
+scanning an agenda.
+
+To override, `org.todo-keyword-styles`, one state per line:
+
+```
+TODO: fg=red bold
+WAITING: fg=orange italic
+CANCELLED: fg=overlay dim
+```
+
+`fg=` and `bg=` take a palette key — which follows a colourscheme swap — or a
+literal `#rrggbb`. Modifiers are `bold`, `italic`, `underline` and `dim`, and
+`no-bold` and friends **clear** one the state inherits from its default. These
+are applied above the theme, so they win.
+
+### What is live and what needs a reload
+
+| | |
+|---|---|
+| cycling, and the `<leader>os` menu | follow `:set` immediately |
+| the per-state **colours** | resolve at load |
+
+Colours are fixed at load because the theme elements and the highlight query
+are both registered once, when the plugin loads. Emacs works the same way —
+`org-todo-keywords` is read at mode init and needs `org-mode-restart`. A
+`:colorscheme` also clears `org.todo-keyword-styles` until the next reload.
+
+`org.highest-priority` is the last priority letter, default `C` (so A, B, C),
+and is read on each keypress.
 
 ## Checkboxes
 

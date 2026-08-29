@@ -57,6 +57,9 @@ lattice-core = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-co
 # MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
 # naming the option's declaration type (`FoldMethodOption`) — it lives here.
 lattice-config = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-config" }
+# TK.3: the test asserts the component's TODO elements land in the SAME
+# registry builtins use, and resolve to real colours.
+lattice-theme = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-theme" }
 lattice-grammar = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-grammar" }
 lattice-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-host" }
 lattice-keymap = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-keymap" }

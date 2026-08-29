@@ -20,6 +20,9 @@ provides = [
     # OC.3: the capture menu, one key per template.
     "transient-source",
     "help",
+    # TK.3: one theme element per TODO state, so `org-todo-keyword-faces`
+    # is an ordinary element override rather than a new mechanism.
+    "theme",
     # OC.6: the clock's session, its minute wake and its modeline segment all
     # live on the event actor (design D6) — off the keystroke path by
     # construction. Without this seam the four clock chords still edit the

@@ -71,6 +71,55 @@ async fn load_language_seam(base: &std::path::Path, wasm: &[u8]) -> usize {
     .await
 }
 
+// ── TK.3 / TK.4: TODO states are their own theme elements ──
+
+/// Load with the `theme` AND `language` seams, returning the registry the
+/// component's elements landed in.
+///
+/// The order matters and is the loader's, not this test's: `theme` drains
+/// before `language`, so a query capture naming an element finds it. If that
+/// ever inverted, the capture would resolve to `Style::Default` and org would
+/// render unstyled — silently, which is why the assertion below is on the
+/// resolved STYLE and not merely on the element existing.
+async fn load_theme_and_language(
+    base: &std::path::Path,
+    wasm: &[u8],
+) -> (usize, lattice_theme::ThemeRegistryHandle) {
+    let plugins_dir = base.join("plugins");
+    let dir = plugins_dir.join("org");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "id = \"org\"\nprovides = [\"theme\", \"config\", \"language\"]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("component.wasm"), wasm).unwrap();
+
+    let theme: lattice_theme::ThemeRegistryHandle = Arc::new(
+        lattice_theme::InMemoryThemeRegistry::new(lattice_theme::default_palette()),
+    );
+    // The plugin's own options register here, so `get_option` answers the
+    // way it does in the editor rather than falling back for a different
+    // reason than production would.
+    let config = Arc::new(lattice_config::ConfigRegistry::new());
+
+    let host = Arc::new(
+        PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
+    );
+    let n = PluginLoader::with_services(
+        host,
+        LoaderServices {
+            runtime: Some(tokio::runtime::Handle::current()),
+            theme_registry: Some(theme.clone()),
+            config_registry: Some(config),
+            ..Default::default()
+        },
+    )
+    .discover_and_load(&plugins_dir, TrustTier::Bundled)
+    .await;
+    (n, theme)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_shipped_component_colours_an_org_buffer() {
     let Some(wasm) = org_component() else {
@@ -201,5 +250,78 @@ async fn an_unknown_or_absent_language_degrades_to_plain_text() {
         with_args.contains(&Style::Keyword),
         "header arguments after the language must not defeat the injection, \
          got {with_args:?}"
+    );
+}
+
+/// TK.3: the shipped component's TODO states are real theme elements.
+///
+/// Asserted through the loader with the same registry builtins use, because
+/// the failure this guards is not "wrong colour" but "no element at all" —
+/// which renders as plain title text and looks exactly like the old hardcoded
+/// query missing a keyword.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk3_todo_states_register_as_theme_elements() {
+    let Some(wasm) = org_component() else {
+        eprintln!("skipping: component not built");
+        return;
+    };
+    let base = tempfile::tempdir().unwrap();
+    let (n, theme) = load_theme_and_language(base.path(), &wasm).await;
+    assert_eq!(n, 1, "the org component loads");
+
+    for name in ["org.todo", "org.todo.active", "org.todo.done"] {
+        assert!(
+            theme
+                .id(&lattice_theme::ElementName::from(name.to_string()))
+                .is_some(),
+            "{name} must exist so an unconfigured keyword still inherits"
+        );
+    }
+    // The default keyword set is `TODO | DONE`.
+    for name in ["org.todo.TODO", "org.todo.DONE"] {
+        assert!(
+            theme
+                .id(&lattice_theme::ElementName::from(name.to_string()))
+                .is_some(),
+            "{name} must exist for `org-todo-keyword-faces` to have somewhere to land"
+        );
+    }
+}
+
+/// The reported symptom, pinned: TODO must not be the theme's *keyword*
+/// colour, and DONE must not be the same colour as TODO.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk3_todo_is_no_longer_painted_as_a_language_keyword() {
+    let Some(wasm) = org_component() else {
+        return;
+    };
+    let base = tempfile::tempdir().unwrap();
+    let (_, theme) = load_theme_and_language(base.path(), &wasm).await;
+    let resolved = theme.resolved();
+    let style = |n: &str| {
+        resolved.get(
+            theme
+                .id(&lattice_theme::ElementName::from(n.to_string()))
+                .unwrap_or_else(|| panic!("{n} registered")),
+        )
+    };
+
+    let todo = style("org.todo.TODO");
+    let done = style("org.todo.DONE");
+    assert!(todo.fg.is_some(), "TODO has a colour of its own");
+    assert_ne!(
+        todo.fg, done.fg,
+        "achieved and outstanding must not look the same"
+    );
+
+    // The old behaviour: `TODO` resolved to `Style::Keyword`, i.e. whatever
+    // the theme paints `if` and `return`. That is the purple that was
+    // reported, and it must not be what a TODO state gets now.
+    let ids = lattice_theme::BuiltinElementIds::capture(theme.as_ref());
+    let keyword_fg =
+        lattice_syntax::theme_style::resolve_syntax_style(&resolved, &ids, Style::Keyword).fg;
+    assert_ne!(
+        todo.fg, keyword_fg,
+        "a TODO state is not a language keyword and must not borrow its colour"
     );
 }

@@ -57,6 +57,14 @@ wit_bindgen::generate!({
             // structural rather than a matter of discipline. Declaring only
             // what the source actually uses keeps it that way.
             import lattice:plugin-host/host-services@0.1.0;
+            // TK.3: one theme element per TODO state. NOT `include
+            // theme-plugin` — that world imports `logging` too, and this
+            // component is instantiated against the grammar seam's sync
+            // linker where `logging` is absent. Same scar as the three
+            // seams below; the export sits at world level, so it lands on
+            // the same `Guest` trait as `register-languages`.
+            import lattice:plugin-host/theme@0.1.0;
+            export register-theme-elements: func();
             export lattice:plugin-host/picker-source@0.1.0;
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
@@ -117,6 +125,9 @@ use exports::lattice::plugin_host::media::Guest as MediaProducer;
 use exports::lattice::plugin_host::picker_source::Guest as PickerSource;
 use lattice::plugin_host::buffer::Document;
 use lattice::plugin_host::config::{get_option, register_option, OptionType};
+use lattice::plugin_host::theme::{
+    register_element, ColorRef, ModifierSet, StyleSpec as ThemeStyleSpec,
+};
 // OC.6: the clock's async side — `events` for the minute wake, `ui` for the
 // modeline segment. Both are also on the sync grammar linker (a component's
 // imports must resolve on every linker it instantiates against) and both refuse
@@ -457,9 +468,152 @@ fn conceal_rules() -> Vec<ConcealRule> {
     ]
 }
 
+/// TK.3 — one theme element per TODO state.
+///
+/// `org-todo-keyword-faces` needs no new mechanism: an element override in the
+/// theme scope IS that feature. What this function supplies is the *default*
+/// each override sits on top of, and the inherit chain that keeps a keyword
+/// the user adds later from rendering unstyled:
+///
+/// ```text
+/// org.todo.<KEYWORD>  →  org.todo.active | org.todo.done  →  org.todo
+/// ```
+///
+/// Every colour is a **palette key**, never a literal, so a colourscheme swap
+/// recolours the whole set and a palette missing a key falls through the chain
+/// rather than failing.
+mod todo_theme {
+    use super::*;
+
+    /// `(fg, bold, italic, dim, done)` for org's conventional vocabulary.
+    ///
+    /// A keyword not listed here inherits `active` / `done` and is styled
+    /// sensibly rather than not at all — which is what makes the load-time
+    /// resolution of the keyword set tolerable instead of a cliff.
+    fn conventional(name: &str) -> Option<(&'static str, bool, bool, bool)> {
+        Some(match name {
+            // Not done.
+            "TODO" => ("red", true, false, false),
+            "NEXT" => ("blue", true, false, false),
+            "STARTED" | "IN-PROGRESS" | "READING" | "WATCHING" | "DOING" => {
+                ("orange", false, false, false)
+            }
+            "WAITING" | "HOLD" | "BLOCKED" => ("yellow", false, true, false),
+            "PROJECT" | "PROJ" => ("blue", false, false, false),
+            "TO-READ" | "TO-WATCH" | "SOMEDAY" => ("yellow", false, false, false),
+            // Done.
+            "DONE" => ("green", true, false, false),
+            // Abandoned, deliberately NOT `DONE`'s green. Emacs' own default
+            // config paints both green; achieved versus abandoned is the
+            // distinction someone scanning an agenda actually wants.
+            "CANCELLED" | "CANCELED" | "KILL" | "ABANDONED" => ("overlay", false, false, true),
+            _ => return None,
+        })
+    }
+
+    /// Every modifier left unspecified, so the inherit chain decides.
+    fn unset() -> ModifierSet {
+        ModifierSet {
+            bold: None,
+            italic: None,
+            underline: None,
+            dim: None,
+            reverse: None,
+        }
+    }
+
+    fn spec(
+        inherit: &str,
+        fg: Option<&str>,
+        bold: bool,
+        italic: bool,
+        dim: bool,
+    ) -> ThemeStyleSpec {
+        ThemeStyleSpec {
+            inherit: Some(inherit.to_string()),
+            fg: fg.map(|k| ColorRef::Palette(k.to_string())),
+            bg: None,
+            modifiers: ModifierSet {
+                // `Some(false)` CLEARS an inherited modifier, which is why
+                // `DONE` can be bold-and-not-dim under a dim parent.
+                bold: Some(bold),
+                italic: Some(italic),
+                underline: None,
+                dim: Some(dim),
+                reverse: None,
+            },
+            scale: None,
+        }
+    }
+
+    /// Register the base three plus one element per configured keyword.
+    ///
+    /// Names are auto-namespaced by the host (`todo.TODO` → `org.todo.TODO`),
+    /// but `inherit` is NOT — it is resolved against the whole registry at
+    /// theme-build time, so it names the full `org.todo.active`.
+    pub fn register(kws: &crate::todo::Keywords) {
+        let base = ThemeStyleSpec {
+            inherit: None,
+            fg: Some(ColorRef::Palette("text".to_string())),
+            bg: None,
+            modifiers: unset(),
+            scale: None,
+        };
+        let _ = register_element("todo", "Base style for every TODO state.", &base);
+        let _ = register_element(
+            "todo.active",
+            "Default for a not-done TODO state with no style of its own.",
+            &spec("org.todo", Some("yellow"), true, false, false),
+        );
+        let _ = register_element(
+            "todo.done",
+            "Default for a done TODO state with no style of its own.",
+            &spec("org.todo", Some("overlay"), false, false, true),
+        );
+
+        for k in &kws.all {
+            let parent = if k.done {
+                "org.todo.done"
+            } else {
+                "org.todo.active"
+            };
+            let s = match conventional(&k.name) {
+                Some((fg, bold, italic, dim)) => spec(parent, Some(fg), bold, italic, dim),
+                // Not a conventional name: inherit and set nothing, so the
+                // chain decides and a user override still has somewhere to
+                // land.
+                None => ThemeStyleSpec {
+                    inherit: Some(parent.to_string()),
+                    fg: None,
+                    bg: None,
+                    modifiers: unset(),
+                    scale: None,
+                },
+            };
+            // A failure costs that keyword its own colour and nothing
+            // else: it still resolves through the chain. Deliberately not
+            // logged — this component must not import `logging`, or it
+            // stops instantiating against the grammar seam's sync linker
+            // (see the world declaration).
+            let _ = register_element(&format!("todo.{}", k.name), "A TODO state.", &s);
+        }
+    }
+}
+
 impl Guest for Component {
     /// OM.7's options. Auto-namespaced by the host to `org.*`, so these are
     /// `org.todo-keywords` and `org.highest-priority` to the user.
+    /// TK.3: one theme element per TODO state, so `org-todo-keyword-faces`
+    /// is an ordinary element override rather than a new mechanism.
+    ///
+    /// Runs before `register_languages` — the loader drains `theme` first —
+    /// which is what lets TK.4's generated query name these elements.
+    fn register_theme_elements() {
+        todo_theme::register(&todo::parse_todo_keywords(
+            &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
+        ));
+    }
+
     fn register_options() {
         let _ = register_option(
             "todo-keywords",

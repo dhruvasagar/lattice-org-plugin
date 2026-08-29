@@ -3342,6 +3342,7 @@ dependencies = [
  "lattice-protocol",
  "lattice-runtime",
  "lattice-syntax",
+ "lattice-theme",
  "lattice-wit",
  "serde",
  "tempfile",

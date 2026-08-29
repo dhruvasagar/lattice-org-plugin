@@ -115,3 +115,91 @@ async fn the_shipped_component_colours_an_org_buffer() {
     // its binary, so the process-global language registry dies with it — the
     // sibling files that DO unregister share a binary with each other.
 }
+
+/// A `#+begin_src rust` block is highlighted by Rust's grammar, not org's.
+///
+/// The mechanism is the one markdown's fenced blocks use, so what is worth
+/// asserting is not that injections exist but that ORG's query drives them: the
+/// language is org's first block *parameter* rather than a dedicated node, and
+/// `block` covers every `#+begin_X`, so a wrong query either injects nothing or
+/// injects into `#+begin_quote`.
+///
+/// `Style::Keyword` on `fn` is the discriminator. Org's own highlights have no
+/// rule that would paint it — inside a block org sees `contents`, one opaque
+/// node — so the style can only have come from Rust's grammar running over the
+/// injected range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_src_block_is_highlighted_by_its_own_language() {
+    let Some(wasm) = org_component() else {
+        eprintln!("skipping: component not built");
+        return;
+    };
+    let base = tempfile::tempdir().unwrap();
+    assert_eq!(load_language_seam(base.path(), &wasm).await, 1, "org loads");
+    let lang = Lang::detect_from_path(Some(std::path::Path::new("notes.org")));
+
+    let mut syntax = Syntax::for_language(lang).unwrap().unwrap();
+    // Line 1 is Rust; line 4 is the same text inside an EXAMPLE block that
+    // NAMES rust — which is the case a `name:`-blind query gets wrong, and the
+    // reason the guard is not decoration. An example block is verbatim text by
+    // definition; a quote block would not discriminate here because it carries
+    // no parameter, so the query would fail to match it either way.
+    let src = "#+begin_src rust\nfn main() {}\n#+end_src\n#+begin_example rust\nfn main() {}\n#+end_example\n";
+    syntax.parse(src);
+    let lines = syntax.highlight_lines_native(0, 6).expect("highlights");
+
+    let in_src: Vec<Style> = lines[1].iter().map(|s| s.style).collect();
+    assert!(
+        in_src.contains(&Style::Keyword),
+        "`fn` inside #+begin_src rust should be a Rust keyword, got {in_src:?} — \
+         org's own highlights cannot produce this, so its absence means the \
+         injection never ran"
+    );
+
+    let in_example: Vec<Style> = lines[4].iter().map(|s| s.style).collect();
+    assert!(
+        !in_example.contains(&Style::Keyword),
+        "an #+begin_example block is verbatim text even when it names a \
+         language; got {in_example:?}"
+    );
+}
+
+/// An org block whose first parameter is not a language anyone has must degrade
+/// to plain text, not fail the file.
+///
+/// `#+begin_src` also routinely carries header arguments — `:results output`,
+/// `:tangle yes` — and the query's anchor is what keeps those from being handed
+/// to the host as language names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_or_absent_language_degrades_to_plain_text() {
+    let Some(wasm) = org_component() else {
+        eprintln!("skipping: component not built");
+        return;
+    };
+    let base = tempfile::tempdir().unwrap();
+    assert_eq!(load_language_seam(base.path(), &wasm).await, 1, "org loads");
+    let lang = Lang::detect_from_path(Some(std::path::Path::new("notes.org")));
+
+    let mut syntax = Syntax::for_language(lang).unwrap().unwrap();
+    // No language at all, a language nothing bundles, and a real one followed
+    // by header args — the third must still inject.
+    let src = "#+begin_src\nfn main() {}\n#+end_src\n\
+               #+begin_src cobol\nfn main() {}\n#+end_src\n\
+               #+begin_src rust :results output\nfn main() {}\n#+end_src\n";
+    syntax.parse(src);
+    let lines = syntax.highlight_lines_native(0, 9).expect("highlights");
+
+    for (row, what) in [(1usize, "no language"), (4, "an unknown language")] {
+        let styles: Vec<Style> = lines[row].iter().map(|s| s.style).collect();
+        assert!(
+            !styles.contains(&Style::Keyword),
+            "{what} must leave the body plain, got {styles:?}"
+        );
+    }
+    let with_args: Vec<Style> = lines[7].iter().map(|s| s.style).collect();
+    assert!(
+        with_args.contains(&Style::Keyword),
+        "header arguments after the language must not defeat the injection, \
+         got {with_args:?}"
+    );
+}

@@ -26,6 +26,34 @@ Org's marker is a **single node whose text length is the level**, so the query
 compares that text — `#eq?` predicates, which no built-in lattice query had
 needed before org.
 
+## Source blocks
+
+A `#+begin_src` block is highlighted by the language it names, not by org:
+
+```org
+#+begin_src rust
+fn main() { println!("hi"); }
+#+end_src
+```
+
+`fn` there is a Rust keyword, coloured by Rust's own grammar. This is the same
+mechanism markdown's fenced blocks use — org contributes an injection query and
+the host resolves the named language against the SAME registry a top-level
+buffer uses, so any bundled language works and so does another plugin's.
+
+Header arguments are fine: `#+begin_src rust :results output` still injects,
+because only the block's first parameter is read as the language.
+
+A language nothing has a grammar for — `#+begin_src cobol` — leaves the body
+plain rather than failing. Short names resolve through the same aliases the rest
+of the editor uses (`rs`, `py`, `js`, `sh`, `rb`, `ts`, `yml`), so
+`#+begin_src py` is Python. A name with no grammar and no alias, `emacs-lisp`
+being the one org users hit most, is simply plain text.
+
+Only `src` blocks inject. `#+begin_example`, `#+begin_quote` and the rest are
+verbatim or prose by definition, and stay that way even when they name a
+language.
+
 ## Folding
 
 `za` toggles, `zR` opens everything, `zM` closes everything — the ordinary

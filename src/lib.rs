@@ -468,7 +468,10 @@ impl Guest for Component {
             grammar: GRAMMAR.to_vec(),
             highlights: Some(include_str!("../queries/highlights.scm").to_string()),
             folds: Some(include_str!("../queries/folds.scm").to_string()),
-            injections: None,
+            // The language a `#+begin_src` block names, so its body is
+            // highlighted by that language's own grammar (the markdown
+            // fenced-block path, reused verbatim host-side).
+            injections: Some(include_str!("../queries/injections.scm").to_string()),
             indents: None,
             textobjects: None,
         });

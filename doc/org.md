@@ -473,18 +473,49 @@ emoji, which occupy two cells, do not yet.
 
 | | |
 |---|---|
-| `<leader>oo` | open the link under the cursor |
+| `<CR>` | follow the link under the cursor |
+| `<leader>oo` | the same, explicitly |
 
-Three destinations, decided by what the link says:
+`<CR>` is the one you will use. `<leader>oo` stays because it still works
+when the caret is *beside* a link rather than inside it, and because taking
+a working chord away to make room for a new one is not an improvement.
+
+Off a link, `<CR>` does nothing — org hands the key back rather than
+consuming it, so if `<CR>` ever grows another meaning in an ordinary buffer
+it will simply work here too.
+
+Four destinations, decided by what the link says:
 
 | | |
 |---|---|
 | `[[file:notes.org]]`, `[[notes/a.org]]` | opens as a buffer |
 | `[[https://example.com]]` | goes to the system handler |
 | `[[*Some Heading]]` | jumps to that headline in this file |
+| `[[id:6F398E54-…]]` | **recognised, not yet resolvable** |
+
+An `id:` link points at a note by its `:ID:` rather than by where it lives,
+which is what makes the link survive renames — and what means resolving it
+needs an index of every note you have. That index is org-roam's, and it is
+not built yet, so following one tells you the index is missing rather than
+guessing. It is listed here because org now *knows* the kind: before, an
+`id:` link was mistaken for a filename and opening it complained about a
+file that was never meant to exist.
 
 Unlike an image, a link does **not** have to be alone on its line — opening
 one mid-sentence is the whole point of the key.
+
+### How links look
+
+A link renders as the text you gave it. `[[id:6F39][Project Kickoff]]` reads
+as **Project Kickoff**; the target and the brackets take up no room.
+
+A link with no description keeps its target on screen —
+`[[https://example.com]]` reads as `https://example.com` — because hiding
+the only text a link has would leave nothing to see or click.
+
+**Insert mode shows the raw text again**, everywhere in the buffer, so
+editing a link is editing exactly what is on disk. Leaving Insert puts the
+rendered form back. Normal is for reading, Insert is for editing.
 
 Internal references match the headline **title** exactly, so a `TODO` keyword
 or priority on the target does not get in the way, and case matters. A

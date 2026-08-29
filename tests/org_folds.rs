@@ -83,6 +83,11 @@ fn org_syntax(tag: &str, src: &str) -> Option<(Syntax, u64)> {
         injections: None,
         indents: None,
         textobjects: None,
+        // H.2: these fixtures register the grammar directly rather than
+        // through the plugin, so they declare no conceal rules. That is
+        // right — they assert folds and headlines, and concealment would
+        // change the display text out from under them.
+        conceal_rules: vec![],
     };
     let interned = plugin_lang::register_with_grammar(&name, &[&ext], &spec, plugin)
         .expect("org registers — a query failure here names the offending file");
@@ -242,6 +247,11 @@ fn the_highlights_query_compiles_and_marks_the_interactive_bits() {
         injections: None,
         indents: None,
         textobjects: None,
+        // H.2: these fixtures register the grammar directly rather than
+        // through the plugin, so they declare no conceal rules. That is
+        // right — they assert folds and headlines, and concealment would
+        // change the display text out from under them.
+        conceal_rules: vec![],
     };
     // The assertion that matters most: this is where a bad node or field name
     // surfaces, and it names `highlights.scm`.

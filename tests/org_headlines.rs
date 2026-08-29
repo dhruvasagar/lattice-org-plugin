@@ -101,6 +101,11 @@ fn register_org(tag: &str) -> Option<(Lang, u64)> {
         injections: None,
         indents: None,
         textobjects: None,
+        // H.2: these fixtures register the grammar directly rather than
+        // through the plugin, so they declare no conceal rules. That is
+        // right — they assert folds and headlines, and concealment would
+        // change the display text out from under them.
+        conceal_rules: vec![],
     };
     let interned = plugin_lang::register_with_grammar(&name, &[&ext], &spec, plugin)
         .expect("org registers — a query failure here names the offending file");

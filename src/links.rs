@@ -191,6 +191,20 @@ pub enum Target {
     Uri(String),
     /// An internal `*Headline` reference, resolved by searching this buffer.
     Headline(String),
+    /// OL.1: `[[id:6F398E54-…]]` — an org-id reference.
+    ///
+    /// **Recognised here, resolvable nowhere yet.** An `:ID:` is a key
+    /// into a corpus, and finding the file that holds it needs an index
+    /// — `org-roam.md`'s subject, not this module's.
+    ///
+    /// It is a variant rather than an omission because the status quo
+    /// was actively misleading: with no `id:` arm, `classify` fell
+    /// through to the file branch below and opening the link reported
+    /// *"no such file: id:6F398E54-…"*, which blames the filesystem for
+    /// a missing index and sends the reader after a file that was never
+    /// meant to exist. Recognising the kind and failing on it honestly
+    /// is strictly better than resolving it wrongly.
+    Id(String),
 }
 
 /// A link found under the cursor, with its byte span.
@@ -238,6 +252,12 @@ fn classify(path: &str) -> Option<Target> {
     }
     if let Some(f) = p.strip_prefix("file:") {
         return (!f.trim().is_empty()).then(|| Target::File(f.to_string()));
+    }
+    // OL.1: BEFORE `has_scheme`, which would otherwise classify `id:` as
+    // a generic URI and hand it to the platform opener.
+    if let Some(id) = p.strip_prefix("id:") {
+        let id = id.trim();
+        return (!id.is_empty()).then(|| Target::Id(id.to_string()));
     }
     if has_scheme(p) {
         return Some(Target::Uri(p.to_string()));
@@ -319,7 +339,64 @@ mod link_tests {
         assert!(link_at("[[]]", 2).is_none());
         assert!(link_at("[[*]]", 2).is_none());
         assert!(link_at("[[file:]]", 3).is_none());
+        assert!(link_at("[[id:]]", 3).is_none());
         assert!(link_at("no link", 2).is_none());
+    }
+
+    // ---- OL.1: `id:` is a link kind ----
+
+    #[test]
+    fn an_id_link_classifies_as_an_id() {
+        assert_eq!(
+            link_at("[[id:6F398E54-7E63-4492-9EB6-89C8A90E7DD3]]", 5)
+                .unwrap()
+                .target,
+            Target::Id("6F398E54-7E63-4492-9EB6-89C8A90E7DD3".into())
+        );
+        assert_eq!(
+            link_at("see [[id:ABC][Some Note]] here", 10)
+                .unwrap()
+                .target,
+            Target::Id("ABC".into())
+        );
+    }
+
+    /// The bug OL.1 exists to end: without the `id:` arm this fell
+    /// through to `Target::File`, and opening it reported "no such file:
+    /// id:6F39…" — blaming the filesystem for a missing index and
+    /// sending the reader after a file that was never meant to exist.
+    #[test]
+    fn an_id_link_is_not_a_file() {
+        let t = link_at("[[id:6F39]]", 5).unwrap().target;
+        assert!(
+            !matches!(t, Target::File(_)),
+            "an id must never reach the file branch: {t:?}"
+        );
+    }
+
+    /// `id:` is checked BEFORE the generic scheme test, or the platform
+    /// URI opener would be handed `id:6F39`.
+    #[test]
+    fn an_id_link_is_not_a_uri() {
+        assert!(!matches!(
+            link_at("[[id:6F39]]", 5).unwrap().target,
+            Target::Uri(_)
+        ));
+    }
+
+    /// The arm keys on the SCHEME, not on the substring — a file whose
+    /// name merely contains `id:` is still a file, and `file:` still
+    /// wins where both could match.
+    #[test]
+    fn only_the_id_scheme_is_an_id() {
+        assert_eq!(
+            link_at("[[file:id:weird.org]]", 5).unwrap().target,
+            Target::File("id:weird.org".into())
+        );
+        assert_eq!(
+            link_at("[[notes/id-list.org]]", 5).unwrap().target,
+            Target::File("notes/id-list.org".into())
+        );
     }
 
     /// Exact and case-sensitive, like org's own internal links: jumping to

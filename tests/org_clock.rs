@@ -300,7 +300,10 @@ async fn the_modeline_segment_appears_without_another_keystroke() {
     goto_line(&mut editor, 0);
     press(&mut editor, "<leader>oi");
 
-    let shown = until(&mut editor, Duration::from_secs(5), |e| segment(e).is_some()).await;
+    let shown = until(&mut editor, Duration::from_secs(5), |e| {
+        segment(e).is_some()
+    })
+    .await;
     assert!(
         shown,
         "the segment must appear on its own — the grammar store emitted an \
@@ -329,7 +332,11 @@ async fn clocking_out_closes_the_line_and_clears_the_segment() {
 
     goto_line(&mut editor, 0);
     press(&mut editor, "<leader>oi");
-    assert!(until(&mut editor, Duration::from_secs(5), |e| segment(e).is_some()).await);
+    assert!(
+        until(&mut editor, Duration::from_secs(5), |e| segment(e)
+            .is_some())
+        .await
+    );
 
     goto_line(&mut editor, 0);
     press(&mut editor, "<leader>oO");
@@ -341,7 +348,9 @@ async fn clocking_out_closes_the_line_and_clears_the_segment() {
         "a closed clock carries both stamps and a duration: {clock_line:?}"
     );
     assert!(
-        until(&mut editor, Duration::from_secs(5), |e| segment(e).is_none()).await,
+        until(&mut editor, Duration::from_secs(5), |e| segment(e)
+            .is_none())
+        .await,
         "and the segment goes away, again with no keystroke to prompt it"
     );
 }
@@ -595,7 +604,8 @@ async fn the_last_clocked_entry_outlives_clocking_out() {
         .filter(|l| l.trim_start().starts_with("CLOCK: ") && !l.contains("--"))
         .count();
     assert_eq!(
-        running, 1,
+        running,
+        1,
         "resume re-clocked the entry clock-out had finished: {:?}",
         text(&editor)
     );

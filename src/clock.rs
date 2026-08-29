@@ -458,8 +458,7 @@ mod tests {
     /// a naive "skip to the next `:END:`" is right here and wrong for LOGBOOK.
     #[test]
     fn the_drawer_goes_below_a_properties_drawer() {
-        let (line, count) =
-            accessor("* Task\n:PROPERTIES:\n:ID: abc\n:END:\nbody\n");
+        let (line, count) = accessor("* Task\n:PROPERTIES:\n:ID: abc\n:END:\nbody\n");
         let hl = headline::Headlines::new(None, &line, count);
         let ins = Logbook::new(&hl).clock_in(0, now()).unwrap();
         assert_eq!(ins.line, 4, "below the properties drawer's :END:");
@@ -468,9 +467,8 @@ mod tests {
 
     #[test]
     fn both_planning_and_properties_are_skipped_together() {
-        let (line, count) = accessor(
-            "* Task\nSCHEDULED: <2026-08-30 Sun>\n:PROPERTIES:\n:ID: abc\n:END:\nbody\n",
-        );
+        let (line, count) =
+            accessor("* Task\nSCHEDULED: <2026-08-30 Sun>\n:PROPERTIES:\n:ID: abc\n:END:\nbody\n");
         let hl = headline::Headlines::new(None, &line, count);
         let ins = Logbook::new(&hl).clock_in(0, now()).unwrap();
         assert_eq!(ins.line, 5);
@@ -490,8 +488,7 @@ mod tests {
     /// the "after a restart" case — the buffer alone says a clock is running.
     #[test]
     fn a_running_clock_is_found_from_the_buffer_alone() {
-        let (line, count) =
-            accessor("* Task\n:LOGBOOK:\nCLOCK: [2026-08-28 Fri 09:15]\n:END:\n");
+        let (line, count) = accessor("* Task\n:LOGBOOK:\nCLOCK: [2026-08-28 Fri 09:15]\n:END:\n");
         let hl = headline::Headlines::new(None, &line, count);
         let r = Logbook::new(&hl).running(0).unwrap();
         assert_eq!(r.line, 2);
@@ -550,13 +547,11 @@ mod tests {
 
     #[test]
     fn closing_an_already_closed_line_is_refused() {
-        assert!(
-            close(
-                "CLOCK: [2026-08-28 Fri 09:15]--[2026-08-28 Fri 10:15] =>  1:00",
-                now()
-            )
-            .is_none()
-        );
+        assert!(close(
+            "CLOCK: [2026-08-28 Fri 09:15]--[2026-08-28 Fri 10:15] =>  1:00",
+            now()
+        )
+        .is_none());
     }
 
     /// Cancel takes the drawer with it when the clock was its only line —

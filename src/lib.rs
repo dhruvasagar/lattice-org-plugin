@@ -122,10 +122,9 @@ use lattice::plugin_host::config::{get_option, register_option, OptionType};
 // imports must resolve on every linker it instantiates against) and both refuse
 // there, which is where "off the keystroke path" is actually enforced.
 use lattice::plugin_host::events;
-use lattice::plugin_host::host_services;
-use lattice::plugin_host::ui;
 use lattice::plugin_host::grammar::{register_action, register_motion, register_text_object};
 use lattice::plugin_host::help::register_topic;
+use lattice::plugin_host::host_services;
 use lattice::plugin_host::language::{register_language, LanguageSpec};
 use lattice::plugin_host::modes::{
     register_mode, ActivationPolicy, BindingMode, ModeCapabilities, ModeDeclaration,
@@ -138,6 +137,7 @@ use lattice::plugin_host::types::{
     MotionSpec, OpenProviderViewPayload, OperatorContext, Position, Range, SurfaceForm,
     TextObjectContext, TextObjectSpec, UiZone, WriteToFilePayload,
 };
+use lattice::plugin_host::ui;
 
 /// Callback ids for `apply-action`. The guest chooses these; the host only
 /// hands them back (§6 — a plugin cannot forge a `CommandId`).
@@ -478,6 +478,10 @@ impl Guest for Component {
             injections: Some(include_str!("../queries/injections.scm").to_string()),
             indents: None,
             textobjects: None,
+            // OL.2 fills this in. Empty here so OL.1 lands on its own:
+            // the WIT field is required, so `Target::Id` could not be
+            // added without it.
+            conceal_rules: vec![],
         });
     }
 
@@ -564,7 +568,11 @@ impl Guest for Component {
                     // rate the segment can change at — a clock reads in whole
                     // minutes, so a faster tick would buy nothing visible.
                     let wake = events::wake_every(60_000);
-                    *s.borrow_mut() = Some(ClockSession { started, title, wake });
+                    *s.borrow_mut() = Some(ClockSession {
+                        started,
+                        title,
+                        wake,
+                    });
                 });
                 // Immediately, not on the first wake — otherwise `◷ 0:00` takes
                 // up to a minute to appear and the chord looks like it failed.
@@ -1569,7 +1577,10 @@ fn replace_lines_at(
             target: buffer_id,
             edit: Edit {
                 range: Range {
-                    start: Position { line: from, byte: 0 },
+                    start: Position {
+                        line: from,
+                        byte: 0,
+                    },
                     end: Position {
                         line: to,
                         byte: to_len,
@@ -1792,7 +1803,10 @@ fn clock_in(
     let Some((headline_line, _)) = hl.enclosing(cursor.line) else {
         return vec![Effect::None];
     };
-    let title = hl.text(headline_line).map(|t| clock_title(&t)).unwrap_or_default();
+    let title = hl
+        .text(headline_line)
+        .map(|t| clock_title(&t))
+        .unwrap_or_default();
 
     // Remember where to jump back to, and tell the async side to start ticking.
     if let Some(path) = doc.path() {
@@ -1805,19 +1819,25 @@ fn clock_in(
 
     // A zero-width range at the insertion line's column 0 — an insert, not a
     // replace, so nothing that was there is touched.
-    vec![
-        Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
+    vec![Effect::ApplyEdit(
+        lattice::plugin_host::types::ApplyEditPayload {
             target: buffer_id,
             edit: Edit {
                 range: Range {
-                    start: Position { line: ins.line, byte: 0 },
-                    end: Position { line: ins.line, byte: 0 },
+                    start: Position {
+                        line: ins.line,
+                        byte: 0,
+                    },
+                    end: Position {
+                        line: ins.line,
+                        byte: 0,
+                    },
                 },
                 kind: EditKind::Replace(ins.text),
             },
             cursor: Some(cursor),
-        }),
-    ]
+        },
+    )]
 }
 
 /// `<leader>oO` (close it) and `<leader>oq` (discard it).
@@ -1859,19 +1879,28 @@ fn clock_stop(
         // Delete whole lines: the range runs from the first line's column 0 to
         // the START of the line after the last, so the newline goes with them
         // and no blank line is left behind.
-        return vec![
-            Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
+        return vec![Effect::ApplyEdit(
+            lattice::plugin_host::types::ApplyEditPayload {
                 target: buffer_id,
                 edit: Edit {
                     range: Range {
-                        start: Position { line: from, byte: 0 },
-                        end: Position { line: to + 1, byte: 0 },
+                        start: Position {
+                            line: from,
+                            byte: 0,
+                        },
+                        end: Position {
+                            line: to + 1,
+                            byte: 0,
+                        },
                     },
                     kind: EditKind::Replace(String::new()),
                 },
-                cursor: Some(Position { line: from, byte: 0 }),
-            }),
-        ];
+                cursor: Some(Position {
+                    line: from,
+                    byte: 0,
+                }),
+            },
+        )];
     }
 
     let Some(text) = hl.text(running.line) else {
@@ -2018,7 +2047,11 @@ fn clock_segment_text(session: &ClockSession, now_minutes: i64) -> String {
     // Trimmed, because the duration is the part that must always be readable —
     // a long headline must not push it off a narrow modeline.
     let title: String = session.title.chars().take(24).collect();
-    let ellipsis = if session.title.chars().count() > 24 { "…" } else { "" };
+    let ellipsis = if session.title.chars().count() > 24 {
+        "…"
+    } else {
+        ""
+    };
     format!("{icon}{} {title}{ellipsis}", elapsed.trim_start())
 }
 
@@ -2419,7 +2452,11 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
         // should, and a silent append is how someone loses track of where their
         // captures are landing.
         capture_target::Insertion::Append => vec![
-            write_at(path.clone(), FileAnchor::End, clocked(text, lines.len() as u32)),
+            write_at(
+                path.clone(),
+                FileAnchor::End,
+                clocked(text, lines.len() as u32),
+            ),
             Effect::Echo(EchoPayload {
                 level: EchoLevel::Warn,
                 text: format!("org: no headline `{headline}` in {path}; appended at the end"),
@@ -3327,8 +3364,9 @@ fn step_timestamp(ctx: &ActionContext, doc: &Document, delta: i64) -> Vec<Effect
 
 /// OM.10 — open the link under the cursor.
 ///
-/// Three destinations, three effects: a file opens as a buffer, a URL goes to
-/// the system handler, and an internal `[[*Headline]]` moves the cursor.
+/// Four destinations: a file opens as a buffer, a URL goes to the system
+/// handler, an internal `[[*Headline]]` moves the cursor, and an `id:`
+/// reference reports that there is no index to resolve it against.
 ///
 /// The internal case searches THIS buffer only, which is what org means by
 /// `*Headline`, and matches the title exactly — a fuzzy match that jumped to
@@ -3367,6 +3405,14 @@ fn open_link(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
                 })],
             }
         }
+        // OL.1: recognised, and honestly unresolvable until org-roam
+        // ships an index. The message names the id AND says what is
+        // missing, because "cannot open" would leave a reader unable to
+        // tell a broken link from an absent feature.
+        links::Target::Id(id) => vec![Effect::Echo(lattice::plugin_host::types::EchoPayload {
+            level: lattice::plugin_host::types::EchoLevel::Warn,
+            text: format!("org: no id index, so [[id:{id}]] cannot be resolved yet"),
+        })],
     }
 }
 

@@ -2788,7 +2788,12 @@ impl GrammarCallbacks for Component {
         }
     }
 
-    fn apply_ex_command(callback: u32, ctx: ExCommandContext) -> Result<Vec<Effect>, String> {
+    fn apply_ex_command(
+        callback: u32,
+        ctx: ExCommandContext,
+        _doc: &Document,
+        _tree: Option<&TreeSnapshot>,
+    ) -> Result<Vec<Effect>, String> {
         match callback {
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered

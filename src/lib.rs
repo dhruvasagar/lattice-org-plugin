@@ -190,6 +190,24 @@ const TIMESTAMP_DOWN: u32 = 19;
 /// `<leader>oo` (OM.10).
 const OPEN_LINK: u32 = 20;
 
+/// `<CR>` (OL.3) — the same body as [`OPEN_LINK`], different miss.
+///
+/// A second action rather than a flag on the first, because the two
+/// chords need OPPOSITE answers when the cursor is not on a link and
+/// the effect vocabulary has no way to say "it depends".
+///
+/// `<leader>oo` must answer `Effect::None`: it is a multi-key chord
+/// behind a plugin-owned prefix, and `Declined` re-runs a chord's
+/// TRAILING key alone — so declining would fire whatever bare `o`
+/// means, which in Normal mode is "open a line below and enter
+/// Insert". A miss would start editing the buffer.
+///
+/// `<CR>` must answer `Effect::Declined`: it is a single key, there is
+/// no trailing key to re-run, and declining is what lets the builtin
+/// first-non-blank-of-next-line motion still work everywhere a link
+/// is not.
+const FOLLOW_LINK: u32 = 47;
+
 /// `org-table-mode` (OM.12).
 const TABLE_NEXT_CELL: u32 = 21;
 const TABLE_PREV_CELL: u32 = 22;
@@ -702,6 +720,13 @@ impl Guest for Component {
                 // timestamp, so the builtin still works on ordinary numbers —
                 // the one place in this plugin where declining is right.
                 bind("<leader>oo", "org-open-link"),
+                // OL.3: `<CR>` follows a link and declines everywhere
+                // else, so the builtin motion still works. `<leader>oo`
+                // stays — it is the explicit form, it works when the
+                // cursor is outside the link's span, and removing a
+                // working chord to make room costs muscle memory for
+                // nothing.
+                bind("<CR>", "org-follow-link"),
                 bind("<C-a>", "org-timestamp-up"),
                 bind("<C-x>", "org-timestamp-down"),
                 // Motions, kept verbatim from nvim-orgmode — `]` and `[` are
@@ -1128,6 +1153,12 @@ impl Guest for Component {
             "Open the link under the cursor: file, URL, or another headline",
             &spec(),
             OPEN_LINK,
+        );
+        register_action(
+            "org-follow-link",
+            "Follow the link under the cursor, else the ordinary <CR> motion",
+            &spec(),
+            FOLLOW_LINK,
         );
         register_action(
             "org-timestamp-up",
@@ -2866,7 +2897,8 @@ impl GrammarCallbacks for Component {
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, tree, -1)),
             TABLE_ALIGN => Ok(table_move(&ctx, doc, tree, 0)),
             TABLE_ROW_UP..=TABLE_DELETE_COL => Ok(table_structure(&ctx, doc, tree, callback)),
-            OPEN_LINK => Ok(open_link(&ctx, doc)),
+            OPEN_LINK => Ok(open_link(&ctx, doc, Effect::None)),
+            FOLLOW_LINK => Ok(open_link(&ctx, doc, Effect::Declined)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
             TIMESTAMP_DOWN => Ok(step_timestamp(&ctx, doc, -1)),
             // IM.7: flips `org.inline-images`. The option is global rather
@@ -3420,17 +3452,21 @@ fn step_timestamp(ctx: &ActionContext, doc: &Document, delta: i64) -> Vec<Effect
 /// handler, an internal `[[*Headline]]` moves the cursor, and an `id:`
 /// reference reports that there is no index to resolve it against.
 ///
+/// `on_miss` is what to answer when the cursor is not inside a link, and
+/// it is a parameter because the two chords bound to this need opposite
+/// answers — see [`FOLLOW_LINK`].
+///
 /// The internal case searches THIS buffer only, which is what org means by
 /// `*Headline`, and matches the title exactly — a fuzzy match that jumped to
 /// the wrong heading would be worse than not jumping. A reference that
 /// resolves to nothing echoes rather than moving the cursor somewhere
 /// arbitrary.
-fn open_link(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+fn open_link(ctx: &ActionContext, doc: &Document, on_miss: Effect) -> Vec<Effect> {
     let Some(text) = doc.line(ctx.cursor.line) else {
-        return vec![Effect::None];
+        return vec![on_miss];
     };
     let Some(link) = links::link_at(&text, ctx.cursor.byte as usize) else {
-        return vec![Effect::None];
+        return vec![on_miss];
     };
     match link.target {
         links::Target::File(path) => vec![Effect::OpenBufferAt(

@@ -1620,6 +1620,117 @@ async fn opening_off_a_link_does_nothing() {
     assert_eq!(editor.cursor.line, 1);
 }
 
+// ── OL.3: `<CR>` follows a link, and declines everywhere else ──
+
+/// `<CR>` on a link does what `<leader>oo` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cr_on_a_link_follows_it() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Index\nsee [[*Deep Work]] below\n* Other\n* TODO Deep Work\nbody\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 8;
+    press(&mut editor, "<CR>");
+    assert_eq!(editor.cursor.line, 3, "`<CR>` followed the link");
+}
+
+/// **The decline, and what it does and does not prove.**
+///
+/// `org-follow-link` answers `Effect::Declined` off a link, which means
+/// "org did not handle this, keep resolving". **Nothing binds `<CR>`
+/// beneath org in a Document buffer today** — lattice has no equivalent
+/// of vim's first-non-blank-of-next-line motion, and `input.rs` routes
+/// `<CR>` to `FollowLink` only for Help / Dashboard / Oil / FileTree
+/// buffers. So declining is observationally a no-op right now, and this
+/// test cannot distinguish it from `Effect::None`; OM.5 records the same
+/// limitation for `<Tab>`.
+///
+/// `Declined` is still the right answer, for two reasons a test cannot
+/// see: it is the honest one, and it is what makes org compose for free
+/// if `<CR>` ever gains a Document-buffer meaning.
+///
+/// What this test DOES prove is the thing worth protecting: `<CR>` in an
+/// org buffer must not reach Insert-mode handling, where it would split
+/// the line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cr_off_a_link_leaves_the_buffer_and_cursor_alone() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Index\nplain prose\n    indented next\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    let before_line = editor.cursor.line;
+    press(&mut editor, "<CR>");
+    assert_eq!(
+        text(&editor),
+        original,
+        "no newline inserted — the failure if the chord reached Insert handling"
+    );
+    assert_eq!(editor.cursor.line, before_line, "nothing beneath moved it");
+}
+
+/// The catastrophic version, pinned separately because it is a
+/// *different* failure from "nothing happened".
+///
+/// Had `<CR>` been bound to `org-open-link` — which answers
+/// `Effect::None` — this would also pass. Had org's action instead let
+/// the key fall all the way through to Insert, `<CR>` would split every
+/// line it was pressed on. One key, one buffer-destroying outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cr_in_an_org_buffer_never_enters_insert_or_splits_a_line() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* Index\nplain prose\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 5;
+    press(&mut editor, "<CR>");
+    press(&mut editor, "<CR>");
+    assert_eq!(
+        text(&editor),
+        original,
+        "two presses, still one buffer — no line was split"
+    );
+    assert!(
+        matches!(editor.modal, lattice_grammar::ModalState::Normal),
+        "still Normal: {:?}",
+        editor.modal
+    );
+}
+
+/// An `id:` link is recognised and unresolvable, so `<CR>` on one must
+/// NOT fall through to the motion — org consumed the chord and said so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cr_on_an_id_link_is_consumed_rather_than_declined() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Index\n[[id:6F39]]\n* Other\n").await;
+
+    goto_line(&mut editor, 1);
+    editor.cursor.byte = 4;
+    press(&mut editor, "<CR>");
+    assert_eq!(
+        editor.cursor.line, 1,
+        "the cursor stays: org answered with an echo, it did not decline"
+    );
+}
+
 // ── OM.12: tables ──
 
 /// `<Tab>` in a table aligns it and steps a cell. The alignment is

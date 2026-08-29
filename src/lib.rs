@@ -219,6 +219,22 @@ const OPEN_LINK: u32 = 20;
 /// is not.
 const FOLLOW_LINK: u32 = 47;
 
+/// TK.6 — fast select. `TODO_SELECT` opens the menu; `TODO_SET` is what a
+/// row runs, carrying the chosen state in its own args.
+///
+/// Two actions rather than one for the reason TR.2a's per-row args exist:
+/// one registered command, N rows, and the key you pressed decides which
+/// state. The alternative is one command per keyword, and keywords are an
+/// option read at menu-build time rather than at load — so they could not
+/// be registered as commands at all.
+const TODO_SELECT: u32 = 48;
+const TODO_SET: u32 = 49;
+
+/// The `transient-source` id. One per guest, so org's menus share it and
+/// branch on what the open was FOR — the shape OC.4 established for
+/// capture's two menus.
+const ORG_TRANSIENT_TODO: &str = "todo";
+
 /// `org-table-mode` (OM.12).
 const TABLE_NEXT_CELL: u32 = 21;
 const TABLE_PREV_CELL: u32 = 22;
@@ -1100,6 +1116,11 @@ impl Guest for Component {
             keymap: vec![
                 bind("<leader>ot", "org-todo-cycle"),
                 bind("<leader>oT", "org-todo-cycle-back"),
+                // TK.6: fast select, ALONGSIDE cycling rather than instead
+                // of it — emacs keeps both under
+                // `org-use-fast-todo-selection`, and cycling is the faster
+                // move when the next state is the one you want.
+                bind("<leader>os", "org-todo-select"),
                 bind("<leader>o,", "org-priority-cycle"),
                 bind("<leader>o:", "org-set-tags"),
             ],
@@ -1455,6 +1476,18 @@ impl Guest for Component {
             "Follow the link under the cursor, else the ordinary <CR> motion",
             &spec(),
             FOLLOW_LINK,
+        );
+        register_action(
+            "org-todo-select",
+            "Choose a TODO state from a menu, keyed the way the option says",
+            &spec(),
+            TODO_SELECT,
+        );
+        register_action(
+            "org-todo-set",
+            "Set the headline's TODO state to the one named in args",
+            &spec(),
+            TODO_SET,
         );
         register_action(
             "org-timestamp-up",
@@ -3220,6 +3253,28 @@ impl GrammarCallbacks for Component {
                 )])
             }
             // OM.7.
+            TODO_SELECT => Ok(vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    // The seam gives a guest ONE `id()`, so org's menus
+                    // share a source and the args say which. OC.4
+                    // established the shape for capture's two.
+                    args: Args::String(ORG_TRANSIENT_TODO.to_string()),
+                },
+            )]),
+            // The chosen state rides the row's own args (TR.2a).
+            TODO_SET => {
+                // An empty string is a real choice — the menu's "(none)"
+                // row clears the state — so a missing arg and a cleared
+                // state are deliberately the same thing here.
+                let want = match &ctx.args {
+                    Args::String(s) => s.clone(),
+                    _ => String::new(),
+                };
+                Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
+                    todo::set_keyword(line, kw, &want)
+                }))
+            }
             TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
                 todo::cycle_keyword(line, kw, true)
             })),
@@ -4021,6 +4076,90 @@ const CAPTURE_TRANSIENT: &str = "org-capture";
 /// TR.2a added. One action, N rows, and the key you pressed is what decides
 /// which template runs. Without it org would need one registered command per
 /// template, and templates are an option read at capture time, not at load.
+/// TK.6 — the TODO state menu, one row per configured keyword.
+///
+/// **Built per open, never cached**, for the same reason the capture menu is:
+/// the rows come from `org.todo-keywords`, and a `:set` must take effect on
+/// the next press. Unlike the per-keyword COLOURS — which resolve at load
+/// because `register-element` drains once — this side of the option is live.
+///
+/// A keyword with no `(k)` still appears, reachable by motion. A menu that
+/// cannot reach a state the file already contains is worse than a menu with a
+/// gap in its shortcuts, and dropping it would make the menu disagree with the
+/// buffer.
+fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let kws = todo::parse_todo_keywords(&option_or("todo-keywords", DEFAULT_TODO_KEYWORDS));
+    if kws.all.is_empty() {
+        // An `err` echoes with the plugin named and the menu stays shut,
+        // which says more than an empty menu does.
+        return Err("org: no TODO keywords configured".to_string());
+    }
+
+    // Keys the option did not give, filled from the keyword itself so every
+    // row is reachable by a key rather than only by motion. Lower-cased
+    // initial first, then any unused letter of the word — deterministic, so
+    // the same configuration always produces the same menu.
+    let mut taken: Vec<char> = kws.all.iter().filter_map(|k| k.key).collect();
+    taken.push('q');
+
+    let mut items: Vec<TransientItem> = Vec::with_capacity(kws.all.len() + 2);
+    for k in &kws.all {
+        let key = k.key.or_else(|| {
+            k.name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .find(|c| !taken.contains(c))
+                .inspect(|c| taken.push(*c))
+        });
+        items.push(TransientItem {
+            key: key.map(|c| vec![c.to_string()]).unwrap_or_default(),
+            label: k.name.clone(),
+            description: if k.done {
+                "done".to_string()
+            } else {
+                String::new()
+            },
+            kind: TransientItemKind::Action(TransientAction {
+                command: "org-todo-set".to_string(),
+                args: WitArgs::String(k.name.clone()),
+            }),
+        });
+    }
+
+    // Clearing the state is a state. Emacs' fast-select spells it SPC, and a
+    // menu that can set every keyword but not remove one is a one-way door.
+    items.push(TransientItem {
+        key: vec!["<Space>".to_string()],
+        label: "(none)".to_string(),
+        description: "clear the state".to_string(),
+        kind: TransientItemKind::Action(TransientAction {
+            command: "org-todo-set".to_string(),
+            args: WitArgs::String(String::new()),
+        }),
+    });
+    items.push(TransientItem {
+        key: vec!["q".to_string()],
+        label: "quit".to_string(),
+        description: String::new(),
+        kind: TransientItemKind::Dismiss,
+    });
+
+    Ok(TransientSpec {
+        title: "TODO state".to_string(),
+        groups: vec![TransientGroup {
+            label: String::new(),
+            items,
+        }],
+        footer: None,
+    })
+}
+
 impl exports::lattice::plugin_host::transient_source::Guest for Component {
     fn id() -> String {
         CAPTURE_TRANSIENT.to_string()
@@ -4034,6 +4173,23 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             TransientSpec,
         };
 
+        // OC.4: ONE registered source, several shapes — which one is decided
+        // by what the open was FOR (TR.3a). Opened for nothing, this is the
+        // template chooser; opened for a template key, it is that template's
+        // fields; opened for `todo`, it is TK.6's state menu. Separate names
+        // would have needed separate `id()`s, and the seam gives a guest one.
+        //
+        // TK.6's branch comes BEFORE the capture-templates parse below, and
+        // that ordering is load-bearing rather than tidy: the TODO menu has
+        // nothing to do with capture, and parsing first meant a user with no
+        // `org.capture-templates` set got "no capture templates" when they
+        // pressed the TODO chord. The test said so in those words.
+        if let Args::String(key) = &ctx.args {
+            if key == ORG_TRANSIENT_TODO {
+                return todo_menu();
+            }
+        }
+
         // An `err` echoes with the plugin named and the menu does not open —
         // which is right for every one of these: an unset option, a set whose
         // TOML does not parse, and a set with nothing usable in it are all
@@ -4042,11 +4198,6 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
         let set = capture_templates::parse(&source).map_err(|e| e.message())?;
 
-        // OC.4: ONE registered source, two shapes — which one is decided by
-        // what the open was FOR (TR.3a). Opened for nothing, this is the
-        // template chooser; opened for a template key, it is that template's
-        // fields. Two names would have needed two `id()`s, and the seam gives
-        // a guest one.
         if let Args::String(key) = &ctx.args {
             if !key.is_empty() {
                 return fields_menu(&set, key.as_str());

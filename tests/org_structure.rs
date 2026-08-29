@@ -251,6 +251,28 @@ async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch
             } => {
                 editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
             }
+            // TK.6: an edit an action produced is pushed onto `out.effects`
+            // for the RENDERER to re-dispatch (`Action::ApplyEdit`, whose
+            // body is host-resident) rather than applied where it was
+            // produced — the deferral `apply_write_to_file` documents.
+            //
+            // This helper had no arm for it, so every test driving an edit
+            // through a path that returns rather than applies saw the buffer
+            // unchanged and read as a product bug. TK.6's menu rows are the
+            // first to hit it: `press()` never did, because `dispatch_chord`
+            // applies on the way through.
+            lattice_grammar::Effect::ApplyEdit {
+                target,
+                edit,
+                cursor,
+            } => {
+                let out = editor.dispatch(lattice_host::action::Action::ApplyEdit {
+                    target,
+                    edit,
+                    cursor,
+                });
+                let _ = out;
+            }
             _ => {}
         }
     }
@@ -1729,6 +1751,115 @@ async fn cr_on_an_id_link_is_consumed_rather_than_declined() {
         editor.cursor.line, 1,
         "the cursor stays: org answered with an echo, it did not decline"
     );
+}
+
+// ── TK.6: fast select ──
+
+/// The menu opens with one row per configured keyword, and the state you
+/// pick lands on the headline.
+///
+/// Driven through the real chord, the real menu and the real row action —
+/// the failure mode this guards is a seam wired end to end that answers
+/// nothing, which is what OC.3a hit when a plugin's prompt submit never
+/// fired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk6_the_todo_menu_offers_every_state_and_sets_the_one_you_pick() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO ship it\n").await;
+    set_org_option(
+        &mut editor,
+        "todo-keywords",
+        "sequence: TODO(t) NEXT(n) | DONE(d)\ntype: PROJECT",
+    );
+
+    press_chord(&mut editor, "<leader>os").await;
+
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the menu opened; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    assert_eq!(spec.title, "TODO state");
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["TODO", "NEXT", "DONE", "PROJECT", "(none)", "quit"],
+        "every configured state, in declaration order, plus clear and quit"
+    );
+
+    // The keys the option gave, and one derived for the keyword that had
+    // none — a state the file can contain must be reachable by a key.
+    let keys: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.key.first().map(String::as_str).unwrap_or(""))
+        .collect();
+    assert_eq!(&keys[..4], &["t", "n", "d", "p"]);
+
+    press_menu_key(&mut editor, "d").await;
+    assert_eq!(
+        text(&editor),
+        "* DONE ship it\n",
+        "the row's own args carried the state"
+    );
+}
+
+/// Clearing a state is a state. A menu that can set every keyword but never
+/// remove one is a one-way door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk6_the_menu_can_clear_the_state() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO ship it\n").await;
+    press_chord(&mut editor, "<leader>os").await;
+    press_menu_key(&mut editor, "<Space>").await;
+    assert_eq!(text(&editor), "* ship it\n");
+}
+
+/// The menu is built per open, so a `:set` takes effect on the next press.
+///
+/// Deliberately contrasted with the per-keyword COLOURS, which resolve at
+/// load because `register-element` drains once. Two halves of one option
+/// with different liveness is exactly the kind of thing that gets forgotten,
+/// so the live half is pinned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk6_the_menu_follows_a_set_without_a_reload() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* ship it\n").await;
+    set_org_option(
+        &mut editor,
+        "todo-keywords",
+        "sequence: PROPOSED | ACCEPTED",
+    );
+    press_chord(&mut editor, "<leader>os").await;
+    let spec = editor
+        .picker
+        .as_ref()
+        .expect("menu opened")
+        .transient
+        .as_ref()
+        .expect("in transient mode");
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(labels, vec!["PROPOSED", "ACCEPTED", "(none)", "quit"]);
 }
 
 // ── OM.12: tables ──

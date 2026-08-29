@@ -520,6 +520,29 @@ pub fn cycle_keyword(line: &str, keywords: &[String], forward: bool) -> Option<S
     Some(render(&h))
 }
 
+/// TK.6 — set `line`'s keyword to `name`, or clear it when `name` is empty.
+///
+/// The counterpart to [`cycle_keyword`] for fast select: cycling walks the
+/// sequence, this jumps straight to the state you chose. Both go through
+/// [`parse`] and [`render`], so setting a keyword cannot disturb the
+/// priority or the tags at the other end of the line.
+///
+/// `None` when `line` is not a headline, or when `name` is not a configured
+/// keyword — a menu row can only offer configured states, so the second case
+/// means the option changed between the menu opening and the key landing, and
+/// writing an unknown word onto the headline would be worse than doing
+/// nothing.
+pub fn set_keyword(line: &str, keywords: &[String], name: &str) -> Option<String> {
+    let mut h = parse(line, keywords)?;
+    if name.is_empty() {
+        h.keyword = None;
+        return Some(render(&h));
+    }
+    let found = keywords.iter().find(|k| k.as_str() == name)?;
+    h.keyword = Some(found.as_str());
+    Some(render(&h))
+}
+
 /// Advance the priority on `line` through `A` … `highest`, then off.
 pub fn cycle_priority(
     line: &str,
@@ -563,6 +586,60 @@ mod tests {
 
     fn kw() -> Vec<String> {
         parse_keywords("TODO NEXT | DONE")
+    }
+
+    // ---- TK.6: setting a specific state ----
+
+    #[test]
+    fn tk6_set_keyword_jumps_straight_to_a_state() {
+        let kw = parse_keywords("TODO NEXT | DONE");
+        assert_eq!(
+            set_keyword("** TODO ship it", &kw, "DONE").as_deref(),
+            Some("** DONE ship it")
+        );
+        // From no state to a state.
+        assert_eq!(
+            set_keyword("** ship it", &kw, "NEXT").as_deref(),
+            Some("** NEXT ship it")
+        );
+    }
+
+    /// Clearing a state IS a state — a menu that can set every keyword but
+    /// never remove one is a one-way door.
+    #[test]
+    fn tk6_an_empty_name_clears_the_state() {
+        let kw = parse_keywords("TODO | DONE");
+        assert_eq!(
+            set_keyword("** TODO ship it", &kw, "").as_deref(),
+            Some("** ship it")
+        );
+    }
+
+    /// The round-trip property `cycle_keyword` relies on, asserted for the
+    /// jump too: setting a state must not disturb the priority or the tags
+    /// at the other end of the line.
+    #[test]
+    fn tk6_setting_a_state_leaves_the_rest_of_the_headline_alone() {
+        let kw = parse_keywords("TODO | DONE");
+        assert_eq!(
+            set_keyword("** TODO [#A] ship it :work:urgent:", &kw, "DONE").as_deref(),
+            Some("** DONE [#A] ship it :work:urgent:")
+        );
+    }
+
+    /// A menu row can only offer configured states, so an unknown name means
+    /// the option changed between the menu opening and the key landing.
+    /// Writing an unknown word onto the headline would be worse than nothing.
+    #[test]
+    fn tk6_an_unconfigured_name_is_refused() {
+        let kw = parse_keywords("TODO | DONE");
+        assert!(set_keyword("** TODO ship it", &kw, "WAITING").is_none());
+    }
+
+    #[test]
+    fn tk6_a_line_that_is_not_a_headline_is_refused() {
+        let kw = parse_keywords("TODO | DONE");
+        assert!(set_keyword("plain prose", &kw, "DONE").is_none());
     }
 
     // ---- TK.5: `org.todo-keyword-styles` ----

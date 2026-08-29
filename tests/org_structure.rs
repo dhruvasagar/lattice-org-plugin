@@ -3444,3 +3444,103 @@ async fn the_agenda_command_is_org_agenda_and_org_registers_it() {
         "org commands must be `org-` prefixed: {stray:?}"
     );
 }
+
+/// OC.11 — `clock-in = true` on a template starts a clock on the entry it
+/// captures.
+///
+/// The interesting part is not the flag, it is WHERE the clock line comes from.
+/// Capture files into another file, and an `apply-edit` names a buffer id an
+/// unopened file does not have — so the drawer is built into the captured TEXT
+/// and rides the same single write. That is what this asserts: one write, and
+/// the entry lands already clocked, with no window in which it exists and its
+/// clock does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_template_can_clock_in_on_what_it_captures() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\nclock-in = true\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "call the bank");
+
+    let written = text_of(&editor, &notes);
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines[0], "* TODO call the bank");
+    assert_eq!(lines[1], ":LOGBOOK:", "the drawer rode in with the entry");
+    assert!(
+        lines[2].starts_with("CLOCK: [") && lines[2].ends_with(']'),
+        "a RUNNING clock — a start stamp with no end: {:?}",
+        lines[2]
+    );
+    assert_eq!(lines[3], ":END:");
+}
+
+/// The flag is opt-in, and its absence must not change a capture at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_template_without_the_flag_captures_no_clock() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "call the bank");
+
+    assert_eq!(
+        text_of(&editor, &notes),
+        "* TODO call the bank\n",
+        "no drawer, no clock line — the default is unchanged"
+    );
+}
+
+/// A body with more than a headline keeps its remaining lines, below the
+/// drawer. The drawer goes directly under the headline, which is where
+/// `clock.rs` puts one for a fresh entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_clock_drawer_sits_under_the_headline_not_over_the_body() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\nclock-in = true\n\
+             target = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\nsome body\n\"\"\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    submit_capture(&mut editor, "call the bank");
+
+    let written = text_of(&editor, &notes);
+    let lines: Vec<&str> = written.lines().collect();
+    assert_eq!(lines[0], "* TODO call the bank");
+    assert_eq!(lines[1], ":LOGBOOK:");
+    assert_eq!(lines[3], ":END:");
+    assert_eq!(lines[4], "some body", "the body survived, below the drawer");
+}

@@ -69,6 +69,16 @@ pub struct Template {
     pub target: Target,
     /// The template text, placeholders unexpanded.
     pub body: String,
+    /// OC.11 — org's `:clock-in`: start a clock on the entry this template
+    /// captures, as part of capturing it.
+    ///
+    /// The clock line is written INTO the captured text rather than edited in
+    /// afterwards, which is what makes this possible at all: capture files into
+    /// another file, and an `apply-edit` names a buffer id that an unopened file
+    /// does not have. Building the `:LOGBOOK:` drawer into the entry sidesteps
+    /// the whole question — one write, and the durable record is correct the
+    /// moment it lands (design D4).
+    pub clock_in: bool,
 }
 
 /// Why a template set could not be read.
@@ -119,6 +129,10 @@ struct RawTemplate {
     target: Option<RawTarget>,
     #[serde(default)]
     body: String,
+    /// `clock-in = true`. Dashed, matching org's `:clock-in` rather than
+    /// inventing a snake-case spelling for a key users already know.
+    #[serde(default, rename = "clock-in")]
+    clock_in: bool,
 }
 
 #[derive(Deserialize)]
@@ -190,6 +204,7 @@ pub fn parse(source: &str) -> Result<ParsedSet, TemplateError> {
             description: t.description.trim().to_string(),
             target,
             body: t.body,
+            clock_in: t.clock_in,
         });
     }
 

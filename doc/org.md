@@ -66,6 +66,7 @@ elsewhere, so a clock survives a restart and can be closed by any editor.
 | `<leader>oO` | `:org-clock-out` | close it, writing the end stamp and elapsed time |
 | `<leader>oq` | `:org-clock-cancel` | discard it, leaving no trace |
 | `<leader>oj` | `:org-clock-goto` | jump to the entry the clock is on |
+| `<leader>oR` | `:org-clock-resume` | start a clock on the last entry clocked |
 
 Each is one registration reachable two ways — the chord and the `:` line run the
 same code.
@@ -84,11 +85,36 @@ Times are **local**, not UTC, and the drawer is created for you if the entry has
 none. The clock line goes below any `SCHEDULED:`/`DEADLINE:` line and any
 `:PROPERTIES:` drawer, which is where org puts it.
 
+`:org-clock-resume` picks the last entry you clocked back up, **wherever it
+is** — including a file you do not have open, which it reaches the same way
+capture reaches its target. If that file happens to be open with unsaved
+changes, save it first: resume reads the file to find the entry, so unsaved
+edits can move the line out from under it.
+
+A capture template can start a clock on what it captures:
+
+```toml
+[[template]]
+key = "t"
+description = "todo"
+clock-in = true
+target = { file = "~/org/inbox.org" }
+body = """
+* TODO %?
+"""
+```
+
+The clock line is written as part of the entry, so it is correct the moment the
+capture lands.
+
 Clocking in on an entry that already has a running clock is refused rather than
 stacking a second one. Clocking out re-reads the buffer rather than trusting
 anything remembered, so it works on a clock started before the editor was last
-closed. `<leader>oj` is the one thing that does need this session's memory — it
-has nowhere to jump to after a restart, and says so.
+closed. `<leader>oj` and `<leader>oR` are the two that need this session's memory —
+after a restart neither has anywhere to go, and both say so. Clocking OUT does
+not forget: the entry stays the "last clocked" one, which is what makes resume
+work and matches org, where `org-clock-goto` finds the current *or last* clocked
+entry.
 
 ## Folding
 

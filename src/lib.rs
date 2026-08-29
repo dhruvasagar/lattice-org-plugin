@@ -254,6 +254,8 @@ const AGENDA_APPLY: u32 = 40;
 /// linear memories, so the bus is the only bridge between them.
 /// Shared parse callback: these four take no arguments, so one is enough.
 const CLOCK_PARSE: u32 = 45;
+/// OC.9 — `:org-clock-resume`, on the last-clocked entry.
+const CLOCK_RESUME: u32 = 46;
 const CLOCK_IN: u32 = 41;
 const CLOCK_OUT: u32 = 42;
 const CLOCK_CANCEL: u32 = 43;
@@ -623,6 +625,8 @@ impl Guest for Component {
                 bind("<leader>oO", "org-clock-out"),
                 bind("<leader>oq", "org-clock-cancel"),
                 bind("<leader>oj", "org-clock-goto"),
+                // OC.9: org's `C-c C-x C-x`, in nvim-orgmode's spelling.
+                bind("<leader>oR", "org-clock-resume"),
                 // OM.11: opens the target picker; `org-refile-to` is the
                 // second hop and is NOT bound — it is invoked by the picker's
                 // accept, never typed.
@@ -1134,6 +1138,13 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             CLOCK_CANCEL,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-clock-resume",
+            "Start a clock on the last entry that was clocked, wherever it is.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            CLOCK_RESUME,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-clock-goto",
@@ -1836,7 +1847,11 @@ fn clock_stop(
         })];
     };
 
-    CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = None);
+    // OC.9: the target is KEPT, not cleared. It stops meaning "where the
+    // running clock is" and starts meaning "the last entry clocked" — which is
+    // what `:org-clock-resume` needs, and is also what org's own
+    // `org-clock-goto` does (it jumps to the current OR last clocked entry).
+    // Whether a clock is *running* is answered by the buffer, as it always was.
     host_services::emit_event(EV_CLOCK_STOPPED, &[]);
 
     if discard {
@@ -1875,6 +1890,73 @@ fn clock_stop(
     )
 }
 
+/// `:org-clock-resume` — start a clock on the last entry that was clocked.
+///
+/// Reuses `org-clock-goto`'s target, which is the whole reason this is cheap:
+/// the grammar store already records `(path, line)` at every clock-in, so
+/// "the last clocked entry" needed no new state.
+///
+/// Two paths, and the second is why this is not limited to the buffer you are
+/// in. When the target is the CURRENT buffer it is an ordinary clock-in at that
+/// line, so the change shows immediately and unsaved edits are respected. When
+/// it is elsewhere the entry is reached the way capture reaches its target —
+/// `read-file` for the characters, `parse-file` for the structure, and ONE
+/// `WriteToFile`. `clock::Logbook` needs neither a buffer nor a cursor, only a
+/// line accessor, so the drawer primitive works over file text unchanged.
+fn clock_resume(buffer_id: u32, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    let Some((path, line)) = CLOCK_GOTO_TARGET.with(|c| c.borrow().clone()) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: "org: nothing has been clocked this session".to_string(),
+        })];
+    };
+
+    // The target is the buffer in front of you: the ordinary path, which also
+    // means an unsaved buffer is not written behind its own back.
+    if doc.path().as_deref() == Some(path.as_str()) {
+        return clock_in(Position { line, byte: 0 }, buffer_id, doc, tree);
+    }
+
+    let Ok(on_disk) = host_services::read_file(&path) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: cannot read {path} to resume its clock"),
+        })];
+    };
+    let file_lines: Vec<String> = on_disk.lines().map(str::to_string).collect();
+    let count = file_lines.len() as u32;
+    let accessor = |n: u32| file_lines.get(n as usize).cloned();
+    let snapshot = lattice::plugin_host::tree_sitter::parse_file(&path);
+    let hl = headline::Headlines::new(snapshot.as_ref(), &accessor, count);
+    let lb = clock::Logbook::new(&hl);
+
+    // The buffer is the record (D4), so "already running" is answered by the
+    // file rather than by anything remembered.
+    if lb.running(line).is_some() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: that entry in {path} is already clocked in"),
+        })];
+    }
+    let now = clock_now();
+    let Some(ins) = lb.clock_in(line, now) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: no entry left at that place in {path}"),
+        })];
+    };
+    let title = hl
+        .enclosing(line)
+        .and_then(|(h, _)| hl.text(h))
+        .map(|t| clock_title(&t))
+        .unwrap_or_default();
+    host_services::emit_event(
+        EV_CLOCK_STARTED,
+        format!("{}\t{title}", now.epoch_minutes()).as_bytes(),
+    );
+    vec![write_at(path, FileAnchor::Line(ins.line), ins.text)]
+}
+
 /// `<leader>oj` — jump to the entry the running clock is on.
 ///
 /// Reads the grammar store's own target (see [`CLOCK_GOTO_TARGET`]), so it
@@ -1893,7 +1975,7 @@ fn clock_goto() -> Vec<Effect> {
         )],
         None => vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Info,
-            text: "org: no clock is running".to_string(),
+            text: "org: nothing has been clocked this session".to_string(),
         })],
     }
 }
@@ -2048,6 +2130,9 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
             description: "capture".to_string(),
             target: capture_templates::Target::File { file },
             body: option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE),
+            // The bare `org.capture-file` path has no template table to carry a
+            // `clock-in` key, so it never clocks.
+            clock_in: false,
         });
     }
 
@@ -2213,6 +2298,51 @@ fn taken_origin() -> String {
 /// file that cannot be read (absent, or outside the grant) resolves to an
 /// append: absent is the ordinary "first capture into a new file" case, and the
 /// host rejects an ungranted path at the boundary anyway with its own message.
+/// Wrap a captured entry's text in a running clock, and tell org's async side.
+///
+/// The drawer is built INTO the text rather than edited in afterwards, because
+/// capture files into another file and an `apply-edit` names a buffer id an
+/// unopened file does not have. One write, and the record is correct the moment
+/// it lands (design D4) — which also means a capture-clock survives immediately,
+/// with no window where the entry exists and its clock does not.
+///
+/// `line` is where the entry starts in the target file, so `org-clock-goto` can
+/// come back to it. It is the one thing here that needs a session rather than
+/// the buffer.
+fn clock_captured_entry(text: String, path: &str, line: u32, title: &str) -> String {
+    let now = clock_now();
+    CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = Some((path.to_string(), line)));
+    host_services::emit_event(
+        EV_CLOCK_STARTED,
+        format!("{}\t{title}", now.epoch_minutes()).as_bytes(),
+    );
+    // After the headline, which is the entry's first line — the same place
+    // `clock.rs` puts it for a fresh drawer.
+    let mut lines = text.lines();
+    let headline = lines.next().unwrap_or_default();
+    let rest: Vec<&str> = lines.collect();
+    let drawer = format!(
+        ":{}:\n{}{}\n:END:",
+        clock::LOGBOOK,
+        clock::CLOCK,
+        now.stamp()
+    );
+    let mut out = format!("{headline}\n{drawer}");
+    if !rest.is_empty() {
+        out.push('\n');
+        out.push_str(&rest.join("\n"));
+    }
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// The headline of a captured entry, for the modeline segment.
+fn captured_title(text: &str) -> String {
+    clock_title(text.lines().next().unwrap_or_default())
+}
+
 fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<Effect> {
     let path = template.target.file().to_string();
     let headline = match &template.target {
@@ -2220,6 +2350,18 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
         capture_templates::Target::FileHeadline { headline, .. } => Some(headline.clone()),
     };
     let Some(headline) = headline else {
+        // Appended at the end, so the entry starts at the file's current line
+        // count. Read only when a clock is actually wanted — an ordinary capture
+        // must not pay for it.
+        let text = if template.clock_in {
+            let at = lattice::plugin_host::host_services::read_file(&path)
+                .map(|s| s.lines().count() as u32)
+                .unwrap_or(0);
+            let title = captured_title(&text);
+            clock_captured_entry(text, &path, at, &title)
+        } else {
+            text
+        };
         return vec![write_at(path, FileAnchor::End, text)];
     };
 
@@ -2258,15 +2400,26 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
         }
         None => headline::outline_text(&lines),
     };
+    // The file is already read above for the target search, so the line the
+    // entry lands on is known without a second read on either arm.
+    let clocked = |text: String, at: u32| {
+        if template.clock_in {
+            let title = captured_title(&text);
+            clock_captured_entry(text, &path, at, &title)
+        } else {
+            text
+        }
+    };
     match capture_target::resolve_in(&lines, &outline, &headline) {
         capture_target::Insertion::AtLine(line) => {
+            let text = clocked(text, line);
             vec![write_at(path, FileAnchor::Line(line), text)]
         }
         // Warn, not Info: the note did not go where the user's config says it
         // should, and a silent append is how someone loses track of where their
         // captures are landing.
         capture_target::Insertion::Append => vec![
-            write_at(path.clone(), FileAnchor::End, text),
+            write_at(path.clone(), FileAnchor::End, clocked(text, lines.len() as u32)),
             Effect::Echo(EchoPayload {
                 level: EchoLevel::Warn,
                 text: format!("org: no headline `{headline}` in {path}; appended at the end"),
@@ -2879,6 +3032,7 @@ impl GrammarCallbacks for Component {
             CLOCK_IN => Ok(clock_in(ctx.cursor, ctx.buffer_id, doc, tree)),
             CLOCK_OUT => Ok(clock_stop(ctx.cursor, ctx.buffer_id, doc, tree, false)),
             CLOCK_CANCEL => Ok(clock_stop(ctx.cursor, ctx.buffer_id, doc, tree, true)),
+            CLOCK_RESUME => Ok(clock_resume(ctx.buffer_id, doc, tree)),
             CLOCK_GOTO => Ok(clock_goto()),
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered

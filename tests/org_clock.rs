@@ -54,7 +54,20 @@ impl lattice_plugin_host::Sleeper for TokioSleeper {
 /// production; a harness that omitted them would leave the clock editing the
 /// buffer correctly and silently never showing a segment — which is exactly the
 /// half-working state these tests exist to catch.
+/// [`org_editor`] with an `fs:write` grant over `base`.
+///
+/// OC.9's resume writes into a file that is not open, and a cross-file write is
+/// refused at the boundary without the grant — silently to the guest, which
+/// would look exactly like a broken resume.
+async fn org_editor_with_write(base: &std::path::Path, text: &str) -> Editor {
+    org_editor_inner(base, text, &[format!("fs:write:{}", base.display())]).await
+}
+
 async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
+    org_editor_inner(base, text, &[]).await
+}
+
+async fn org_editor_inner(base: &std::path::Path, text: &str, caps: &[String]) -> Editor {
     lattice_plugin_loader::disable_autoload();
     let mut editor = Editor::boot(CoreDocument::from_text("scratch\n"));
 
@@ -63,10 +76,17 @@ async fn org_editor(base: &std::path::Path, text: &str) -> Editor {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\n\
-         provides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"events\"]\n\
-         default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n\
-         editor_capabilities = [\"tree-sitter\"]\n",
+        format!(
+            "id = \"org\"\n\
+             provides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"events\"]\n\
+             default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n\
+             editor_capabilities = [\"tree-sitter\"]\n\
+             capabilities = [{}]\n",
+            caps.iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -154,6 +174,11 @@ fn press(editor: &mut Editor, keys: &str) {
 fn ex(editor: &mut Editor, line: &str) {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.execute_ex_line(line, &mut out);
+    // Only `next_actions` are drained. `out.effects` is a RECORD of what the
+    // dispatch did, not a to-do list: `Effect::WriteToFile` is applied INLINE by
+    // the host (deliberately — it returns a Result, which is what makes "cut
+    // only if the insert landed" expressible), so re-applying it here writes the
+    // entry twice. Learned by doing exactly that.
     for action in out.next_actions {
         let _ = editor.dispatch(action);
     }
@@ -163,6 +188,25 @@ fn ex(editor: &mut Editor, line: &str) {
 fn goto_line(editor: &mut Editor, line: u32) {
     editor.cursor.line = line;
     editor.cursor.byte = 0;
+}
+
+/// The text of another buffer by path.
+///
+/// `WriteToFile` OPENS its target and edits the buffer rather than writing the
+/// file — so a cross-file write is visible here and not on disk until a save.
+/// Reading the disk instead is how this test first "failed" against a resume
+/// that had worked perfectly.
+fn text_of(editor: &Editor, path: &std::path::Path) -> String {
+    let id = editor
+        .find_document_by_path(path)
+        .unwrap_or_else(|| panic!("{} was opened", path.display()));
+    editor
+        .buffers
+        .document_handle(id)
+        .unwrap()
+        .snapshot()
+        .text()
+        .to_string()
 }
 
 fn text(editor: &Editor) -> String {
@@ -457,5 +501,102 @@ async fn the_clock_commands_refuse_arguments() {
         text(&editor),
         "* Task\nbody\n",
         "a refused parse must not edit the buffer"
+    );
+}
+
+/// OC.9 — resume the last clocked entry, in a file that is not even open.
+///
+/// This is the case that decided the design. `apply-edit` names a buffer id, and
+/// an unopened file has none — so resume reaches the entry the way capture
+/// reaches its target: `read-file` for characters, `parse-file` for structure,
+/// one `WriteToFile`. `clock::Logbook` needs only a line accessor, so OC.5's
+/// drawer primitive works over file text with no change at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_clocks_into_a_file_that_is_not_open() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // The entry lives in `other.org`; the editor will be looking at `notes.org`.
+    let other = base.path().join("other.org");
+    std::fs::write(&other, "* Elsewhere\nbody\n").unwrap();
+
+    let mut editor = org_editor_with_write(base.path(), "* Here\n").await;
+
+    // Clock in on the OTHER file, then out — which leaves it as "last clocked".
+    editor.do_edit(Some(other.clone()), false);
+    editor.run_tick_pending();
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-clock-in");
+    ex(&mut editor, "org-clock-out");
+
+    // Save, so the file on disk matches the buffer. Resume reads the FILE to
+    // find the entry — see its doc — so a target with unsaved edits would have
+    // it computing an insertion line against text the buffer no longer has.
+    editor.do_write(None);
+    editor.run_tick_pending();
+
+    // Now go somewhere else entirely and resume.
+    let notes = base.path().join("notes.org");
+    editor.do_edit(Some(notes), false);
+    editor.run_tick_pending();
+    ex(&mut editor, "org-clock-resume");
+
+    let written = text_of(&editor, &other);
+    let running = written
+        .lines()
+        .filter(|l| l.trim_start().starts_with("CLOCK: ") && !l.contains("--"))
+        .count();
+    assert_eq!(
+        running, 1,
+        "resume wrote a running clock into a file nobody had open: {written:?}"
+    );
+}
+
+/// With nothing clocked this session there is nowhere to resume, and saying so
+/// beats guessing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_with_nothing_clocked_says_so() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+    ex(&mut editor, "org-clock-resume");
+    assert_eq!(
+        text(&editor),
+        "* Task\nbody\n",
+        "nothing to resume must edit nothing"
+    );
+}
+
+/// Clock-out no longer forgets where it was, so `:org-clock-goto` still works
+/// afterwards — which is org's own behaviour (it jumps to the current OR last
+/// clocked entry) and is what makes resume possible at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_last_clocked_entry_outlives_clocking_out() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-clock-in");
+    ex(&mut editor, "org-clock-out");
+
+    // Resume in the SAME buffer takes the ordinary in-buffer path, so a second
+    // running clock appears without touching the disk behind the buffer's back.
+    ex(&mut editor, "org-clock-resume");
+    let running = text(&editor)
+        .lines()
+        .filter(|l| l.trim_start().starts_with("CLOCK: ") && !l.contains("--"))
+        .count();
+    assert_eq!(
+        running, 1,
+        "resume re-clocked the entry clock-out had finished: {:?}",
+        text(&editor)
     );
 }

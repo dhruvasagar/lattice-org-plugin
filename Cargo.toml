@@ -83,6 +83,13 @@ lattice-picker = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 arc-swap = "1"
+# OR.10: the dailies tests need TODAY in local time — the same answer the guest
+# gets, from the same source. `local-utc-offset-seconds` is implemented as
+# `chrono::Local::now().offset()`, so the test asks chrono directly rather than
+# re-deriving an offset from `SystemTime`, which would be a second
+# implementation of the thing under test. Hardcoding a date would instead make
+# the tests fail once a day.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # OC.6: `lattice_plugin_host::Sleeper` returns a `BoxFuture`, so the test's
 # tokio-backed impl of it names the type. The plugin host owns no runtime by
 # design, which is why the timer is the caller's to supply — here, the test's.

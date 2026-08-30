@@ -3328,6 +3328,7 @@ name = "lattice-org-plugin"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "chrono",
  "futures",
  "lattice-config",
  "lattice-core",

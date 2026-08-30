@@ -83,6 +83,24 @@ fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::Disp
                 editor.do_edit(path, force);
                 editor.set_cursor_clamped(position);
             }
+            // OR.10: opening an EXISTING daily is a plain `OpenBuffer`, and
+            // the renderer is the only thing that applies one
+            // (`lattice-ui-tui/src/app/dispatch.rs`). Dropping it here would
+            // make "open the journal that is already there" indistinguishable
+            // from a command that does nothing.
+            lattice_grammar::Effect::OpenBuffer { path, force } => {
+                editor.do_edit(path, force);
+            }
+            // OR.10: `:org-roam-dailies-goto-date` with no date prompts, and
+            // the prompt is the renderer's too.
+            lattice_grammar::Effect::OpenPrompt {
+                prompt,
+                initial,
+                on_submit_action,
+                buffer_name,
+            } => {
+                editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
+            }
             lattice_grammar::Effect::ApplyEdit {
                 target,
                 edit,
@@ -1059,8 +1077,9 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
                 anchor,
                 text,
                 cut,
+                create_parents,
             } => {
-                editor.apply_write_to_file(path, anchor, text, cut);
+                editor.apply_write_to_file(path, anchor, text, cut, create_parents);
             }
             lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);
@@ -1453,4 +1472,313 @@ async fn run_backlinks(editor: &mut Editor) -> Vec<String> {
     editor.execute_ex_line("org-roam-backlinks", &mut out);
     apply_renderer_effects(editor, out);
     settle_picker_rows(editor).await
+}
+
+// ---------------------------------------------------------------------------
+// OR.10 — dailies.
+//
+// The arithmetic is unit-tested in `src/roam_dailies.rs`; what only exists
+// inside wasm is the pair of paths through the host: `read-file` deciding
+// whether the entry is already there, and the two different effects that
+// follow. Those are what these drive.
+// ---------------------------------------------------------------------------
+
+/// The text of the buffer whose path ends with `suffix`, or `None`.
+///
+/// By PATH, not by `name_of` — `name_of` is the SYNTHETIC-name slot, and a
+/// path-backed Document has none, which is the filter that made
+/// `creating_a_note_opens_a_draft_with_an_id_and_title` look broken for two
+/// slices.
+fn buffer_text_ending_with(editor: &Editor, suffix: &str) -> Option<String> {
+    let mut ids = Vec::new();
+    editor.buffers.for_each(|entry| ids.push(entry.id));
+    ids.into_iter().find_map(|id| {
+        let handle = editor.buffers.document_handle(id)?;
+        let path = handle.snapshot().path.clone()?;
+        if !path.to_string_lossy().ends_with(suffix) {
+            return None;
+        }
+        Some(lattice_runtime::Document::text(handle.as_ref()))
+    })
+}
+
+/// Run a dailies ex-command and let the effects land.
+async fn run_dailies(editor: &mut Editor, line: &str) {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line(line, &mut out);
+    apply_renderer_effects(editor, out);
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        editor.run_tick_pending();
+    }
+}
+
+/// The filename of the journal entry `offset` days from today, in LOCAL time.
+///
+/// From `chrono::Local`, which is the same source the host's
+/// `local-utc-offset-seconds` is implemented on top of — so the test and the
+/// guest agree about which day it is even when UTC disagrees with both.
+/// Hardcoding a date would make these fail once a day; re-deriving the offset
+/// from `SystemTime` would be a second implementation of the thing under test.
+fn daily_name(offset: i64) -> String {
+    let day = chrono::Local::now().date_naive() + chrono::Duration::days(offset);
+    format!("{}.org", day.format("%Y-%m-%d"))
+}
+
+/// `:org-roam-dailies-today` creates the entry when it is absent — with an
+/// `:ID:` and a `#+title:`, which is what makes a journal day linkable.
+///
+/// A BUFFER, not a file on disk: `Effect::WriteToFile` resolves the path to a
+/// buffer, so a new entry is a draft the user finalizes. Same design and same
+/// reason as `:org-roam-create-node`'s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dailies_today_creates_the_entry_when_it_is_absent() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let name = daily_name(0);
+    run_dailies(&mut editor, "org-roam-dailies-today").await;
+
+    // The message on failure, not just the absence: this exact assertion has
+    // failed twice for reasons the buffer list could not tell apart — a denied
+    // `fs:write` grant and a refused `mkdir` both read as "no draft".
+    let text = buffer_text_ending_with(&editor, &name).unwrap_or_else(|| {
+        let msg = editor
+            .last_message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        panic!("today's journal draft `daily/{name}` was opened; last message: {msg:?}")
+    });
+    assert!(
+        text.contains(":ID:"),
+        "a new daily is a NODE — without an id the day cannot be linked to: {text:?}"
+    );
+    let stem = name.trim_end_matches(".org");
+    assert!(
+        text.contains(&format!("#+title: {stem}")),
+        "and its title is the date: {text:?}"
+    );
+}
+
+/// Running it twice OPENS rather than appending a second header.
+///
+/// This is the assertion that fails if existence is read from the roam index
+/// instead of from `read-file`: the index lags the watcher's debounce, so a
+/// file written a moment ago still reads as absent and the header lands twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dailies_today_opens_the_entry_that_is_already_there() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // On disk BEFORE the command runs, and deliberately never indexed — the
+    // whole point is that `read-file` sees it and the index does not have to.
+    let name = daily_name(0);
+    let dir = corpus.join("daily");
+    std::fs::create_dir_all(&dir).unwrap();
+    let existing =
+        ":PROPERTIES:\n:ID:       ALREADY-HERE\n:END:\n#+title: yesterday's words\n\nkept\n";
+    std::fs::write(dir.join(&name), existing).unwrap();
+
+    run_dailies(&mut editor, "org-roam-dailies-today").await;
+
+    let text = buffer_text_ending_with(&editor, &name)
+        .unwrap_or_else(|| panic!("the existing `daily/{name}` was opened"));
+    assert_eq!(
+        text.matches(":ID:").count(),
+        1,
+        "opened, not appended to — a second `:ID:` is a file org cannot read: {text:?}"
+    );
+    assert!(
+        text.contains("ALREADY-HERE") && text.contains("kept"),
+        "and it is the user's file, untouched: {text:?}"
+    );
+}
+
+/// Yesterday and tomorrow name the days either side of today. The month- and
+/// year-boundary arithmetic is unit-tested; what this pins is that the two
+/// commands are wired to the right shift and not, say, both to today.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn yesterday_and_tomorrow_are_the_days_either_side() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    run_dailies(&mut editor, "org-roam-dailies-yesterday").await;
+    let yesterday = daily_name(-1);
+    assert!(
+        buffer_text_ending_with(&editor, &yesterday).is_some(),
+        "yesterday's entry `daily/{yesterday}` was opened"
+    );
+
+    run_dailies(&mut editor, "org-roam-dailies-tomorrow").await;
+    let tomorrow = daily_name(1);
+    assert!(
+        buffer_text_ending_with(&editor, &tomorrow).is_some(),
+        "tomorrow's entry `daily/{tomorrow}` was opened"
+    );
+    assert_ne!(yesterday, tomorrow, "and they are different days");
+}
+
+/// `:org-roam-dailies-goto-date 2024-02-29` opens that day — an explicit date,
+/// and a leap day, which is the one a month-length table gets wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn goto_date_opens_the_day_it_was_given() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    run_dailies(&mut editor, "org-roam-dailies-goto-date 2024-02-29").await;
+
+    let text = buffer_text_ending_with(&editor, "2024-02-29.org")
+        .expect("the leap day's entry was opened");
+    assert!(
+        text.contains("#+title: 2024-02-29"),
+        "titled by the date asked for: {text:?}"
+    );
+}
+
+/// A malformed date is refused BY THE `:` LINE, before any file is touched.
+///
+/// The refusal happening at parse time is the point: the text is still on
+/// screen and editable there, whereas an echo after the fact scrolls away. And
+/// nothing is created — a typo must not leave a file named after a day that
+/// does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_date_is_refused_and_creates_nothing() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    run_dailies(&mut editor, "org-roam-dailies-goto-date 2026-02-30").await;
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("not a day that exists"),
+        "the refusal says the day is impossible rather than blaming the format: {msg:?}"
+    );
+    assert!(
+        buffer_text_ending_with(&editor, "2026-02-30.org").is_none(),
+        "and no entry was opened for a day that does not exist"
+    );
+    assert!(
+        !corpus.join("daily").join("2026-02-30.org").exists(),
+        "and nothing was written to disk"
+    );
+}
+
+/// With no date, `-goto-date` PROMPTS — pre-filled with today — and submitting
+/// opens the day typed. This is the second hop `<leader>ondD` depends on, and
+/// the hop that a plugin prompt has silently failed at before (OC.3a).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn goto_date_without_one_prompts_and_the_submit_opens_the_day() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    run_dailies(&mut editor, "org-roam-dailies-goto-date").await;
+
+    let action = editor
+        .pending_prompt_submit_action
+        .clone()
+        .expect("a bare `-goto-date` opens a prompt rather than guessing a day");
+    assert_eq!(action, "org-roam-dailies-goto-date-submit");
+    let stem = daily_name(0);
+    assert_eq!(
+        editor.prompt_line_text(),
+        stem.trim_end_matches(".org"),
+        "pre-filled with today, so the common edit is two keystrokes"
+    );
+
+    // Hop two: re-open with the typed text seeded and submit, which is what
+    // `org_structure.rs`'s `submit_prompt` does for capture.
+    editor.open_prompt_line(
+        String::new(),
+        "2025-11-04".to_string(),
+        action,
+        editor.pending_prompt_buffer_name.clone(),
+    );
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_prompt_line_submit(&mut out);
+    apply_renderer_effects(&mut editor, out);
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        editor.run_tick_pending();
+    }
+
+    let text = buffer_text_ending_with(&editor, "2025-11-04.org")
+        .expect("submitting the prompt opened the day typed into it");
+    assert!(
+        text.contains("#+title: 2025-11-04"),
+        "titled by the date submitted: {text:?}"
+    );
+}
+
+/// With `org.roam-directory` unset, dailies SAY so rather than creating a
+/// journal wherever the editor happened to be started. Roam's inert contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dailies_refuse_when_roam_is_not_configured() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((_index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    editor
+        .config
+        .parse_and_set_command("org.roam-directory=")
+        .expect("the option exists");
+
+    run_dailies(&mut editor, "org-roam-dailies-today").await;
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("roam-directory"),
+        "the refusal names the option to set: {msg:?}"
+    );
+    assert!(
+        buffer_text_ending_with(&editor, &daily_name(0)).is_none(),
+        "and no journal was invented outside a corpus"
+    );
 }

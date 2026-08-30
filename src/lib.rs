@@ -145,6 +145,9 @@ mod roam;
 // OR.4: the thin tree half — where the headlines and drawers are.
 mod roam_backlinks;
 mod roam_complete;
+// OR.10: the journal — a date names exactly one file, and this is the
+// arithmetic that turns one into the other.
+mod roam_dailies;
 mod roam_find;
 mod roam_index;
 mod roam_scan;
@@ -264,6 +267,13 @@ const FOLLOW_LINK: u32 = 47;
 const TODO_SELECT: u32 = 48;
 const TODO_SET: u32 = 49;
 
+/// OR.10 — the second hop of `<leader>ondD`. The chord runs
+/// `:org-roam-dailies-goto-date` with no date, which opens a prompt naming this
+/// ACTION; the host runs the minibuffer and dispatches here with what was
+/// typed. It is an action rather than an ex-command because `on-submit-action`
+/// names one — the same two-hop shape `org-set-tags-submit` uses.
+const ROAM_DAILIES_GOTO_DATE_SUBMIT: u32 = 50;
+
 /// The `transient-source` id. One per guest, so org's menus share it and
 /// branch on what the open was FOR — the shape OC.4 established for
 /// capture's two menus.
@@ -351,6 +361,19 @@ const ROAM_CREATE_PARSE: u32 = 50;
 const ROAM_ID_CREATE: u32 = 51;
 /// OR.9 — `:org-roam-backlinks`, what points at the note you are in.
 const ROAM_BACKLINKS: u32 = 52;
+/// OR.10 — the journal. Four commands and one date, so four callbacks rather
+/// than one taking a keyword: each is separately bindable, separately
+/// completable and separately documented, which is what makes `<leader>ondy`
+/// possible at all.
+const ROAM_DAILIES_TODAY: u32 = 53;
+const ROAM_DAILIES_YESTERDAY: u32 = 54;
+const ROAM_DAILIES_TOMORROW: u32 = 55;
+const ROAM_DAILIES_GOTO_DATE: u32 = 56;
+/// `-goto-date` is the only one that takes an argument, and it takes it
+/// OPTIONALLY: with a date it goes, without one it prompts. So it cannot share
+/// `CLOCK_PARSE` (which refuses arguments) or `ROAM_CREATE_PARSE` (which
+/// requires one).
+const ROAM_DAILIES_DATE_PARSE: u32 = 57;
 
 /// OC.6 — the events handler ids. The guest picks these; the host hands them
 /// back to `on-event`.
@@ -1370,6 +1393,16 @@ impl Guest for Component {
                 // a terminal binding in another is the ambiguity vim settles
                 // with `timeoutlen`, which this editor does not have.
                 bind("<leader>onf", "org-roam-find-node"),
+                // OR.10 — the journal, under `<leader>ond…` because emacs
+                // org-roam puts it under `C-c n d` and the letters are the
+                // same: `d` today, `y` yesterday, `t` tomorrow, `D` a date you
+                // are asked for. Universal for find-node's reason, and more
+                // so: the whole point of "open today's journal" is that you
+                // are somewhere else when you want it.
+                bind("<leader>ondd", "org-roam-dailies-today"),
+                bind("<leader>ondy", "org-roam-dailies-yesterday"),
+                bind("<leader>ondt", "org-roam-dailies-tomorrow"),
+                bind("<leader>ondD", "org-roam-dailies-goto-date"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.
@@ -1814,6 +1847,49 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             ROAM_SYNC,
+        );
+        // OR.10 — the journal. Three commands that take nothing and one that
+        // takes a date optionally.
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-dailies-today",
+            "Open today's journal entry, creating it if it does not exist yet.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_DAILIES_TODAY,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-dailies-yesterday",
+            "Open yesterday's journal entry, creating it if it does not exist yet.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_DAILIES_YESTERDAY,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-dailies-tomorrow",
+            "Open tomorrow's journal entry, creating it if it does not exist yet.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_DAILIES_TOMORROW,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-dailies-goto-date",
+            "Open the journal entry for a date, given as `YYYY-MM-DD`. With no \
+             date, asks for one.",
+            &lattice::plugin_host::types::ExCommandSpec {
+                latency_class: LatencyClass::Reflex,
+                accepts_bang: false,
+                accepts_range: false,
+                args_schema: Vec::new(),
+                surface_form: SurfaceForm::Keyword,
+            },
+            ROAM_DAILIES_DATE_PARSE,
+            ROAM_DAILIES_GOTO_DATE,
+        );
+        register_action(
+            "org-roam-dailies-goto-date-submit",
+            "Open the journal entry for the date typed into the dailies prompt",
+            &spec(),
+            ROAM_DAILIES_GOTO_DATE_SUBMIT,
         );
         register_action(
             "org-archive-subtree",
@@ -2771,6 +2847,9 @@ fn archive_subtree(
             start: Position { line: sl, byte: sb },
             end: Position { line: el, byte: eb },
         }),
+        // The archive file sits BESIDE the source (`<this file>_archive`),
+        // so its directory is the one the buffer is already open in.
+        create_parents: false,
     })]
 }
 
@@ -3127,6 +3206,10 @@ fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
         anchor,
         text,
         cut: None,
+        // A capture target is a path the USER typed into a template, which is
+        // exactly the case the host's refusal exists for: a typo must not
+        // silently build a tree.
+        create_parents: false,
     })
 }
 
@@ -3229,6 +3312,9 @@ fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -
             start: Position { line: sl, byte: sb },
             end: Position { line: el, byte: eb },
         }),
+        // A refile target is an existing headline in an existing file —
+        // the picker only offers what it walked.
+        create_parents: false,
     })]
 }
 
@@ -3530,6 +3616,21 @@ impl GrammarCallbacks for Component {
                 }))
             }
             SET_TAGS => Ok(set_tags_prompt(&ctx, doc, tree)),
+            // OR.10 — the dailies prompt's second hop. Escape dispatches
+            // nothing, so a dismissed prompt creates no file; an empty submit
+            // is the same answer, said out loud.
+            ROAM_DAILIES_GOTO_DATE_SUBMIT => {
+                let Some(text) = submitted_text(&ctx.args) else {
+                    return Ok(vec![Effect::None]);
+                };
+                Ok(match roam_dailies::parse(&text) {
+                    Ok(date) => open_daily(date),
+                    Err(error) => vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: error,
+                    })],
+                })
+            }
             SET_TAGS_SUBMIT => {
                 let Some(tags) = submitted_text(&ctx.args) else {
                     return Ok(vec![Effect::None]);
@@ -3724,6 +3825,19 @@ impl GrammarCallbacks for Component {
             // OR.6: the whole rest of the line is the new note's title,
             // verbatim. Not split on whitespace: a title has spaces in it, and
             // the picker's create row passes what the user typed.
+            // OR.10: `-goto-date` takes a date OPTIONALLY. Absent means "ask
+            // me", which is what makes the same command serve `<leader>ondD`.
+            // The date is VALIDATED here rather than in the handler so a typo
+            // is refused by the `:` line — where the text is still on screen
+            // and editable — instead of by an echo after it has scrolled away.
+            ROAM_DAILIES_DATE_PARSE => {
+                let trimmed = rest.trim();
+                if trimmed.is_empty() {
+                    Ok(Args::None)
+                } else {
+                    roam_dailies::parse(trimmed).map(|_| Args::String(trimmed.to_string()))
+                }
+            }
             ROAM_CREATE_PARSE => {
                 let trimmed = rest.trim();
                 if trimmed.is_empty() {
@@ -3847,6 +3961,9 @@ impl GrammarCallbacks for Component {
                     anchor: lattice::plugin_host::types::FileAnchor::End,
                     text: roam_find::new_node_text(&id, &title),
                     cut: None,
+                    // The roam directory is a path the user configured; if it does
+                    // not exist that is worth saying, not papering over.
+                    create_parents: false,
                 })])
             }
             ROAM_SYNC => {
@@ -3856,6 +3973,40 @@ impl GrammarCallbacks for Component {
                     text: "org-roam: re-scanning\u{2026}".to_string(),
                 })])
             }
+            // OR.10 — the journal. Today, and the two days either side of it,
+            // are the same call with a different shift.
+            ROAM_DAILIES_TODAY => Ok(open_daily(roam_dailies::Date::from_now(&clock_now()))),
+            ROAM_DAILIES_YESTERDAY => Ok(open_daily(
+                roam_dailies::Date::from_now(&clock_now()).shifted(-1),
+            )),
+            ROAM_DAILIES_TOMORROW => Ok(open_daily(
+                roam_dailies::Date::from_now(&clock_now()).shifted(1),
+            )),
+            // With a date, go. Without one, ask — which is the whole reason
+            // `<leader>ondD` can bind this command rather than needing an
+            // action of its own.
+            ROAM_DAILIES_GOTO_DATE => Ok(match &ctx.args {
+                Args::String(text) if !text.trim().is_empty() => match roam_dailies::parse(text) {
+                    // Already validated at parse time; re-checked because the
+                    // action seam (the prompt's second hop) reaches the same
+                    // helper without going through `parse_ex_args`.
+                    Ok(date) => open_daily(date),
+                    Err(error) => vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: error,
+                    })],
+                },
+                _ => vec![Effect::OpenPrompt(
+                    lattice::plugin_host::types::OpenPromptPayload {
+                        prompt: "Journal date (YYYY-MM-DD): ".to_string(),
+                        // Pre-filled with today, so the common edit is two
+                        // keystrokes on the day rather than typing a date out.
+                        initial: roam_dailies::Date::from_now(&clock_now()).title(),
+                        on_submit_action: "org-roam-dailies-goto-date-submit".to_string(),
+                        buffer_name: None,
+                    },
+                )],
+            }),
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered
             // `scanned-excerpt-source` for rows. This plugin does not open it — it rings
@@ -4276,6 +4427,79 @@ fn id_create(ctx: &ExCommandContext, doc: &Document, tree: Option<&TreeSnapshot>
             cursor: Some(Position { line, byte: 0 }),
         },
     )]
+}
+
+/// OR.10 — open one day's journal entry, creating it if it is not there.
+///
+/// ## Existence is answered by `read-file`, not guessed
+///
+/// The roam index would be the tempting source — it has walked the corpus and
+/// knows every file it saw. It is the wrong one: the index lags the filesystem
+/// by a watcher debounce, so a journal created seconds ago reads as absent, and
+/// "absent" here means *append the header again* to a file that already has
+/// one. `host-services.read-file` is the fresh answer and, per its own doc
+/// comment, is reachable from this seam precisely because a guest's WASI view
+/// is not.
+///
+/// A read that fails for a reason other than absence — a revoked `fs:read`
+/// grant, a permission bit — lands on the create path. That is deliberate: the
+/// create path APPENDS (`FileAnchor::End`), so the worst case is a duplicated
+/// header at the end of a file the user can see and delete, rather than
+/// anything lost. Guessing the other way and refusing to open would make an
+/// unreadable journal unreachable.
+///
+/// ## A new daily is a node, because the corpus's are
+///
+/// All eight dailies in the reference corpus carry a file-level `:ID:`, which
+/// emacs's *default* dailies template does not write — the user's own template
+/// does. Writing one matters beyond matching: without an id a journal entry
+/// cannot be linked to, and linking a day to what happened on it is most of
+/// what a journal is for. So this reuses `new_node_text`, which is the same
+/// body `:org-roam-create-node` writes and the same one OR.4's extraction reads
+/// back.
+fn open_daily(date: roam_dailies::Date) -> Vec<Effect> {
+    let Some(path) = roam_dailies::path(&date) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org-roam: set `org.roam-directory` to the folder your notes live in".to_string(),
+        })];
+    };
+    if host_services::read_file(&path).is_ok() {
+        return vec![Effect::OpenBuffer(
+            lattice::plugin_host::types::OpenBufferPayload {
+                path: Some(path),
+                force: false,
+            },
+        )];
+    }
+    let id = match host_services::new_uuid() {
+        Ok(id) => id,
+        // Refuses rather than degrades, for `:org-roam-create-node`'s reason:
+        // an `:ID:` is written into the user's file and outlives the session,
+        // so an empty one is worse than no entry.
+        Err(error) => {
+            return vec![Effect::Echo(EchoPayload {
+                level: EchoLevel::Error,
+                text: format!("org-roam: cannot mint an id: {error}"),
+            })];
+        }
+    };
+    // ONE effect and no trailing echo, for `:org-roam-create-node`'s reason:
+    // `WriteToFile` reports its own failure by setting the message, and an
+    // `Echo` after it would overwrite exactly that — so a refused write would
+    // look like a successful one. The opened buffer IS the feedback.
+    vec![Effect::WriteToFile(WriteToFilePayload {
+        path,
+        anchor: lattice::plugin_host::types::FileAnchor::End,
+        text: roam_find::new_node_text(&id, &date.title()),
+        cut: None,
+        // The ONE site that asks. `daily/` is named by an option with a
+        // default and is never typed by the user, so it is part of the
+        // layout org owns — and without it the very first
+        // `:org-roam-dailies-today` on a fresh corpus fails, which is
+        // the one use where the feature has to work.
+        create_parents: true,
+    })]
 }
 
 /// OR.9 — open the backlinks picker for the node the cursor is in.

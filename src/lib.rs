@@ -65,7 +65,14 @@ wit_bindgen::generate!({
             // the same `Guest` trait as `register-languages`.
             import lattice:plugin-host/theme@0.1.0;
             export register-theme-elements: func();
+            // OR.5b: the registry a picker plugin declares its sources
+            // through. NOT `include picker-source-plugin` — that world also
+            // imports `logging`, and this component is instantiated against
+            // the grammar seam's sync linker where `logging` is absent. Same
+            // scar as the seams below.
+            import lattice:plugin-host/picker-registry@0.1.0;
             export lattice:plugin-host/picker-source@0.1.0;
+            export register-picker-sources: func();
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
             // `logging` and `project`, and an import a component declares
@@ -751,6 +758,30 @@ impl Guest for Component {
         let (styles, _problems) =
             todo::parse_keyword_styles(&get_option("todo-keyword-styles").unwrap_or_default());
         todo_theme::apply_overrides(&styles);
+    }
+
+    /// OR.5b: declare org's picker sources. One today (refile); roam's
+    /// find-node and insert-node join it at OR.6/OR.7, which is the reason the
+    /// seam had to stop being "one component IS one source".
+    fn register_picker_sources() {
+        lattice::plugin_host::picker_registry::register_picker_source(
+            &lattice::plugin_host::types::PickerSourceSpec {
+                id: REFILE_PICKER.to_string(),
+                doc: "Org headlines a subtree can be refiled under".to_string(),
+                args_schema: Vec::new(),
+                args_hint: "[max-level]".to_string(),
+                // Not live: the target set is the files on disk, and re-walking
+                // them on every keystroke of the query would put a filesystem
+                // walk on the typing path for a list that does not change while
+                // the picker is open.
+                live: false,
+                // OR.5: refile moves a subtree UNDER an existing headline, so
+                // there is nothing here to create — a "create" row would have
+                // to invent a parent, which is not what the user asked for.
+                // Roam's own pickers are where the label earns its keep.
+                create_label: None,
+            },
+        );
     }
 
     fn register_options() {
@@ -3665,26 +3696,9 @@ impl MediaProducer for Component {
 /// into org's own action, which is what `picker-accept-outcome::invoke-command`
 /// is for.
 impl PickerSource for Component {
-    fn spec() -> lattice::plugin_host::types::PickerSourceSpec {
-        lattice::plugin_host::types::PickerSourceSpec {
-            id: REFILE_PICKER.to_string(),
-            doc: "Org headlines a subtree can be refiled under".to_string(),
-            args_schema: Vec::new(),
-            args_hint: "[max-level]".to_string(),
-            // Not live: the target set is the files on disk, and re-walking
-            // them on every keystroke of the query would put a filesystem walk
-            // on the typing path for a list that does not change while the
-            // picker is open.
-            live: false,
-            // OR.5: refile moves a subtree UNDER an existing headline, so there
-            // is nothing here to create — a "create" row would have to invent a
-            // parent, which is not what the user asked for. Roam's own pickers
-            // (OR.6/OR.7) are where the label earns its keep.
-            create_label: None,
-        }
-    }
 
     fn init(
+        _source: String,
         ctx: lattice::plugin_host::types::PickerContext,
         args: Vec<String>,
     ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
@@ -3760,6 +3774,7 @@ impl PickerSource for Component {
     }
 
     fn accept(
+        _source: String,
         _ctx: lattice::plugin_host::types::PickerContext,
         routing: lattice::plugin_host::types::RoutingPayload,
     ) -> Result<lattice::plugin_host::types::PickerAcceptOutcome, String> {

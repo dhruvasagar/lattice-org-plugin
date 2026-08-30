@@ -41,15 +41,27 @@ provides = [
 
 # Publishes the enablement request for each mode named here. Without it a mode
 # registers correctly and simply never activates — `auto_activatable_minors`
-# filters on enablement — so the chords silently do nothing. This also
-# auto-registers the single `org.enabled` gate that turns all of them on or off.
+# filters on enablement BEFORE it filters on policy — so the chords silently do
+# nothing. This also auto-registers the single `org.enabled` gate that turns all
+# of them on or off.
 #
-# `org-global-mode` is the universal `<C-x>o` prefix (agenda + capture), which
-# has to be on wherever you are; `org-todo-mode` is keyword cycling inside org
-# files. `org-table-mode` and `org-agenda-mode` are NOT here: the table minor
-# activates with the major, and the agenda view's minor is activated by the
-# provider that builds the view.
-default_modes = ["org-todo-mode", "org-global-mode"]
+# An `ActivationPolicy` is NOT a substitute for being listed here, and reading
+# it as one is what left `org-table-mode` off this line until 2026-08-30.
+# `Majors(["org-mode"])` says *where* a minor may activate; enablement says
+# *whether* it may at all, and a minor that is never enabled is never asked
+# about policy. The eleven table chords — `<Tab>` between cells among them —
+# therefore did nothing on a default install, while the plugin's own tests
+# passed because every one of them enabled the mode by hand first.
+#
+# `org-global-mode` is the universal `<leader>o` prefix (agenda, capture,
+# org-roam), which has to be on wherever you are; `org-todo-mode` is keyword
+# cycling inside org files; `org-table-mode` is table editing inside them.
+#
+# `org-agenda-mode` is the one that stays off, and for a reason that is about
+# activation rather than enablement: the agenda view's major is
+# `multibuffer-mode`, so no policy on this list could reach it. The provider
+# that builds the view activates it.
+default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 
 # Archive (`<leader>o$`), refile (`<leader>or`) and capture (`<leader>oc`) all
 # write to a file other than the one you are in, and the host checks the target

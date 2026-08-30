@@ -144,7 +144,7 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
              provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\"]\n\
              capabilities = [\"fs:write:{}\", \"state:write\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n\
-             default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n",
+             default_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\n",
             corpus.display()
         ),
     )

@@ -314,7 +314,7 @@ const REFILE_PICKER: &str = "org-refile";
 /// scannable; `:picker org-refile 5` overrides it per invocation.
 const DEFAULT_REFILE_MAX_LEVEL: usize = 3;
 
-/// `<C-x>oc` (OM.11, moved at OC.1) — capture's two hops: the prompt, and what
+/// `<leader>oc` (OM.11, moved at OC.1) — capture's two hops: the prompt, and what
 /// the host dispatches with the submitted text.
 const CAPTURE: u32 = 35;
 const CAPTURE_SUBMIT: u32 = 36;
@@ -941,13 +941,13 @@ impl Guest for Component {
             DEFAULT_CAPTURE_TEMPLATES,
             "Your capture templates, as TOML: one `[[template]]` per entry with \
              `key`, `description`, `target = { file = \"…\", headline = \"…\" }` \
-             and a `body`. Unset means `<C-x>oc` says so rather than guessing.",
+             and a `body`. Unset means `<leader>oc` says so rather than guessing.",
         );
         let _ = register_option(
             "capture-file",
             OptionType::String,
             DEFAULT_CAPTURE_FILE,
-            "Where `<C-x>oc` files a capture when `capture-templates` is unset. \
+            "Where `<leader>oc` files a capture when `capture-templates` is unset. \
              Absolute, or relative to the editor's working directory.",
         );
         let _ = register_option(
@@ -2943,7 +2943,7 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
     }
 }
 
-/// The first hop of `<C-x>oc`: resolve the template, then open the prompt.
+/// The first hop of `<leader>oc`: resolve the template, then open the prompt.
 ///
 /// Resolving BEFORE the prompt is what makes an unset or broken configuration
 /// say so at the keystroke rather than after the user has already typed a note
@@ -4790,7 +4790,7 @@ const CAPTURE_TRANSIENT: &str = "org-capture";
 /// the whole reason `plugin-transients.md` exists.
 ///
 /// **Built per open, never cached.** A menu row's set comes from
-/// `org.capture-templates`, and `:set` must take effect on the next `<C-x>oc`.
+/// `org.capture-templates`, and `:set` must take effect on the next `<leader>oc`.
 /// The seam calls `build` per open for exactly this reason.
 ///
 /// **Each row carries the template's key in its own args** — the per-row slot

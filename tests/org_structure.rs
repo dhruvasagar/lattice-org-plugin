@@ -132,7 +132,7 @@ async fn org_editor_with_caps(
             // tree and the guest falls back to line matching — so a harness
             // that omitted it would test the text path while claiming to test
             // the tree one.
-            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\", \"events\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\"]\neditor_capabilities = [\"tree-sitter\"]\ncapabilities = [{caps}]\n"
+            "id = \"org\"\nprovides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\", \"events\"]\ndefault_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\neditor_capabilities = [\"tree-sitter\"]\ncapabilities = [{caps}]\n"
         ),
     )
     .unwrap();
@@ -199,24 +199,12 @@ async fn org_editor_with_caps(
     editor
 }
 
-/// Enable a plugin minor and activate it on the open buffer. A plugin minor
-/// is inert until enabled (CI.3), and only `org-todo-mode` gets that for free
-/// via the manifest's `default_mode`.
-fn enable_minor(editor: &mut Editor, mode: &str) {
-    {
-        let mut next = (**editor.mode_registry.load()).clone();
-        next.set_minor_enabled(ModeId::new(mode), true);
-        editor.mode_registry.store(std::sync::Arc::new(next));
-    }
-    let proto = lattice_protocol::ids::BufferId::new(editor.document_buffer_id.0 as u64);
-    editor
-        .event_bus
-        .publish(lattice_protocol::Event::MajorEntered {
-            buffer: proto,
-            major: "org-mode".into(),
-        });
-    editor.run_tick_pending();
-}
+// `enable_minor` lived here and every table test called it first. It is gone
+// with `org-table-mode`'s addition to the manifest's `default_modes`, and the
+// deletion is the point rather than tidying: a test that enables the mode by
+// hand passes against the broken product too, which is exactly why eleven dead
+// chords survived this file. The table tests below now reach `<Tab>` the way a
+// user does, through enablement the manifest asked for.
 
 fn chord(s: &str) -> KeyChord {
     parse_chord_sequence(s)
@@ -1888,7 +1876,6 @@ async fn tab_in_a_table_aligns_and_steps_a_cell() {
     let base = tempfile::tempdir().unwrap();
     let original = "| Name | Qty |\n|---+---|\n| bread | 1 |\n";
     let mut editor = org_editor(base.path(), original).await;
-    enable_minor(&mut editor, "org-table-mode");
 
     goto_line(&mut editor, 0);
     editor.cursor.byte = 2;
@@ -1915,7 +1902,6 @@ async fn tab_off_a_table_falls_through_to_the_headline_cycle() {
     let base = tempfile::tempdir().unwrap();
     let original = "* One\nbody\n";
     let mut editor = org_editor(base.path(), original).await;
-    enable_minor(&mut editor, "org-table-mode");
 
     // On a headline, NOT in a table: table-mode declines, org-mode cycles.
     goto_line(&mut editor, 0);
@@ -1938,7 +1924,6 @@ async fn table_rows_and_columns_move_and_the_caret_follows() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "| a | b |\n| c | d |\n").await;
-    enable_minor(&mut editor, "org-table-mode");
 
     // Move the second row up.
     goto_line(&mut editor, 1);
@@ -1959,7 +1944,6 @@ async fn inserting_a_row_and_column_widens_the_whole_table() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "| a | b |\n").await;
-    enable_minor(&mut editor, "org-table-mode");
 
     goto_line(&mut editor, 0);
     editor.cursor.byte = 2;
@@ -1985,7 +1969,6 @@ async fn the_last_row_and_a_separator_refuse_to_be_destroyed() {
     let base = tempfile::tempdir().unwrap();
     let original = "| a |\n";
     let mut editor = org_editor(base.path(), original).await;
-    enable_minor(&mut editor, "org-table-mode");
 
     goto_line(&mut editor, 0);
     press(&mut editor, "<leader>tdr");
@@ -3539,7 +3522,6 @@ async fn a_table_inside_a_block_is_not_aligned() {
     // Deliberately ragged, so an alignment pass would be visible.
     let original = "* T\n#+BEGIN_SRC org\n|a|bb|\n|ccc|d|\n#+END_SRC\n";
     let mut editor = org_editor(base.path(), original).await;
-    enable_minor(&mut editor, "org-table-mode");
 
     goto_line(&mut editor, 2);
     press(&mut editor, "<leader>o|");
@@ -3564,7 +3546,6 @@ async fn alignment_stops_at_the_table_the_caret_is_in() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* T\n|a|bb|\n|ccc|d|\n\n|x|y|\n").await;
-    enable_minor(&mut editor, "org-table-mode");
 
     goto_line(&mut editor, 1);
     press(&mut editor, "<leader>o|");

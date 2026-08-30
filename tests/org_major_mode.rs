@@ -274,12 +274,14 @@ async fn the_global_mode_activates_in_a_buffer_that_is_not_org() {
     let plugins_dir = base.path().join("plugins");
     let dir = plugins_dir.join("org");
     std::fs::create_dir_all(&dir).unwrap();
-    // The shipped manifest's spelling: BOTH modes on by default, one gate.
+    // The shipped manifest's spelling: every auto-activating minor on by
+    // default, one gate. Kept in step with the real `plugin.toml` by
+    // `every_auto_activating_minor_is_in_the_shipped_manifests_default_modes`.
     std::fs::write(
         dir.join("plugin.toml"),
         "id = \"org\"\n\
          provides = [\"modes\", \"language\", \"help\", \"config\", \"media\"]\n\
-         default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n",
+         default_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), &wasm).unwrap();
@@ -465,5 +467,100 @@ async fn an_org_buffer_folds_by_syntax_without_the_user_setting_it() {
             .expect("registered"),
         FoldMethod::Manual,
         "and the user's global setting is untouched"
+    );
+}
+
+/// **Every minor that can auto-activate is listed in the SHIPPED
+/// `plugin.toml`'s `default_modes` — or it is dead.**
+///
+/// This is the invariant `org-table-mode` violated for its whole life, and the
+/// reason it did so is that the manifest read as if a policy were enough:
+/// "`org-table-mode` … activates with the major". It does not.
+/// `auto_activatable_minors` filters on **enablement before policy**, so a
+/// minor that is never enabled is never asked where it may activate. Eleven
+/// table chords — `<Tab>` between cells among them — did nothing on a default
+/// install.
+///
+/// Nothing caught it because nothing read the shipped manifest. Four test
+/// harnesses each hand-write their own `plugin.toml`, so the file a user
+/// actually gets was covered by no test at all, and every table test enabled
+/// the mode by hand first — which passes against the broken version too.
+///
+/// So this reads the real file from `CARGO_MANIFEST_DIR` and checks it against
+/// the modes the component actually registered. `Manual` minors are exempt and
+/// `org-agenda-mode` is the one: the agenda view's major is `multibuffer-mode`,
+/// which no policy on this list could reach, so the provider that builds the
+/// view activates it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_auto_activating_minor_is_in_the_shipped_manifests_default_modes() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    // The file a user gets, not the harness's copy of it.
+    let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
+        .expect("the shipped plugin.toml is beside Cargo.toml");
+    let default_modes = shipped
+        .lines()
+        .find(|l| l.trim_start().starts_with("default_modes"))
+        .expect("the shipped manifest declares default_modes");
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let editor = boot_sealed_editor();
+
+    // Snapshot BEFORE the load, and diff after — so this checks exactly the
+    // modes the component contributed. Matching on an `org-` prefix would be
+    // the obvious shortcut and would silently stop covering a mode the day one
+    // is named otherwise. The registry also holds NATIVE minors
+    // (`magit-core-mode` among them), and those are auto-enabled at
+    // registration rather than through any manifest, so including them would
+    // make this fail for a reason that is not org's to fix.
+    let before: std::collections::HashSet<ModeId> = editor
+        .mode_registry
+        .load()
+        .iter()
+        .map(|(id, _)| id)
+        .collect();
+
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let registry = editor.mode_registry.load();
+    let mut checked = Vec::new();
+    for (id, mode) in registry.iter() {
+        if before.contains(&id) || mode.kind() != ModeKind::Minor {
+            continue;
+        }
+        // `Manual` is the honest opt-out: something else activates it.
+        if matches!(
+            mode.activation_policy(),
+            lattice_mode::ActivationPolicy::Manual
+        ) {
+            continue;
+        }
+        assert!(
+            default_modes.contains(id.as_str()),
+            "`{id}` can auto-activate but is not in the shipped manifest's \
+             default_modes, so it is never enabled and its chords are dead. \
+             Add it, or give it `ActivationPolicy::Manual` and say what \
+             activates it.\n  default_modes line: {default_modes}"
+        );
+        checked.push(id.to_string());
+    }
+    checked.sort();
+    assert_eq!(
+        checked,
+        vec![
+            "org-global-mode".to_string(),
+            "org-table-mode".to_string(),
+            "org-todo-mode".to_string(),
+        ],
+        "org's three auto-activating minors — asserted by name rather than by \
+         count so a rename cannot quietly leave this test checking nothing"
     );
 }

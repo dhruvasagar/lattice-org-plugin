@@ -79,7 +79,7 @@ async fn org_editor_inner(base: &std::path::Path, text: &str, caps: &[String]) -
         format!(
             "id = \"org\"\n\
              provides = [\"modes\", \"grammar\", \"language\", \"help\", \"config\", \"events\"]\n\
-             default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n\
+             default_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n\
              capabilities = [{}]\n",
             caps.iter()

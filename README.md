@@ -256,7 +256,7 @@ provides = [
     "picker-source", "completion-source", "transient-source",
     "events", "help",
 ]
-default_modes = ["org-todo-mode", "org-global-mode"]
+default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 capabilities = ["fs:write:/home/you/org", "state:write"]
 editor_capabilities = ["tree-sitter"]
 ```
@@ -277,19 +277,30 @@ agenda all still work and those three chords say they were refused.
 
 `default_modes` is load-bearing: it is what publishes the enablement request
 for each mode named, and without it a mode registers correctly and simply never
-activates — the chords are silently dead. Two are named because they answer
+activates — the chords are silently dead. Three are named because they answer
 different questions: `org-todo-mode` is keyword cycling *inside org files*,
-`org-global-mode` is the `<leader>o` prefix (capture, agenda, roam) that has
-to work *wherever you are*. It is `<leader>o` and not `<C-x>o`: org's MAJOR
-keymap binds a TERMINAL `<C-x>` (timestamp decrement), so inside an org buffer
-`<C-x>` fires that and never waits for a second key — a prefix in one layer
-against a terminal binding in another is the ambiguity vim settles with
-`timeoutlen`, which lattice does not have. `org-table-mode` and `org-agenda-mode` are absent on
-purpose — the table minor rides the major, and the agenda view's minor is
-activated by the provider that builds the view.
+`org-table-mode` is table editing in them, and `org-global-mode` is the
+`<leader>o` prefix (capture, agenda, roam) that has to work *wherever you are*.
+It is `<leader>o` and not `<C-x>o`: org's MAJOR keymap binds a TERMINAL `<C-x>`
+(timestamp decrement), so inside an org buffer `<C-x>` fires that and never
+waits for a second key — a prefix in one layer against a terminal binding in
+another is the ambiguity vim settles with `timeoutlen`, which lattice does not
+have.
+
+**An `ActivationPolicy` is not a substitute for being listed here**, and this
+README said otherwise until 2026-08-30: `org-table-mode` was described as
+riding the major. It does not. `auto_activatable_minors` filters on enablement
+*before* policy, so a minor that is never enabled is never asked where it may
+activate — and the eleven table chords, `<Tab>` between cells among them, did
+nothing on a default install. Nothing caught it because no test read this file;
+one does now.
+
+`org-agenda-mode` is the one genuinely absent, for a reason about activation
+rather than enablement: the agenda view's major is `multibuffer-mode`, which no
+policy here could reach, so the provider that builds the view activates it.
 
 It also auto-registers the single `org.enabled` gate, so `:set org.enabled=false`
-turns both off together and leaves the outliner, tables and highlighting.
+turns all three off together and leaves the outliner and highlighting.
 
 In normal use the plugin manager does this for you from the git source
 (PM.5–PM.8) and caches the build under `~/.config/lattice/plugins/`.

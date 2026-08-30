@@ -115,6 +115,12 @@ mod clock;
 mod headline;
 mod links;
 mod refile;
+// OR.4: what makes a file's contents into roam nodes — the pure half.
+mod roam;
+// OR.4: the thin tree half — where the headlines and drawers are.
+mod roam_index;
+mod roam_scan;
+mod roam_tree;
 mod table;
 mod timestamp;
 mod todo;
@@ -305,16 +311,29 @@ const CLOCK_IN: u32 = 41;
 const CLOCK_OUT: u32 = 42;
 const CLOCK_CANCEL: u32 = 43;
 const CLOCK_GOTO: u32 = 44;
+/// OR.4 — `:org-roam-sync`, the escape hatch when the watcher missed something.
+const ROAM_SYNC: u32 = 47;
 
 /// OC.6 — the events handler ids. The guest picks these; the host hands them
 /// back to `on-event`.
 const ON_CLOCK_EVENT: u32 = 1;
+/// OR.4: the watcher told us files under the roam directory changed.
+const ON_ROAM_FILES_CHANGED: u32 = 2;
 
 /// The plugin events the grammar store emits and the events store consumes.
 /// Private to this plugin: both ends are org, so the payload is org's own
 /// business and the host moves the bytes without reading them.
 const EV_CLOCK_STARTED: &str = "org/clock-started";
 const EV_CLOCK_STOPPED: &str = "org/clock-stopped";
+/// OR.4: `:org-roam-sync`, rung from the grammar store so the EVENT store does
+/// the walk.
+///
+/// The bridge is not ceremony. A cold pass reads 706 files and parses the ones
+/// that moved; running that inside the ex-command would do it on the dispatch
+/// thread and freeze the editor for the duration. Ringing the doorbell costs a
+/// bus publish and puts the work where every other expensive org thing already
+/// lives (design D6, and the OC.1 pattern the clock uses).
+const EV_ROAM_SYNC: &str = "org/roam-sync";
 
 /// OC.4 — the fields menu's own submit, distinct from the prompt's.
 ///
@@ -824,6 +843,25 @@ impl Guest for Component {
              `~` is expanded. Blank lines and `#` comments are ignored. Unset \
              scans the project root, as before.",
         );
+        // OR.4: the corpus root. UNSET by default, and that default is the
+        // feature's contract — see `roam_scan::roam_directory`.
+        let _ = register_option(
+            "roam-directory",
+            OptionType::String,
+            "",
+            "Where your org-roam notes live. Unset means roam is inert: no \
+             walk, no watcher, no index, and `<CR>` on an `[[id:\u{2026}]]` link \
+             says the directory is not configured rather than blaming the \
+             filesystem. The directory must also be in this plugin's \
+             `fs:read` grant, or the walk reaches nothing.",
+        );
+        let _ = register_option(
+            "roam-dailies-directory",
+            OptionType::String,
+            "daily",
+            "Where `:org-roam-dailies-*` files live. Relative to \
+             `org.roam-directory` unless it starts with `/`.",
+        );
         let _ = register_option(
             "inline-images",
             OptionType::Boolean,
@@ -920,6 +958,31 @@ impl Guest for Component {
             ON_CLOCK_EVENT,
         );
         ui::register_segment(CLOCK_SEGMENT, UiZone::Right, 8);
+        // OR.4: the roam index. Everything below is a no-op when
+        // `org.roam-directory` is unset — no walk, no watcher, no store write —
+        // so an org user who keeps no zettelkasten pays nothing for it.
+        //
+        // The subscription is UNCONDITIONAL, and the walk is not. A plugin
+        // loads before the user's `init.rs` has necessarily set
+        // `org.roam-directory` (that is the documented `plugin-loaded`
+        // pattern), so a subscription armed only when the option is already set
+        // would never arm for the user who configures roam the documented way.
+        // A subscription with no watch behind it receives nothing and costs
+        // nothing; `sync_all` arms the watch when there is a directory to
+        // watch.
+        events::subscribe(
+            &EventFilter {
+                kinds: Some(vec![EventKind::FilesChanged]),
+                path_globs: None,
+                major_modes: None,
+            },
+            ON_ROAM_FILES_CHANGED,
+        );
+        // Boot does a full walk, because lattice was not running while the
+        // corpus changed and a watcher cannot report what it did not see.
+        // Unchanged files cost a read and a hash; only moved ones parse. A
+        // no-op when roam is unconfigured.
+        roam_scan::sync_all();
     }
 
     /// The grammar store told us a clock started or stopped.
@@ -928,6 +991,15 @@ impl Guest for Component {
     /// the bytes without reading them — so it is a tab-separated string rather
     /// than MessagePack, which would have cost a dependency for two fields.
     fn on_event(handler: u32, ev: Event) {
+        // OR.4: a batch of changed paths. Re-indexing happens HERE, on the
+        // event actor's own task, so it reaches the store with no keystroke
+        // involved — which is the property the whole watcher exists for.
+        if handler == ON_ROAM_FILES_CHANGED {
+            if let Event::FilesChanged(paths) = ev {
+                roam_scan::reindex(&paths);
+            }
+            return;
+        }
         if handler != ON_CLOCK_EVENT {
             return;
         }
@@ -959,6 +1031,9 @@ impl Guest for Component {
                 // Immediately, not on the first wake — otherwise `◷ 0:00` takes
                 // up to a minute to appear and the chord looks like it failed.
                 publish_clock_segment();
+            }
+            EV_ROAM_SYNC => {
+                roam_scan::sync_all();
             }
             EV_CLOCK_STOPPED => {
                 SESSION.with(|s| {
@@ -1572,6 +1647,14 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             CLOCK_GOTO,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-sync",
+            "Re-scan `org.roam-directory` and rebuild the roam index. The \
+             escape hatch when the watcher missed something.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_SYNC,
         );
         register_action(
             "org-archive-subtree",
@@ -3506,6 +3589,15 @@ impl GrammarCallbacks for Component {
             CLOCK_CANCEL => Ok(clock_stop(ctx.cursor, ctx.buffer_id, doc, tree, true)),
             CLOCK_RESUME => Ok(clock_resume(ctx.buffer_id, doc, tree)),
             CLOCK_GOTO => Ok(clock_goto()),
+            // OR.4: ring the doorbell; the event store walks. See
+            // `EV_ROAM_SYNC` for why this is not done here.
+            ROAM_SYNC => {
+                host_services::emit_event(EV_ROAM_SYNC, &[]);
+                Ok(vec![Effect::Echo(EchoPayload {
+                    level: EchoLevel::Info,
+                    text: "org-roam: re-scanning\u{2026}".to_string(),
+                })])
+            }
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered
             // `agenda-source` for rows. This plugin does not open it — it rings
@@ -3584,6 +3676,11 @@ impl PickerSource for Component {
             // on the typing path for a list that does not change while the
             // picker is open.
             live: false,
+            // OR.5: refile moves a subtree UNDER an existing headline, so there
+            // is nothing here to create — a "create" row would have to invent a
+            // parent, which is not what the user asked for. Roam's own pickers
+            // (OR.6/OR.7) are where the label earns its keep.
+            create_label: None,
         }
     }
 

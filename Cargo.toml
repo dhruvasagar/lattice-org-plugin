@@ -31,6 +31,13 @@ wit-bindgen = "0.58"
 # fails to parse.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# OR.4: the roam index's on-store encoding. The store holds opaque bytes and the
+# GUEST owns the schema, so the format is this plugin's choice — MessagePack,
+# because the records are structs of strings and a text format would double the
+# size of a blob the picker reads on every open. Pure-Rust and wasm-friendly,
+# and the same crate the SDK already uses for plugin event payloads.
+rmp-serde = "1.3"
+
 
 # The moved-from-lattice integration tests drive a REAL editor: they boot one,
 # load this plugin's component through the loader, and dispatch chords. That

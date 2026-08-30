@@ -214,6 +214,14 @@ fn remove_backlink(target: &str, source: &str) {
     }
 }
 
+/// Every node, for a reader that wants the whole set (OR.6's picker).
+///
+/// One `get` and one deserialize rather than one call per node — which is the
+/// entire reason the blob exists beside the per-id records.
+pub fn all_nodes() -> Vec<Node> {
+    get_decoded::<Vec<Node>>(NODES_KEY).unwrap_or_default()
+}
+
 /// Rebuild the all-nodes blob from the `n/<id>` records.
 ///
 /// Called **once per batch**, not once per file: it is O(nodes) in host calls,

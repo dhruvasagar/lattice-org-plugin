@@ -125,6 +125,7 @@ mod refile;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
 mod roam;
 // OR.4: the thin tree half — where the headlines and drawers are.
+mod roam_find;
 mod roam_index;
 mod roam_scan;
 mod roam_tree;
@@ -320,12 +321,42 @@ const CLOCK_CANCEL: u32 = 43;
 const CLOCK_GOTO: u32 = 44;
 /// OR.4 — `:org-roam-sync`, the escape hatch when the watcher missed something.
 const ROAM_SYNC: u32 = 47;
+/// OR.6 — `:org-roam-find-node`, and the create row's landing place.
+const ROAM_FIND_NODE: u32 = 48;
+const ROAM_CREATE_NODE: u32 = 49;
+/// The create command takes the new note's title as its one argument, so it
+/// needs its own parse callback rather than the clock's no-arg one.
+const ROAM_CREATE_PARSE: u32 = 50;
 
 /// OC.6 — the events handler ids. The guest picks these; the host hands them
 /// back to `on-event`.
 const ON_CLOCK_EVENT: u32 = 1;
 /// OR.4: the watcher told us files under the roam directory changed.
 const ON_ROAM_FILES_CHANGED: u32 = 2;
+
+/// OR.6: `YYYYMMDDHHMMSS` in LOCAL time, for a new note's filename.
+///
+/// Local rather than UTC, because the stamp is what the user sees in a
+/// directory listing and a note filed under yesterday's date because they live
+/// east of Greenwich is the midnight bug in a different costume. The offset
+/// comes from `local-utc-offset-seconds` (OC.4) — `wasi:clocks` is UTC and the
+/// guest has no `TZ`.
+fn roam_file_stamp() -> String {
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let local = utc + host_services::local_utc_offset_seconds() as i64;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let (y, m, d) = agenda::civil_from_epoch_day(days);
+    format!(
+        "{y:04}{m:02}{d:02}{:02}{:02}{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
 
 /// The plugin events the grammar store emits and the events store consumes.
 /// Private to this plugin: both ends are org, so the payload is org's own
@@ -782,6 +813,9 @@ impl Guest for Component {
                 create_label: None,
             },
         );
+        // OR.6: roam's find-node. The SECOND source from this component, which
+        // is what OR.5b existed to make possible.
+        lattice::plugin_host::picker_registry::register_picker_source(&roam_find::spec());
     }
 
     fn register_options() {
@@ -1678,6 +1712,28 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             CLOCK_GOTO,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-find-node",
+            "Find an org-roam note by title or alias, and jump to it.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_FIND_NODE,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-create-node",
+            "Create an org-roam note titled by the argument, and open it. \
+             Usually reached by picking the create row in `:org-roam-find-node` \
+             rather than typed.",
+            &lattice::plugin_host::types::ExCommandSpec {
+                latency_class: LatencyClass::Reflex,
+                accepts_bang: false,
+                accepts_range: false,
+                args_schema: Vec::new(),
+                surface_form: SurfaceForm::Keyword,
+            },
+            ROAM_CREATE_PARSE,
+            ROAM_CREATE_NODE,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-sync",
@@ -2637,7 +2693,7 @@ fn archive_subtree(
         path: archive::archive_path(&source),
         // Append. Org's archive file is a log, and the newest entry belonging
         // at the bottom is what makes it readable top-to-bottom later.
-        anchor: FileAnchor::End,
+        anchor: lattice::plugin_host::types::FileAnchor::End,
         text,
         cut: Some(Range {
             start: Position { line: sl, byte: sb },
@@ -3593,6 +3649,17 @@ impl GrammarCallbacks for Component {
                     Err("org: this command takes no arguments".to_string())
                 }
             }
+            // OR.6: the whole rest of the line is the new note's title,
+            // verbatim. Not split on whitespace: a title has spaces in it, and
+            // the picker's create row passes what the user typed.
+            ROAM_CREATE_PARSE => {
+                let trimmed = rest.trim();
+                if trimmed.is_empty() {
+                    Err("org-roam: a new note needs a title".to_string())
+                } else {
+                    Ok(Args::String(trimmed.to_string()))
+                }
+            }
             AGENDA_PARSE => {
                 let trimmed = rest.trim();
                 Ok(if trimmed.is_empty() {
@@ -3622,6 +3689,78 @@ impl GrammarCallbacks for Component {
             CLOCK_GOTO => Ok(clock_goto()),
             // OR.4: ring the doorbell; the event store walks. See
             // `EV_ROAM_SYNC` for why this is not done here.
+            // OR.6: open the picker. The host owns the picker; this names it.
+            ROAM_FIND_NODE => Ok(vec![Effect::OpenPicker(
+                lattice::plugin_host::types::OpenPickerPayload {
+                    source: roam_find::FIND_NODE_PICKER.to_string(),
+                    args: Vec::new(),
+                },
+            )]),
+            // OR.6: mint an id, write the note, open it.
+            //
+            // This is the grammar seam, which is the whole reason `new-uuid` is
+            // host-side (OR.3): a guest minting through `wasi:random` would work
+            // on the picker path and take the plugin down here. And the write is
+            // an `Effect`, not a `std::fs::write`, for the same structural
+            // reason — the sync linker cannot serve WASI at all.
+            ROAM_CREATE_NODE => {
+                let title = match &ctx.args {
+                    Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        return Ok(vec![Effect::Echo(EchoPayload {
+                            level: EchoLevel::Warn,
+                            text: "org-roam: a new note needs a title".to_string(),
+                        })]);
+                    }
+                };
+                let Some(dir) = roam_scan::roam_directory() else {
+                    return Ok(vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: "org-roam: set `org.roam-directory` first".to_string(),
+                    })]);
+                };
+                let id = match host_services::new_uuid() {
+                    Ok(id) => id,
+                    // The one place this seam refuses rather than degrades — an
+                    // `:ID:` is written into the user's file and outlives the
+                    // session, so an empty one is worse than no note.
+                    Err(error) => {
+                        return Ok(vec![Effect::Echo(EchoPayload {
+                            level: EchoLevel::Error,
+                            text: format!("org-roam: cannot mint an id: {error}"),
+                        })]);
+                    }
+                };
+                let slug = roam_find::slug(&title);
+                let stamp = roam_file_stamp();
+                let name = if slug.is_empty() {
+                    // A title of pure punctuation still gets a file, named by
+                    // its timestamp alone — refusing to create it would be the
+                    // picker declining a title the user deliberately typed.
+                    format!("{stamp}.org")
+                } else {
+                    format!("{stamp}-{slug}.org")
+                };
+                let path = format!("{}/{name}", dir.trim_end_matches('/'));
+                // `WriteToFile` RESOLVES the path to a buffer, so the note
+                // becomes a live unsaved buffer rather than only a file on
+                // disk. That is org-roam-capture's own model — a new note is a
+                // draft you finalize — and it is also why an abandoned draft
+                // never enters the index: the watcher sees it when it lands on
+                // disk, which is when the user saves.
+                Ok(vec![
+                    Effect::WriteToFile(WriteToFilePayload {
+                        path,
+                        anchor: lattice::plugin_host::types::FileAnchor::End,
+                        text: roam_find::new_node_text(&id, &title),
+                        cut: None,
+                    }),
+                    Effect::Echo(EchoPayload {
+                        level: EchoLevel::Info,
+                        text: format!("org-roam: created \u{201c}{title}\u{201d}"),
+                    }),
+                ])
+            }
             ROAM_SYNC => {
                 host_services::emit_event(EV_ROAM_SYNC, &[]);
                 Ok(vec![Effect::Echo(EchoPayload {
@@ -3696,12 +3835,23 @@ impl MediaProducer for Component {
 /// into org's own action, which is what `picker-accept-outcome::invoke-command`
 /// is for.
 impl PickerSource for Component {
-
     fn init(
-        _source: String,
+        source: String,
         ctx: lattice::plugin_host::types::PickerContext,
         args: Vec<String>,
     ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
+        // OR.6: two sources now share this body. Route first.
+        if source == roam_find::FIND_NODE_PICKER {
+            return Ok(roam_find::init()?
+                .into_iter()
+                .map(|(candidate, routing)| {
+                    exports::lattice::plugin_host::picker_source::CandidatePair {
+                        candidate,
+                        routing,
+                    }
+                })
+                .collect());
+        }
         // `org-refile-targets`' `:maxlevel`, as a picker argument rather than
         // an option: the picker world has no `config` seam, and an argument is
         // per-invocation anyway — `:picker org-refile 5` when you know the
@@ -3774,10 +3924,13 @@ impl PickerSource for Component {
     }
 
     fn accept(
-        _source: String,
+        source: String,
         _ctx: lattice::plugin_host::types::PickerContext,
         routing: lattice::plugin_host::types::RoutingPayload,
     ) -> Result<lattice::plugin_host::types::PickerAcceptOutcome, String> {
+        if source == roam_find::FIND_NODE_PICKER {
+            return roam_find::accept(routing);
+        }
         match routing {
             lattice::plugin_host::types::RoutingPayload::InvokeCommand(cmd) => {
                 Ok(lattice::plugin_host::types::PickerAcceptOutcome::InvokeCommand(cmd))

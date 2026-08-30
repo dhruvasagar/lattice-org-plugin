@@ -73,6 +73,13 @@ wit_bindgen::generate!({
             import lattice:plugin-host/picker-registry@0.1.0;
             export lattice:plugin-host/picker-source@0.1.0;
             export register-picker-sources: func();
+            // OR.7: org-roam nodes inside an `[[…]]` link. NOT `include
+            // completion-source-plugin` — that world imports `logging` too,
+            // and every import a component declares must be satisfiable on
+            // EVERY linker it is instantiated against, including the grammar
+            // seam's sync one where `logging` is deliberately absent. Same
+            // scar as `picker-source` and `transient-source` above.
+            export lattice:plugin-host/completion-source@0.1.0;
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
             // `logging` and `project`, and an import a component declares
@@ -125,6 +132,7 @@ mod refile;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
 mod roam;
 // OR.4: the thin tree half — where the headlines and drawers are.
+mod roam_complete;
 mod roam_find;
 mod roam_index;
 mod roam_scan;
@@ -3903,6 +3911,7 @@ impl PickerSource for Component {
                 pairs.push(
                     exports::lattice::plugin_host::picker_source::CandidatePair {
                         candidate: lattice::plugin_host::types::RawCandidate {
+                            insert_text: None,
                             text: target.label.clone(),
                             display: target.label.clone(),
                             source: Some(REFILE_PICKER.to_string()),
@@ -4426,6 +4435,30 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
         }],
         footer: None,
     })
+}
+
+/// OR.7 — the completion seam. One source: org-roam nodes, offered only
+/// inside an `[[…]]` link in an org buffer (`roam_complete` decides both,
+/// from the `language` + `line-before-cursor` the context carries).
+///
+/// The host runs `generate` off the keystroke path and feeds the result
+/// through its own native matcher / ranker / annotator — the seam is a
+/// GENERATOR by design, because `matches` and `annotate` run per candidate on
+/// the synchronous keystroke pipeline and crossing them would fire hundreds
+/// of boundary calls per keystroke (paramount #1).
+impl exports::lattice::plugin_host::completion_source::Guest for Component {
+    fn spec() -> lattice::plugin_host::types::CompletionSourceSpec {
+        roam_complete::spec()
+    }
+
+    fn generate(
+        ctx: lattice::plugin_host::types::GenerateContext,
+    ) -> Result<Vec<lattice::plugin_host::types::RawCandidate>, String> {
+        // `Ok` with an empty list, never `Err`, when the source simply does
+        // not apply: an `Err` is logged host-side as a broken source, and
+        // "the cursor is not in a link" is the normal case, not a fault.
+        Ok(roam_complete::generate(&ctx))
+    }
 }
 
 impl exports::lattice::plugin_host::transient_source::Guest for Component {

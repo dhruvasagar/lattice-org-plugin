@@ -119,6 +119,7 @@ fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
     };
     (
         RawCandidate {
+            insert_text: None,
             text: node.title.clone(),
             display,
             source: Some(FIND_NODE_PICKER.to_string()),

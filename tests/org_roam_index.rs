@@ -67,9 +67,10 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
         dir.join("plugin.toml"),
         format!(
             "id = \"org\"\n\
-             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\"]\n\
+             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\"]\n\
              capabilities = [\"fs:write:{}\", \"state:write\"]\n\
-             editor_capabilities = [\"tree-sitter\"]\n",
+             editor_capabilities = [\"tree-sitter\"]\n\
+             default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n",
             corpus.display()
         ),
     )
@@ -747,4 +748,154 @@ async fn find_node_with_no_directory_says_so() {
         message.contains("org.roam-directory"),
         "the picker named the option to set rather than showing nothing: {message:?}"
     );
+}
+
+/// OR.7 — **the node completion source reaches the popup.**
+///
+/// The scar this is shaped against: PH7.6 gave a WASM completion source a WIT
+/// export, an actor, a carrier mode and an `AsyncCompletionSource` adapter, the
+/// loader registered all of it — and the host drove only LSP, so `generate` was
+/// never called. Everything looked wired. Nothing completed. So this asserts on
+/// the rows in the popup, which is the only place the whole chain is visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_a_link_opener_offers_the_indexed_nodes() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let rows = complete_in_org(&mut editor, &corpus, "see [[").await;
+    assert!(
+        rows.iter().any(|r| r == "Honey Garlic Chicken Breast"),
+        "the file node is offered as a completion: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r == "Async"),
+        "and so is the headline node: {rows:?}"
+    );
+}
+
+/// The source declines outside a link — the guard that keeps 500-node corpora
+/// out of every ordinary word completion in an org buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_words_do_not_offer_nodes() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // Positive control first: the same editor DOES offer nodes after `[[`, so
+    // an empty result below cannot be "the source never ran".
+    let inside = complete_in_org(&mut editor, &corpus, "see [[Hon").await;
+    assert!(
+        inside.iter().any(|r| r == "Honey Garlic Chicken Breast"),
+        "control: inside a link the node is offered: {inside:?}"
+    );
+
+    let outside = complete_in_org(&mut editor, &corpus, "Hon").await;
+    assert!(
+        !outside.iter().any(|r| r == "Honey Garlic Chicken Breast"),
+        "a bare word must not offer nodes: {outside:?}"
+    );
+}
+
+/// Accepting a node writes an `[[id:…][title]]` link — the title is what was
+/// matched, the link is what lands, and the opener already in the buffer is
+/// not repeated.
+///
+/// Typed the way it is actually done: trigger at the opener, then keep typing.
+/// The anchor is fixed when the popup opens, so a query typed after it grows
+/// **across spaces** — which is the only way a multi-word title can be narrowed
+/// to, and the reason the source insists the anchor sit at the opener.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepting_a_node_inserts_an_id_link() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let rows = complete_in_org(&mut editor, &corpus, "see [[").await;
+    assert!(
+        rows.iter().any(|r| r == "Honey Garlic Chicken Breast"),
+        "the node is offered at the opener: {rows:?}"
+    );
+
+    // Narrow by typing — through the real insert path, so the host re-derives
+    // the query from the anchor exactly as it does for a user.
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_insert_text("Honey Garlic Chicken B", &mut out);
+    let narrowed: Vec<String> = editor
+        .insert_completion
+        .as_ref()
+        .map(|s| s.rendered.iter().map(|c| c.raw.display.clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        narrowed,
+        vec!["Honey Garlic Chicken Breast".to_string()],
+        "a multi-word query narrows to the one node"
+    );
+
+    editor.do_completion_accept();
+
+    let line = editor.document.snapshot().buffer.line(0).unwrap();
+    assert_eq!(
+        line, "see [[id:FILE-AAAA][Honey Garlic Chicken Breast]]",
+        "the id link replaced the typed title, opener included exactly once"
+    );
+}
+
+/// Open a scratch `.org` buffer holding `line`, put the cursor at its end in
+/// Insert, fire the completion fan-out, and read the popup's rows back.
+///
+/// The anchor is what makes multi-word titles work and it is computed by the
+/// host at trigger time, so the test types the whole line and triggers at the
+/// end — the same order a user does it in, and the only order in which the
+/// anchor lands where the source requires.
+async fn complete_in_org(editor: &mut Editor, corpus: &Path, line: &str) -> Vec<String> {
+    let file = corpus.join("draft.org");
+    std::fs::write(&file, format!("{line}\n")).unwrap();
+    editor.do_edit(Some(file), false);
+    // The plugin's completion source rides a MINOR mode, and a minor is
+    // enabled and then activated across two separate drains — so a buffer
+    // opened without ticking between has the major and none of the plugin
+    // minors. `ActiveCompletionSources` is rebuilt on each transition, and
+    // reading it before both drains have run shows only the native sources.
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        editor.run_tick_pending();
+    }
+    editor.modal = lattice_grammar::ModalState::Insert;
+    editor.cursor = lattice_protocol::Position::new(0, line.len() as u32);
+    editor.do_completion_trigger();
+
+    // The fan-out runs off-thread, so settle on the ASYNC ROUND finishing —
+    // not on "any rows", which the sync buffer-words source satisfies
+    // immediately and which would read every async result as absent.
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        editor.drain_pending_insert_completion_lsp();
+        if editor.pending_insert_completion_async_token.is_none() {
+            // The token clears on the first outcome; drain once more so a
+            // second source landing in the same tick is not left behind.
+            editor.drain_pending_insert_completion_lsp();
+            break;
+        }
+    }
+    editor
+        .insert_completion
+        .as_ref()
+        .map(|s| s.rendered.iter().map(|c| c.raw.display.clone()).collect())
+        .unwrap_or_default()
 }

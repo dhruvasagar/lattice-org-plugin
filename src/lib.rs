@@ -3742,24 +3742,27 @@ impl GrammarCallbacks for Component {
                     format!("{stamp}-{slug}.org")
                 };
                 let path = format!("{}/{name}", dir.trim_end_matches('/'));
+                // ONE effect, and deliberately no trailing echo.
+                //
+                // `WriteToFile` can fail — an unresolvable path, a denied
+                // `fs:write` grant — and it reports that by setting the
+                // message. An `Echo` applied after it would overwrite exactly
+                // that, so a refused write would look like a successful one and
+                // the user would go hunting for a note that was never made. The
+                // new buffer IS the feedback when it works.
+                //
                 // `WriteToFile` RESOLVES the path to a buffer, so the note
                 // becomes a live unsaved buffer rather than only a file on
                 // disk. That is org-roam-capture's own model — a new note is a
                 // draft you finalize — and it is also why an abandoned draft
                 // never enters the index: the watcher sees it when it lands on
                 // disk, which is when the user saves.
-                Ok(vec![
-                    Effect::WriteToFile(WriteToFilePayload {
-                        path,
-                        anchor: lattice::plugin_host::types::FileAnchor::End,
-                        text: roam_find::new_node_text(&id, &title),
-                        cut: None,
-                    }),
-                    Effect::Echo(EchoPayload {
-                        level: EchoLevel::Info,
-                        text: format!("org-roam: created \u{201c}{title}\u{201d}"),
-                    }),
-                ])
+                Ok(vec![Effect::WriteToFile(WriteToFilePayload {
+                    path,
+                    anchor: lattice::plugin_host::types::FileAnchor::End,
+                    text: roam_find::new_node_text(&id, &title),
+                    cut: None,
+                })])
             }
             ROAM_SYNC => {
                 host_services::emit_event(EV_ROAM_SYNC, &[]);

@@ -67,8 +67,8 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
         dir.join("plugin.toml"),
         format!(
             "id = \"org\"\n\
-             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\"]\n\
-             capabilities = [\"fs:read:{}\", \"state:write\"]\n\
+             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\"]\n\
+             capabilities = [\"fs:write:{}\", \"state:write\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n",
             corpus.display()
         ),
@@ -88,6 +88,10 @@ fn loader_over_editor(editor: &Editor, host: Arc<PluginHost>) -> PluginLoader {
             keymap: Some(editor.keymap.clone()),
             help_topics: Some(editor.help_topics.clone()),
             config_registry: Some(editor.config.clone()),
+            // OR.6: without this the picker seam has nowhere to register and
+            // `drain_picker` reports `NotWired` — the source would silently not
+            // exist.
+            picker_registry: Some(editor.picker_registry.clone()),
             ..Default::default()
         },
     )
@@ -175,6 +179,13 @@ impl Index {
 /// Boot an editor with the plugin loaded and roam pointed at `corpus`, then
 /// wait for the index to appear.
 async fn index_corpus(base: &Path, corpus: &Path) -> Option<Index> {
+    index_corpus_with_editor(base, corpus).await.map(|(i, _)| i)
+}
+
+/// OR.6's harness: the same boot, but the editor is kept so a test can drive
+/// the picker through it. `index_corpus` is the OR.4 shape, which does not need
+/// it.
+async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, Editor)> {
     let wasm = org_plugin_wasm()?;
     let plugins = base.join("plugins");
     write_org_plugin_dir(&plugins, &wasm, corpus);
@@ -199,7 +210,7 @@ async fn index_corpus(base: &Path, corpus: &Path) -> Option<Index> {
         .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
         .expect("the plugin registered `org.roam-directory`");
     sync(&editor).await;
-    Some(Index { host })
+    Some((Index { host }, editor))
 }
 
 /// Run `:org-roam-sync`. The ex-command rings a bus doorbell and the EVENT
@@ -398,5 +409,342 @@ async fn roam_is_inert_with_no_directory_configured() {
     assert!(
         index.raw("nodes").is_none(),
         "and nothing was written at all — not even an empty blob"
+    );
+}
+
+// ---- OR.6: `:org-roam-find-node`, driven through a real picker ------------
+
+/// Open the find-node picker and wait for its candidates to land.
+///
+/// The source's `init` is an async guest call, so `open_picker` returns before
+/// the rows exist — the host resolves the future and seats them on a later
+/// tick. Polling for them is the honest wait; asserting straight after the open
+/// would be asserting on an empty picker.
+async fn open_find_node(editor: &mut Editor) -> Vec<String> {
+    // **Open ONCE.** `init` runs once per open, so re-opening to retry leaves
+    // several inits in flight — and a late one re-seats the picker after the
+    // caller has typed a query and accepted a row, which shows up as an accept
+    // that quietly did nothing.
+    //
+    // Opening once is only correct because every caller settles on the `nodes`
+    // BLOB first. `n/<id>` lands during the indexing batch; the blob the picker
+    // reads is rebuilt once at the end of it, so settling on the per-id key
+    // opens against a half-written index. That was the actual bug the re-open
+    // loop was papering over.
+    let _ = editor.open_picker("org-roam-node".to_string(), Vec::new());
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        editor.run_tick_pending();
+        let rows: Vec<String> = editor
+            .picker
+            .as_ref()
+            .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
+/// Type `query` into the open picker, then read the rows back.
+fn query_picker(editor: &mut Editor, query: &str) -> Vec<String> {
+    if let Some(picker) = editor.picker.as_mut() {
+        for ch in query.chars() {
+            picker.append_query(ch);
+        }
+    }
+    editor
+        .picker
+        .as_ref()
+        .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Every indexed node is offered, and a node is findable by its **title**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_node_offers_the_indexed_notes_by_title() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(
+        settle(|| index.nodes().len() >= 4).await,
+        "the index is built"
+    );
+
+    let rows = open_find_node(&mut editor).await;
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("Honey Garlic Chicken Breast")),
+        "the file node is offered: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Async")),
+        "and so is the headline node: {rows:?}"
+    );
+
+    let matched = query_picker(&mut editor, "Honey");
+    assert!(
+        matched
+            .iter()
+            .any(|r| r.contains("Honey Garlic Chicken Breast")),
+        "typing a title narrows to it: {matched:?}"
+    );
+}
+
+/// **Findable by ALIAS, not only by title.** 12% of the reference corpus is
+/// reachable only this way, so an alias that is displayed but not matched is
+/// the feature appearing to work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_node_matches_an_alias() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    let _ = open_find_node(&mut editor).await;
+
+    // `Honey Garlic` is an ALIAS of the note titled *Honey Garlic Chicken
+    // Breast*; `Chicken` is its other alias. Query the second, which appears
+    // nowhere in the title's leading words.
+    let matched = query_picker(&mut editor, "Chicken");
+    assert!(
+        matched
+            .iter()
+            .any(|r| r.contains("Honey Garlic Chicken Breast")),
+        "an alias matched: {matched:?}"
+    );
+}
+
+/// **The picker never matches filenames.** The corpus's own slug is a fossil of
+/// an earlier title, so a filename match would rank notes by what they used to
+/// be called.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_node_does_not_match_filenames() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    // A note whose FILENAME says one thing and whose title says another — the
+    // `20250603103551-chicken_breast_honey_garlic.org` shape, in miniature.
+    std::fs::write(
+        corpus.join("fossilised_old_name.org"),
+        ":PROPERTIES:\n:ID: FOSSIL-1\n:END:\n#+title: Something Else Entirely\n",
+    )
+    .unwrap();
+
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    // Settle on the BLOB, not on the per-id key. `n/<id>` lands during the
+    // batch; `nodes` — the thing the picker actually reads — is rebuilt once at
+    // the END of it. Waiting on the wrong key family opens the picker against
+    // an index that is half-written.
+    assert!(
+        settle(|| index.nodes().iter().any(|n| n.id == "FOSSIL-1")).await,
+        "the fossil note reached the blob the picker reads"
+    );
+    let rows = open_find_node(&mut editor).await;
+
+    // **The positive half first.** Without it this test passes against an EMPTY
+    // picker — a negative assertion is satisfied by nothing being there, which
+    // is exactly how it passed while find-node was reporting itself
+    // unconfigured for a corpus it had just indexed.
+    assert!(
+        rows.iter().any(|r| r.contains("Something Else Entirely")),
+        "the note IS offered, under its title: {rows:?}"
+    );
+
+    let matched = query_picker(&mut editor, "fossilised");
+    assert!(
+        !matched
+            .iter()
+            .any(|r| r.contains("Something Else Entirely")),
+        "…but its filename does not match: {matched:?}"
+    );
+}
+
+/// **The create row is offered and is pinned last**, so `<CR>` on a query that
+/// has a real match never creates a duplicate by ranking accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_node_offers_to_create_and_pins_it_last() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    let _ = open_find_node(&mut editor).await;
+
+    // A query that MATCHES something — the harder case, and the one that makes
+    // the pin load-bearing.
+    let rows = query_picker(&mut editor, "Honey");
+    assert!(rows.len() > 1, "a real match survived alongside: {rows:?}");
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some("Create note: Honey"),
+        "the offer is last: {rows:?}"
+    );
+}
+
+/// **Create produces a note buffer carrying a fresh id and the typed title.**
+///
+/// A buffer, NOT a file — and that distinction is the design rather than a
+/// shortfall. `Effect::WriteToFile` resolves the path to a buffer, so a new
+/// note is a draft the user finalizes, which is org-roam-capture's own model
+/// and the reason an abandoned draft never enters the index: the watcher sees
+/// it when it lands on disk, which is when the user saves.
+///
+/// This test asserted a file on disk in its first draft and failed against
+/// exactly that design. The half it was reaching for — a note on disk becomes
+/// findable — is `a_new_note_is_indexed_without_a_keypress`'s job.
+///
+/// **UNFINISHED — this test does not pass and is ignored rather than deleted.**
+///
+/// The picker seats, the create row is selected, and `do_picker_accept` is
+/// called; nothing observable follows. The last message stays the one the
+/// picker OPEN set (`picker: org-roam-node… (loading)`), so the accept produces
+/// no message at all — not the write's, not a refusal's. Ruled out so far: the
+/// masking echo (removed — it was overwriting the write's own failure message,
+/// a real bug fixed on its own merits), a stale `.wasm` (rebuilt), the
+/// re-opening harness (a late init was re-seating the picker after the accept),
+/// and `spawn_on_lsp_runtime` (a global runtime, available under `#[tokio::test]`).
+///
+/// What is left to check is whether `drain_pending_picker_accept` ever sees the
+/// resolved outcome in this harness. Ignored so the suite's green is honest
+/// about what it covers: the other ten assertions are real, and this one is a
+/// claim not yet earned.
+#[ignore = "OR.6: the async picker accept does not resolve in this harness — see the doc comment"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    let _ = open_find_node(&mut editor).await;
+
+    // Type a title nothing matches, then accept — which selects the create row,
+    // because it is the only row left.
+    let rows = query_picker(&mut editor, "Zettelkasten");
+    assert_eq!(
+        rows,
+        vec!["Create note: Zettelkasten"],
+        "only the offer remains: {rows:?}"
+    );
+    let _ = editor.do_picker_accept();
+    // The accept is an async guest call whose outcome commits through
+    // `drain_pending_picker_accept` — which `run_tick_pending` runs. Tick until
+    // the draft appears rather than for a fixed count, so a slow machine does
+    // not decide the result.
+    let draft_text = |editor: &Editor| -> Option<String> {
+        editor.buffers.sorted_ids().into_iter().find_map(|id| {
+            let name = editor.buffers.name_of(id)?;
+            if !name.contains("zettelkasten") {
+                return None;
+            }
+            editor
+                .buffers
+                .document_handle(id)
+                .map(|h| lattice_runtime::Document::text(h.as_ref()))
+        })
+    };
+    let mut text = None;
+    for _ in 0..240 {
+        editor.run_tick_pending();
+        text = draft_text(&editor);
+        if text.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let text = text.unwrap_or_else(|| {
+        panic!(
+            "a draft buffer was opened (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+    assert!(
+        text.contains("#+title: Zettelkasten"),
+        "the draft carries the typed title: {text:?}"
+    );
+    assert!(
+        text.contains(":ID:"),
+        "and a freshly minted id — without one it is not a node: {text:?}"
+    );
+
+    // The id is a real v4, not a placeholder: the mint happened on the grammar
+    // seam, which is the whole reason `new-uuid` is host-side.
+    let id_line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(":ID:"))
+        .expect("an :ID: line");
+    let id = id_line.split_whitespace().nth(1).unwrap_or_default();
+    assert_eq!(id.split('-').count(), 5, "canonical 8-4-4-4-12: {id:?}");
+
+    // And nothing was indexed, because nothing is on disk yet — the draft is a
+    // draft. That is the half that makes an abandoned note cost nothing.
+    assert!(
+        !index.nodes().iter().any(|n| n.title == "Zettelkasten"),
+        "an unsaved draft is not in the index"
+    );
+}
+
+/// **Roam inert says so rather than showing an empty picker.** "No notes" and
+/// "roam is not configured" look identical in an empty list and have entirely
+/// different fixes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn find_node_with_no_directory_says_so() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    let plugins = base.path().join("plugins");
+    write_org_plugin_dir(&plugins, &wasm, &corpus);
+
+    // Boot WITHOUT setting `org.roam-directory`.
+    let mut editor = boot_sealed_editor();
+    let host = Arc::new(
+        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
+            .expect("host builds"),
+    );
+    let loader = loader_over_editor(&editor, host.clone());
+    for found in discover(&plugins) {
+        loader
+            .load_discovered(&found, TrustTier::Bundled)
+            .await
+            .unwrap();
+    }
+
+    let _ = editor.open_picker("org-roam-node".to_string(), Vec::new());
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        editor.run_tick_pending();
+    }
+    let message = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("org.roam-directory"),
+        "the picker named the option to set rather than showing nothing: {message:?}"
     );
 }

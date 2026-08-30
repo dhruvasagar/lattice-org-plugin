@@ -132,6 +132,7 @@ mod refile;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
 mod roam;
 // OR.4: the thin tree half — where the headlines and drawers are.
+mod roam_backlinks;
 mod roam_complete;
 mod roam_find;
 mod roam_index;
@@ -337,6 +338,8 @@ const ROAM_CREATE_NODE: u32 = 49;
 const ROAM_CREATE_PARSE: u32 = 50;
 /// OR.8 — `:org-roam-id-create`, making the headline at point a node.
 const ROAM_ID_CREATE: u32 = 51;
+/// OR.9 — `:org-roam-backlinks`, what points at the note you are in.
+const ROAM_BACKLINKS: u32 = 52;
 
 /// OC.6 — the events handler ids. The guest picks these; the host hands them
 /// back to `on-event`.
@@ -826,6 +829,11 @@ impl Guest for Component {
         // OR.6: roam's find-node. The SECOND source from this component, which
         // is what OR.5b existed to make possible.
         lattice::plugin_host::picker_registry::register_picker_source(&roam_find::spec());
+        // OR.9: what points at the note you are in. A picker rather than a
+        // multibuffer because backlinks is navigation — you look at what links
+        // here and go read it — and a picker is what navigation wants. The
+        // read-in-place view is a separate question; see `roam_backlinks`.
+        lattice::plugin_host::picker_registry::register_picker_source(&roam_backlinks::spec());
     }
 
     fn register_options() {
@@ -1741,6 +1749,13 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             ROAM_FIND_NODE,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-backlinks",
+            "List the notes that link to the org-roam node at point.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_BACKLINKS,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-id-create",
@@ -3737,6 +3752,14 @@ impl GrammarCallbacks for Component {
             // minting through `wasi:random` would work on the picker path and
             // take the plugin down here, because the sync linker serves no WASI.
             ROAM_ID_CREATE => Ok(id_create(&ctx, doc, tree)),
+            // OR.9 — resolve the node at point HERE, on the grammar seam, and
+            // hand its id to the picker as an argument.
+            //
+            // The picker seam has no cursor and no document: `init` receives
+            // args and a `picker-context`, not the buffer you were in. So the
+            // ex-command is the only place that can answer "which node am I
+            // in", and the id crosses as the argument it resolved.
+            ROAM_BACKLINKS => Ok(backlinks_at_point(&ctx, doc)),
             ROAM_CREATE_NODE => {
                 let title = match &ctx.args {
                     Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -3877,7 +3900,18 @@ impl PickerSource for Component {
         ctx: lattice::plugin_host::types::PickerContext,
         args: Vec<String>,
     ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
-        // OR.6: two sources now share this body. Route first.
+        // OR.6/OR.9: three sources now share this body. Route first.
+        if source == roam_backlinks::BACKLINKS_PICKER {
+            return Ok(roam_backlinks::init(&args)?
+                .into_iter()
+                .map(|(candidate, routing)| {
+                    exports::lattice::plugin_host::picker_source::CandidatePair {
+                        candidate,
+                        routing,
+                    }
+                })
+                .collect());
+        }
         if source == roam_find::FIND_NODE_PICKER {
             return Ok(roam_find::init()?
                 .into_iter()
@@ -3966,6 +4000,9 @@ impl PickerSource for Component {
         _ctx: lattice::plugin_host::types::PickerContext,
         routing: lattice::plugin_host::types::RoutingPayload,
     ) -> Result<lattice::plugin_host::types::PickerAcceptOutcome, String> {
+        if source == roam_backlinks::BACKLINKS_PICKER {
+            return roam_backlinks::accept(routing);
+        }
         if source == roam_find::FIND_NODE_PICKER {
             return roam_find::accept(routing);
         }
@@ -4209,6 +4246,33 @@ fn id_create(ctx: &ExCommandContext, doc: &Document, tree: Option<&TreeSnapshot>
             // The caret stays on the headline it just identified. Following the
             // drawer down would move the user off the thing they acted on.
             cursor: Some(Position { line, byte: 0 }),
+        },
+    )]
+}
+
+/// OR.9 — open the backlinks picker for the node the cursor is in.
+///
+/// Resolving the node happens here rather than in the picker because the
+/// picker seam has neither a cursor nor the document — `init` gets args and a
+/// `picker-context`. So this reads the buffer, finds the innermost node
+/// containing the cursor, and passes its id across as the picker's argument.
+///
+/// **Not in a node is a message, not an empty picker.** "Nothing links here"
+/// and "you are not in a note" look identical in an empty list and have
+/// entirely different fixes — `find_node`'s unconfigured case makes the same
+/// distinction for the same reason.
+fn backlinks_at_point(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect> {
+    let read = |n: u32| doc.line(n);
+    let Some(id) = roam_backlinks::node_id_at(&read, doc.line_count(), ctx.cursor.line) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org-roam: not inside a node — no `:ID:` on this entry or its file".to_string(),
+        })];
+    };
+    vec![Effect::OpenPicker(
+        lattice::plugin_host::types::OpenPickerPayload {
+            source: roam_backlinks::BACKLINKS_PICKER.to_string(),
+            args: vec![id],
         },
     )]
 }

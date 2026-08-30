@@ -237,6 +237,16 @@ pub fn node(id: &str) -> Option<Node> {
     get_decoded::<Node>(&node_key(id))
 }
 
+/// The ids of the nodes that link TO `id`.
+///
+/// OR.9: the whole backlinks query, one `get`. Empty is an honest answer about
+/// a real node — "nothing links here yet" — and is not distinguishable at this
+/// level from "no such node", which is why the caller checks configuration
+/// separately rather than reading meaning into an empty list.
+pub fn backlinks(id: &str) -> Vec<String> {
+    get_decoded::<Vec<String>>(&backlink_key(id)).unwrap_or_default()
+}
+
 /// Whether the index holds anything at all.
 ///
 /// OR.8 needs this to tell "no such id" from "the index has not been built

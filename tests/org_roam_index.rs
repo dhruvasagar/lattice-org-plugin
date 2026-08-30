@@ -1323,3 +1323,121 @@ async fn id_create_mints_once_and_declines_the_second_time() {
         .unwrap_or_default();
     assert!(msg.contains("already has"), "and it says why: {msg:?}");
 }
+
+// ---------------------------------------------------------------------------
+// OR.9 — `:org-roam-backlinks`: what points at the note you are in.
+//
+// A picker, not a multibuffer: backlinks is navigation. The read-in-place
+// question is `plugin-multibuffer-views.md`'s, and MV.1 has since made it
+// buildable — this stays a picker because that is what navigation wants, not
+// because a view was impossible.
+// ---------------------------------------------------------------------------
+
+/// The corpus links `chicken.org` → FILE-BBBB (`rust.org`) and `rust.org`'s
+/// headline node → FILE-AAAA (`chicken.org`). So each has exactly one backlink,
+/// and they are different notes — a symmetric fixture would not catch a source
+/// and target being swapped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backlinks_lists_the_notes_that_link_here() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // In `rust.org`'s FILE node, which `chicken.org` links to.
+    open_at(&mut editor, &corpus.join("rust.org"), 3).await;
+    let rows = run_backlinks(&mut editor).await;
+
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("Honey Garlic Chicken Breast")),
+        "the linking note is listed: {rows:?}"
+    );
+}
+
+/// A node nothing points at gets an HONEST EMPTY view, not an error.
+///
+/// "Nothing links here yet" is a true and useful answer about a real note. That
+/// is the opposite of the unconfigured case, which errors precisely because an
+/// empty list there would be indistinguishable from "you have no notes".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_with_no_backlinks_is_empty_not_an_error() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // `example.org` is linked from nowhere.
+    open_at(&mut editor, &corpus.join("example.org"), 3).await;
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-roam-backlinks", &mut out);
+    apply_renderer_effects(&mut editor, out);
+    settle_picker_rows(&mut editor).await;
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("not inside a node"),
+        "it IS a node — the message should not say otherwise: {msg:?}"
+    );
+    let rows: Vec<String> = editor
+        .picker
+        .as_ref()
+        .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+        .unwrap_or_default();
+    assert!(rows.is_empty(), "and it lists nothing: {rows:?}");
+}
+
+/// Outside a node, the command SAYS so rather than opening an empty picker.
+///
+/// "Nothing links here" and "you are not in a note" look identical in an empty
+/// list and have entirely different fixes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outside_a_node_it_says_so() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let plain = corpus.join("plain-no-ids.org");
+    std::fs::write(&plain, "#+title: Plain\n\n* A headline\nbody\n").unwrap();
+    open_at(&mut editor, &plain, 3).await;
+
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-roam-backlinks", &mut out);
+    apply_renderer_effects(&mut editor, out);
+
+    assert!(editor.picker.is_none(), "no picker opened");
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("not inside a node"),
+        "and it says why: {msg:?}"
+    );
+}
+
+/// Run `:org-roam-backlinks` and read the picker's rows back.
+async fn run_backlinks(editor: &mut Editor) -> Vec<String> {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-roam-backlinks", &mut out);
+    apply_renderer_effects(editor, out);
+    settle_picker_rows(editor).await
+}

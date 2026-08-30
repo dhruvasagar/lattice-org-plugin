@@ -1320,6 +1320,18 @@ impl Guest for Component {
                 // the second hop and is NOT bound — the host dispatches it on
                 // submit.
                 bind("<leader>oc", "org-capture-menu"),
+                // OR.6 — finding a note belongs on the UNIVERSAL mode with
+                // capture and the agenda, for their reason: the note you want
+                // is rarely the file you are in. A `Majors(["org-mode"])`
+                // binding would mean you can only reach your notes from a note.
+                //
+                // `<leader>on…` mirrors emacs org-roam's `C-c n …` prefix, so
+                // the f keeps its meaning; users carry that muscle memory in.
+                // NOT `<C-x>n…` — org's MAJOR binds a terminal `<C-x>`
+                // (timestamp decrement, OM.9), and a prefix in one layer against
+                // a terminal binding in another is the ambiguity vim settles
+                // with `timeoutlen`, which this editor does not have.
+                bind("<leader>onf", "org-roam-find-node"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.

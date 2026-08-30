@@ -44,6 +44,32 @@ struct Node {
     level: u32,
 }
 
+/// Press a chord the way the renderer does. Mirrors `org_structure.rs`'s
+/// helper: `dispatch_chord` already RAN the action, so only an `Invoke` is
+/// re-dispatched, and only to recover its effects.
+async fn press_chord(editor: &mut Editor, keys: &str) {
+    use lattice_protocol::parse_chord_sequence;
+    let expanded = editor.keymap.expand_leader(keys);
+    let seq = parse_chord_sequence(&expanded).expect("parses");
+    let mut partial = Vec::new();
+    let mut resolved = None;
+    for c in seq {
+        resolved = Some(editor.dispatch_chord(c, &mut partial));
+    }
+    if let Some(lattice_host::action::Action::Invoke(inv)) = resolved {
+        let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
+        // `Effect::OpenPicker` is the RENDERER's to apply — the action returns
+        // it rather than opening, so a test that drops the effects sees no
+        // picker and reads as a dead chord. Only the arm this file needs;
+        // `org_structure.rs`'s `apply_renderer_effects` is the fuller peer.
+        for effect in out.effects {
+            if let lattice_grammar::Effect::OpenPicker { source, args } = effect {
+                let _ = editor.open_picker(source, args);
+            }
+        }
+    }
+}
+
 fn boot_sealed_editor() -> Editor {
     lattice_plugin_loader::disable_autoload();
     Editor::boot(CoreDocument::from_text("scratch\n"))
@@ -191,7 +217,7 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
     let plugins = base.join("plugins");
     write_org_plugin_dir(&plugins, &wasm, corpus);
 
-    let editor = boot_sealed_editor();
+    let mut editor = boot_sealed_editor();
     let host = Arc::new(
         PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
     );
@@ -210,6 +236,38 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
         .config
         .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
         .expect("the plugin registered `org.roam-directory`");
+
+    // OR.6: the two steps a chord needs before it can dispatch, both of which
+    // this harness lacked — which is why `<leader>onf` was once believed
+    // broken and reverted. Neither is roam's; `org_structure.rs`'s harness has
+    // carried both since OM.4b/OM.7 and its `<leader>oc` test passes.
+    //
+    //   1. Boot expands a plugin mode's grammar rows into keymap layers from a
+    //      `PluginLoaded` subscription, on a SPAWNED task — right in
+    //      production, a race against a test that dispatches immediately.
+    //   2. A plugin minor is INERT until `ModeEnablementRequested` lands, and
+    //      `run_tick_pending` is the aggregator that drain hangs off.
+    //
+    // Without them the mode registers, the binding is present in the
+    // declaration, and the chord still reaches nothing — which reads exactly
+    // like a bad binding.
+    {
+        let commands = editor.registry.load();
+        for (mode_id, kind) in editor.mode_registry.load().iter_meta() {
+            let layer = match kind {
+                lattice_mode::ModeKind::Major => lattice_keymap::KeymapLayer::MajorMode(mode_id),
+                lattice_mode::ModeKind::Minor => lattice_keymap::KeymapLayer::MinorMode(mode_id),
+            };
+            lattice_host::keymap_normal::expand_plugin_mode_grammar_rows(
+                &editor.keymap,
+                &commands,
+                &editor.builtins,
+                layer,
+            );
+        }
+    }
+    editor.run_tick_pending();
+
     sync(&editor).await;
     Some((Index { host }, editor))
 }
@@ -609,22 +667,24 @@ async fn find_node_offers_to_create_and_pins_it_last() {
 /// exactly that design. The half it was reaching for — a note on disk becomes
 /// findable — is `a_new_note_is_indexed_without_a_keypress`'s job.
 ///
-/// **UNFINISHED — this test does not pass and is ignored rather than deleted.**
+/// **This was `#[ignore]`d through OR.6 and OR.7, and the product was never
+/// broken.** The whole failure was this test looking the draft up through
+/// `BufferStore::name_of`, which is the SYNTHETIC-name slot (`*messages*`,
+/// `*lsp-log*`). A path-backed Document has no synthetic name, so the
+/// predicate dropped every real file buffer — including the scratch buffer the
+/// editor boots with. It would have reported "no draft" against any product,
+/// working or not.
 ///
-/// The picker seats, the create row is selected, and `do_picker_accept` is
-/// called; nothing observable follows. The last message stays the one the
-/// picker OPEN set (`picker: org-roam-node… (loading)`), so the accept produces
-/// no message at all — not the write's, not a refusal's. Ruled out so far: the
-/// masking echo (removed — it was overwriting the write's own failure message,
-/// a real bug fixed on its own merits), a stale `.wasm` (rebuilt), the
-/// re-opening harness (a late init was re-seating the picker after the accept),
-/// and `spawn_on_lsp_runtime` (a global runtime, available under `#[tokio::test]`).
-///
-/// What is left to check is whether `drain_pending_picker_accept` ever sees the
-/// resolved outcome in this harness. Ignored so the suite's green is honest
-/// about what it covers: the other ten assertions are real, and this one is a
-/// claim not yet earned.
-#[ignore = "OR.6: the async picker accept does not resolve in this harness — see the doc comment"]
+/// Worth the words because of how the search went. The symptom — an accept
+/// producing no message at all, not the write's and not a refusal's — reads
+/// like something swallowing a result, so four rounds of investigation looked
+/// for the swallower: the masking echo, a stale `.wasm`, the re-opening
+/// harness, the runtime, and finally `drain_pending_picker_accept`'s dropped
+/// `.effects`. That last one is even true as a description of the code, and a
+/// patch for it made this test pass — but reverting the patch left it passing,
+/// because `handle_effect` already applies `Effect::WriteToFile` inline. An
+/// assertion that cannot observe a success is indistinguishable from a product
+/// that cannot produce one, and it makes every fix look plausible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
     let base = tempfile::tempdir().unwrap();
@@ -645,21 +705,32 @@ async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
         vec!["Create note: Zettelkasten"],
         "only the offer remains: {rows:?}"
     );
-    let _ = editor.do_picker_accept();
+    // The accept's effects are the RENDERER's to apply — `Effect::WriteToFile`
+    // among them. Dropping the outcome, as this test first did, is the same
+    // mistake that made `<leader>onf` look like a dead chord.
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
     // The accept is an async guest call whose outcome commits through
     // `drain_pending_picker_accept` — which `run_tick_pending` runs. Tick until
     // the draft appears rather than for a fixed count, so a slow machine does
     // not decide the result.
+    // Look the draft up by its PATH, not by `name_of`.
+    //
+    // `name_of` is the SYNTHETIC-name slot — `*messages*`, `*lsp-log*` — and a
+    // path-backed Document has none, so a `name_of` predicate drops every real
+    // file buffer including the scratch one the editor booted with. This test
+    // spent its whole ignored life asserting through that filter, which is why
+    // a draft that was being created looked like a draft that never was.
     let draft_text = |editor: &Editor| -> Option<String> {
-        editor.buffers.sorted_ids().into_iter().find_map(|id| {
-            let name = editor.buffers.name_of(id)?;
-            if !name.contains("zettelkasten") {
+        let mut ids = Vec::new();
+        editor.buffers.for_each(|entry| ids.push(entry.id));
+        ids.into_iter().find_map(|id| {
+            let handle = editor.buffers.document_handle(id)?;
+            let path = handle.snapshot().path.clone()?;
+            if !path.to_string_lossy().contains("zettelkasten") {
                 return None;
             }
-            editor
-                .buffers
-                .document_handle(id)
-                .map(|h| lattice_runtime::Document::text(h.as_ref()))
+            Some(lattice_runtime::Document::text(handle.as_ref()))
         })
     };
     let mut text = None;
@@ -898,4 +969,82 @@ async fn complete_in_org(editor: &mut Editor, corpus: &Path, line: &str) -> Vec<
         .as_ref()
         .map(|s| s.rendered.iter().map(|c| c.raw.display.clone()).collect())
         .unwrap_or_default()
+}
+
+/// OR.6 — **`<leader>onf` opens find-node**, from a buffer that is not an org
+/// file.
+///
+/// This binding was written once, appeared not to dispatch, and was reverted on
+/// the principle that a chord which silently does nothing is worse than none.
+/// The chord was fine; the harness was missing the two steps `org_structure.rs`
+/// has carried since OM.4b/OM.7 — the spawned grammar-row expansion and the
+/// enablement drain — so the mode was registered, disabled, and unreachable.
+/// Three wrong explanations were tried before that one, which is why the fix is
+/// in `index_corpus_with_editor` with a comment rather than here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_find_node_chord_opens_the_picker_from_any_buffer() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // The scratch buffer the editor booted with — deliberately NOT an org file.
+    // `org-global-mode` is Universal for capture's and the agenda's reason, and
+    // finding a note has that reason too: the note you want is rarely the file
+    // you are in.
+    assert!(editor.picker.is_none(), "no picker before the chord");
+    press_chord(&mut editor, "<leader>onf").await;
+
+    let rows = settle_picker_rows(&mut editor).await;
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("Honey Garlic Chicken Breast")),
+        "the chord opened find-node with the corpus in it: {rows:?}"
+    );
+}
+
+/// Apply the effects an accept returns, the way the renderer does.
+fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
+    for effect in out.effects {
+        match effect {
+            lattice_grammar::Effect::WriteToFile {
+                path,
+                anchor,
+                text,
+                cut,
+            } => {
+                editor.apply_write_to_file(path, anchor, text, cut);
+            }
+            lattice_grammar::Effect::OpenPicker { source, args } => {
+                let _ = editor.open_picker(source, args);
+            }
+            other => {
+                eprintln!("unapplied accept effect: {other:?}");
+            }
+        }
+    }
+    for action in out.next_actions {
+        let _ = editor.dispatch(action);
+    }
+}
+
+/// Drain until the picker's async source has seated its rows.
+async fn settle_picker_rows(editor: &mut Editor) -> Vec<String> {
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        editor.run_tick_pending();
+        let rows: Vec<String> = editor
+            .picker
+            .as_ref()
+            .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    Vec::new()
 }

@@ -60,7 +60,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"scanned-excerpt-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
+        "id = \"org\"\nprovides = [\"scanned-excerpt-source\", \"multibuffer-view-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), wasm).unwrap();
@@ -92,6 +92,19 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
                 lattice_mode::MediaSourceRegistry::new(),
             ))),
             agenda_registry: Some(agenda_registry),
+            // MV.3: the agenda is a plugin-owned view now, so the loader
+            // needs somewhere to register its opener and somewhere to put its
+            // excerpts. Both come off the editor's own service registry —
+            // absent, the seam is `NotWired` and the WHOLE plugin fails to
+            // load, which is how this surfaced.
+            provider_view_registry: editor
+                .services
+                .get::<lattice_mode::ProviderViewRegistryHandle>()
+                .map(|h| (*h).clone()),
+            multibuffer_registry: editor
+                .services
+                .get::<lattice_multibuffer::registry::MultibufferRegistryHandle>()
+                .map(|h| (*h).clone()),
             ..Default::default()
         },
     )

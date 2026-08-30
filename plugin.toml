@@ -16,6 +16,8 @@ provides = [
 
     "media",
     "scanned-excerpt-source",
+    # MV.3: the agenda is org's view, so org declares it.
+    "multibuffer-view-source",
     "picker-source",
     # OR.7: org-roam nodes inside an `[[…]]` link.
     "completion-source",

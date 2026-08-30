@@ -149,6 +149,19 @@ fn loader_over_editor(editor: &Editor, host: Arc<PluginHost>) -> PluginLoader {
             // `drain_picker` reports `NotWired` — the source would silently not
             // exist.
             picker_registry: Some(editor.picker_registry.clone()),
+            // MV.3: the agenda is a plugin-owned view now, so the loader
+            // needs somewhere to register its opener and somewhere to put its
+            // excerpts. Both come off the editor's own service registry —
+            // absent, the seam is `NotWired` and the WHOLE plugin fails to
+            // load, which is how this surfaced.
+            provider_view_registry: editor
+                .services
+                .get::<lattice_mode::ProviderViewRegistryHandle>()
+                .map(|h| (*h).clone()),
+            multibuffer_registry: editor
+                .services
+                .get::<lattice_multibuffer::registry::MultibufferRegistryHandle>()
+                .map(|h| (*h).clone()),
             ..Default::default()
         },
     )

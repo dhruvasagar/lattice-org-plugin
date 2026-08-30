@@ -73,6 +73,17 @@ wit_bindgen::generate!({
             import lattice:plugin-host/picker-registry@0.1.0;
             export lattice:plugin-host/picker-source@0.1.0;
             export register-picker-sources: func();
+            // MV.3: the agenda is org's view, so org declares it. NOT
+            // `include multibuffer-view-plugin` — that world imports
+            // `logging`, and every import a component declares must be
+            // satisfiable on EVERY linker it is instantiated against,
+            // including the grammar seam's sync one where `logging` is
+            // deliberately absent. Same scar as the seams above: OC.2 added
+            // one `logging::log` call and the WHOLE plugin stopped
+            // instantiating.
+            import lattice:plugin-host/multibuffer-view-registry@0.1.0;
+            export lattice:plugin-host/multibuffer-view-source@0.1.0;
+            export register-multibuffer-views: func();
             // OR.7: org-roam nodes inside an `[[…]]` link. NOT `include
             // completion-source-plugin` — that world imports `logging` too,
             // and every import a component declares must be satisfiable on
@@ -834,6 +845,23 @@ impl Guest for Component {
         // here and go read it — and a picker is what navigation wants. The
         // read-in-place view is a separate question; see `roam_backlinks`.
         lattice::plugin_host::picker_registry::register_picker_source(&roam_backlinks::spec());
+    }
+
+    fn register_multibuffer_views() {
+        lattice::plugin_host::multibuffer_view_registry::register_multibuffer_view(
+            &lattice::plugin_host::types::MultibufferViewSpec {
+                // The name `:org-agenda` already opens, unchanged — the trigger
+                // does not move, only who declares what it opens.
+                id: "agenda".to_string(),
+                doc: "Every dated row an org file has, across your agenda files".to_string(),
+                buffer_name: "*agenda*".to_string(),
+                view_mode: None,
+                // One agenda, re-scanned in place: a second `:org-agenda` must
+                // not accumulate views.
+                reuse: true,
+                input: lattice::plugin_host::types::MultibufferViewInput::Scan,
+            },
+        );
     }
 
     fn register_options() {
@@ -4638,6 +4666,41 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
 /// GENERATOR by design, because `matches` and `annotate` run per candidate on
 /// the synchronous keystroke pipeline and crossing them would fire hundreds
 /// of boundary calls per keystroke (paramount #1).
+/// MV.3 — the agenda, declared by the plugin whose feature it is.
+///
+/// Before this, `*agenda*`, the provider name, the reuse policy and the view's
+/// modes were constants in `lattice-multibuffer`'s own agenda provider: org
+/// supplied the ROWS and the host owned everything about the view. Now org owns
+/// its identity and the host owns the machinery — the bounded walk, the
+/// read-and-parse-once handoff, the stable sort across files, the group-run
+/// computation and the progress headerline, none of which is org-specific and
+/// all of which is measured.
+///
+/// `input: scan` because the agenda's answer genuinely requires reading every
+/// candidate file's contents. Its rows still arrive through
+/// `scanned-excerpt-source`; the host reads each file once and hands over text
+/// AND tree, so this guest needs no filesystem capability for the agenda at all.
+/// A `pull` view would have to discover and read the files itself.
+///
+/// `view_mode: None` deliberately — `org-agenda-mode` reaches the view through
+/// the SOURCE's `view-mode` export, which is where it has always come from and
+/// still works. Naming it here as well would activate it twice.
+impl exports::lattice::plugin_host::multibuffer_view_source::Guest for Component {
+    /// Never called for the agenda: a `scan` view's rows come from the host's
+    /// walk through `scanned-excerpt-source`, not from here. An error rather
+    /// than an empty result, because reaching this would mean the host drove a
+    /// scan view down the pull path — a wiring fault worth seeing, not an empty
+    /// agenda worth shrugging at.
+    fn build(
+        view: String,
+        _args: Vec<String>,
+    ) -> Result<lattice::plugin_host::types::MultibufferViewResult, String> {
+        Err(format!(
+            "org: `{view}` is a scan view; its rows come from the scan seam, not `build`"
+        ))
+    }
+}
+
 impl exports::lattice::plugin_host::completion_source::Guest for Component {
     fn spec() -> lattice::plugin_host::types::CompletionSourceSpec {
         roam_complete::spec()

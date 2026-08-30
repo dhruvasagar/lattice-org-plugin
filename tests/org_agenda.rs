@@ -2,7 +2,7 @@
 //!
 //! The exit criterion for both: a 3-file fixture produces a date-grouped
 //! agenda in the right order. This walks the whole path — discover → load →
-//! the `agenda-source` seam drains → the host's agenda provider walks a
+//! the `scanned-excerpt-source` seam drains → the host's agenda provider walks a
 //! directory of `.org` files → the plugin's `scan` answers with dated rows →
 //! the rows land as excerpts, interleaved ACROSS files by date, under one
 //! header per day.
@@ -52,7 +52,7 @@ fn org_plugin_wasm() -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-/// `provides` names `agenda-source` alongside the rest, and again NOT in
+/// `provides` names `scanned-excerpt-source` alongside the rest, and again NOT in
 /// dependency order — OM.0 made the loader sort, so manifest order is
 /// cosmetic and this is where that keeps being true.
 fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
@@ -60,7 +60,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("plugin.toml"),
-        "id = \"org\"\nprovides = [\"agenda-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
+        "id = \"org\"\nprovides = [\"scanned-excerpt-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\"]\ndefault_mode = \"org-todo-mode\"\n",
     )
     .unwrap();
     std::fs::write(dir.join("component.wasm"), wasm).unwrap();
@@ -75,7 +75,7 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
     );
     let agenda_registry = editor
         .services
-        .get::<lattice_mode::AgendaSourceRegistryHandle>()
+        .get::<lattice_mode::ScannedExcerptSourceRegistryHandle>()
         .map(|h| (*h).clone())
         .expect("the editor publishes the agenda registry at boot");
     PluginLoader::with_services(
@@ -226,7 +226,7 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
     // an empty view the user has to guess about.
     let sources = editor
         .services
-        .get::<lattice_mode::AgendaSourceRegistryHandle>()
+        .get::<lattice_mode::ScannedExcerptSourceRegistryHandle>()
         .unwrap();
     assert!(
         sources.load().is_empty(),

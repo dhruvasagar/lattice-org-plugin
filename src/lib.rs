@@ -47,7 +47,7 @@ wit_bindgen::generate!({
             // `begin` / `scan`) sit at WORLD level, so they land on the same
             // `Guest` trait as `register-languages` rather than behind an
             // interface — which is why they read differently below.
-            include lattice:plugin-host/agenda-source-plugin@0.1.0;
+            include lattice:plugin-host/scanned-excerpt-source-plugin@0.1.0;
             // OM.11: refile's target list. NOT `include
             // picker-source-plugin` — that world also imports `logging`, and
             // a component's imports must ALL be satisfiable on EVERY seam's
@@ -1306,7 +1306,7 @@ impl Guest for Component {
         //
         // AG.1: `oa` reaches THIS plugin's `:org-agenda`. The agenda VIEW is
         // still the multibuffer provider's and this plugin still only supplies
-        // rows through the `agenda-source` seam — what changed is who owns the
+        // rows through the `scanned-excerpt-source` seam — what changed is who owns the
         // trigger. A host-registered `:agenda` meant a feature every user calls
         // `org-agenda` shipped under a generic name that the plugin had no way
         // to correct from its own side.
@@ -1493,7 +1493,7 @@ impl Guest for Component {
         // came from, and only the source knows it.
         lattice::plugin_host::grammar::register_ex_command(
             "org-agenda",
-            "Open the agenda: every dated row an agenda-source finds under the \
+            "Open the agenda: every dated row a scanned-excerpt-source finds under the \
              configured files, grouped and ordered by the source, as editable \
              excerpts. Pass a path to scan somewhere else instead.",
             &ExCommandSpec {
@@ -3807,7 +3807,7 @@ impl GrammarCallbacks for Component {
             }
             // The agenda view is generic host machinery: it builds the
             // multibuffer, walks the files and asks every registered
-            // `agenda-source` for rows. This plugin does not open it — it rings
+            // `scanned-excerpt-source` for rows. This plugin does not open it — it rings
             // the doorbell by the provider's name and supplies its own rows
             // through the seam, exactly as before. Only the trigger moved.
             AGENDA_APPLY => Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(

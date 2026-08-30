@@ -3650,7 +3650,7 @@ async fn a_capture_target_inside_a_block_is_not_a_target() {
 /// shipped under a generic name that org could not correct from its own side.
 ///
 /// The VIEW is still generic host machinery and this plugin still supplies rows
-/// only through the `agenda-source` seam. What moved is the trigger.
+/// only through the `scanned-excerpt-source` seam. What moved is the trigger.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_agenda_command_is_org_agenda_and_org_registers_it() {
     if org_plugin_wasm().is_none() {

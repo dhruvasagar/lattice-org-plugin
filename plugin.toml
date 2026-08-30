@@ -15,7 +15,7 @@ provides = [
     "grammar",
 
     "media",
-    "agenda-source",
+    "scanned-excerpt-source",
     "picker-source",
     # OR.7: org-roam nodes inside an `[[…]]` link.
     "completion-source",

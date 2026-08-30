@@ -136,7 +136,7 @@ impl Keywords {
 /// Structure comes from the tree; characters come from `text`. The seam
 /// exposes node kinds and ranges but no node text, and reading a TODO keyword
 /// through one boundary crossing per headline would cost far more than the
-/// whole-file string the host already hands over — see `agenda-source.wit`.
+/// whole-file string the host already hands over — see `scanned-excerpt-source.wit`.
 pub fn scan_tree(root: &Node, text: &str, keywords: &Keywords) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
@@ -294,7 +294,7 @@ fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
 /// Every agenda row in one file's text, without a parse tree.
 ///
 /// The fallback for a host that had no grammar for this file
-/// (`agenda-source.wit` keeps a source independent of the `language` seam). For
+/// (`scanned-excerpt-source.wit` keeps a source independent of the `language` seam). For
 /// org itself [`scan_tree`] is the real path — this one carries the old
 /// line-offset assumption, and its bug, and is reached only when there is
 /// nothing better.

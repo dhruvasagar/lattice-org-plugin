@@ -222,6 +222,31 @@ pub fn all_nodes() -> Vec<Node> {
     get_decoded::<Vec<Node>>(NODES_KEY).unwrap_or_default()
 }
 
+/// One node by its id, or `None` when the index does not hold it.
+///
+/// OR.8: **this is the keystroke-path lookup** — `<CR>` on an `[[id:…]]` link
+/// calls it. One exact-key `get` and one decode, never a walk of `nodes`:
+/// deserialising a 90 KB blob to answer one question is not a thing to do while
+/// someone is holding a key down, and it is the whole reason §4.2 keeps
+/// `n/<id>` as a separate key beside the blob.
+///
+/// Case-insensitive, because [`node_key`] lowercases: org ids are written
+/// however the tool that minted them felt, and a link that differs from its
+/// drawer only in case is the same link to a reader.
+pub fn node(id: &str) -> Option<Node> {
+    get_decoded::<Node>(&node_key(id))
+}
+
+/// Whether the index holds anything at all.
+///
+/// OR.8 needs this to tell "no such id" from "the index has not been built
+/// yet", which are different problems with different fixes — one is a broken
+/// link, the other is a `:org-roam-sync` away. A message that conflated them
+/// would send the reader looking in the wrong place.
+pub fn is_empty() -> bool {
+    host_services::store_keys(NODE_PREFIX).is_empty()
+}
+
 /// Rebuild the all-nodes blob from the `n/<id>` records.
 ///
 /// Called **once per batch**, not once per file: it is O(nodes) in host calls,
@@ -253,4 +278,120 @@ pub fn forget_file(path: &str) -> bool {
     retract(&previous);
     let _ = host_services::store_delete(&file_key(path));
     true
+}
+
+/// OR.8 — where an `:ID:` drawer goes for the headline on `headline_line`, and
+/// whether one is needed at all.
+///
+/// `None` means the headline already carries an `:ID:` and nothing should be
+/// written. That is the no-op case rather than an error: running
+/// `:org-roam-id-create` twice is something a user does, and answering it with
+/// a second drawer would produce a file org itself cannot read.
+///
+/// `Some((line, text))` is the line to insert `text` before — always
+/// `headline_line + 1`, because org requires the drawer to be the first thing
+/// under its headline. An existing drawer WITHOUT an `:ID:` is extended in
+/// place instead, by inserting the `:ID:` line just inside its opener; that is
+/// why the answer is a line rather than a fixed offset.
+///
+/// `line` is the file read through an accessor rather than a materialised
+/// `Vec`, matching `headline.rs`'s shape: a drawer is a handful of lines under
+/// its headline, and collecting the whole file to look at four of them would
+/// scale the cost with the document instead of with the drawer.
+pub fn id_drawer_insert(
+    line: &dyn Fn(u32) -> Option<String>,
+    headline_line: u32,
+    id: &str,
+) -> Option<(u32, String)> {
+    let first = headline_line + 1;
+    let opens_drawer = line(first).is_some_and(|l| l.trim().eq_ignore_ascii_case(":properties:"));
+
+    if !opens_drawer {
+        // No drawer at all: write a whole one.
+        return Some((first, format!(":PROPERTIES:\n:ID:       {id}\n:END:\n")));
+    }
+
+    // A drawer exists. Walk to its `:END:`, and stop at a new headline in case
+    // the drawer was never closed — an unterminated drawer is malformed, and
+    // scanning past the next headline would attach this id to the wrong entry.
+    let mut i = first + 1;
+    while let Some(text) = line(i) {
+        let trimmed = text.trim();
+        if trimmed.eq_ignore_ascii_case(":end:") {
+            break;
+        }
+        if trimmed.starts_with('*') {
+            break;
+        }
+        if trimmed
+            .strip_prefix(':')
+            .and_then(|rest| rest.split_once(':'))
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("id"))
+        {
+            // Already a node.
+            return None;
+        }
+        i += 1;
+    }
+    // Extend the existing drawer rather than opening a second one.
+    Some((first + 1, format!(":ID:       {id}\n")))
+}
+
+#[cfg(test)]
+mod id_create_tests {
+    use super::*;
+
+    /// The file as the accessor the production caller passes.
+    fn lines(text: &str) -> impl Fn(u32) -> Option<String> + '_ {
+        let owned: Vec<String> = text.lines().map(str::to_string).collect();
+        move |n: u32| owned.get(n as usize).cloned()
+    }
+
+    #[test]
+    fn a_headline_with_no_drawer_gets_a_whole_one() {
+        let l = lines("* Topic\nbody\n");
+        let (at, text) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 1);
+        assert_eq!(text, ":PROPERTIES:\n:ID:       ABC\n:END:\n");
+    }
+
+    #[test]
+    fn a_headline_that_already_has_an_id_is_a_no_op() {
+        // The second-drawer case: answering this with an insert would produce
+        // a file org cannot read.
+        let l = lines("* Topic\n:PROPERTIES:\n:ID:       OLD\n:END:\nbody\n");
+        assert_eq!(id_drawer_insert(&l, 0, "NEW"), None);
+    }
+
+    #[test]
+    fn an_existing_id_is_recognised_whatever_its_case() {
+        let l = lines("* Topic\n:properties:\n:id:       old\n:end:\n");
+        assert_eq!(id_drawer_insert(&l, 0, "NEW"), None);
+    }
+
+    #[test]
+    fn a_drawer_without_an_id_is_extended_not_replaced() {
+        let l = lines("* Topic\n:PROPERTIES:\n:CATEGORY: work\n:END:\n");
+        let (at, text) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 2, "just inside the opener, above the existing property");
+        assert_eq!(text, ":ID:       ABC\n");
+    }
+
+    #[test]
+    fn an_unterminated_drawer_stops_at_the_next_headline() {
+        // Malformed input: scanning past the headline would read the NEXT
+        // entry's id and wrongly call this one already-identified.
+        let l = lines("* One\n:PROPERTIES:\n* Two\n:PROPERTIES:\n:ID:       OTHER\n:END:\n");
+        assert!(
+            id_drawer_insert(&l, 0, "ABC").is_some(),
+            "the first headline still needs its own id"
+        );
+    }
+
+    #[test]
+    fn a_headline_at_the_end_of_the_file_still_gets_a_drawer() {
+        let l = lines("* Topic");
+        let (at, _) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 1);
+    }
 }

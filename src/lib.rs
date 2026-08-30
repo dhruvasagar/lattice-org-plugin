@@ -335,6 +335,8 @@ const ROAM_CREATE_NODE: u32 = 49;
 /// The create command takes the new note's title as its one argument, so it
 /// needs its own parse callback rather than the clock's no-arg one.
 const ROAM_CREATE_PARSE: u32 = 50;
+/// OR.8 — `:org-roam-id-create`, making the headline at point a node.
+const ROAM_ID_CREATE: u32 = 51;
 
 /// OC.6 — the events handler ids. The guest picks these; the host hands them
 /// back to `on-event`.
@@ -1739,6 +1741,13 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             ROAM_FIND_NODE,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-id-create",
+            "Give the headline at point an `:ID:`, making it an org-roam node.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_ID_CREATE,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-create-node",
@@ -3723,6 +3732,11 @@ impl GrammarCallbacks for Component {
             // on the picker path and take the plugin down here. And the write is
             // an `Effect`, not a `std::fs::write`, for the same structural
             // reason — the sync linker cannot serve WASI at all.
+            // OR.8 — `:org-roam-id-create`. The grammar seam, and the second
+            // consumer of OR.3's host-side `new-uuid` for its reason: a guest
+            // minting through `wasi:random` would work on the picker path and
+            // take the plugin down here, because the sync linker serves no WASI.
+            ROAM_ID_CREATE => Ok(id_create(&ctx, doc, tree)),
             ROAM_CREATE_NODE => {
                 let title = match &ctx.args {
                     Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
@@ -4133,14 +4147,116 @@ fn open_link(ctx: &ActionContext, doc: &Document, on_miss: Effect) -> Vec<Effect
                 })],
             }
         }
-        // OL.1: recognised, and honestly unresolvable until org-roam
-        // ships an index. The message names the id AND says what is
-        // missing, because "cannot open" would leave a reader unable to
-        // tell a broken link from an absent feature.
-        links::Target::Id(id) => vec![Effect::Echo(lattice::plugin_host::types::EchoPayload {
+        // OR.8: resolved through the index OL.1 was waiting for.
+        links::Target::Id(id) => follow_id(&id),
+    }
+}
+
+/// OR.8 — `:org-roam-id-create`: give the headline at point an `:ID:`.
+///
+/// **Already has one ⇒ a no-op with a message, not an error and not a second
+/// drawer.** Running this twice is something a user does, and org cannot read a
+/// headline carrying two `:PROPERTIES:` blocks — so the check is
+/// [`roam_index::id_drawer_insert`]'s job and it answers `None` here.
+///
+/// The insert is ONE edit at the start of a line, which is what keeps it
+/// composable with the existing drawer case: an entry that already has a
+/// drawer without an `:ID:` gets the line added inside it rather than a second
+/// drawer opened above it.
+///
+/// The new node does not appear in the index until the file is SAVED and the
+/// watcher sees it — the same rule §5.2 sets for a created note, and the reason
+/// an abandoned edit never enters the index.
+fn id_create(ctx: &ExCommandContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    let warn = |text: String| {
+        vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text,
+        })]
+    };
+    let read = |n: u32| doc.line(n);
+    let view = headline::Headlines::new(tree, &read, doc.line_count());
+    let Some((line, _)) = view.enclosing(ctx.cursor.line) else {
+        return warn("org-roam: not inside a headline — `:ID:` goes on an entry".to_string());
+    };
+    let id = match host_services::new_uuid() {
+        Ok(id) => id,
+        // Refuses rather than degrades, for `:org-roam-create-node`'s reason:
+        // an `:ID:` is written into the user's file and outlives the session,
+        // so an empty one is worse than none.
+        Err(error) => {
+            return vec![Effect::Echo(EchoPayload {
+                level: EchoLevel::Error,
+                text: format!("org-roam: cannot mint an id: {error}"),
+            })];
+        }
+    };
+    let Some((at, drawer)) = roam_index::id_drawer_insert(&read, line, &id) else {
+        return warn("org-roam: this entry already has an `:ID:`".to_string());
+    };
+    vec![Effect::ApplyEdit(
+        lattice::plugin_host::types::ApplyEditPayload {
+            target: ctx.buffer_id,
+            edit: Edit {
+                range: Range {
+                    start: Position { line: at, byte: 0 },
+                    end: Position { line: at, byte: 0 },
+                },
+                // `edit-kind` has one arm — an insert is a Replace over an
+                // empty range, which is how every other insert here is written.
+                kind: EditKind::Replace(drawer),
+            },
+            // The caret stays on the headline it just identified. Following the
+            // drawer down would move the user off the thing they acted on.
+            cursor: Some(Position { line, byte: 0 }),
+        },
+    )]
+}
+
+/// OR.8 — follow an `[[id:…]]` link through the roam index.
+///
+/// One exact-key `get` (`roam_index::node`), never a walk of `nodes` — this is
+/// the keystroke path, and the separate `n/<id>` key exists precisely so that
+/// `<CR>` costs a lookup rather than a 90 KB decode.
+///
+/// **Three failures, three different messages**, because they send the reader
+/// to three different places: roam is not configured (set the option), the
+/// index is empty (run `:org-roam-sync`), or the id is genuinely absent (the
+/// link is broken). OL.1's single "no id index" message could not distinguish
+/// a broken link from an absent feature, which is the reason it said so
+/// explicitly rather than saying "cannot open".
+///
+/// Jumps to file AND line, so a headline node lands on its headline rather than
+/// at the top of a file it shares with other nodes — 19% of the reference
+/// corpus is headline nodes, and every one of them would otherwise arrive in
+/// the wrong place.
+fn follow_id(id: &str) -> Vec<Effect> {
+    let warn = |text: String| {
+        vec![Effect::Echo(lattice::plugin_host::types::EchoPayload {
             level: lattice::plugin_host::types::EchoLevel::Warn,
-            text: format!("org: no id index, so [[id:{id}]] cannot be resolved yet"),
-        })],
+            text,
+        })]
+    };
+    if roam_scan::roam_directory().is_none() {
+        return warn(format!(
+            "org: [[id:{id}]] needs a note directory — set `org.roam-directory`"
+        ));
+    }
+    match roam_index::node(id) {
+        Some(node) => vec![Effect::OpenBufferAt(
+            lattice::plugin_host::types::OpenBufferAtPayload {
+                path: Some(node.file),
+                position: Position {
+                    line: node.line,
+                    byte: 0,
+                },
+                force: false,
+            },
+        )],
+        None if roam_index::is_empty() => warn(format!(
+            "org: the roam index is empty, so [[id:{id}]] cannot be resolved — run `:org-roam-sync`"
+        )),
+        None => warn(format!("org: no note with id {id}")),
     }
 }
 

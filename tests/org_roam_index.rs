@@ -58,14 +58,44 @@ async fn press_chord(editor: &mut Editor, keys: &str) {
     }
     if let Some(lattice_host::action::Action::Invoke(inv)) = resolved {
         let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
-        // `Effect::OpenPicker` is the RENDERER's to apply — the action returns
-        // it rather than opening, so a test that drops the effects sees no
-        // picker and reads as a dead chord. Only the arm this file needs;
-        // `org_structure.rs`'s `apply_renderer_effects` is the fuller peer.
-        for effect in out.effects {
-            if let lattice_grammar::Effect::OpenPicker { source, args } = effect {
+        apply_renderer_effects(editor, out);
+    }
+}
+
+/// Apply the effects an action RETURNS, the way the renderer does.
+///
+/// These are the arms this file needs, and every one of them has already
+/// masqueraded as a product bug once: an action that returns
+/// `Effect::OpenPicker` looks like a dead chord if the test drops it, and one
+/// that returns `Effect::OpenBufferAt` looks like an id that would not resolve.
+/// `org_structure.rs`'s `apply_renderer_effects` is the fuller peer.
+fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
+    for effect in out.effects {
+        match effect {
+            lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);
             }
+            lattice_grammar::Effect::OpenBufferAt {
+                path,
+                position,
+                force,
+            } => {
+                editor.do_edit(path, force);
+                editor.set_cursor_clamped(position);
+            }
+            lattice_grammar::Effect::ApplyEdit {
+                target,
+                edit,
+                cursor,
+            } => {
+                let _ = editor.dispatch(lattice_host::action::Action::ApplyEdit {
+                    target,
+                    edit,
+                    cursor,
+                });
+            }
+            // Echo and the rest are applied where they were produced.
+            _ => {}
         }
     }
 }
@@ -1047,4 +1077,249 @@ async fn settle_picker_rows(editor: &mut Editor) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// OR.8 — `[[id:…]]` resolves, and `:org-roam-id-create` mints one.
+//
+// Driven through the REAL dispatch gate: `<CR>` is pressed in a real editor
+// over a real indexed corpus, never against a hand-built `GrammarEnv`. The
+// failure this slice most expects is the one OC.10 and OT.4 both hit — a seam
+// wired end to end that answers nothing, because the gate synthesises a
+// context no host test goes through.
+// ---------------------------------------------------------------------------
+
+/// Open `file` and put the cursor ON the link on `line`, with the drains a
+/// plugin mode needs between the two.
+///
+/// The byte matters: `open_link` asks `links::link_at(text, cursor.byte)`, so a
+/// cursor parked at column 0 of a line whose link starts at column 12 is not in
+/// a link at all and `<CR>` correctly declines. A test that did that would read
+/// as "following is broken" when following was never asked for.
+async fn open_at_link(editor: &mut Editor, file: &Path, line: u32) {
+    editor.do_edit(Some(file.to_path_buf()), false);
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        editor.run_tick_pending();
+    }
+    let text = editor
+        .document
+        .snapshot()
+        .buffer
+        .line(line)
+        .unwrap_or_default();
+    let byte = text
+        .find("[[")
+        .unwrap_or_else(|| panic!("line {line} has no link: {text:?}")) as u32;
+    editor.cursor = lattice_protocol::Position { line, byte };
+}
+
+/// Open `file` with the cursor at the start of `line` — for the paths that are
+/// not about links.
+async fn open_at(editor: &mut Editor, file: &Path, line: u32) {
+    editor.do_edit(Some(file.to_path_buf()), false);
+    for _ in 0..8 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        editor.run_tick_pending();
+    }
+    editor.cursor = lattice_protocol::Position { line, byte: 0 };
+}
+
+/// The path the editor is currently showing, and the cursor's line.
+fn where_am_i(editor: &Editor) -> (Option<String>, u32) {
+    let path = editor
+        .document
+        .snapshot()
+        .path
+        .clone()
+        .map(|p| p.to_string_lossy().to_string());
+    (path, editor.cursor.line)
+}
+
+/// `<CR>` on a link to a FILE node opens that file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn following_an_id_link_opens_the_file_node() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    // `chicken.org` line 7 links to FILE-BBBB, which is `rust.org`'s file node.
+    let chicken = corpus.join("chicken.org");
+    open_at_link(&mut editor, &chicken, 7).await;
+    press_chord(&mut editor, "<CR>").await;
+
+    let (path, line) = where_am_i(&editor);
+    let path = path.expect("a file is open");
+    assert!(
+        path.ends_with("rust.org"),
+        "followed the id to its file: {path} (msg: {:?})",
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+    assert_eq!(line, 0, "a FILE node lands at the top of its file");
+}
+
+/// `<CR>` on a link to a HEADLINE node lands on the headline, not on line 0.
+///
+/// 19% of the reference corpus is headline nodes; without the line every one of
+/// them would arrive at the top of a file it shares with other notes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn following_an_id_link_lands_on_a_headline_nodes_line() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+    let head = index
+        .node("HEAD-CCCC")
+        .expect("the headline node is indexed");
+    assert!(head.line > 0, "fixture: the headline is not on line 0");
+
+    let linking = corpus.join("link-to-headline.org");
+    std::fs::write(
+        &linking,
+        ":PROPERTIES:\n:ID:       FILE-EEEE\n:END:\n#+title: Pointer\n\nSee [[id:HEAD-CCCC][async]].\n",
+    )
+    .unwrap();
+    assert!(settle(|| index.nodes().len() >= 5).await, "reindexed");
+
+    open_at_link(&mut editor, &linking, 5).await;
+    press_chord(&mut editor, "<CR>").await;
+
+    let (path, line) = where_am_i(&editor);
+    assert!(path.expect("a file is open").ends_with("rust.org"));
+    assert_eq!(line, head.line, "landed on the headline, not the file top");
+}
+
+/// An id that differs only in case still resolves — the store lowercases keys
+/// because org ids are written however the tool that minted them felt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_id_resolves_whatever_its_case() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let linking = corpus.join("lowercase-link.org");
+    std::fs::write(
+        &linking,
+        ":PROPERTIES:\n:ID:       FILE-FFFF\n:END:\n#+title: Shouty\n\nSee [[id:file-bbbb][rust]].\n",
+    )
+    .unwrap();
+    assert!(settle(|| index.nodes().len() >= 5).await, "reindexed");
+
+    open_at_link(&mut editor, &linking, 5).await;
+    press_chord(&mut editor, "<CR>").await;
+
+    let (path, _) = where_am_i(&editor);
+    assert!(
+        path.expect("a file is open").ends_with("rust.org"),
+        "a lowercase link resolved an uppercase id (msg: {:?})",
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+}
+
+/// An unknown id says so, and says something different from "no directory" and
+/// from "index not built" — three problems with three different fixes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_id_names_itself_and_does_not_move_the_cursor() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let linking = corpus.join("broken-link.org");
+    std::fs::write(
+        &linking,
+        ":PROPERTIES:\n:ID:       FILE-GGGG\n:END:\n#+title: Broken\n\nSee [[id:NO-SUCH-ID][gone]].\n",
+    )
+    .unwrap();
+    assert!(settle(|| index.nodes().len() >= 5).await, "reindexed");
+
+    open_at_link(&mut editor, &linking, 5).await;
+    press_chord(&mut editor, "<CR>").await;
+
+    let (path, _) = where_am_i(&editor);
+    assert!(
+        path.expect("still here").ends_with("broken-link.org"),
+        "a broken link does not move you somewhere arbitrary"
+    );
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("NO-SUCH-ID"),
+        "the message names the id: {msg:?}"
+    );
+    assert!(
+        !msg.contains("roam-directory") && !msg.contains("org-roam-sync"),
+        "and does not send the reader to the wrong fix: {msg:?}"
+    );
+}
+
+/// `:org-roam-id-create` gives the headline at point an `:ID:`, and running it
+/// again is a no-op rather than a second drawer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn id_create_mints_once_and_declines_the_second_time() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await, "index is built");
+
+    let file = corpus.join("plain.org");
+    std::fs::write(&file, "#+title: Plain\n\n* A section\nbody\n").unwrap();
+    open_at(&mut editor, &file, 2).await;
+
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-roam-id-create", &mut out);
+    apply_renderer_effects(&mut editor, out);
+
+    let text = editor.document.snapshot().buffer.as_string();
+    assert!(
+        text.contains(":PROPERTIES:") && text.contains(":ID:"),
+        "the headline got a drawer: {text:?}"
+    );
+    let first_id_count = text.matches(":ID:").count();
+    assert_eq!(first_id_count, 1);
+
+    // Again — a no-op, not a second drawer. org cannot read an entry carrying
+    // two `:PROPERTIES:` blocks.
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-roam-id-create", &mut out);
+    apply_renderer_effects(&mut editor, out);
+
+    let text = editor.document.snapshot().buffer.as_string();
+    assert_eq!(
+        text.matches(":PROPERTIES:").count(),
+        1,
+        "no second drawer: {text:?}"
+    );
+    assert_eq!(text.matches(":ID:").count(), 1, "no second id: {text:?}");
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(msg.contains("already has"), "and it says why: {msg:?}");
 }

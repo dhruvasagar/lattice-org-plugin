@@ -983,11 +983,11 @@ impl Guest for Component {
             "roam-directory",
             OptionType::String,
             "",
-            "Where your org-roam notes live. Unset means roam is inert: no \
-             walk, no watcher, no index, and `<CR>` on an `[[id:\u{2026}]]` link \
-             says the directory is not configured rather than blaming the \
-             filesystem. The directory must also be in this plugin's \
-             `fs:read` grant, or the walk reaches nothing.",
+            "Where your org-roam notes live. `~` is expanded. Unset means \
+             roam is inert: no walk, no watcher, no index, and `<CR>` on an \
+             `[[id:\u{2026}]]` link says the directory is not configured rather \
+             than blaming the filesystem. The directory must also be in this \
+             plugin's `fs:read` grant, or the walk reaches nothing.",
         );
         let _ = register_option(
             "roam-dailies-directory",

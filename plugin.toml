@@ -69,7 +69,7 @@ default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 # files live in; without it those three chords are refused and say so, and
 # everything else still works.
 #
-# capabilities = ["fs:write:/Users/you/org"]
+capabilities = ["fs:write:~/src/dhruvasagar/org-files", "state:write"]
 
 # OT.4: the grammar seam is capability-gated, and without this grant it hands
 # every motion, text object and action a `none` tree handle. Org then falls back

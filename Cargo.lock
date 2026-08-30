@@ -3051,6 +3051,7 @@ dependencies = [
 name = "lattice-core"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "fancy-regex",
  "lattice-protocol",
  "memchr",

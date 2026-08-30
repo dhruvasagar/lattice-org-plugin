@@ -40,13 +40,42 @@ pub fn roam_directory() -> Option<String> {
     Some(expand_tilde(trimmed))
 }
 
-/// `~` expansion. The guest has no environment (`WasiCtxBuilder` inherits
-/// none), so `$HOME` is unreadable here — but the host mounts the granted
-/// prefixes at their own absolute paths, so a `~` that reached the host would
-/// simply not resolve. Left as-is when there is nothing to expand from, which
-/// surfaces as a walk that finds nothing rather than as a wrong directory.
+/// `~` expansion.
+///
+/// This was a no-op, and its comment explained why: the guest had no
+/// environment, so `$HOME` was unreadable and a `~` could only be passed
+/// through to a host that would not resolve it either. The cost was a config
+/// that could not be portable — `org.roam-directory` had to name
+/// `/Users/dhruva/…`, and the same file on another machine found nothing. It
+/// failed silently, as an empty corpus rather than a bad path.
+///
+/// The host now supplies `HOME` in the guest's WASI environment for exactly
+/// this, and nothing else: no `PATH`, no `USER`, no shell. Knowing the path
+/// grants no access — every read still goes through the capability preopens, so
+/// a plugin that learns the home directory and asks to read it is refused
+/// exactly as before.
+///
+/// **`~user` is left verbatim**, deliberately: expanding it against OUR home
+/// would produce a plausible path to the wrong place, which is worse than one
+/// that still visibly has a `~` in it. Same rule as the host's
+/// `lattice_core::home::expand_tilde`, which this mirrors.
 fn expand_tilde(path: &str) -> String {
-    path.to_string()
+    let Some(rest) = path.strip_prefix('~') else {
+        return path.to_string();
+    };
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return path.to_string();
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        return path.to_string();
+    };
+    let home = home.trim_end_matches('/');
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        home.to_string()
+    } else {
+        format!("{home}/{rest}")
+    }
 }
 
 /// The configured TODO keywords, so a headline's title loses its keyword.
@@ -182,5 +211,37 @@ mod tests {
         );
         assert!(!is_org("/roam/README.md"));
         assert!(!is_org("/roam/notorg"));
+    }
+
+    /// The guest's half of tilde expansion. Mirrors the host's
+    /// `lattice_core::home::expand_tilde` rule for rule, because a config that
+    /// expands one way in a capability grant and another way in an option is
+    /// worse than one that does not expand at all.
+    #[test]
+    fn a_leading_tilde_expands_against_home() {
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("SKIP: no HOME in this test environment");
+            return;
+        };
+        let home = home.trim_end_matches('/');
+        assert_eq!(expand_tilde("~/notes"), format!("{home}/notes"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/"), home);
+    }
+
+    #[test]
+    fn a_path_without_a_leading_tilde_is_untouched() {
+        assert_eq!(expand_tilde("/abs/roam"), "/abs/roam");
+        assert_eq!(expand_tilde("relative/roam"), "relative/roam");
+        assert_eq!(expand_tilde(""), "");
+        assert_eq!(expand_tilde("a~b"), "a~b", "a tilde must LEAD to count");
+    }
+
+    /// `~user` stays verbatim. Expanding it against OUR home would point at a
+    /// plausible wrong directory, and a roam corpus silently read from the
+    /// wrong place is worse than one that is not found.
+    #[test]
+    fn another_users_home_is_left_alone() {
+        assert_eq!(expand_tilde("~alice/roam"), "~alice/roam");
     }
 }

@@ -3780,3 +3780,80 @@ async fn the_clock_drawer_sits_under_the_headline_not_over_the_body() {
     assert_eq!(lines[3], ":END:");
     assert_eq!(lines[4], "some body", "the body survived, below the drawer");
 }
+
+/// **`<Tab>` cycles ANY fold that opens at the cursor, not only a headline.**
+///
+/// The gate used to be `is_headline`, so `<Tab>` on a `:PROPERTIES:` drawer or
+/// a `#+BEGIN_SRC` line declined and fell through to the builtin. That was a
+/// gap rather than a policy: `queries/folds.scm` has always captured
+/// `(drawer)`, `(property_drawer)`, `(block)` and friends alongside
+/// `(section)`, and the host's `do_cycle_fold_at_cursor` matches the innermost
+/// fold with `|_| true`. Only the guest's gate was narrow.
+///
+/// Asserted on the ACTION the chord produces rather than on `editor.folds`:
+/// structure-driven folds arrive from an asynchronous parse, so the fold set is
+/// empty in this harness whatever `<Tab>` did — the same reason the original
+/// cycle test asserts routing. `AppEffect::CycleFoldAtCursor` becomes
+/// `Action::CycleFoldAtCursor` in `next_actions`, which is observable and is
+/// exactly the routing under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tab_cycles_a_drawer_and_a_block_not_only_a_headline() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let src = "* Note\n\
+               :PROPERTIES:\n\
+               :ID:       ABC\n\
+               :END:\n\
+               body\n\
+               #+BEGIN_SRC rust\n\
+               let x = 1;\n\
+               #+END_SRC\n";
+    let mut editor = org_editor(base.path(), src).await;
+
+    let cycles_at = |editor: &mut Editor, line: u32| -> bool {
+        goto_line(editor, line);
+        let expanded = editor.keymap.expand_leader("<Tab>");
+        let seq = parse_chord_sequence(&expanded).expect("parses");
+        let mut partial: Vec<KeyChord> = Vec::new();
+        let mut resolved = None;
+        for c in seq {
+            resolved = Some(editor.dispatch_chord(c, &mut partial));
+        }
+        let Some(lattice_host::action::Action::Invoke(inv)) = resolved else {
+            return false;
+        };
+        let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
+        out.next_actions
+            .iter()
+            .any(|a| matches!(a, lattice_host::action::Action::CycleFoldAtCursor))
+    };
+
+    assert!(
+        cycles_at(&mut editor, 0),
+        "the headline still cycles — the case that already worked"
+    );
+    assert!(
+        cycles_at(&mut editor, 1),
+        "`:PROPERTIES:` opens a property_drawer fold, so `<Tab>` on it must cycle"
+    );
+    assert!(
+        cycles_at(&mut editor, 5),
+        "`#+BEGIN_SRC` opens a block fold, so `<Tab>` on it must cycle"
+    );
+
+    // And the rule stays "opens here", not "is inside" — OT.4's point. Inside
+    // the block the fold began on an earlier line, so `<Tab>` keeps its native
+    // meaning where a user is editing code.
+    assert!(
+        !cycles_at(&mut editor, 6),
+        "inside a source block `<Tab>` must decline, not fold the block from \
+         under the cursor"
+    );
+    assert!(
+        !cycles_at(&mut editor, 4),
+        "plain body text opens no fold, so `<Tab>` declines"
+    );
+}

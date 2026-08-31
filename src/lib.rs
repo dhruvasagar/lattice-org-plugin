@@ -1481,6 +1481,32 @@ impl Guest for Component {
                 bind("<leader>ondy", "org-roam-dailies-yesterday"),
                 bind("<leader>ondt", "org-roam-dailies-tomorrow"),
                 bind("<leader>ondD", "org-roam-dailies-goto-date"),
+                // The SAME commands under `<C-c>n…`, emacs org-roam's own
+                // prefix, letter for letter.
+                //
+                // Both, not one. `<leader>on…` is the vim-native spelling and
+                // stays; `<C-c>n…` is what a hand coming from emacs already
+                // knows, and it is three keystrokes rather than five. Two
+                // spellings of one command is cheap — they resolve to the same
+                // `ActionId`, so there is no second handler to keep in step.
+                //
+                // **`<C-c>` is safe here because it is a PREFIX, never a
+                // terminal binding.** `<C-c>` alone stays vim's interrupt; only
+                // `<C-c>n` continues into org. That is the same reason magit
+                // binds `<C-c>g` / `<C-c>f` on its own global mode, which is
+                // the precedent this follows — and it is why the `<C-x>o`
+                // proposal could NOT work, since org's major binds a terminal
+                // `<C-x>` (timestamp decrement, OM.9) and a prefix in one layer
+                // against a terminal binding in another is the ambiguity vim
+                // settles with `timeoutlen`, which this editor does not have.
+                //
+                // No collision with magit's buffer-local `<C-c><C-c>` /
+                // `<C-c><C-k>`: those continue on a different second key.
+                bind("<C-c>nf", "org-roam-find-node"),
+                bind("<C-c>ndd", "org-roam-dailies-today"),
+                bind("<C-c>ndy", "org-roam-dailies-yesterday"),
+                bind("<C-c>ndt", "org-roam-dailies-tomorrow"),
+                bind("<C-c>ndD", "org-roam-dailies-goto-date"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.
@@ -3606,18 +3632,7 @@ impl GrammarCallbacks for Component {
             // forward). When `org-table-mode` arrives it binds `<Tab>` above
             // this one and declines outside a table, making the chain two
             // hops with no change here.
-            CYCLE => {
-                let line = |n: u32| doc.line(n);
-                // OT.4: "is a section headline here", not "does this line start
-                // with stars" — so `<Tab>` inside a source block declines to
-                // the native meaning instead of cycling a fold that is not one.
-                let hl = headline::Headlines::new(tree, &line, doc.line_count());
-                if hl.is_headline(ctx.cursor.line) {
-                    Ok(vec![Effect::AppAction(AppEffect::CycleFoldAtCursor)])
-                } else {
-                    Ok(vec![Effect::Declined])
-                }
-            }
+            CYCLE => Ok(cycle_at_cursor(&ctx, doc, tree)),
             // `<S-Tab>` is whole-buffer, so it does not decline: org's global
             // cycle is meaningful wherever the cursor is.
             CYCLE_GLOBAL => Ok(vec![Effect::AppAction(AppEffect::CycleFoldsGlobal)]),
@@ -4600,6 +4615,93 @@ fn open_daily(date: roam_dailies::Date) -> Vec<Effect> {
         // the one use where the feature has to work.
         create_parents: true,
     })]
+}
+
+/// `<Tab>` — cycle whatever fold the cursor is ON.
+///
+/// ## Any fold, not only a headline
+///
+/// This used to fire only on a headline and decline everywhere else, so
+/// `<Tab>` on a `:PROPERTIES:` drawer or a `#+BEGIN_SRC` line fell through to
+/// the builtin and did nothing org-ish. That was a gap rather than a policy:
+/// `queries/folds.scm` has always captured `(drawer)`, `(property_drawer)`,
+/// `(block)`, `(dynamic_block)`, `(list)`, `(table)` and `(latex_env)`
+/// alongside `(section)`, and the host's `do_cycle_fold_at_cursor` matches the
+/// innermost fold with `|_| true` — it never cared what kind it was. Only this
+/// gate did.
+///
+/// ## The rule is "starts here", not "is inside"
+///
+/// A fold cycles when the cursor is on the line that OPENS it, which is emacs's
+/// rule and preserves the one OT.4 argued for: inside a source block the block
+/// began on an earlier line, so this declines and `<Tab>` keeps its native
+/// meaning where a user is editing code. On the `#+BEGIN_SRC` line itself it
+/// now folds, which is what was missing.
+///
+/// ## Two conditions beyond the kind
+///
+/// **Multi-line**, because the fold pipeline drops single-line captures
+/// ("nothing to hide"). Without this check the guest would claim a fold the
+/// host cannot find, and `do_cycle_fold_at_cursor` falls back to the GLOBAL
+/// cycle when it finds nothing — so a `<Tab>` on an unfoldable line would fold
+/// the entire buffer. A wrong answer that big is worse than declining.
+///
+/// **Probed at the first non-blank column**, not column 0: a node that starts
+/// after indentation does not contain column 0, so the walk would land in
+/// whatever encloses it and miss the drawer entirely. That is OT.6's lesson,
+/// which cost every indented checkbox list once.
+fn cycle_at_cursor(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    let read = |n: u32| doc.line(n);
+    let here = ctx.cursor.line;
+
+    // Mirrors `queries/folds.scm`. The two lists must agree: a kind here that
+    // the query does not capture claims a fold the host cannot find (and gets
+    // the global cycle), and a kind the query captures but this omits is a fold
+    // `<Tab>` silently refuses to touch — the bug being fixed.
+    const FOLDABLE: [&str; 8] = [
+        "section",
+        "block",
+        "dynamic_block",
+        "drawer",
+        "property_drawer",
+        "list",
+        "table",
+        "latex_env",
+    ];
+
+    if let Some(snapshot) = tree {
+        let text = read(here).unwrap_or_default();
+        let col = (text.len() - text.trim_start().len()) as u32;
+        let kinds: Vec<String> = FOLDABLE.iter().map(|k| (*k).to_string()).collect();
+        if let Some(node) = snapshot.enclosing(
+            Position {
+                line: here,
+                byte: col,
+            },
+            &kinds,
+        ) {
+            let range = node.byte_range();
+            let opens_here = range.start.line == here;
+            let multi_line = tree::last_content_line(&range) > range.start.line;
+            if opens_here && multi_line {
+                return vec![Effect::AppAction(AppEffect::CycleFoldAtCursor)];
+            }
+        }
+        return vec![Effect::Declined];
+    }
+
+    // No tree — the text fallback can only recognise a headline, which is what
+    // this did for every kind before. Degraded rather than wrong.
+    let hl = headline::Headlines::new(tree, &read, doc.line_count());
+    if hl.is_headline(here) {
+        vec![Effect::AppAction(AppEffect::CycleFoldAtCursor)]
+    } else {
+        vec![Effect::Declined]
+    }
 }
 
 /// OR.9 — open the backlinks picker for the node the cursor is in.

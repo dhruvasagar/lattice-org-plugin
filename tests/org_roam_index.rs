@@ -1921,3 +1921,58 @@ async fn a_corpus_larger_than_one_batch_indexes_without_trapping() {
         .expect("a node from the middle of the queue survived the chain");
     assert_eq!(one.title, "Bulk Note 42");
 }
+
+/// **`<C-c>n…` reaches the same commands as `<leader>on…`.**
+///
+/// Emacs org-roam's own prefix, letter for letter, kept alongside the
+/// vim-native spelling rather than replacing it — three keystrokes instead of
+/// five for a hand that already knows `C-c n f`.
+///
+/// Asserted through the real keymap rather than by reading the declaration: a
+/// binding that is present in the mode's `keymap` and never expands into a
+/// layer resolves to nothing, which is exactly how `<leader>onf` was once
+/// believed broken and reverted (see this file's harness comment).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_emacs_prefix_reaches_the_same_roam_commands() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((_index, editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    // Each pair must land on the SAME command id — two spellings, one handler.
+    for (emacs, vim) in [
+        ("<C-c>nf", "<leader>onf"),
+        ("<C-c>ndd", "<leader>ondd"),
+        ("<C-c>ndy", "<leader>ondy"),
+        ("<C-c>ndt", "<leader>ondt"),
+        ("<C-c>ndD", "<leader>ondD"),
+    ] {
+        let resolve = |keys: &str| -> Option<String> {
+            let expanded = editor.keymap.expand_leader(keys);
+            let seq = lattice_protocol::parse_chord_sequence(&expanded).expect("parses");
+            let modes: Vec<lattice_mode::ModeId> = editor
+                .mode_registry
+                .load()
+                .iter_meta()
+                .map(|(id, _)| id)
+                .collect();
+            editor
+                .keymap
+                .resolve_trace(lattice_keymap::BindingMode::Normal, &seq, &modes)
+                .hits
+                .last()
+                .map(|h| format!("{:?}", h.command))
+        };
+        let a = resolve(emacs);
+        let b = resolve(vim);
+        assert!(
+            a.is_some(),
+            "`{emacs}` must resolve to a command — a declared binding that never \
+             expands into a keymap layer reaches nothing"
+        );
+        assert_eq!(a, b, "`{emacs}` and `{vim}` must reach the same command");
+    }
+}

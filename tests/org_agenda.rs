@@ -1091,11 +1091,9 @@ async fn the_agenda_folds_by_header_group_not_by_source_file() {
     // And the folds it produces are the groups. One per header run, and each
     // stops before the next begins — the property file folds cannot give an
     // interleaved view.
-    let folds =
-        lattice_core::FoldSource::compute_folds(&lattice_multibuffer::HeaderGroupFoldProvider::new(
-            (*handle).clone(),
-            view,
-        ));
+    let folds = lattice_core::FoldSource::compute_folds(
+        &lattice_multibuffer::HeaderGroupFoldProvider::new((*handle).clone(), view),
+    );
     let excerpts = handle.excerpts();
     let headers: Vec<&str> = excerpts
         .iter()
@@ -1107,7 +1105,10 @@ async fn the_agenda_folds_by_header_group_not_by_source_file() {
         headers.len(),
         "one fold per header run; headers={headers:?} folds={folds:?} {status:?}"
     );
-    assert!(folds.len() >= 3, "the corpus spans several blocks: {headers:?}");
+    assert!(
+        folds.len() >= 3,
+        "the corpus spans several blocks: {headers:?}"
+    );
     for pair in folds.windows(2) {
         assert!(
             pair[0].end_line < pair[1].start_line,
@@ -1122,5 +1123,81 @@ async fn the_agenda_folds_by_header_group_not_by_source_file() {
     assert_eq!(
         covered, total_rows,
         "every agenda row belongs to a group: {folds:?}"
+    );
+}
+
+/// **AF.2: the agenda buffer opens collapsed.**
+///
+/// The agenda's major is `multibuffer-mode`, not `org-mode`, so it never saw
+/// the `foldlevel=0` the org major declares and fell back to the global 99 —
+/// a view whose entire structure is blocks, opening with every block expanded.
+///
+/// Two halves, and the second is what makes this about SCOPING rather than
+/// about folding: the agenda resolves `foldlevel=0`, and the user's global
+/// setting is untouched, so project search and project diff — which share the
+/// `multibuffer-mode` major — still open expanded.
+///
+/// Also worth pinning because a MINOR mode's option override is a path nothing
+/// else in this plugin exercises: `org-mode`'s overrides ride a major.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_opens_collapsed_to_its_group_headers() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    write_corpus(&notes);
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    // The precondition that makes this mean anything.
+    assert_eq!(
+        *editor
+            .config
+            .get_typed::<lattice_config::core_options::FoldLevel>()
+            .expect("registered"),
+        99,
+        "sanity: the global default is 99, so 0 can only come from the mode"
+    );
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    editor.run_tick_pending();
+
+    assert_eq!(
+        *editor.resolved_option::<lattice_config::core_options::FoldLevel>(view),
+        0,
+        "the agenda opens collapsed to its blocks; got {status:?}"
+    );
+    assert_eq!(
+        *editor
+            .config
+            .get_typed::<lattice_config::core_options::FoldLevel>()
+            .expect("registered"),
+        99,
+        "and the global setting is untouched, so search and diff still open \
+         expanded — they share the multibuffer major"
     );
 }

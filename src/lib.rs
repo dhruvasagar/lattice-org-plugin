@@ -1637,8 +1637,33 @@ impl Guest for Component {
                 bind("<leader>o,", "org-priority-cycle"),
             ],
             target_language: None,
-            // MO.1: this mode sets no options for its buffers.
-            options: vec![],
+            // AF.2: the agenda opens COLLAPSED, to its section and date
+            // headers.
+            //
+            // The agenda's major is `multibuffer-mode`, not `org-mode`, so it
+            // never saw the `foldlevel=0` the org major declares and fell back
+            // to the global 99 — a view whose entire structure is blocks,
+            // opening with every block expanded.
+            //
+            // Declared HERE rather than on the multibuffer major, and the
+            // scoping is the point: `multibuffer-mode` is also project search,
+            // project diff and the references view, none of which should open
+            // collapsed. `org-agenda-mode` activates on agenda views and
+            // nothing else, so it is the narrowest mode that owns the question.
+            //
+            // What a closed group shows is its header row, its FIRST row, and
+            // a `⋯ N lines` summary — not the header alone. A fold's head is a
+            // content row and an agenda header is a virtual row outside the
+            // fold, so "collapse to the header alone" is not expressible in
+            // the fold model; one row of preview per block is arguably the
+            // better read regardless.
+            //
+            // A layer, so `:setlocal foldlevel=99` in the agenda still wins.
+            options: vec![ModeOptionOverride {
+                name: "foldlevel".to_string(),
+                value: "0".to_string(),
+                priority: OverridePriority::Normal,
+            }],
         });
 
         // OM.12 — `org-table-mode`, the third mode.

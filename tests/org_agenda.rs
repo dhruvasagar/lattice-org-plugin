@@ -1030,3 +1030,97 @@ async fn agenda_rows_carry_per_excerpt_syntax_handles() {
         "the handle resolved no spans for the headline row: {spans:?}"
     );
 }
+
+/// **AF.1: the agenda folds by SECTION and DATE — what the user sees — not by
+/// source file.**
+///
+/// Folding by file is the multibuffer default and it is wrong here, because
+/// the agenda's headline property is that rows interleave across files by date
+/// (OM.A2). A file's fold spans its first row to its last, so collapsing
+/// `home.org` — which holds both the earliest and the latest entry in this
+/// corpus — would swallow every `work.org` and `notes.org` row in between.
+///
+/// The provider declares `FoldGrouping::HeaderRuns` at view creation, so the
+/// mode registers header-run folds instead. Asserted through the real
+/// component and the real fold pipeline, because the declaration is only worth
+/// anything if it survives to the folds the editor actually holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_folds_by_header_group_not_by_source_file() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    write_corpus(&notes);
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+
+    // The declaration reached the view.
+    assert_eq!(
+        handle.fold_grouping(),
+        lattice_multibuffer::FoldGrouping::HeaderRuns,
+        "the agenda provider must declare header-run folding"
+    );
+
+    // And the folds it produces are the groups. One per header run, and each
+    // stops before the next begins — the property file folds cannot give an
+    // interleaved view.
+    let folds =
+        lattice_core::FoldSource::compute_folds(&lattice_multibuffer::HeaderGroupFoldProvider::new(
+            (*handle).clone(),
+            view,
+        ));
+    let excerpts = handle.excerpts();
+    let headers: Vec<&str> = excerpts
+        .iter()
+        .map(|e| e.header.title.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert_eq!(
+        folds.len(),
+        headers.len(),
+        "one fold per header run; headers={headers:?} folds={folds:?} {status:?}"
+    );
+    assert!(folds.len() >= 3, "the corpus spans several blocks: {headers:?}");
+    for pair in folds.windows(2) {
+        assert!(
+            pair[0].end_line < pair[1].start_line,
+            "groups must not overlap — this is what folding by file got wrong: {folds:?}"
+        );
+    }
+    // Every composed ROW is inside exactly one group, so nothing is
+    // unfoldable. Rows, not excerpts: a scheduled entry's excerpt spans its
+    // planning line too, so the two counts differ by design (§6.2).
+    let total_rows: u32 = excerpts.iter().map(|e| e.line_count()).sum();
+    let covered: u32 = folds.iter().map(|f| f.end_line - f.start_line + 1).sum();
+    assert_eq!(
+        covered, total_rows,
+        "every agenda row belongs to a group: {folds:?}"
+    );
+}

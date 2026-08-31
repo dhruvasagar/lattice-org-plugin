@@ -938,3 +938,95 @@ async fn a_malformed_section_set_falls_back_and_says_so_in_the_view() {
         "…and is still the built-in block it fell back to, got {titles:?}"
     );
 }
+
+/// **Do the agenda's rows carry syntax spans at all?**
+///
+/// Written to find out rather than to pin a belief: the machinery is all
+/// present on paper — the provider passes `lang_registry` to
+/// `create_multibuffer_view`, `add_source` detects `.org` through the plugin
+/// extension registry, and the cells worker reads `excerpt_syntax` — so this
+/// asserts the chain end to end before anything is changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_rows_carry_per_excerpt_syntax_handles() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        format!("* TODO Ship the thing\n  SCHEDULED: {}\n", stamp(1)),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+
+    // The chain, reported in one line on failure so a regression names the
+    // broken link instead of prompting another round of guessing. The
+    // BOOT-registered registry is included deliberately: it is bundled-only
+    // and answers `false` for org, which is the bug AH.1 fixed — reading it
+    // here documents that the fix is "ask the live registry", not "the
+    // service was empty".
+    let detected = lattice_syntax::Lang::detect_from_path(Some(std::path::Path::new("x.org")));
+    let boot_registry_knows_org = editor
+        .services
+        .get::<std::sync::Arc<lattice_syntax::LangRegistry>>()
+        .and_then(|lr| {
+            lattice_syntax::Syntax::for_language_with_registry(detected, (*lr).clone())
+                .ok()
+                .map(|o| o.is_some())
+        });
+    let entries = handle.excerpt_syntax_entries();
+    assert!(
+        !entries.is_empty(),
+        "the agenda's excerpts have no syntax handles, so every row paints \
+         uncoloured. detect_from_path(.org) = {detected:?}; the boot-registered \
+         registry knows org = {boot_registry_knows_org:?} (false is EXPECTED — \
+         `add_source` must consult the live registry); sources = {}; got {status:?}",
+        handle.excerpts().len(),
+    );
+
+    // A handle is not enough — it must actually resolve spans for the row's
+    // source lines. A handle whose grammar never loaded answers `None` and is
+    // indistinguishable from no handle at the pixel.
+    let (_, _, source_start, ref h) = entries[0];
+    // Through the inherent `SyntaxHandle` API rather than the
+    // `ExcerptHighlighter` trait, so this test needs no extra dependency to
+    // ask a question about spans.
+    let snap = h.snapshot();
+    let spans: Option<Vec<Vec<lattice_syntax::StyledSpan>>> =
+        snap.highlight_lines(source_start, source_start + 1).ok();
+    assert!(
+        spans
+            .as_ref()
+            .is_some_and(|s| s.iter().any(|l| !l.is_empty())),
+        "the handle resolved no spans for the headline row: {spans:?}"
+    );
+}

@@ -993,6 +993,52 @@ mod tests {
 
     // ── sections (AS.1) ─────────────────────────────────────────────────
 
+    /// **The shipped default set, pinned by name and in order.**
+    ///
+    /// Every other section test asserts BEHAVIOUR — that a window admits the
+    /// rows it says it does — which is the right shape for a filter but leaves
+    /// the actual default configuration asserted only in aggregate. This one
+    /// states it: four blocks, these titles, this order, these filters. It is
+    /// the thing a user reads in `doc/org.md` and the thing
+    /// `agenda_sections::resolve` falls back to, so a change here is a change
+    /// to what everyone's agenda looks like and should have to be typed twice.
+    #[test]
+    fn the_shipped_default_set_is_these_four_blocks_in_this_order() {
+        let s = default_sections(7);
+        let shape: Vec<_> = s
+            .iter()
+            .map(|s| {
+                (
+                    s.title.as_str(),
+                    s.filter.when,
+                    s.filter.todo_only,
+                    s.filter.min_priority,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                // Past-dated and not done. First, because a missed deadline
+                // the view stays quiet about is the failure org exists to
+                // prevent.
+                ("Overdue", When::Overdue, true, None),
+                // Today through `org.agenda-span`. NOT `todo_only`: a plain
+                // dated headline is an appointment, and a calendar that hides
+                // your appointments is not one.
+                ("Agenda", When::Days(7), false, None),
+                // TODOs with no date — invisible to the agenda entirely
+                // before AS.1.
+                ("Unscheduled", When::Undated, true, None),
+                // `[#A]`, whenever it is due. Deliberately overlaps the three
+                // above: a row appearing twice is what a dashboard is for.
+                ("Priority A", When::Any, true, Some('A')),
+            ]
+        );
+        // The span is the option's, not a constant baked in beside it.
+        assert_eq!(default_sections(0)[1].filter.when, When::Days(0));
+    }
+
     fn kw() -> Keywords {
         Keywords::from_spec("TODO NEXT | DONE")
     }

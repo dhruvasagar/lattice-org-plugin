@@ -122,6 +122,10 @@ fn candidate(node: &Node) -> RawCandidate {
         kind: CandidateKind::Plain,
         data: CandidateData::Plain,
         annotations: Vec::new(),
+        // PS.1: the completion popup shows node titles too, and a title that
+        // is a headline in the buffer should not become plain text because it
+        // is being offered rather than read.
+        display_spans: crate::roam::title_display_spans(&node.title, &node.title),
     }
 }
 

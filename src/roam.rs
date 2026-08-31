@@ -52,6 +52,7 @@
 //! [`crate::roam_tree`]) is the thin layer that harvests those facts, and it is
 //! covered by the integration tests that run a real editor.
 
+use crate::lattice::plugin_host::types::DisplaySpan;
 use serde::{Deserialize, Serialize};
 
 /// One roam node, as it lands in the store.
@@ -780,5 +781,114 @@ Body with [[id:TARGET][a link]].
         let got = extract("/n.org", text, &outline, &keywords());
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].node.id, "ABC");
+    }
+}
+
+/// PS.1: the styled runs a **node title** renders with in a picker row.
+///
+/// A node title IS a headline's text — it is read out of `* Some Title` or
+/// `#+title:` — but by the time it reaches a picker it has no stars, no file
+/// line, and nothing for a grammar to match. So the row rendered plain while
+/// the same title syntax-highlighted perfectly in the buffer it came from,
+/// which is the gap `display-spans` exists to close: the plugin that knows the
+/// title is a headline says so, rather than the host guessing.
+///
+/// `text.title.1` and not a level-derived one. A headline node can sit at any
+/// depth, but a picker row has no outline around it to make depth mean
+/// anything — every row is a peer of every other. Levelling them would paint
+/// the *file*'s structure onto a list that is not structured that way, which
+/// reads as noise rather than information.
+///
+/// The slot names travel as strings and resolve host-side through the same
+/// path a `highlights.scm` capture takes, so these rows follow a colourscheme
+/// swap exactly as the buffer does.
+pub fn title_display_spans(display: &str, title: &str) -> Vec<DisplaySpan> {
+    let mut spans = Vec::new();
+    // The title is a PREFIX of `display` by construction at every call site
+    // (aliases and context are appended after it). Guarded anyway: a caller
+    // that changes that would otherwise paint the headline style over
+    // whatever happened to occupy those bytes.
+    if title.is_empty() || !display.starts_with(title) {
+        return spans;
+    }
+    spans.push(DisplaySpan {
+        start: 0,
+        end: title.len() as u32,
+        slot: "text.title.1".to_string(),
+    });
+    // Everything the call site appended — ` (alias, alias)`, a file name —
+    // is context rather than title, and takes comment styling so the eye
+    // lands on the name first.
+    if display.len() > title.len() {
+        spans.push(DisplaySpan {
+            start: title.len() as u32,
+            end: display.len() as u32,
+            slot: "comment".to_string(),
+        });
+    }
+    spans
+}
+
+#[cfg(test)]
+mod title_span_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::title_display_spans;
+
+    /// PS.1: the title takes headline styling; anything appended after it is
+    /// context and takes comment styling.
+    #[test]
+    fn a_title_with_appended_context_splits_into_two_runs() {
+        let title = "Reading list";
+        let display = "Reading list  (books, to-read)";
+        let spans = title_display_spans(display, title);
+        assert_eq!(spans.len(), 2, "got {spans:?}");
+        assert_eq!((spans[0].start, spans[0].end), (0, title.len() as u32));
+        assert_eq!(spans[0].slot, "text.title.1");
+        assert_eq!(
+            (spans[1].start, spans[1].end),
+            (title.len() as u32, display.len() as u32)
+        );
+        assert_eq!(spans[1].slot, "comment");
+    }
+
+    /// No context appended ⇒ one run over the whole row.
+    #[test]
+    fn a_bare_title_is_one_run() {
+        let spans = title_display_spans("Reading list", "Reading list");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].slot, "text.title.1");
+        assert_eq!(spans[0].end, "Reading list".len() as u32);
+    }
+
+    /// **Offsets are BYTES.** A title with non-ASCII in it must produce spans
+    /// on UTF-8 boundaries, or the host drops them — and a `.chars()`-based
+    /// implementation would land mid-codepoint on exactly this input.
+    #[test]
+    fn offsets_are_byte_offsets_not_char_offsets() {
+        let title = "Café notes";
+        let display = "Café notes  (drinks)";
+        let spans = title_display_spans(display, title);
+        assert_eq!(spans[0].end, title.len() as u32, "byte length, not 10");
+        assert_eq!(
+            title.len(),
+            11,
+            "the fixture actually has a multi-byte char"
+        );
+        for s in &spans {
+            assert!(
+                display.is_char_boundary(s.start as usize)
+                    && display.is_char_boundary(s.end as usize),
+                "span {s:?} must sit on UTF-8 boundaries or the host drops it"
+            );
+        }
+    }
+
+    /// The prefix guard: a caller that stops appending after the title (or
+    /// starts prepending) gets NO spans rather than the headline style painted
+    /// over whatever now occupies those bytes.
+    #[test]
+    fn a_display_that_does_not_start_with_the_title_is_left_unstyled() {
+        assert!(title_display_spans("(alias) Reading list", "Reading list").is_empty());
+        assert!(title_display_spans("Reading list", "").is_empty());
     }
 }

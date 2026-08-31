@@ -4407,6 +4407,12 @@ impl PickerSource for Component {
                             kind: lattice::plugin_host::types::CandidateKind::Plain,
                             data: lattice::plugin_host::types::CandidateData::Plain,
                             annotations: Vec::new(),
+                            // PS.1: unstyled deliberately. A refile target is a
+                            // `parent/child/grandchild` PATH, not one headline's
+                            // text, so painting it as a title would style the
+                            // separators too and claim a structure the row does
+                            // not have.
+                            display_spans: Vec::new(),
                         },
                         // The routing token IS the invocation. The picker never
                         // interprets it; it hands back whichever one the user

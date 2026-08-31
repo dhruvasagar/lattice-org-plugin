@@ -125,6 +125,10 @@ fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
     } else {
         format!("{}  ({})", node.title, node.aliases.join(", "))
     };
+    // PS.1: a node title is a headline's text, so it renders as one. Without
+    // this the row is plain — there are no stars and no file line for a
+    // grammar to match by the time a title reaches a picker.
+    let display_spans = crate::roam::title_display_spans(&display, &node.title);
     (
         RawCandidate {
             insert_text: None,
@@ -134,6 +138,7 @@ fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
             kind: CandidateKind::Plain,
             data: CandidateData::Plain,
             annotations,
+            display_spans,
         },
         // The node's location, not its id: `accept` should not have to consult
         // the index again to answer where to go.

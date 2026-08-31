@@ -95,6 +95,10 @@ fn row(node: &Node) -> (RawCandidate, RoutingPayload) {
         kind: CandidateKind::Plain,
         data: CandidateData::Plain,
         annotations: Vec::new(),
+        // PS.1: a backlink row is a node title, so it renders as one. The
+        // file-name context rides as an ANNOTATION rather than in `display`
+        // (below), so the title is the whole of the styled text here.
+        display_spans: crate::roam::title_display_spans(&node.title, &node.title),
     };
     // The file basename beside the title, so two notes with similar titles are
     // still tellable apart. Shown, not matched — the title is what you search.

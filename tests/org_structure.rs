@@ -4083,6 +4083,22 @@ async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
     );
     let modes: Vec<ModeId> = active.keymap_gated_ids();
 
+    // OC.7c: the buffer is HIGHLIGHTED as org.
+    //
+    // Nothing about a capture buffer is org to `Lang::detect_from_path` — it
+    // has no path — so the language can only have come from the major's
+    // declared `target_language`, resolved through the mode registry. Before
+    // OC.7c `lang_for_mode_id` answered `None` for every plugin major and the
+    // buffer rendered unstyled.
+    let syntax_lang = editor.document_syntax_for(buffer).map(|s| s.lang());
+    assert_eq!(
+        syntax_lang,
+        Some(lattice_syntax::Lang::Plugin(
+            lattice_syntax::plugin_lang::LanguageName::intern("org")
+        )),
+        "the capture buffer resolves org's grammar from its major, not from a path"
+    );
+
     let resolves = |chord: &str, modes: &[ModeId]| {
         let seq = lattice_protocol::parse_chord_sequence(chord).expect("parses");
         editor

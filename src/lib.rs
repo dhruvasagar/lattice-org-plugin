@@ -380,6 +380,16 @@ const ROAM_DAILIES_DATE_PARSE: u32 = 57;
 const ON_CLOCK_EVENT: u32 = 1;
 /// OR.4: the watcher told us files under the roam directory changed.
 const ON_ROAM_FILES_CHANGED: u32 = 2;
+/// OR.4a: `org.roam-directory` was set or changed.
+///
+/// Without this, roam never indexes for the user who configures it the
+/// DOCUMENTED way. `register-events` runs org's boot walk at plugin-load time;
+/// an `init.rs` sets the option from a `plugin-loaded` handler, which fires
+/// after. The walk therefore reads an unset directory, indexes nothing, and —
+/// with nothing watching the option — never runs again. The symptom is `0/0` in
+/// the find-node picker, which is indistinguishable from a corpus with no notes
+/// in it.
+const ON_ROAM_OPTION_CHANGED: u32 = 3;
 
 /// OR.6: `YYYYMMDDHHMMSS` in LOCAL time, for a new note's filename.
 ///
@@ -1112,6 +1122,23 @@ impl Guest for Component {
             },
             ON_ROAM_FILES_CHANGED,
         );
+        // OR.4a: and the option itself. The boot walk below runs BEFORE a
+        // user's `init.rs` has set `org.roam-directory` — that is the
+        // documented `plugin-loaded` config shape — so without this the walk
+        // reads an unset option and roam is silently inert for exactly the
+        // users who configured it correctly.
+        //
+        // Unconditional, like the watch subscription above and for the same
+        // reason: an option that is never set delivers nothing and costs
+        // nothing.
+        events::subscribe(
+            &EventFilter {
+                kinds: Some(vec![EventKind::OptionChanged]),
+                path_globs: None,
+                major_modes: None,
+            },
+            ON_ROAM_OPTION_CHANGED,
+        );
         // Boot does a full walk, because lattice was not running while the
         // corpus changed and a watcher cannot report what it did not see.
         // Unchanged files cost a read and a hash; only moved ones parse. A
@@ -1131,6 +1158,28 @@ impl Guest for Component {
         if handler == ON_ROAM_FILES_CHANGED {
             if let Event::FilesChanged(paths) = ev {
                 roam_scan::reindex(&paths);
+            }
+            return;
+        }
+        // OR.4a: the corpus root was named (or moved). Walk it.
+        //
+        // Filtered by NAME here rather than by the subscription, because the
+        // event filter has no option-name field — every option change is
+        // delivered and this arm decides. `roam-dailies-directory` is
+        // deliberately not included: it changes where a journal FILE goes, not
+        // which tree is indexed, and the walk covers it either way when it sits
+        // under the roam directory.
+        if handler == ON_ROAM_OPTION_CHANGED {
+            if let Event::OptionChanged(c) = ev {
+                if c.name != "org.roam-directory" {
+                    return;
+                }
+                // `sync_all` re-reads the option and arms the watch on the new
+                // root. It is a no-op when the value was cleared, which is the
+                // honest answer for "roam is now unconfigured" — the stale
+                // index stays until something replaces it rather than the
+                // picker going empty with no explanation.
+                roam_scan::sync_all();
             }
             return;
         }

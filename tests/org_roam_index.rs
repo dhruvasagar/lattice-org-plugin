@@ -1782,3 +1782,70 @@ async fn dailies_refuse_when_roam_is_not_configured() {
         "and no journal was invented outside a corpus"
     );
 }
+
+// ---------------------------------------------------------------------------
+// OR.4a — setting `org.roam-directory` builds the index, WITHOUT a manual sync.
+//
+// Every other test in this file calls `:org-roam-sync` by hand, and the
+// harness comment says why: the option does not exist until org has loaded, so
+// `init.rs` sets it from a `plugin-loaded` handler. What none of them noticed
+// is that the same ordering breaks the PRODUCT, not just the test setup.
+//
+// `register_events` runs org's boot walk at plugin-load time. The user's
+// `init.rs` sets `org.roam-directory` on `PluginLoaded`, which fires after. So
+// the walk reads an unset option, indexes nothing, and — with nothing
+// subscribed to `OptionChanged` — never runs again. A user following the
+// documented deferred-config pattern gets `0/0` in the find-node picker
+// forever, and the only way out is to know `:org-roam-sync` exists.
+//
+// The manual sync in every other test is exactly what hid it: a test that
+// syncs by hand passes against a product that never syncs on its own. Same
+// shape as `org-table-mode`'s hand-enable.
+// ---------------------------------------------------------------------------
+
+/// Boot + load org, set `org.roam-directory`, and DO NOT sync. The index must
+/// build anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    let plugins = base.path().join("plugins");
+    write_org_plugin_dir(&plugins, &wasm, &corpus);
+
+    let editor = boot_sealed_editor();
+    let host = Arc::new(
+        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
+            .expect("host builds"),
+    );
+    let loader = loader_over_editor(&editor, host.clone());
+    for found in discover(&plugins) {
+        loader
+            .load_discovered(&found, TrustTier::Bundled)
+            .await
+            .expect("the org plugin loads");
+    }
+
+    // The documented shape, and the ONLY step: set the option after the load,
+    // exactly as an `init.rs` `plugin-loaded` handler does. No `:org-roam-sync`
+    // anywhere below — that is the whole point.
+    editor
+        .config
+        .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
+        .expect("the plugin registered `org.roam-directory`");
+
+    let index = Index { host };
+    assert!(
+        settle(|| index.nodes().len() >= 4).await,
+        "setting the directory must build the index on its own — a user who \
+         follows the documented `plugin-loaded` config pattern never types \
+         `:org-roam-sync`, and an empty picker is indistinguishable from a \
+         corpus that has no notes in it. Got {} node(s).",
+        index.nodes().len()
+    );
+}

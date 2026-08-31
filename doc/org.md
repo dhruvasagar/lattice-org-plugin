@@ -275,9 +275,26 @@ You stay where you are. Refile files something; it does not navigate.
 
 ### Capturing
 
-`<leader>oc` opens the **capture menu** — one key per template — and the key
-you press picks the template. It then prompts for a line and files it through
-that template.
+`<leader>oc` (or `C-c c`) opens the **capture menu** — one key per template —
+and the key you press picks the template. A template that asks `%^{…}`
+questions collects those first; then a **capture buffer** opens, holding the
+template expanded, with the cursor where `%?` was.
+
+| | |
+|---|---|
+| `C-c C-c` | file it where the template says |
+| `C-c C-k` | throw it away — **nothing is written** |
+
+It is a real org buffer: syntax highlighting, motions, folding and TODO
+cycling all work while you write. Only the two chords above are
+capture-specific, so `C-c C-c` in an ordinary org file still does nothing.
+
+Edit it freely — what gets filed is what is on screen when you press
+`C-c C-c`, not the template you started from. A template with no `%?` leaves
+the cursor at the end.
+
+Two things to know: after filing, the pane does not yet return to the buffer
+you fired the capture from. And one capture runs at a time.
 
 **`<leader>oc` and `<leader>oa` work in ANY buffer**, not just org files. That
 is the point: the thought you are trying not to lose arrives while you are
@@ -582,9 +599,18 @@ A link with no description keeps its target on screen —
 `[[https://example.com]]` reads as `https://example.com` — because hiding
 the only text a link has would leave nothing to see or click.
 
-**Insert mode shows the raw text again**, everywhere in the buffer, so
-editing a link is editing exactly what is on disk. Leaving Insert puts the
-rendered form back. Normal is for reading, Insert is for editing.
+**And it is coloured**, so you can tell a link is under the cursor without
+following it. That matters more here than it looks: once the brackets are
+hidden, a link with no styling is indistinguishable from prose. The colour
+comes from your colourscheme (a described link takes the reference style, a
+bare one the URL style), so it changes with `:colorscheme` like everything
+else.
+
+**Insert mode shows the raw text again — on the line you are editing.** The
+rest of the buffer stays rendered. That is vim's `concealcursor` behaviour and
+the reason for it is the same: you reveal in order to edit the thing under the
+cursor, and the other links on screen have no reason to turn back into
+`[[id:…][…]]`. Leaving Insert puts the line back.
 
 Internal references match the headline **title** exactly, so a `TODO` keyword
 or priority on the target does not get in the way, and case matters. A

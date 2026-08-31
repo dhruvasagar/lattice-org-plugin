@@ -40,20 +40,46 @@
 //!
 //! ## What counts as a row
 //!
-//! An open headline (one whose TODO keyword is not a *done* keyword) carrying
-//! a date, from one of three places, in priority order:
+//! An open headline (one whose TODO keyword is not a *done* keyword) that
+//! carries **either** a date **or** a TODO keyword.
+//!
+//! A date comes from one of three places, in priority order:
 //!
 //!   1. `DEADLINE: <2026-08-25 Tue>` on the planning line,
 //!   2. `SCHEDULED: <2026-08-25 Tue>` on the planning line,
 //!   3. a plain **active** timestamp `<2026-08-25 Tue>` on the headline itself.
 //!
-//! An **inactive** stamp `[2026-08-25 Tue]` never makes a row — that is what
-//! inactive means in org, and treating it as one would drag every logbook
+//! An **inactive** stamp `[2026-08-25 Tue]` never dates a row — that is what
+//! inactive means in org, and treating it as a date would drag every logbook
 //! entry and every `CLOSED:` line into the agenda.
 //!
-//! A headline with NO keyword and no date is not a row. A headline with a
-//! *done* keyword is not a row, dated or not: org hides completed entries by
-//! default, and an agenda that lists what you finished is a log, not a plan.
+//! **AS.1 made the date optional**, and it is the largest behavioural change
+//! this module has had. A `* TODO Write the thing` with no plan was previously
+//! not a row under any configuration, so the most ordinary line in anyone's
+//! org file could not reach the view whose job is to show you your tasks. It
+//! is an undated row now, and the "Unscheduled" section displays it.
+//!
+//! A headline with NO keyword and no date is still not a row: that is prose
+//! structure, and admitting it would make the agenda a table of contents. A
+//! headline with a *done* keyword is not a row, dated or not — org hides
+//! completed entries by default, and an agenda that lists what you finished is
+//! a log, not a plan.
+//!
+//! ## Sections (AS.1)
+//!
+//! A row is a CANDIDATE. Each [`Section`] decides whether it wants it, so one
+//! headline can produce several `entry` values — an overdue `[#A]` TODO is
+//! emitted three times, under Overdue, under its date, and under the priority
+//! block. That is a dashboard behaving as intended rather than a duplicate:
+//! `append_excerpts` does not dedup, so two excerpts over one source range are
+//! simply two rows of one view.
+//!
+//! **The mechanism needs no ABI change and no host change**, which is why it
+//! lives entirely here. The host stable-sorts on `sort-key`, groups rows into
+//! runs of equal `group`, and titles the first row of each run with `label` —
+//! all three opaque and guest-owned, as `scanned-excerpt-source.wit` says.
+//! Making a section's rows a contiguous run is therefore just "give them the
+//! same leading digits", which is what [`sort_key_in_section`] does.
 //!
 //! ## The excerpt spans the planning line
 //!
@@ -87,7 +113,21 @@ impl Kind {
     }
 }
 
-/// One agenda row, before it becomes a WIT `entry`.
+/// When a row is due, and where that date came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dated {
+    /// Days since the Unix epoch.
+    pub day: i64,
+    pub kind: Kind,
+}
+
+/// One agenda row, before it becomes one or more WIT `entry` values.
+///
+/// AS.1: "one or more". A row is a candidate, and each SECTION decides whether
+/// it wants it — so a `[#A]` item scheduled for yesterday is emitted three
+/// times, under Overdue, under its date, and under the priority block. The
+/// host does not dedup excerpts, which is what makes that legal rather than a
+/// hack: two excerpts over the same source range are two rows of one view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     /// 0-based line of the headline.
@@ -95,11 +135,40 @@ pub struct Row {
     /// 0-based last line of the row's excerpt, inclusive — the planning line
     /// when there is one, else the headline itself.
     pub end_line: u32,
-    /// Days since the Unix epoch.
-    pub day: i64,
-    pub kind: Kind,
+    /// The date this row is filed under, or `None` for a TODO carrying no plan
+    /// and no inline stamp.
+    ///
+    /// AS.1 made this optional and that is the slice's largest behavioural
+    /// change. Undated rows were previously not rows at all — `row_for_section`
+    /// returned `None` the moment it found no stamp — so a `* TODO Write the
+    /// thing` with no `SCHEDULED:` could never appear in the agenda under any
+    /// circumstances. A whole class of task was invisible to the view whose
+    /// job is to show you your tasks.
+    pub date: Option<Dated>,
     /// `[#A]`, if the headline carries one.
     pub priority: Option<char>,
+    /// The TODO keyword the headline carries, if any. `None` means a plain
+    /// dated headline — an appointment rather than a task.
+    ///
+    /// Needed because a section filters on it: "unscheduled TODOs" must not
+    /// sweep up every undated plain headline in the corpus, which is most of
+    /// them.
+    pub keyword: Option<String>,
+}
+
+impl Row {
+    /// The day this row sorts under. Undated rows sort as if today, so they
+    /// land beside — not centuries away from — everything else in whatever
+    /// section takes them.
+    fn sort_day(&self, today: i64) -> i64 {
+        self.date.map(|d| d.day).unwrap_or(today)
+    }
+
+    fn kind_rank(&self) -> i64 {
+        // Undated ranks after every dated kind: within a section that mixes
+        // them, a thing with a date is the more urgent thing.
+        self.date.map(|d| d.kind.rank()).unwrap_or(3)
+    }
 }
 
 /// The keyword sets a scan reads headlines against. Captured once per scan
@@ -185,18 +254,27 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
 
     // OT.5: the plan's entries, read as nodes. See `plan_date`.
     let from_plan = plan.as_ref().and_then(|p| plan_date(p, lines));
-    let (kind, stamp, from_plan) = match from_plan {
-        Some((kind, stamp)) => (kind, stamp, true),
+    let dated = match from_plan {
+        Some((kind, stamp)) => Some((kind, stamp, true)),
         // No dated plan entry: the headline's own inline timestamp, which the
         // grammar does NOT model — see `plan_date`.
-        None => {
-            let stamp = timestamp::first_stamp(headline_text)?;
-            if !stamp.active {
-                return None;
-            }
-            (Kind::Timestamp, stamp, false)
-        }
+        None => timestamp::first_stamp(headline_text)
+            .filter(|s| s.active)
+            .map(|stamp| (Kind::Timestamp, stamp, false)),
     };
+
+    // AS.1: no date is no longer no row. Before this, an undated headline
+    // returned `None` here and left the agenda — so `* TODO Write the thing`
+    // was unreachable from the view whose job is to show your tasks. It is a
+    // row now, with `date: None`, and the SECTIONS decide whether anything
+    // wants it. A headline with neither a date NOR a keyword is still not a
+    // row: that is ordinary prose structure, and admitting it would make the
+    // agenda a table of contents.
+    if dated.is_none() && parsed.keyword.is_none() {
+        return None;
+    }
+
+    let from_plan = dated.as_ref().map(|(_, _, p)| *p).unwrap_or(false);
     Some(Row {
         line: headline_line,
         // When the date came from the plan the excerpt spans down to it, so the
@@ -207,9 +285,12 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
             (true, Some((_, last))) => last,
             _ => headline_line,
         },
-        day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
-        kind,
+        date: dated.map(|(kind, stamp, _)| Dated {
+            day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
+            kind,
+        }),
         priority: parsed.priority,
+        keyword: parsed.keyword.map(str::to_string),
     })
 }
 
@@ -313,9 +394,15 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
         // inside the body — or worse, one belonging to a child headline whose
         // stars have not been reached yet — date the wrong entry.
         let planning = lines.get(i + 1).copied().unwrap_or("");
-        let Some((kind, stamp, spans_planning)) = date_for(line, planning) else {
+        let dated = date_for(line, planning);
+        // AS.1, mirroring `row_for_section`: undated is a row when it carries
+        // a keyword, and not a row otherwise. The two paths must agree on what
+        // IS a row or the agenda would gain and lose whole sections depending
+        // on whether the host happened to have an org grammar loaded.
+        if dated.is_none() && headline.keyword.is_none() {
             continue;
-        };
+        }
+        let spans_planning = dated.as_ref().map(|(_, _, s)| *s).unwrap_or(false);
         rows.push(Row {
             line: i as u32,
             end_line: if spans_planning {
@@ -323,9 +410,12 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
             } else {
                 i as u32
             },
-            day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
-            kind,
+            date: dated.map(|(kind, stamp, _)| Dated {
+                day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
+                kind,
+            }),
             priority: headline.priority,
+            keyword: headline.keyword.map(str::to_string),
         });
     }
     rows
@@ -405,19 +495,209 @@ pub fn group_label(day: i64, today: i64) -> String {
 
 /// The `sort-key` the host stable-sorts every file's rows on.
 ///
-/// Day dominates; within a day, kind; within a kind, priority. Packed into
-/// one `i64` because the ABI carries exactly one number — and packed with a
-/// wide multiplier so a future tiebreaker has room rather than needing an
-/// ABI change to add one.
+/// Section dominates; then day; within a day, kind; within a kind, priority.
+/// Packed into one `i64` because the ABI carries exactly one number — and
+/// packed with wide multipliers so a future tiebreaker has room rather than
+/// needing an ABI change to add one.
+///
+/// **Section rank in the high digits is the whole of the multi-section
+/// mechanism** (AS.1). The host stable-sorts on this number and knows nothing
+/// else about ordering, so making a section's rows sort as one contiguous run
+/// is exactly "give them all the same leading digits". No ABI change, no host
+/// change: `sort-key` was always documented as "the guest owns what it means".
 ///
 /// `A` sorts before `B` before "no priority", which is org's order: an
 /// unprioritised item is not urgent, it is unranked.
-pub fn sort_key(row: &Row) -> i64 {
+///
+/// `DAY_BIAS` keeps the day term non-negative so a pre-epoch date cannot
+/// borrow into the section digits and file a 1969 row under the wrong
+/// section. It covers ±1000 years, well past any date org's parser accepts.
+const DAY_BIAS: i64 = 400_000;
+
+pub fn sort_key_in_section(row: &Row, section_rank: i64, today: i64) -> i64 {
     let priority = match row.priority {
         Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as i64) - ('A' as i64),
         _ => 100,
     };
-    row.day * 10_000 + row.kind.rank() * 1_000 + priority
+    section_rank * 10_000_000_000_000
+        + (row.sort_day(today) + DAY_BIAS) * 10_000
+        + row.kind_rank() * 1_000
+        + priority
+}
+
+/// Which rows a section takes. Deliberately DATA rather than a predicate
+/// closure: AS.2 makes this set writable from `lattice.toml` and from
+/// `init.rs`, and a filter that is data can be parsed from a config file
+/// while a closure cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Filter {
+    pub when: When,
+    /// Only rows carrying a not-done TODO keyword. `false` also admits plain
+    /// dated headlines — appointments, which belong in a date view and not in
+    /// a task list.
+    pub todo_only: bool,
+    /// Highest priority letter admitted, inclusive: `Some('A')` takes only
+    /// `[#A]`, `Some('B')` takes `[#A]` and `[#B]`.
+    pub min_priority: Option<char>,
+}
+
+/// The date window a section admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum When {
+    /// Dated strictly before today. Org surfaces these hardest, because a
+    /// missed deadline the view stays quiet about is the failure the tool
+    /// exists to prevent.
+    Overdue,
+    /// `today ..= today + n`. `Days(0)` is emacs's daily agenda, `Days(6)` its
+    /// week.
+    Days(u32),
+    /// No date at all — the class that was invisible before AS.1.
+    Undated,
+    /// Every row, dated or not.
+    Any,
+}
+
+impl When {
+    /// Does this window group its rows by DATE (a header per day, as the
+    /// classic agenda does) or as one block under the section's own title?
+    ///
+    /// Date-grouping only makes sense where every row has a date and the dates
+    /// differ, so it follows from the window rather than being a second knob
+    /// the two could disagree on.
+    fn groups_by_date(self) -> bool {
+        matches!(self, When::Overdue | When::Days(_))
+    }
+
+    fn admits(self, row: &Row, today: i64) -> bool {
+        match (self, row.date) {
+            (When::Any, _) => true,
+            (When::Undated, None) => true,
+            (When::Undated, Some(_)) => false,
+            (_, None) => false,
+            (When::Overdue, Some(d)) => d.day < today,
+            (When::Days(n), Some(d)) => d.day >= today && d.day <= today + i64::from(n),
+        }
+    }
+}
+
+/// One block of the agenda: a title and the rows it takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    pub title: String,
+    pub filter: Filter,
+}
+
+impl Section {
+    fn admits(&self, row: &Row, keywords: &Keywords, today: i64) -> bool {
+        if !self.filter.when.admits(row, today) {
+            return false;
+        }
+        if self.filter.todo_only {
+            // A not-done keyword. `row_for_section` already dropped DONE rows,
+            // so the test that matters here is "carries a keyword at all".
+            match row.keyword.as_deref() {
+                Some(k) if !keywords.is_done(Some(k)) => {}
+                _ => return false,
+            }
+        }
+        if let Some(min) = self.filter.min_priority {
+            let Some(p) = row.priority else {
+                return false;
+            };
+            if p.to_ascii_uppercase() > min.to_ascii_uppercase() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The shipped section set, in render order.
+///
+/// Chosen against emacs org-agenda's own defaults and the composite
+/// `org-agenda-custom-commands` dashboards people actually write:
+///
+/// 1. **Overdue** first, because it is the one org surfaces hardest and the
+///    one a user most needs to see before deciding what to do today.
+/// 2. **The dated agenda**, which is what this view was before AS.1, scoped to
+///    a span rather than to every date the corpus happens to contain.
+/// 3. **Unscheduled TODOs**, previously invisible entirely.
+/// 4. **Priority A**, a standing "what matters" block that deliberately
+///    overlaps the three above — a row appearing twice is the point of a
+///    dashboard, not a bug in one.
+///
+/// AS.2 makes this the FALLBACK rather than the law: a user's own section list
+/// replaces it wholesale.
+pub fn default_sections(span: u32) -> Vec<Section> {
+    vec![
+        Section {
+            title: "Overdue".to_string(),
+            filter: Filter {
+                when: When::Overdue,
+                todo_only: true,
+                min_priority: None,
+            },
+        },
+        Section {
+            title: "Agenda".to_string(),
+            filter: Filter {
+                when: When::Days(span),
+                todo_only: false,
+                min_priority: None,
+            },
+        },
+        Section {
+            title: "Unscheduled".to_string(),
+            filter: Filter {
+                when: When::Undated,
+                todo_only: true,
+                min_priority: None,
+            },
+        },
+        Section {
+            title: "Priority A".to_string(),
+            filter: Filter {
+                when: When::Any,
+                todo_only: true,
+                min_priority: Some('A'),
+            },
+        },
+    ]
+}
+
+/// What one row contributes to the view: `(group_key, label, sort_key)` per
+/// section that takes it, in section order.
+///
+/// The group key is prefixed with the section's rank even when the section
+/// groups by date, and that prefix is load-bearing: two sections can both
+/// contain 2026-08-25, and an unprefixed ISO key would make the host see one
+/// run spanning a section boundary and title only the first of them.
+pub fn entries_for_row(
+    row: &Row,
+    sections: &[Section],
+    keywords: &Keywords,
+    today: i64,
+) -> Vec<(String, String, i64)> {
+    let mut out = Vec::new();
+    for (rank, section) in sections.iter().enumerate() {
+        if !section.admits(row, keywords, today) {
+            continue;
+        }
+        let rank = rank as i64;
+        let (key, label) = match (section.filter.when.groups_by_date(), row.date) {
+            (true, Some(d)) => (
+                format!("{rank}:{}", group_key(d.day)),
+                format!("{} — {}", section.title, group_label(d.day, today)),
+            ),
+            // One block under the section's own title. Also the honest answer
+            // for a date-grouping section handed an undated row, which
+            // `When::admits` makes unreachable but which must not silently
+            // produce a header reading the epoch if that ever changes.
+            _ => (format!("{rank}:"), section.title.clone()),
+        };
+        out.push((key, label, sort_key_in_section(row, rank, today)));
+    }
+    out
 }
 
 /// Inverse of [`timestamp::epoch_day`] — Hinnant's `civil_from_days`.
@@ -461,12 +741,12 @@ mod tests {
             scan("* TODO Ship it\n  SCHEDULED: <2026-08-30 Sun> DEADLINE: <2026-08-26 Wed>\n");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].kind,
+            rows[0].date.expect("dated").kind,
             Kind::Scheduled,
             "the text path takes the keyword it finds first"
         );
         assert_eq!(
-            rows[0].day,
+            rows[0].date.expect("dated").day,
             timestamp::epoch_day(2026, 8, 30),
             "...and with it the later date"
         );
@@ -514,8 +794,11 @@ mod tests {
             rows[0].end_line, 1,
             "the excerpt shows the date, not just the title"
         );
-        assert_eq!(rows[0].kind, Kind::Scheduled);
-        assert_eq!(rows[0].day, timestamp::epoch_day(2026, 8, 25));
+        assert_eq!(rows[0].date.expect("dated").kind, Kind::Scheduled);
+        assert_eq!(
+            rows[0].date.expect("dated").day,
+            timestamp::epoch_day(2026, 8, 25)
+        );
     }
 
     /// Both present: org sorts it as the deadline, so the deadline wins.
@@ -524,15 +807,18 @@ mod tests {
         let rows =
             scan("* TODO Ship it\n  DEADLINE: <2026-08-20 Thu> SCHEDULED: <2026-08-25 Tue>\n");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, Kind::Deadline);
-        assert_eq!(rows[0].day, timestamp::epoch_day(2026, 8, 20));
+        assert_eq!(rows[0].date.expect("dated").kind, Kind::Deadline);
+        assert_eq!(
+            rows[0].date.expect("dated").day,
+            timestamp::epoch_day(2026, 8, 20)
+        );
     }
 
     #[test]
     fn an_active_timestamp_on_the_headline_is_a_row() {
         let rows = scan("* Meeting <2026-08-25 Tue 10:30>\n");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, Kind::Timestamp);
+        assert_eq!(rows[0].date.expect("dated").kind, Kind::Timestamp);
         assert_eq!(
             rows[0].end_line, 0,
             "no planning line, so the excerpt is the headline alone"
@@ -541,10 +827,26 @@ mod tests {
 
     /// The distinction the whole inactive-stamp syntax exists for. Counting
     /// these would drag every logbook line and every `CLOSED:` into the view.
+    ///
+    /// AS.1 narrowed what this can assert, and the narrowing is the feature.
+    /// An inactive stamp still contributes no DATE — but a headline carrying a
+    /// TODO keyword is now an undated row rather than nothing, so the second
+    /// case below is a row whose `date` is `None`. The claim being pinned is
+    /// therefore "an inactive stamp never dates a row", which is what the
+    /// syntax means; "an inactive stamp means no row at all" was only ever
+    /// true because undated rows did not exist.
     #[test]
-    fn an_inactive_timestamp_is_never_a_row() {
+    fn an_inactive_timestamp_never_dates_a_row() {
+        // No keyword and no active stamp: still not a row at all.
         assert!(scan("* Meeting [2026-08-25 Tue]\n").is_empty());
-        assert!(scan("* TODO Ship it\n  CLOSED: [2026-08-20 Thu]\n").is_empty());
+
+        // A keyword makes it a row — but `CLOSED:` did not date it.
+        let rows = scan("* TODO Ship it\n  CLOSED: [2026-08-20 Thu]\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].date, None,
+            "an inactive stamp must not date the row it sits under"
+        );
     }
 
     /// An agenda that lists what you finished is a log, not a plan.
@@ -560,9 +862,24 @@ mod tests {
         );
     }
 
+    /// AS.1 inverted this, and it is the slice's headline behaviour change.
+    ///
+    /// An undated TODO used to be invisible to the agenda under every
+    /// configuration — so `* TODO Write the thing`, the single most ordinary
+    /// line in anyone's org file, could not reach the view whose job is to
+    /// show you your tasks. It is a row now, with no date, and the
+    /// "Unscheduled" section is what displays it.
+    ///
+    /// The old rule survives for headlines with NO keyword: those are prose
+    /// structure, and admitting them would turn the agenda into a table of
+    /// contents.
     #[test]
-    fn an_undated_headline_is_not_a_row() {
-        assert!(scan("* TODO Ship it\nbody\n* Another\n").is_empty());
+    fn an_undated_todo_is_a_row_but_an_undated_plain_headline_is_not() {
+        let rows = scan("* TODO Ship it\nbody\n* Another\n");
+        assert_eq!(rows.len(), 1, "the TODO is a row, got {rows:?}");
+        assert_eq!(rows[0].line, 0);
+        assert_eq!(rows[0].date, None, "and it carries no date");
+        assert_eq!(rows[0].keyword.as_deref(), Some("TODO"));
     }
 
     /// Only the line immediately below. A `SCHEDULED:` deeper in the body
@@ -571,15 +888,25 @@ mod tests {
     /// agenda and jump the user to the wrong line.
     #[test]
     fn only_the_line_below_the_headline_is_a_planning_line() {
+        // AS.1: the parent is now an undated row rather than no row, so the
+        // claim is that the stray `SCHEDULED:` did not DATE it — which is the
+        // thing this test was always about.
         let rows = scan("* TODO Parent\n\n  SCHEDULED: <2026-08-25 Tue>\n");
-        assert!(
-            rows.is_empty(),
-            "a blank line ends the planning position, got {rows:?}"
+        assert_eq!(rows.len(), 1, "got {rows:?}");
+        assert_eq!(
+            rows[0].date, None,
+            "a blank line ends the planning position, so nothing dated it"
         );
 
         let rows = scan("* TODO Parent\n** TODO Child\n  SCHEDULED: <2026-08-25 Tue>\n");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].line, 1, "the CHILD is the dated row");
+        assert_eq!(rows.len(), 2, "both headlines are rows; got {rows:?}");
+        assert_eq!(rows[0].line, 0);
+        assert_eq!(rows[0].date, None, "the PARENT is undated");
+        assert_eq!(rows[1].line, 1, "the CHILD is the dated row");
+        assert_eq!(
+            rows[1].date.expect("child is dated").day,
+            timestamp::epoch_day(2026, 8, 25)
+        );
     }
 
     /// A file with no headlines at all is empty, not an error — the scan
@@ -596,10 +923,14 @@ mod tests {
         let row = |day, kind, priority| Row {
             line: 0,
             end_line: 0,
-            day,
-            kind,
+            date: Some(Dated { day, kind }),
             priority,
+            keyword: Some("TODO".to_string()),
         };
+        // AS.1 packs a section rank above the day term. Rank 0 throughout
+        // here: this test is about ordering WITHIN a section, and the
+        // cross-section ordering has its own test below.
+        let sort_key = |r: &Row| sort_key_in_section(r, 0, 0);
         let d0 = timestamp::epoch_day(2026, 8, 25);
         let d1 = timestamp::epoch_day(2026, 8, 26);
 
@@ -629,17 +960,182 @@ mod tests {
     /// Negative days (pre-1970) must not break the packing. `day * 10_000`
     /// with a positive kind/priority offset stays monotone only if the
     /// offsets are smaller than the multiplier — this is that assertion.
+    ///
+    /// AS.1 raised the stakes. A section rank now sits ABOVE the day term, so
+    /// a negative day does not merely mis-sort within a section: it borrows
+    /// into the rank digits and files a 1969 row under a different section
+    /// entirely. `DAY_BIAS` is what stops that, and the last assertion is the
+    /// one that catches its removal.
     #[test]
     fn sort_keys_stay_ordered_for_dates_before_the_epoch() {
         let row = |y, m, d| Row {
             line: 0,
             end_line: 0,
-            day: timestamp::epoch_day(y, m, d),
-            kind: Kind::Timestamp,
+            date: Some(Dated {
+                day: timestamp::epoch_day(y, m, d),
+                kind: Kind::Timestamp,
+            }),
             priority: None,
+            keyword: Some("TODO".to_string()),
         };
+        let sort_key = |r: &Row| sort_key_in_section(r, 0, 0);
         assert!(sort_key(&row(1969, 12, 31)) < sort_key(&row(1970, 1, 1)));
         assert!(sort_key(&row(1900, 1, 1)) < sort_key(&row(1969, 12, 31)));
+
+        // A pre-epoch row in section 1 still sorts after EVERY row of section
+        // 0, however far in the future those are.
+        assert!(
+            sort_key_in_section(&row(2999, 12, 31), 0, 0)
+                < sort_key_in_section(&row(1900, 1, 1), 1, 0),
+            "section rank must dominate the day term in both directions"
+        );
+    }
+
+    // ── sections (AS.1) ─────────────────────────────────────────────────
+
+    fn kw() -> Keywords {
+        Keywords::from_spec("TODO NEXT | DONE")
+    }
+
+    fn r(day: Option<i64>, priority: Option<char>, keyword: Option<&str>) -> Row {
+        Row {
+            line: 0,
+            end_line: 0,
+            date: day.map(|day| Dated {
+                day,
+                kind: Kind::Scheduled,
+            }),
+            priority,
+            keyword: keyword.map(str::to_string),
+        }
+    }
+
+    /// The four shipped sections, each taking what it says it takes.
+    #[test]
+    fn each_default_section_admits_exactly_its_own_rows() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let titles = |row: &Row| -> Vec<String> {
+            entries_for_row(row, &s, &kw(), today)
+                .into_iter()
+                .enumerate()
+                .map(|(_, (key, _, _))| key.split(':').next().unwrap().to_string())
+                .collect()
+        };
+
+        // Yesterday's TODO: Overdue (0) only — it is outside the forward span.
+        assert_eq!(titles(&r(Some(today - 1), None, Some("TODO"))), ["0"]);
+        // Today's TODO: the dated section (1).
+        assert_eq!(titles(&r(Some(today), None, Some("TODO"))), ["1"]);
+        // Day 7 is inside a span of 7; day 8 is outside and lands nowhere.
+        assert_eq!(titles(&r(Some(today + 7), None, Some("TODO"))), ["1"]);
+        assert!(titles(&r(Some(today + 8), None, Some("TODO"))).is_empty());
+        // Undated TODO: Unscheduled (2) — the class AS.1 made visible.
+        assert_eq!(titles(&r(None, None, Some("TODO"))), ["2"]);
+        // A plain dated headline is an appointment: the date section takes it,
+        // the task sections do not.
+        assert_eq!(titles(&r(Some(today), None, None)), ["1"]);
+    }
+
+    /// A row landing in several sections is the point of a dashboard, and the
+    /// host permits it because `append_excerpts` does not dedup.
+    #[test]
+    fn one_row_can_appear_in_several_sections() {
+        let today = 20_000;
+        let s = default_sections(7);
+        // Overdue, a TODO, and `[#A]`: Overdue + Priority A. Not the dated
+        // section — it is in the past.
+        let out = entries_for_row(
+            &r(Some(today - 3), Some('A'), Some("TODO")),
+            &s,
+            &kw(),
+            today,
+        );
+        let ranks: Vec<&str> = out
+            .iter()
+            .map(|(k, _, _)| k.split(':').next().unwrap())
+            .collect();
+        assert_eq!(ranks, ["0", "3"], "overdue and priority-A, got {out:?}");
+
+        // Every emitted key sorts in its own section's band, so the host's
+        // stable sort cannot interleave them.
+        assert!(out[0].2 < out[1].2);
+    }
+
+    /// `min_priority` is a CEILING on the letter: `B` admits A and B.
+    #[test]
+    fn min_priority_admits_everything_at_least_that_urgent() {
+        let today = 20_000;
+        let s = vec![Section {
+            title: "Important".to_string(),
+            filter: Filter {
+                when: When::Any,
+                todo_only: true,
+                min_priority: Some('B'),
+            },
+        }];
+        let took = |p: Option<char>| {
+            !entries_for_row(&r(None, p, Some("TODO")), &s, &kw(), today).is_empty()
+        };
+        assert!(took(Some('A')));
+        assert!(took(Some('B')));
+        assert!(!took(Some('C')));
+        assert!(!took(None), "unprioritised is unranked, not urgent");
+    }
+
+    /// Two sections can both contain the same DATE, and the group key must
+    /// keep them apart — otherwise the host sees one run spanning a section
+    /// boundary and titles only the first of them, silently merging the two.
+    #[test]
+    fn group_keys_do_not_collide_across_sections_on_one_date() {
+        let today = 20_000;
+        // Two date-grouping sections whose windows overlap on `today`.
+        let s = vec![
+            Section {
+                title: "First".to_string(),
+                filter: Filter {
+                    when: When::Days(0),
+                    todo_only: true,
+                    min_priority: None,
+                },
+            },
+            Section {
+                title: "Second".to_string(),
+                filter: Filter {
+                    when: When::Days(7),
+                    todo_only: true,
+                    min_priority: None,
+                },
+            },
+        ];
+        let out = entries_for_row(&r(Some(today), None, Some("TODO")), &s, &kw(), today);
+        assert_eq!(out.len(), 2);
+        assert_ne!(
+            out[0].0, out[1].0,
+            "same date in two sections must not share a group key"
+        );
+        assert!(out[0].0.starts_with("0:") && out[1].0.starts_with("1:"));
+    }
+
+    /// A non-date-grouping section renders ONE header, its own title — not a
+    /// header per day, which for "Unscheduled" would be a header per nothing.
+    #[test]
+    fn a_block_section_labels_every_row_with_one_title() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let a = entries_for_row(&r(None, None, Some("TODO")), &s, &kw(), today);
+        let b = entries_for_row(&r(None, None, Some("NEXT")), &s, &kw(), today);
+        assert_eq!(a[0].0, b[0].0, "one group key for the whole block");
+        assert_eq!(a[0].1, "Unscheduled");
+        assert_eq!(b[0].1, "Unscheduled");
+    }
+
+    /// A done row is not a row at all, so no section can resurrect it — the
+    /// scan drops it before sections are consulted.
+    #[test]
+    fn no_section_can_admit_a_done_row() {
+        assert!(scan("* DONE Ship it\n").is_empty());
+        assert!(scan("* DONE Ship it\n  SCHEDULED: <2026-08-25 Tue>\n").is_empty());
     }
 
     // ── grouping ────────────────────────────────────────────────────────

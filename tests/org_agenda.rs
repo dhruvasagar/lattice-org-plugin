@@ -289,39 +289,60 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
     let handle = mb.handle(view).expect("the view is still open");
     let excerpts = handle.excerpts();
 
-    // Four rows, and the misses are as load-bearing as the hits:
+    // Five rows, and the misses are as load-bearing as the hits:
     //   * `main.rs` contributes nothing — nothing claimed `.rs`, so it was
     //     never read (its `* TODO Top` would be here if it had been);
     //   * `DONE Already shipped` is filtered — an agenda listing what you
     //     finished is a log, not a plan;
-    //   * `TODO No date on this one` is filtered — undated is not agenda-able;
-    //   * `Old note [<date>]` is filtered — an INACTIVE stamp is never a row.
-    assert_eq!(excerpts.len(), 4, "got {status:?}");
+    //   * `Old note [<date>]` is filtered — an INACTIVE stamp never dates a
+    //     row, and with no keyword it is not a row at all;
+    //   * `Groceries` is filtered — a plain undated headline is prose
+    //     structure, not a task.
+    //
+    // AS.1 changed this count from four. `TODO No date on this one` used to
+    // be filtered as "undated is not agenda-able"; it is the fifth row now,
+    // under Unscheduled. That rule was the bug — an undated TODO is the most
+    // ordinary line in an org file and it could not reach the agenda at all.
+    assert_eq!(excerpts.len(), 5, "got {status:?}");
 
-    // --- The headline claim of OM.A2: rows interleave ACROSS files by date.
+    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
+
+    // --- AS.1: rows arrive in SECTION blocks, and a section is a contiguous
+    // run because the guest packs its rank into the high digits of the
+    // `sort_key` the host orders on. Nothing host-side knows sections exist.
+    assert!(
+        titles[0].starts_with("Overdue"),
+        "the overdue block leads, got {titles:?}"
+    );
+    assert!(
+        titles[0].contains("overdue by 2 day(s)"),
+        "…and a date-grouping section still dates its header, got {titles:?}"
+    );
+    assert!(
+        titles[1].starts_with("Agenda") && titles[1].contains("(tomorrow)"),
+        "then the dated block, got {titles:?}"
+    );
+    assert!(
+        titles[3].starts_with("Agenda") && titles[3].contains("in 3 day(s)"),
+        "…still ordered by date within the block, got {titles:?}"
+    );
+    assert_eq!(
+        titles[4], "Unscheduled",
+        "and the undated TODO closes the view under its own block"
+    );
+
+    // --- The headline claim of OM.A2, UNCHANGED by sections: rows interleave
+    // ACROSS files by date *within* a block.
     //
     // home.org holds both the earliest (deadline, 2 days ago) and the latest
     // (scheduled, in 3 days). If each file's rows were merely concatenated,
     // those two would be adjacent — this ordering is only reachable through
     // the cross-file sort on the guest's `sort_key`.
-    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
-    assert!(
-        titles[0].contains("overdue by 2 day(s)"),
-        "the overdue deadline leads, got {titles:?}"
-    );
-    assert!(
-        titles[1].contains("(tomorrow)"),
-        "then tomorrow's group, got {titles:?}"
-    );
     assert_eq!(
         titles[2], "",
         "…whose SECOND row continues the group and renders no header — and it \
          came from a different FILE, which is the property a per-file grouping \
          could not express"
-    );
-    assert!(
-        titles[3].contains("in 3 day(s)"),
-        "then the furthest-out group, got {titles:?}"
     );
 
     // Tomorrow's group is drawn from two different files, which is exactly
@@ -347,7 +368,7 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
 
     match status {
         HeaderlineStatus::Complete { summary, .. } => {
-            assert!(summary.contains("4 row(s)"), "got {summary}");
+            assert!(summary.contains("5 row(s)"), "got {summary}");
         }
         other => panic!("expected a Complete headerline, got {other:?}"),
     }

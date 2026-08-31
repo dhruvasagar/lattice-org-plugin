@@ -468,6 +468,17 @@ const DEFAULT_CAPTURE_TEMPLATES: &str = "";
 /// exactly as it did before this option existed.
 const DEFAULT_AGENDA_FILES: &str = "";
 
+/// AS.1: how many days past today the dated section spans. A string because it
+/// reaches the option seam alongside its peers and `option_or` is the one
+/// accessor; parsed with a fallback so a typo'd `:set org.agenda-span=soon`
+/// gives the default rather than an empty agenda.
+///
+/// `7` is emacs's `org-agenda-span` default in day units — a week counting
+/// today. `0` gives the daily agenda. There is deliberately no "everything"
+/// value: the unbounded view is exactly what AS.1 replaced, and it is the one
+/// that buries today under a year of someone's recurring reminders.
+const DEFAULT_AGENDA_SPAN: &str = "7";
+
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
 struct Component;
@@ -992,6 +1003,20 @@ impl Guest for Component {
              directory is walked; a file is scanned whatever its extension. \
              `~` is expanded. Blank lines and `#` comments are ignored. Unset \
              scans the project root, as before.",
+        );
+        // AS.1: the dated section's window. Registered as a String rather than
+        // an Integer to sit beside every other org option behind the one
+        // `option_or` accessor — the seam has an Integer kind, but mixing
+        // accessors for one subsystem's options buys nothing and costs a
+        // second code path that can disagree about what "unset" means.
+        let _ = register_option(
+            "agenda-span",
+            OptionType::String,
+            DEFAULT_AGENDA_SPAN,
+            "How many days past today the agenda's dated section covers. `7` \
+             is a week counting today (emacs's default); `0` is the daily \
+             agenda. Overdue items are shown by their own section regardless, \
+             so a short span does not hide a missed deadline.",
         );
         // OR.4: the corpus root. UNSET by default, and that default is the
         // feature's contract — see `roam_scan::roam_directory`.
@@ -2188,11 +2213,27 @@ impl Guest for Component {
     /// would change what counts as done halfway through the project, and an
     /// agenda that hides an entry in one file and shows its twin in another
     /// is not a stale answer, it is an incoherent one.
+    ///
+    /// AS.1 adds *the section set*, for the same reason and more sharply: a
+    /// section's rank is packed into every row's sort key, so a set that
+    /// changed mid-scan would file file A's rows under section 2 and file B's
+    /// identical rows under section 3, and the host — which sorts on that
+    /// number and knows nothing else — would interleave them into a view with
+    /// no coherent reading at all.
     fn begin() -> u64 {
         let today = today_epoch_day();
         let keywords = agenda::Keywords::from_spec(
             &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
         );
+        let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_else(|_| {
+                DEFAULT_AGENDA_SPAN
+                    .parse()
+                    .expect("the compiled-in default parses")
+            });
+        let sections = agenda::default_sections(span);
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host
@@ -2207,15 +2248,27 @@ impl Guest for Component {
         // here: a scan must be coherent against ONE anchor. Hashing them means
         // the host discards yesterday's cached rows the moment the day rolls,
         // without the host knowing that days or keywords exist.
+        //
+        // AS.1: the section set joins them, and it must — the sections decide
+        // which rows exist and under which header, so a cached scan from
+        // before a `:set org.agenda-span` would be answering the old question.
         let generation = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             today.hash(&mut h);
             keywords.all.hash(&mut h);
             keywords.done.hash(&mut h);
+            for s in &sections {
+                s.title.hash(&mut h);
+                s.filter.hash(&mut h);
+            }
             h.finish()
         };
-        SCAN.set(Some(ScanState { today, keywords }));
+        SCAN.set(Some(ScanState {
+            today,
+            keywords,
+            sections,
+        }));
         generation
     }
 
@@ -2241,14 +2294,23 @@ impl Guest for Component {
                 Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, &state.keywords),
                 None => agenda::scan_file(&text, &state.keywords),
             };
+            // AS.1: one row, zero or more entries. A row is a candidate and
+            // each section decides whether it wants it, so an overdue `[#A]`
+            // TODO is emitted three times and a headline nothing wants is
+            // emitted none. `flat_map` rather than `map` is the entire shape
+            // change at this seam — the ABI did not move.
             Ok(rows
                 .into_iter()
-                .map(|row| Entry {
-                    line: row.line,
-                    end_line: row.end_line,
-                    group: agenda::group_key(row.day),
-                    label: agenda::group_label(row.day, state.today),
-                    sort_key: agenda::sort_key(&row),
+                .flat_map(|row| {
+                    agenda::entries_for_row(&row, &state.sections, &state.keywords, state.today)
+                        .into_iter()
+                        .map(move |(group, label, sort_key)| Entry {
+                            line: row.line,
+                            end_line: row.end_line,
+                            group,
+                            label,
+                            sort_key,
+                        })
                 })
                 .collect())
         })
@@ -2259,6 +2321,10 @@ impl Guest for Component {
 struct ScanState {
     today: i64,
     keywords: agenda::Keywords,
+    /// AS.1: the blocks this scan files rows into, resolved once so every
+    /// file of one scan agrees on both the set and each section's RANK — the
+    /// rank is packed into the sort key the host orders on.
+    sections: Vec<agenda::Section>,
 }
 
 thread_local! {

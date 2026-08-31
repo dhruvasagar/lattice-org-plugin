@@ -621,15 +621,32 @@ fn highest_priority() -> char {
 /// written, which is why the host-side tests assert it.
 fn conceal_rules() -> Vec<ConcealRule> {
     vec![
-        // `[[target][description]]` → `description`.
+        // `[[target][description]]` → `description`, STYLED.
+        //
+        // OL.1: concealing alone made links less visible rather than more.
+        // The brackets and target disappear and what is left is prose, so
+        // nothing says `<CR>` under the cursor would go anywhere.
+        //
+        // The grammar cannot supply this: the pinned tree-sitter-org has no
+        // link node — links are undifferentiated `expr` tokens — and a
+        // `highlights.scm` rule naming an absent node fails to compile and
+        // takes the whole language registration with it. So the rule that
+        // already knows where a link is carries the style too, which also
+        // means the two cannot disagree about where one is.
+        //
+        // `text.reference` — "this stands for something else", which is what
+        // a description is. A builtin capture name, so a colourscheme styles
+        // it without org registering a theme element.
         ConcealRule {
             pattern: r"(\[\[[^]]+\]\[)[^]]+(\]\])".to_string(),
             hide: vec![1, 2],
+            slot: Some("text.reference".to_string()),
         },
-        // `[[target]]` → `target`.
+        // `[[target]]` → `target`, styled as the URL it is.
         ConcealRule {
             pattern: r"(\[\[)([^]]+)(\]\])".to_string(),
             hide: vec![1, 3],
+            slot: Some("text.uri".to_string()),
         },
     ]
 }
@@ -5707,11 +5724,11 @@ mod conceal_rule_tests {
     /// could agree with itself forever while disagreeing with the thing
     /// that actually renders the buffer.
     fn compiled() -> Vec<lattice_syntax::conceal::ConcealRule> {
-        let declared: Vec<(String, Vec<u32>)> = conceal_rules()
+        let declared: Vec<(String, Vec<u32>, Option<String>)> = conceal_rules()
             .into_iter()
-            .map(|r| (r.pattern, r.hide))
+            .map(|r| (r.pattern, r.hide, r.slot))
             .collect();
-        let (ok, errs) = compile_rules(&declared);
+        let (ok, errs) = compile_rules(&declared, None);
         assert!(
             errs.is_empty(),
             "org must ship rules the host accepts: {errs:?}"
@@ -5812,12 +5829,12 @@ mod conceal_rule_tests {
     /// Order-independence, from the side that declares the rules.
     #[test]
     fn declaring_them_the_other_way_round_renders_the_same() {
-        let mut declared: Vec<(String, Vec<u32>)> = conceal_rules()
+        let mut declared: Vec<(String, Vec<u32>, Option<String>)> = conceal_rules()
             .into_iter()
-            .map(|r| (r.pattern, r.hide))
+            .map(|r| (r.pattern, r.hide, r.slot))
             .collect();
         declared.reverse();
-        let (reversed, _) = compile_rules(&declared);
+        let (reversed, _) = compile_rules(&declared, None);
         for line in [
             "[[id:6F39][Project Kickoff]]",
             "see [[https://example.com]] ok",
@@ -5829,6 +5846,51 @@ mod conceal_rule_tests {
                 "{line}"
             );
         }
+    }
+
+    /// **OL.1: the part of a link that stays on screen is styled.**
+    ///
+    /// Reported as links rendering plain. Conceal made that worse rather than
+    /// milder — it hides the brackets and the target, so what remains is bare
+    /// prose with nothing saying `<CR>` under the cursor would go anywhere.
+    ///
+    /// Asserted DISJOINT from the concealed ranges, which is the whole point:
+    /// a style covering only the hidden bytes would look correct in a span
+    /// dump and paint nothing at all.
+    #[test]
+    fn ol1_the_visible_part_of_a_link_is_styled() {
+        use lattice_syntax::conceal::conceal_style_spans;
+        let rules = compiled();
+
+        let line = "see [[id:6F39][Project Kickoff]] ok";
+        let hidden = conceal_spans(&rules, line);
+        let styled = conceal_style_spans(&rules, line);
+        assert_eq!(styled.len(), 1, "one styled run: {styled:?}");
+        let (s, e, style) = styled[0];
+        assert_eq!(
+            &line[s as usize..e as usize],
+            "Project Kickoff",
+            "the DESCRIPTION survives conceal, so it is what gets styled"
+        );
+        assert_eq!(style, lattice_syntax::Style::Link);
+        for (hs, he) in &hidden {
+            assert!(
+                e <= *hs || s >= *he,
+                "styled {s}..{e} overlaps hidden {hs}..{he} — it would paint \
+                 bytes that are about to disappear"
+            );
+        }
+
+        // The bare form styles the target, which is what it shows.
+        let line = "see [[https://example.com]] ok";
+        let styled = conceal_style_spans(&rules, line);
+        assert_eq!(styled.len(), 1, "{styled:?}");
+        let (s, e, style) = styled[0];
+        assert_eq!(&line[s as usize..e as usize], "https://example.com");
+        assert_eq!(style, lattice_syntax::Style::Url);
+
+        // Prose is untouched — the rules match links, not bracket-ish text.
+        assert!(conceal_style_spans(&rules, "no links on this line").is_empty());
     }
 }
 

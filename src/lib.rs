@@ -130,6 +130,7 @@ wit_bindgen::generate!({
 });
 
 mod agenda;
+mod agenda_sections;
 mod archive;
 mod capture;
 mod capture_flow;
@@ -478,6 +479,14 @@ const DEFAULT_AGENDA_FILES: &str = "";
 /// value: the unbounded view is exactly what AS.1 replaced, and it is the one
 /// that buries today under a year of someone's recurring reminders.
 const DEFAULT_AGENDA_SPAN: &str = "7";
+
+/// AS.2: the section set, empty by default — which means the built-in one.
+///
+/// Empty rather than the built-in set spelled out as TOML, because the two
+/// would then be a pair that can drift: a change to `default_sections` would
+/// silently stop matching the string every `:describe-option` shows. Unset
+/// meaning "the defaults" keeps one definition of what the defaults are.
+const DEFAULT_AGENDA_SECTIONS: &str = "";
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -1017,6 +1026,21 @@ impl Guest for Component {
              is a week counting today (emacs's default); `0` is the daily \
              agenda. Overdue items are shown by their own section regardless, \
              so a short span does not hide a missed deadline.",
+        );
+        // AS.2: the section set, as TOML in a string — `capture-templates`'
+        // shape and its reason (an option is `boolean | integer | string`, so
+        // an array-of-tables cannot reach one at all). One option serves both
+        // config homes: `lattice.toml` sets it, and `init.rs` sets the same
+        // string through `config::set_option`. See `agenda_sections`.
+        let _ = register_option(
+            "agenda-sections",
+            OptionType::String,
+            DEFAULT_AGENDA_SECTIONS,
+            "The agenda's blocks, as TOML: one `[[section]]` per block with a \
+             `title`, a `when` (`overdue`, `days`, `undated` or `any`), and \
+             optionally `days`, `todo-only` and `min-priority`. A `days` \
+             section with no `days` uses `org.agenda-span`. Unset gives the \
+             built-in set: Overdue, Agenda, Unscheduled, Priority A.",
         );
         // OR.4: the corpus root. UNSET by default, and that default is the
         // feature's contract — see `roam_scan::roam_directory`.
@@ -2233,7 +2257,13 @@ impl Guest for Component {
                     .parse()
                     .expect("the compiled-in default parses")
             });
-        let sections = agenda::default_sections(span);
+        // AS.2: the user's set if `org.agenda-sections` holds one, the
+        // built-ins otherwise. Parsed on read and never cached, the
+        // `capture-templates` precedent — `:set org.agenda-sections=…` must
+        // land on the next scan, and a cache would need an `OptionChanged`
+        // subscription to stay honest.
+        let sections =
+            agenda_sections::resolve(&option_or("agenda-sections", DEFAULT_AGENDA_SECTIONS), span);
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host

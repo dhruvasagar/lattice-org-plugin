@@ -767,3 +767,174 @@ async fn the_agenda_files_option_decides_what_is_scanned() {
         "an unconfigured directory must not be scanned: {files:?}"
     );
 }
+
+/// **AS.2 — `org.agenda-sections` replaces the built-in blocks, and reaches
+/// the guest through the ordinary option seam.**
+///
+/// The whole of the "TOML *and* `init.rs`" answer is that there is one option
+/// and no new seam. This test drives it the way `lattice.toml` would (a
+/// `SetOption` effect carrying the same string); `init.rs` reaches the same
+/// option through `config::set_option`, which is already how a user sets
+/// `auto-pair.style`. Asserting through the REAL component matters here for
+/// the reason `agenda-files` does: a set that parses in a unit test but never
+/// crosses the ABI is a set nobody's agenda uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_sections_option_replaces_the_built_in_blocks() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        format!(
+            "* TODO Overdue thing\n  SCHEDULED: {}\n\
+             * TODO Soon thing\n  SCHEDULED: {}\n\
+             * TODO Undated thing\nbody\n",
+            stamp(-3),
+            stamp(1),
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    // A set that is deliberately NOT the built-in one: two blocks, renamed,
+    // in the opposite order (undated first). Neither the titles nor the
+    // ordering could come from the defaults, so a pass proves the option was
+    // read rather than ignored.
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-sections=[[section]]\n\
+               title = \"Inbox\"\n\
+               when = \"undated\"\n\
+               todo-only = true\n\
+               \n\
+               [[section]]\n\
+               title = \"Late\"\n\
+               when = \"overdue\"\n\
+               todo-only = true\n"
+            .to_string(),
+    });
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
+
+    // Two rows, not three: `Soon thing` is inside no configured block, and a
+    // row nothing takes is a row that does not appear. That is the option
+    // being a DECISION rather than an addition to the built-ins.
+    assert_eq!(excerpts.len(), 2, "got {status:?} titles={titles:?}");
+    assert_eq!(
+        titles[0], "Inbox",
+        "the user's first block leads, under the user's own title"
+    );
+    assert!(
+        titles[1].starts_with("Late"),
+        "…then the second, got {titles:?}"
+    );
+    // The order is the CONFIG's, not the built-ins' — undated is last in the
+    // default set and first here.
+    assert!(
+        !titles.iter().any(|t| t.contains("Unscheduled")),
+        "no built-in block survived, got {titles:?}"
+    );
+}
+
+/// A malformed set falls back to the built-ins and SAYS SO in the first
+/// header.
+///
+/// The guest cannot log — calling `logging::log` makes the component import
+/// `logging`, which org's multi-seam linker does not wire, so the whole
+/// component fails to instantiate (tried and reverted; see
+/// `agenda_sections`' module header). The section titles are the only channel
+/// this code owns, and an agenda that silently ignores your config is exactly
+/// the silent-failure class this codebase keeps paying for.
+///
+/// Falling back rather than showing nothing is the other half: an empty
+/// agenda and a correct-but-empty agenda look identical, and "you have no
+/// tasks" is the worst thing this view can say incorrectly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_section_set_falls_back_and_says_so_in_the_view() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        format!("* TODO Late thing\n  SCHEDULED: {}\n", stamp(-3)),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-sections=[[section]]\ntitle = ".to_string(),
+    });
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
+
+    // The row is still there — a broken config costs you your layout, never
+    // your tasks.
+    assert_eq!(excerpts.len(), 1, "got {status:?} titles={titles:?}");
+    assert!(
+        titles[0].contains("org.agenda-sections"),
+        "the view names the broken option, got {titles:?}"
+    );
+    assert!(
+        titles[0].contains("Overdue"),
+        "…and is still the built-in block it fell back to, got {titles:?}"
+    );
+}

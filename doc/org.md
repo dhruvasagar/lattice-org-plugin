@@ -646,8 +646,8 @@ network traffic you did not ask for.
 
 ## Agenda
 
-`:org-agenda` collects every dated headline across your org files into one
-view, ordered by date and grouped by day.
+`:org-agenda` collects your headlines across every org file into one view,
+grouped into **sections**.
 
 | | |
 |---|---|
@@ -682,7 +682,95 @@ still the right one for a repo with org files in it; the option is for the
 agenda that follows you between checkouts, which is what org means by an
 agenda. `:org-agenda ~/notes` overrides the option for one invocation.
 
-A row is an **open** headline carrying a date:
+### Sections
+
+The view ships as four blocks, in this order:
+
+| Block | What it holds |
+|---|---|
+| **Overdue** | dated in the past and not done — first, because a deadline the view stays quiet about is the failure the tool exists to prevent |
+| **Agenda** | today through `org.agenda-span` days out, grouped by day |
+| **Unscheduled** | TODOs with no date at all |
+| **Priority A** | `[#A]` items, whenever they are due |
+
+A headline can appear in **more than one** block — an overdue `[#A]` TODO is in
+Overdue and in Priority A. That is what a dashboard is for; each row is a live
+excerpt of the same source line, so editing either one edits the file.
+
+`org.agenda-span` is how far forward the dated block reaches. `7` (the default,
+as in emacs) is a week counting today; `0` gives the daily agenda. Overdue items
+have their own block regardless, so a short span never hides a missed deadline.
+
+```toml
+[org]
+agenda-span = "0"   # just today
+```
+
+#### Writing your own
+
+`org.agenda-sections` replaces the built-in set with yours. One `[[section]]`
+per block, rendered in the order you write them:
+
+```toml
+[org]
+agenda-sections = '''
+[[section]]
+title = "Inbox"
+when = "undated"
+todo-only = true
+
+[[section]]
+title = "Late"
+when = "overdue"
+todo-only = true
+
+[[section]]
+title = "This week"
+when = "days"
+days = 7
+
+[[section]]
+title = "Big rocks"
+when = "any"
+todo-only = true
+min-priority = "B"
+'''
+```
+
+| Key | Means |
+|---|---|
+| `title` | the block's header. Required |
+| `when` | `overdue`, `days`, `undated` or `any`. Required |
+| `days` | for `when = "days"`: how far forward. Defaults to `org.agenda-span` |
+| `todo-only` | only headlines carrying a TODO keyword. Default `false`, which also admits plain dated headlines — appointments |
+| `min-priority` | a single letter: `"B"` admits `[#A]` and `[#B]`. Unprioritised is unranked, not urgent, so it is never admitted |
+
+`when = "overdue"` and `when = "days"` group their rows **by day**, with a date
+header each. `undated` and `any` render one header — their own title.
+
+The same string works from `init.rs`, which is the same option by another door:
+
+```rust
+config::set_option("org.agenda-sections", r#"
+[[section]]
+title = "Inbox"
+when = "undated"
+todo-only = true
+"#);
+```
+
+Set it in neither place and you get the four built-in blocks. Set it in both and
+your `init.rs` wins, because that is how every option layers.
+
+If the TOML does not parse, the agenda **falls back to the built-in blocks and
+says so in the first header** rather than showing you nothing — an empty agenda
+and a genuinely empty agenda look identical, and "you have no tasks" is the
+worst thing this view can say incorrectly. One unusable section is skipped and
+the rest still render.
+
+### What counts as a row
+
+An **open** headline that carries a date, a TODO keyword, or both:
 
 ```org
 * TODO Ship the thing
@@ -690,7 +778,13 @@ A row is an **open** headline carrying a date:
 * TODO Water the plants
   SCHEDULED: <2026-08-29 Sat>
 * Standup <2026-08-26 Wed 09:30>
+* TODO Write the thing
 ```
+
+The last one has no date, and it is still a row — the Unscheduled block is
+where it lands. A plain headline with neither a date nor a keyword is **not** a
+row; that is prose structure, and admitting it would make the agenda a table of
+contents.
 
 The rows are real excerpts of the files they came from, not rendered text.
 That is what makes the last row of the table above possible: editing in the
@@ -709,10 +803,9 @@ Three things are deliberately **not** rows:
   immediately below counts, because one under a *child* headline belongs to
   the child, and dating the parent with it would send `<CR>` to the wrong line.
 
-Within a day, deadlines come before scheduled items, which come before bare
-timestamps; within those, `[#A]` before `[#B]` before no priority — unranked
-rather than urgent. Days you have missed are labelled as such, because a
-deadline the view stays quiet about is the failure the tool exists to prevent.
+Within a block: by day, then deadlines before scheduled items before bare
+timestamps, then `[#A]` before `[#B]` before no priority — unranked rather than
+urgent. Days you have missed are labelled as such.
 
 The scan runs off the UI thread and reads only the files this plugin claims,
 so `:org-agenda` in a source checkout with no org files in it costs a directory

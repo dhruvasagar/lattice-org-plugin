@@ -1849,3 +1849,75 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
         index.nodes().len()
     );
 }
+
+/// **OR.4b — a real-sized corpus indexes without trapping.**
+///
+/// The bug this pins: `sync_all` did the entire cold walk inside ONE guest
+/// call. The async seam's budget is `epoch_deadline: 1_000` — about a second —
+/// and 706 files take roughly twenty-seven, so the guest ran past the deadline,
+/// trapped, and the host quarantined the plugin for the session. The picker
+/// then showed `0/0` forever and `:org-roam-sync` echoed "re-scanning" and
+/// never finished, because a quarantined plugin never runs again.
+///
+/// **Every other test in this file uses a four-file corpus**, which finishes in
+/// milliseconds — so the whole suite passed against a product that could not
+/// index any real zettelkasten. The bug is a function of corpus SIZE, which is
+/// exactly the axis none of the fixtures varied.
+///
+/// So this one writes enough files to need several batches. It is not the
+/// 706-file corpus (a fixture that slow would not earn its place in the suite),
+/// but it is comfortably more than one `BATCH`, which is what makes the chain
+/// itself the thing under test: a single-batch corpus would pass against the
+/// broken version too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_corpus_larger_than_one_batch_indexes_without_trapping() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    std::fs::create_dir_all(&corpus).unwrap();
+
+    // 120 files — several times the 25-file batch, so the scan must hop at
+    // least four times to finish.
+    const FILES: usize = 120;
+    for i in 0..FILES {
+        std::fs::write(
+            corpus.join(format!("note{i:03}.org")),
+            format!(
+                ":PROPERTIES:\n:ID:       BULK-{i:03}\n:END:\n#+title: Bulk Note {i}\n\nbody\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let Some((index, _editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    // A longer window than `settle`'s 5s: this corpus is deliberately several
+    // batches, and each batch is a full event round trip through the actor plus
+    // 25 tree-sitter parses under a debug host. The point is that the chain
+    // FINISHES, not that it finishes fast.
+    let mut ok = false;
+    for _ in 0..600 {
+        if index.nodes().len() >= FILES {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        ok,
+        "every file must be indexed across however many batches it takes; the \
+         single-call version trapped on the epoch deadline and quarantined the \
+         plugin instead. Got {} of {FILES}.",
+        index.nodes().len()
+    );
+
+    // And the plugin is still alive afterwards — a trap would have quarantined
+    // it, which is the failure mode that made this invisible: the index being
+    // empty and the plugin being dead look identical from the picker.
+    let one = index
+        .node("bulk-042")
+        .expect("a node from the middle of the queue survived the chain");
+    assert_eq!(one.title, "Bulk Note 42");
+}

@@ -118,51 +118,209 @@ pub fn index_one(path: &str, keywords: &[String]) -> bool {
     roam_index::index_file(path, &text, &extracted)
 }
 
-/// Walk the corpus and index everything that changed.
+/// OR.4b — a cold scan, carried across many guest calls.
 ///
-/// The `nodes` blob is rebuilt **once**, at the end, and only if something
-/// moved — rebuilding per file would make a cold pass quadratic in host calls.
-pub fn sync_all() -> usize {
+/// ## Why this is not one loop
+///
+/// It was, and on a real corpus it took the plugin down. The async seam's
+/// budget is `epoch_deadline: 1_000` — about **one second per call** — and a
+/// cold pass over the reference corpus (706 files, each a host `read-file`, a
+/// hash, a tree-sitter parse and a store write) takes roughly twenty-seven. So
+/// the guest ran past the deadline, **trapped**, and the host quarantined the
+/// plugin for the rest of the session.
+///
+/// Every symptom followed from that and none of them named it: the picker
+/// showed `0/0` because the `nodes` blob is only written at the END of a scan;
+/// `:org-roam-sync` echoed "re-scanning" and never finished; and after the
+/// first trap nothing org did worked at all, because a quarantined plugin
+/// stays quarantined.
+///
+/// No test caught it because every roam test uses a four-file corpus, which
+/// finishes in milliseconds. The bug is a function of corpus SIZE, and the
+/// per-file estimates in the design fragment were right — it is their sum that
+/// was never checked against a real zettelkasten.
+///
+/// ## The shape
+///
+/// [`begin`] walks once and parks the file list; each [`step`] indexes at most
+/// [`BATCH`] of them and rings the doorbell again if any remain. The queue
+/// lives in a `thread_local` because the events store is one `Store` whose
+/// memory persists across calls (the clock's `SESSION` is the precedent), so
+/// carrying it costs no store round-trip per batch.
+///
+/// ## What stops a scan from being cancelled
+///
+/// **A bounded batch cannot trap.** That is the whole guarantee, and it is why
+/// `BATCH` is set by the worst case rather than the average.
+///
+/// **A stale chain stops itself.** Each step carries the generation it was
+/// started with, and a step whose generation is not the current one returns
+/// without doing anything or re-arming. So pointing `org.roam-directory` at a
+/// new corpus mid-scan does not leave two chains interleaving writes from two
+/// roots — the old one simply stops on its next hop.
+///
+/// **One bad file cannot break the chain.** [`index_one`] already swallows a
+/// read or parse failure per file (`error-parser`'s rule), so a scan steps past
+/// it rather than dying on it.
+mod scan {
+    /// How long one guest call may spend indexing before it yields.
+    ///
+    /// **A time budget, not a file count**, and the difference is the whole
+    /// point. What traps is wall time against the seam's ~1s epoch deadline
+    /// (`epoch_deadline: 1_000` ticks at ~1 ms each). A fixed file count only
+    /// approximates that, and approximates it worst exactly where it matters:
+    /// a corpus of large or deeply-nested notes costs several times a corpus of
+    /// small ones per file, so the count that is safe on one is a trap on the
+    /// other. Measuring the thing that actually runs out removes the guess.
+    ///
+    /// 250 ms leaves 4× headroom under the deadline — enough to absorb one
+    /// pathologically slow file discovered mid-batch, since the check happens
+    /// BETWEEN files and a single file's parse still has to fit.
+    pub const BUDGET_MS: u64 = 250;
+
+    /// Always index at least this many per call, however slow.
+    ///
+    /// A machine slow enough that one file exceeds the budget would otherwise
+    /// make no progress at all and re-arm forever — a livelock that looks
+    /// exactly like the hang this whole change exists to remove. Better to risk
+    /// one long call than to spin.
+    pub const MIN_PER_CALL: usize = 1;
+
+    pub struct Scan {
+        pub files: Vec<String>,
+        pub at: usize,
+        pub changed: usize,
+        pub keywords: Vec<String>,
+    }
+
+    thread_local! {
+        pub static SCAN: std::cell::RefCell<Option<Scan>> =
+            const { std::cell::RefCell::new(None) };
+        /// Bumped on every `begin`. A step carrying an older value is stale.
+        pub static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+}
+
+/// Start a cold scan of the corpus. Returns the number of files queued.
+///
+/// Replaces any scan in flight — a new root makes the old queue wrong, and the
+/// generation bump is what stops the old chain rather than letting both run.
+pub fn begin() -> usize {
     let Some(root) = roam_directory() else {
+        // Not configured. Clear any progress a previous root left on screen.
+        crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
         return 0;
     };
     // Arm the watch here rather than only at registration, and idempotently.
     //
-    // Two reasons, both about ordering. `register-events` runs when the plugin
-    // loads, which may be BEFORE the user's `init.rs` sets
-    // `org.roam-directory` (the documented CI.1 `plugin-loaded` pattern is
-    // exactly that shape) — so a watch armed only there would never arm for
-    // the user who configures roam the documented way. And a `watch` on a path
-    // already watched is `ok` and arms nothing new, so calling it on every
-    // sync costs one host call and closes the hole.
+    // `register-events` runs when the plugin loads, which may be BEFORE the
+    // user's `init.rs` sets `org.roam-directory` (the documented CI.1
+    // `plugin-loaded` pattern is exactly that shape). A watch armed only there
+    // would never arm for the user who configures roam the documented way, and
+    // a `watch` on an already-watched path is `ok` and arms nothing new.
     //
-    // The watch goes up BEFORE the walk: a file written between the walk
-    // finishing and the watch arming would be observed by neither, and the
-    // symptom — a note you know you wrote missing from the picker — reads as
-    // data loss.
+    // BEFORE the walk: a file written between the walk finishing and the watch
+    // arming would be observed by neither, and the symptom — a note you know
+    // you wrote missing from the picker — reads as data loss.
     let _ = host_services::watch(&root);
-    // A denied or unwalkable root is a silent zero, deliberately.
-    //
-    // **The guest must not log.** Calling `logging::log` makes the component
-    // IMPORT `logging`, and org's multi-seam linker does not wire that import
-    // on the grammar seam — the WHOLE component then fails to instantiate.
-    // That has happened before (OC.2), so the honest degradation here is to
-    // index nothing and let `:org-roam-sync` be the user's escape hatch, not
-    // to explain the problem at the cost of the plugin.
-    let Ok(files) = host_services::walk(&root) else {
+    // A denied or unwalkable root is a silent zero, deliberately. **The guest
+    // must not log**: calling `logging::log` makes the component IMPORT
+    // `logging`, which org's multi-seam linker does not wire on the grammar
+    // seam, and the WHOLE component then fails to instantiate (OC.2).
+    let Ok(all) = host_services::walk(&root) else {
         return 0;
     };
+    let files: Vec<String> = all.into_iter().filter(|p| is_org(p)).collect();
+    let total = files.len();
+    // Bump BEFORE the queue is replaced: any chain still draining the old
+    // root reads this on its next hop and stops.
+    scan::GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
     let keywords = todo_keywords();
-    let mut changed = 0usize;
-    for path in files.iter().filter(|p| is_org(p)) {
-        if index_one(path, &keywords) {
-            changed += 1;
+    scan::SCAN.with(|s| {
+        *s.borrow_mut() = Some(scan::Scan {
+            files,
+            at: 0,
+            changed: 0,
+            keywords,
+        });
+    });
+    if total == 0 {
+        crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
+        return 0;
+    }
+    publish_progress(0, total);
+    total
+}
+
+/// The current scan's generation, for the step that is about to be armed.
+pub fn generation() -> u64 {
+    scan::GENERATION.with(|g| g.get())
+}
+
+/// Index one batch. Returns `true` while more remain — the caller re-arms.
+///
+/// A `generation` that is not the current one is a stale chain: it returns
+/// `false` and does nothing, which is what stops two scans interleaving.
+pub fn step(generation: u64) -> bool {
+    if generation != scan::GENERATION.with(|g| g.get()) {
+        return false;
+    }
+    scan::SCAN.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(sc) = borrow.as_mut() else {
+            return false;
+        };
+        // Index until the time budget is spent, checking BETWEEN files so a
+        // file is never abandoned half-indexed.
+        let started = std::time::SystemTime::now();
+        let mut done_now = 0usize;
+        while sc.at < sc.files.len() {
+            if index_one(&sc.files[sc.at], &sc.keywords) {
+                sc.changed += 1;
+            }
+            sc.at += 1;
+            done_now += 1;
+            if done_now >= scan::MIN_PER_CALL {
+                let spent = started
+                    .elapsed()
+                    .map(|d| d.as_millis() as u64)
+                    // An unreadable clock yields immediately rather than
+                    // running unbounded: one file per call is slow, and a trap
+                    // takes the whole plugin down.
+                    .unwrap_or(u64::MAX);
+                if spent >= scan::BUDGET_MS {
+                    break;
+                }
+            }
         }
-    }
-    if changed > 0 {
-        roam_index::rebuild_nodes_blob();
-    }
-    changed
+        let total = sc.files.len();
+        let done = sc.at >= total;
+        if done {
+            // The blob is rebuilt ONCE, at the end — rebuilding per batch would
+            // make a cold scan quadratic in host calls, which is the cost the
+            // whole batching exists to avoid paying twice.
+            if sc.changed > 0 {
+                roam_index::rebuild_nodes_blob();
+            }
+            *borrow = None;
+            crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
+        } else {
+            publish_progress(sc.at, total);
+        }
+        !done
+    })
+}
+
+/// Show the scan's progress in the modeline.
+///
+/// The modeline rather than an echo, because a scan outlives the message line:
+/// an echo is replaced by the next thing that echoes, and the whole complaint
+/// this fixes was a user who could not tell a long scan from a dead one.
+fn publish_progress(at: usize, total: usize) {
+    crate::lattice::plugin_host::ui::emit_segment(
+        crate::ROAM_SEGMENT,
+        &format!("\u{27f3} roam {at}/{total}"),
+    );
 }
 
 /// Re-index exactly the paths a watcher reported.

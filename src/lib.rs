@@ -429,6 +429,12 @@ const EV_CLOCK_STOPPED: &str = "org/clock-stopped";
 /// bus publish and puts the work where every other expensive org thing already
 /// lives (design D6, and the OC.1 pattern the clock uses).
 const EV_ROAM_SYNC: &str = "org/roam-sync";
+/// OR.4b: one batch of a cold scan. The guest publishes this to ITSELF to
+/// carry the scan across calls — a whole corpus in one call blows the seam's
+/// ~1s epoch deadline, traps, and quarantines the plugin. The payload is the
+/// scan's generation, so a chain left over from a previous root stops instead
+/// of interleaving with the current one.
+const EV_ROAM_SCAN_STEP: &str = "org/roam-scan-step";
 
 /// OC.4 — the fields menu's own submit, distinct from the prompt's.
 ///
@@ -1102,6 +1108,9 @@ impl Guest for Component {
             ON_CLOCK_EVENT,
         );
         ui::register_segment(CLOCK_SEGMENT, UiZone::Right, 8);
+        // OR.4b: the scan's progress. Priority 9 puts it right of the
+        // clock and left of `core.position`.
+        ui::register_segment(ROAM_SEGMENT, UiZone::Right, 9);
         // OR.4: the roam index. Everything below is a no-op when
         // `org.roam-directory` is unset — no walk, no watcher, no store write —
         // so an org user who keeps no zettelkasten pays nothing for it.
@@ -1143,7 +1152,11 @@ impl Guest for Component {
         // corpus changed and a watcher cannot report what it did not see.
         // Unchanged files cost a read and a hash; only moved ones parse. A
         // no-op when roam is unconfigured.
-        roam_scan::sync_all();
+        //
+        // OR.4b: `begin` only QUEUES the walk. The indexing happens one batch
+        // per call, driven by `EV_ROAM_SCAN_STEP` below — a whole corpus in
+        // this one call is what used to trap and quarantine the plugin.
+        arm_roam_scan();
     }
 
     /// The grammar store told us a clock started or stopped.
@@ -1174,12 +1187,16 @@ impl Guest for Component {
                 if c.name != "org.roam-directory" {
                     return;
                 }
-                // `sync_all` re-reads the option and arms the watch on the new
-                // root. It is a no-op when the value was cleared, which is the
-                // honest answer for "roam is now unconfigured" — the stale
-                // index stays until something replaces it rather than the
-                // picker going empty with no explanation.
-                roam_scan::sync_all();
+                // Re-reads the option, arms the watch on the new root and
+                // queues a fresh scan. The generation bump inside `begin` is
+                // what stops a chain still draining the OLD root, rather than
+                // letting two interleave their writes.
+                //
+                // A cleared value queues nothing, which is the honest answer
+                // for "roam is now unconfigured" — the stale index stays until
+                // something replaces it rather than the picker going empty
+                // with no explanation.
+                arm_roam_scan();
             }
             return;
         }
@@ -1216,7 +1233,19 @@ impl Guest for Component {
                 publish_clock_segment();
             }
             EV_ROAM_SYNC => {
-                roam_scan::sync_all();
+                // OR.4b: queue the walk, then let the batch chain drain it.
+                arm_roam_scan();
+            }
+            // OR.4b: one batch, then re-arm. The generation rides in the
+            // payload so a chain from a previous root stops here rather than
+            // interleaving its writes with the current scan's.
+            EV_ROAM_SCAN_STEP => {
+                let generation = String::from_utf8_lossy(&p.payload)
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if roam_scan::step(generation) {
+                    host_services::emit_event(EV_ROAM_SCAN_STEP, generation.to_string().as_bytes());
+                }
             }
             EV_CLOCK_STOPPED => {
                 SESSION.with(|s| {
@@ -2794,6 +2823,13 @@ fn clock_goto() -> Vec<Effect> {
 /// `org.clock`, so it can neither shadow a built-in nor another plugin.
 const CLOCK_SEGMENT: &str = "clock";
 
+/// OR.4b — the roam scan's progress, in the modeline.
+///
+/// Its own segment rather than sharing the clock's: the two are unrelated and
+/// can be live at once, and a scan that overwrote a running clock would look
+/// like the clock had stopped.
+const ROAM_SEGMENT: &str = "roam-scan";
+
 /// What the events store remembers between wakes. `None` when no clock is
 /// running, which is also the state after a restart (design D4 — the modeline
 /// is empty, the file is still right).
@@ -2835,6 +2871,21 @@ fn clock_segment_text(session: &ClockSession, now_minutes: i64) -> String {
 }
 
 /// Push the segment for the running clock, or clear it when none is running.
+/// OR.4b — queue a cold scan and ring the first step.
+///
+/// Split from `roam_scan::begin` because the doorbell is the HOST's mechanism
+/// and the queue is the guest's: `begin` walks and parks the file list, this
+/// starts the chain that drains it. A scan with nothing queued rings nothing,
+/// so an unconfigured roam costs one option read.
+fn arm_roam_scan() {
+    if roam_scan::begin() > 0 {
+        host_services::emit_event(
+            EV_ROAM_SCAN_STEP,
+            roam_scan::generation().to_string().as_bytes(),
+        );
+    }
+}
+
 fn publish_clock_segment() {
     SESSION.with(|s| match s.borrow().as_ref() {
         Some(session) => {

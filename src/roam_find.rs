@@ -97,15 +97,23 @@ fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
     if !node.aliases.is_empty() {
         annotations.push(Annotation::Custom(AnnotationCustom {
             text: node.aliases.join(", "),
-            // The plugin escape hatch's theme slot. `comment` because an alias
-            // is context beside the title, not the title.
-            slot: "comment".to_string(),
+            // A REAL annotation slot key, not a syntax element name.
+            // `BuiltinElementIds::annotation_slot` maps the
+            // `completion.annotation.*` vocabulary and falls back to
+            // `.custom` for anything else — so the `comment` this used to
+            // pass resolved to the same fixed colour as the tags below, which
+            // is why the picker looked unstyled. `.doc` is the descriptive
+            // column, which is what an alias is.
+            slot: "completion.annotation.doc".to_string(),
         }));
     }
     if !node.tags.is_empty() {
         annotations.push(Annotation::Custom(AnnotationCustom {
             text: format!(":{}:", node.tags.join(":")),
-            slot: "keyword".to_string(),
+            // `.kind` for the same reason: it is the classifying column, and
+            // it resolves to a different element from `.doc`, so aliases and
+            // tags are finally distinguishable.
+            slot: "completion.annotation.kind".to_string(),
         }));
     }
     // An alias is searchable by being part of the matched text, not by being an

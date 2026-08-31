@@ -1374,11 +1374,37 @@ impl Guest for Component {
             // `foldmethod=indent` user still gets indent folds everywhere else.
             // A `:setlocal` in an org buffer still wins over it, which is the
             // right way round — the user gets the last word in their own buffer.
-            options: vec![ModeOptionOverride {
-                name: "foldmethod".to_string(),
-                value: "syntax".to_string(),
-                priority: OverridePriority::Normal,
-            }],
+            options: vec![
+                ModeOptionOverride {
+                    name: "foldmethod".to_string(),
+                    value: "syntax".to_string(),
+                    priority: OverridePriority::Normal,
+                },
+                // …and the fold tree starts CLOSED. `foldmethod=syntax` builds
+                // the tree; without this it builds it and then opens all of it,
+                // because `foldlevel` defaults to 99 (effective infinity) so
+                // that search results, project diffs and agent transcripts —
+                // whose folds come from always-registered overlay sources — do
+                // not open collapsed to nothing.
+                //
+                // Org is the case that default is wrong for. An outline that
+                // opens fully expanded is a wall of text; emacs org ships
+                // `#+STARTUP: overview` as its default for exactly this reason,
+                // and `foldlevel=0` is that in vim's vocabulary — level 1 is
+                // the outermost fold, so 0 closes every one of them and leaves
+                // the top-level headlines standing. `<Tab>` / `<S-Tab>` cycle
+                // out from there, which is the gesture the collapsed state
+                // exists to make meaningful.
+                //
+                // A layer like its neighbour: the user's global `foldlevel` is
+                // untouched everywhere else, and a `:setlocal foldlevel=99` in
+                // an org buffer still wins.
+                ModeOptionOverride {
+                    name: "foldlevel".to_string(),
+                    value: "0".to_string(),
+                    priority: OverridePriority::Normal,
+                },
+            ],
         });
 
         // OM.7 — `org-todo-mode`, a MINOR riding the major above.
@@ -1507,6 +1533,19 @@ impl Guest for Component {
                 bind("<C-c>ndy", "org-roam-dailies-yesterday"),
                 bind("<C-c>ndt", "org-roam-dailies-tomorrow"),
                 bind("<C-c>ndD", "org-roam-dailies-goto-date"),
+                // And emacs org's own two global entry points, for the same
+                // reason and under the same safety argument: `C-c a` and
+                // `C-c c` are the first two lines of every org setup guide
+                // ever written, so they are the bindings a hand arriving
+                // from emacs reaches for before it has read anything of
+                // ours. `<leader>oa` / `<leader>oc` above stay — two
+                // spellings of one `ActionId`, no second handler.
+                //
+                // `a` and `c` are free beneath `<C-c>`: magit's are
+                // `<C-c><C-c>` / `<C-c><C-k>`, which continue on a CONTROL
+                // key, and `<C-c>g` / `<C-c>f` differ in the second letter.
+                bind("<C-c>a", "org-agenda"),
+                bind("<C-c>c", "org-capture-menu"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.

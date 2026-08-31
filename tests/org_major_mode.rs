@@ -468,6 +468,28 @@ async fn an_org_buffer_folds_by_syntax_without_the_user_setting_it() {
         FoldMethod::Manual,
         "and the user's global setting is untouched"
     );
+
+    // …and the tree it builds starts CLOSED. `foldmethod=syntax` alone builds
+    // the fold tree and then opens all of it, because `foldlevel` defaults to
+    // 99 so that overlay-fold buffers (search results, diffs, agent
+    // transcripts) do not open collapsed to nothing. Org is the case that
+    // default is wrong for: an outline that opens fully expanded is a wall of
+    // text, and emacs org ships `#+STARTUP: overview` for the same reason.
+    // `foldlevel=0` is that in vim's vocabulary — level 1 is the outermost
+    // fold, so 0 closes every one.
+    assert_eq!(
+        *editor.resolved_option::<lattice_config::core_options::FoldLevel>(buffer),
+        0,
+        "an org buffer opens folded to its top-level headlines"
+    );
+    assert_eq!(
+        *editor
+            .config
+            .get_typed::<lattice_config::core_options::FoldLevel>()
+            .expect("registered"),
+        99,
+        "and the global foldlevel is untouched, so nothing else opens collapsed"
+    );
 }
 
 /// **Every minor that can auto-activate is listed in the SHIPPED

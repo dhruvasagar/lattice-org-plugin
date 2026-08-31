@@ -1922,11 +1922,13 @@ async fn a_corpus_larger_than_one_batch_indexes_without_trapping() {
     assert_eq!(one.title, "Bulk Note 42");
 }
 
-/// **`<C-c>n…` reaches the same commands as `<leader>on…`.**
+/// **The emacs `<C-c>` spellings reach the same commands as the
+/// `<leader>o…` ones.**
 ///
-/// Emacs org-roam's own prefix, letter for letter, kept alongside the
-/// vim-native spelling rather than replacing it — three keystrokes instead of
-/// five for a hand that already knows `C-c n f`.
+/// Emacs org's own prefixes, letter for letter, kept alongside the vim-native
+/// spelling rather than replacing it — three keystrokes instead of five for a
+/// hand that already knows `C-c n f`, and `C-c a` / `C-c c` are the first two
+/// lines of every org setup guide ever written.
 ///
 /// Asserted through the real keymap rather than by reading the declaration: a
 /// binding that is present in the mode's `keymap` and never expands into a
@@ -1949,6 +1951,8 @@ async fn the_emacs_prefix_reaches_the_same_roam_commands() {
         ("<C-c>ndy", "<leader>ondy"),
         ("<C-c>ndt", "<leader>ondt"),
         ("<C-c>ndD", "<leader>ondD"),
+        ("<C-c>a", "<leader>oa"),
+        ("<C-c>c", "<leader>oc"),
     ] {
         let resolve = |keys: &str| -> Option<String> {
             let expanded = editor.keymap.expand_leader(keys);

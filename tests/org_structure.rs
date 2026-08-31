@@ -609,6 +609,12 @@ async fn headline_motions_walk_forward_and_back() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* One\nbody\n** Child\nkid\n* Two\n").await;
+    // MO.3b: `org-mode` now declares `foldlevel=0`, so an org buffer opens
+    // fully collapsed. These three tests are about the MOTION grammar, not
+    // about what a motion does across a closed fold (`]]` correctly skips a
+    // headline hidden inside one), so open every fold first and let the
+    // fixture mean what it was written to mean.
+    press(&mut editor, "zR");
 
     goto_line(&mut editor, 0);
     press(&mut editor, "]]");
@@ -651,6 +657,12 @@ async fn parent_skips_siblings_where_prev_headline_would_not() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* One\n** Two\n*** A\n*** B\n").await;
+    // MO.3b: `org-mode` now declares `foldlevel=0`, so an org buffer opens
+    // fully collapsed. These three tests are about the MOTION grammar, not
+    // about what a motion does across a closed fold (`]]` correctly skips a
+    // headline hidden inside one), so open every fold first and let the
+    // fixture mean what it was written to mean.
+    press(&mut editor, "zR");
 
     // From `*** B`, `[[` reaches its level-3 SIBLING; `g{` must skip it to the
     // level-2 parent. This is the whole reason `g{` is not just `[[`.
@@ -3382,6 +3394,12 @@ async fn the_parent_motion_climbs_one_section() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* One\n** Two\n*** A\n*** B\nbody under B\n").await;
+    // MO.3b: `org-mode` now declares `foldlevel=0`, so an org buffer opens
+    // fully collapsed. These three tests are about the MOTION grammar, not
+    // about what a motion does across a closed fold (`]]` correctly skips a
+    // headline hidden inside one), so open every fold first and let the
+    // fixture mean what it was written to mean.
+    press(&mut editor, "zR");
 
     goto_line(&mut editor, 3); // `*** B`
     press(&mut editor, "g{");

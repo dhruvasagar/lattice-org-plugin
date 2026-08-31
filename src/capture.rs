@@ -324,3 +324,130 @@ mod tests {
         assert_eq!(expand("* %?\n", "a", today(), ""), "* a\n");
     }
 }
+
+/// OC.7b: a NUL, used to mark where `%?` was so the caret can be put there.
+///
+/// A sentinel rather than a second expander: `%?` is the only placeholder whose
+/// output position matters, and every OTHER placeholder (`%U`, `%T`, `%^{…}`,
+/// `%a`) still has to expand around it. Reimplementing that walk to also track
+/// an offset would be a second copy of the rules, and the two would drift —
+/// `%t` was added to one such copy and not the other once already.
+///
+/// NUL because a capture template is user text and every printable sentinel is
+/// something a user might legitimately write. A template containing a literal
+/// NUL is pathological, and the worst it costs is a caret in an odd place.
+const POINT_SENTINEL: &str = "\u{0}";
+
+/// OC.7b: the template as the capture BUFFER shows it, and where to put the
+/// caret in it.
+///
+/// The prompt flow substituted `%?` with what the user had typed, because the
+/// text arrived before the expansion. A buffer inverts that: the expansion
+/// comes first and the user types INTO it, so `%?` is not a value to
+/// substitute — it is a position.
+///
+/// A template with no `%?` puts the caret at the END of the inserted text,
+/// which is emacs's behaviour — and it falls out rather than being coded for.
+/// `expand_with` already appends a non-empty `entered` on its own line when it
+/// saw no placeholder, precisely so the prompt flow could not silently discard
+/// what the user typed. The sentinel inherits that, so the same rule that
+/// protects typed text also places the point.
+///
+/// `None` is therefore reachable only if the sentinel is somehow absent from
+/// the output, which means a template contained a literal NUL.
+/// `entered` is text already collected for `%?` — the fields menu's body row.
+/// It is placed AT the point and the caret lands after it, so a menu answer is
+/// a starting draft rather than the final word. Empty for the common path,
+/// where the buffer IS where you type.
+pub fn expand_for_buffer(
+    template: &str,
+    entered: &str,
+    answers: &[String],
+    today: i64,
+    annotation: &str,
+) -> (String, Option<(u32, u32)>) {
+    let marked = format!("{entered}{POINT_SENTINEL}");
+    let expanded = expand_with(template, &marked, answers, today, annotation);
+    let Some(at) = expanded.find(POINT_SENTINEL) else {
+        return (expanded, None);
+    };
+    let mut text = expanded;
+    text.replace_range(at..at + POINT_SENTINEL.len(), "");
+    // Byte offset → (line, byte-within-line), which is what `position` is.
+    let before = &text[..at];
+    let line = before.matches('\n').count() as u32;
+    let col = match before.rfind('\n') {
+        Some(nl) => (at - nl - 1) as u32,
+        None => at as u32,
+    };
+    (text, Some((line, col)))
+}
+
+#[cfg(test)]
+mod buffer_expansion_tests {
+    use super::*;
+
+    fn today() -> i64 {
+        crate::timestamp::epoch_day(2026, 8, 26)
+    }
+
+    /// `%?` becomes a POSITION, not substituted text — the inversion the
+    /// buffer surface is.
+    #[test]
+    fn the_point_placeholder_becomes_a_caret_position() {
+        let (text, point) = expand_for_buffer("* TODO %?\n  body\n", "", &[], today(), "");
+        assert_eq!(text, "* TODO \n  body\n", "the marker itself is removed");
+        assert_eq!(point, Some((0, 7)), "line 0, just past `* TODO `");
+    }
+
+    /// Every other placeholder still expands around it, which is the reason
+    /// this reuses `expand_with` rather than walking the template again.
+    #[test]
+    fn the_other_placeholders_still_expand() {
+        let (text, point) = expand_for_buffer(
+            "* %^{What}\n  %U\n  %?",
+            "",
+            &["Ship it".into()],
+            today(),
+            "",
+        );
+        assert!(text.starts_with("* Ship it\n"), "got {text:?}");
+        assert!(text.contains("[2026-08-26"), "the stamp expanded: {text:?}");
+        let (line, col) = point.expect("a point");
+        assert_eq!(line, 2, "the caret is on the third line: {text:?}");
+        assert_eq!(col, 2, "…after the two-space indent");
+    }
+
+    /// A multi-byte line before the caret must not shift it: the offset is
+    /// BYTES within the line, which is what `position` means.
+    #[test]
+    fn the_caret_offset_is_bytes_not_chars() {
+        let (text, point) = expand_for_buffer("* Café %?\n", "", &[], today(), "");
+        assert_eq!(
+            point,
+            Some((0, 8)),
+            "`* Café ` is 8 bytes, 7 chars: {text:?}"
+        );
+    }
+
+    /// Text collected before the buffer opened seeds the point, and the caret
+    /// lands AFTER it — a menu answer is a draft to keep editing, not the
+    /// final word.
+    #[test]
+    fn entered_text_seeds_the_point_and_the_caret_follows_it() {
+        let (text, point) = expand_for_buffer("* TODO %?\n", "call the bank", &[], today(), "");
+        assert_eq!(text, "* TODO call the bank\n");
+        assert_eq!(point, Some((0, 20)), "just past what was collected");
+    }
+
+    /// No `%?` ⇒ the caret lands at the END of the inserted text, emacs's
+    /// behaviour — and it FALLS OUT of the rule that stops the prompt flow
+    /// discarding typed text (`expand_with` appends a non-empty `entered` on
+    /// its own line when it saw no placeholder). One rule, two jobs.
+    #[test]
+    fn a_template_without_a_point_puts_the_caret_at_the_end() {
+        let (text, point) = expand_for_buffer("* TODO Ship it\n", "", &[], today(), "");
+        assert_eq!(text, "* TODO Ship it\n\n");
+        assert_eq!(point, Some((1, 0)), "on the line after the entry");
+    }
+}

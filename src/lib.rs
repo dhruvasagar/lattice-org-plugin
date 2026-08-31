@@ -446,6 +446,16 @@ const EV_ROAM_SCAN_STEP: &str = "org/roam-scan-step";
 /// inference.
 const CAPTURE_FIELDS_SUBMIT: u32 = 38;
 
+/// OC.7b — `C-c C-c` in the capture buffer: file what is written there.
+const CAPTURE_FINALIZE: u32 = 58;
+/// OC.7b — `C-c C-k`: throw the capture away, writing nothing.
+///
+/// Emacs's aborted capture creates NOTHING, and that falls out of the buffer
+/// model rather than needing to be undone: the file is written on finalize, so
+/// an abort has nothing to clean up. It is the property OR.6's
+/// `WriteToFile`-on-create does not have.
+const CAPTURE_ABORT: u32 = 59;
+
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
 /// scatter notes across the filesystem; being told to set it once is better
@@ -1601,6 +1611,41 @@ impl Guest for Component {
             options: vec![],
         });
 
+        // OC.7b — `org-capture-mode`, the capture buffer's minor.
+        //
+        // A MINOR on an `org-mode` major, not a major of its own. A capture
+        // buffer IS an org buffer — the user wants org's grammar, motions,
+        // folding and TODO cycling while writing the entry — so only the
+        // finalize/abort pair is capture-specific.
+        //
+        // Which is also why the chords cannot go on `org-mode`: `C-c C-c`
+        // there would file-and-close every org file the user touched.
+        // Scoping them to a minor that is activated on exactly one buffer is
+        // what makes `<C-c>` safe to bind at all — it is vim's interrupt, and
+        // a global binding would shadow it.
+        //
+        // MANUAL activation: the buffer names the minor when it opens
+        // (`open-synthetic-buffer.activate-minor`), which is the only place
+        // that knows a capture is what this buffer is for. No
+        // `ActivationPolicy` can express "the buffer the capture flow just
+        // created" — the same reason `org-agenda-mode` is Manual.
+        //
+        // Reused verbatim by org-roam capture (OR.11): same buffer, same
+        // chords, same handlers; only the order of what is asked before the
+        // buffer opens differs.
+        let _ = register_mode(&ModeDeclaration {
+            id: "org-capture-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Manual,
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![
+                bind("<C-c><C-c>", "org-capture-finalize"),
+                bind("<C-c><C-k>", "org-capture-abort"),
+            ],
+            target_language: None,
+            options: vec![],
+        });
+
         // OM.A3 — `org-agenda-mode`, the fourth mode.
         //
         // MANUAL activation, and that is the whole reason it is a separate
@@ -2133,6 +2178,18 @@ impl Guest for Component {
             CAPTURE_FIELDS_SUBMIT,
         );
         register_action(
+            "org-capture-finalize",
+            "File the capture buffer's contents (C-c C-c)",
+            &spec(),
+            CAPTURE_FINALIZE,
+        );
+        register_action(
+            "org-capture-abort",
+            "Discard the capture, writing nothing (C-c C-k)",
+            &spec(),
+            CAPTURE_ABORT,
+        );
+        register_action(
             "org-capture-submit",
             "File the captured note (dispatched by the prompt on submit)",
             &spec(),
@@ -2380,6 +2437,36 @@ struct ScanState {
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.
     sections: Vec<agenda::Section>,
+}
+
+thread_local! {
+    /// OC.7b: the capture the buffer on screen belongs to.
+    ///
+    /// `C-c C-c` must know WHERE to file what was typed, and the action context
+    /// carries `buffer-id` and `cursor` but no buffer NAME — and
+    /// `document.path()` is `none` for a synthetic buffer, by definition. So
+    /// the target cannot be recovered from the buffer; it is remembered when
+    /// the buffer is opened.
+    ///
+    /// A `thread_local` is the whole synchronisation story for the same reason
+    /// the agenda's `SCAN` is: single-threaded guest, one actor, calls
+    /// serialised by the host's per-plugin channel.
+    ///
+    /// **One capture in flight at a time**, which is a real limit and not an
+    /// oversight. The buffer name is derived from the template key, so two
+    /// captures of the same template would collide on the buffer anyway; and
+    /// emacs's default is likewise one (`org-capture` in progress refuses a
+    /// second). Cleared on finalize and on abort, so an abandoned capture
+    /// cannot mis-file the next one.
+    static PENDING_CAPTURE: std::cell::RefCell<Option<PendingCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// OC.7b: what `C-c C-c` needs that the buffer cannot tell it.
+#[derive(Clone)]
+struct PendingCapture {
+    /// The resolved template — its target file and headline.
+    template: capture_templates::Template,
 }
 
 thread_local! {
@@ -3281,19 +3368,70 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         )];
     }
 
-    vec![Effect::OpenPrompt(
-        lattice::plugin_host::types::OpenPromptPayload {
-            prompt: if template.description.is_empty() {
-                "Capture: ".to_string()
-            } else {
-                format!("Capture ({}): ", template.description)
-            },
-            initial: String::new(),
-            on_submit_action: "org-capture-submit".to_string(),
-            buffer_name: (!template.key.is_empty())
-                .then(|| format!("*org-capture:{}*", template.key)),
+    // OC.7b: the BUFFER, not a one-line prompt. Before this the template was
+    // never shown — it was expanded only at submit — so the user typed into an
+    // empty minibuffer and found out what the template did afterwards.
+    open_capture_buffer(&template, &[], "")
+}
+
+/// OC.7b: open the capture BUFFER — the surface emacs has and the prompt was
+/// standing in for.
+///
+/// Shared by both entry paths on purpose. A template with `%^{…}` questions
+/// still collects them in the transient first (emacs's order: prompts, then
+/// the buffer), and a template without them comes straight here; either way
+/// what appears is the same buffer with the same chords, so there is one
+/// capture surface rather than two that can drift.
+///
+/// The major is `org-mode`, because a capture buffer IS an org buffer — it
+/// wants org's grammar, motions and folding. Only the finalize/abort pair is
+/// capture-specific, so it rides `org-capture-mode` as a MINOR; putting those
+/// chords on the major would make `C-c C-c` file every org file you touched.
+fn open_capture_buffer(
+    template: &capture_templates::Template,
+    answers: &[String],
+    entered: &str,
+) -> Vec<Effect> {
+    let annotation = CAPTURE_ORIGIN
+        .with(|c| c.borrow().clone())
+        .unwrap_or_default();
+    let (text, point) = capture::expand_for_buffer(
+        &template.body,
+        entered,
+        answers,
+        today_epoch_day(),
+        &annotation,
+    );
+    let name = capture_buffer_name(&template.key);
+    // Remembered BEFORE the effect is returned: the action context carries a
+    // buffer id and a cursor but no buffer NAME, and a synthetic buffer's
+    // `document.path()` is `none`, so `C-c C-c` could not otherwise work out
+    // where to file what it is looking at.
+    PENDING_CAPTURE.with(|c| {
+        *c.borrow_mut() = Some(PendingCapture {
+            template: template.clone(),
+        })
+    });
+    vec![Effect::OpenSyntheticBuffer(
+        lattice::plugin_host::types::OpenSyntheticBufferPayload {
+            name,
+            mode_id: "org-mode".to_string(),
+            content: Some(text),
+            cursor: point.map(|(line, byte)| lattice::plugin_host::types::Position { line, byte }),
+            activate_minor: Some("org-capture-mode".to_string()),
         },
     )]
+}
+
+/// The capture buffer's name. Keyed by template so two templates do not fight
+/// over one buffer, and stable so re-firing the same template returns to the
+/// note in progress rather than starting a second.
+fn capture_buffer_name(key: &str) -> String {
+    if key.is_empty() {
+        "*org-capture*".to_string()
+    } else {
+        format!("*org-capture:{key}*")
+    }
 }
 
 /// The name the host smuggles back with a prompt submit, minus its wrapping.
@@ -3528,14 +3666,94 @@ fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
     // writes the template — losing it would be worse than writing it bare.
     let entered = answers.pop().unwrap_or_default();
 
-    let text = capture::expand_with(
-        &template.body,
-        &entered,
-        &answers,
-        today_epoch_day(),
-        &taken_origin(),
-    );
-    capture_effects(&template, text)
+    // OC.7b: the menu still collects the `%^{…}` answers first — emacs's
+    // order, prompts then buffer — but what it opens now is the capture
+    // buffer rather than a write. The body row it collected seeds the `%?`
+    // point and the caret lands after it, so the answer is a draft the user
+    // can keep editing rather than the final word.
+    open_capture_buffer(&template, &answers, &entered)
+}
+
+/// OC.7b — `C-c C-c`: file what the capture buffer holds.
+///
+/// The buffer's WHOLE text is the entry. Not the template re-expanded, and not
+/// what a prompt collected: the point of the buffer surface is that the user
+/// may have rewritten any of it, so the only honest source is what is on
+/// screen when they finalize.
+fn capture_finalize(doc: &Document) -> Vec<Effect> {
+    let Some(pending) = PENDING_CAPTURE.with(|c| c.borrow().clone()) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: no capture in progress".to_string(),
+        })];
+    };
+    let text = document_text(doc);
+    // Cleared BEFORE the write is even queued. If the write fails the capture
+    // is still over — leaving it pending would make the next `C-c C-c` in an
+    // unrelated buffer file this one's text.
+    PENDING_CAPTURE.with(|c| *c.borrow_mut() = None);
+    if text.trim().is_empty() {
+        return vec![
+            Effect::BufferDelete(true),
+            Effect::Echo(EchoPayload {
+                level: EchoLevel::Info,
+                text: "org: nothing captured".to_string(),
+            }),
+        ];
+    }
+    let mut effects = capture_effects(&pending.template, text);
+    // AFTER the write, so a failed write leaves the buffer on screen with the
+    // text still in it rather than closing over the top of it.
+    effects.push(Effect::BufferDelete(true));
+    effects
+}
+
+/// OC.7b — `C-c C-k`: throw the capture away.
+///
+/// **Nothing is created, and that falls out rather than being cleaned up.**
+/// The file is written on finalize, so an abort has nothing to undo — the
+/// property OR.6's `WriteToFile`-on-create does not have, and the reason the
+/// buffer surface is worth the ABI it took.
+fn capture_abort() -> Vec<Effect> {
+    let was_pending = PENDING_CAPTURE.with(|c| c.borrow_mut().take()).is_some();
+    if !was_pending {
+        return vec![Effect::Declined];
+    }
+    vec![
+        Effect::BufferDelete(true),
+        Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: "org: capture aborted".to_string(),
+        }),
+    ]
+}
+
+/// Every line of `doc`, rejoined, with trailing blank lines trimmed to one
+/// newline.
+///
+/// The `document` resource deliberately has no "give me everything" call —
+/// bulk text is not supposed to cross casually — but a capture buffer IS the
+/// payload, and it is one short entry.
+///
+/// The trim is not tidiness. A template with no `%?` gets its caret placed on
+/// a fresh line at the end (`expand_for_buffer`), so filing verbatim would
+/// write that blank line into the user's org file, and every capture through
+/// such a template would leave one behind. Leading structure is untouched —
+/// only the tail, and only down to a single terminating newline.
+fn document_text(doc: &Document) -> String {
+    let n = doc.line_count();
+    let mut out = String::new();
+    for i in 0..n {
+        if let Some(l) = doc.line(i) {
+            out.push_str(&l);
+        }
+        out.push('\n');
+    }
+    let trimmed = out.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("{trimmed}\n")
 }
 
 fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
@@ -3824,6 +4042,8 @@ impl GrammarCallbacks for Component {
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
+            CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
+            CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
             TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, tree, 1)),
             TABLE_PREV_CELL => Ok(table_move(&ctx, doc, tree, -1)),

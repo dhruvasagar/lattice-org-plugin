@@ -236,6 +236,25 @@ fn press(editor: &mut Editor, keys: &str) {
 async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
     for effect in out.effects {
         match effect {
+            // OC.7b: the capture surface. Renderer-applied like its
+            // neighbours here, and for the same reason they are — a headless
+            // test that only presses would prove the chord resolved and
+            // nothing more.
+            lattice_grammar::Effect::OpenSyntheticBuffer {
+                name,
+                mode_id,
+                content,
+                cursor,
+                activate_minor,
+            } => {
+                editor.open_synthetic_buffer_seeded(
+                    &name,
+                    &mode_id,
+                    content.as_deref(),
+                    cursor,
+                    activate_minor.as_deref(),
+                );
+            }
             lattice_grammar::Effect::OpenTransient { source, args } => {
                 editor.open_named_transient(source, args);
                 // A PLUGIN menu builds off-thread — the seam calls the guest's
@@ -2381,6 +2400,46 @@ fn open_capture(editor: &mut Editor) {
     editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
 }
 
+/// OC.7b: type `text` into the open capture buffer and press `C-c C-c`.
+///
+/// The buffer flow's two steps, which the prompt flow collapsed into one:
+/// the template is on screen first, the user edits it, and only then is it
+/// filed.
+async fn finalize_capture(editor: &mut Editor, text: &str) {
+    if !text.is_empty() {
+        // Typed AT the caret, which the seed parked where `%?` was — so this
+        // exercises the position OC.7a carries, not just the text it seeds.
+        // The ACTIVE pane's buffer, not `document_buffer_id`: opening the
+        // capture activated it, but a synthetic buffer is not the "document"
+        // buffer, so the latter still names whatever file the capture was
+        // fired from — and typing into that is the bug this would hide.
+        let target = editor.active_pane_buffer_id();
+        // `apply_edit_effect_inline`, not `handle_effect(ApplyEdit)`:
+        // `handle_effect` TRANSLATES the effect into an `Action::ApplyEdit` on
+        // `next_actions` and applies nothing, so a caller that drops the
+        // outcome silently loses the edit. That deferral is deliberate (the
+        // edit lands in the action dispatch where every other buffer mutation
+        // does), and it is exactly what a test harness with no dispatch loop
+        // has to step around.
+        let at = editor.cursor;
+        editor.apply_edit_effect_inline(
+            target,
+            lattice_protocol::edit::Edit::insert(at, text.to_string()),
+            None,
+        );
+        editor.run_tick_pending();
+    }
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-capture-finalize")
+        .expect("the finalize action is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
+    apply_renderer_effects(editor, out).await;
+    editor.run_tick_pending();
+}
+
 fn submit_capture(editor: &mut Editor, text: &str) {
     let id = editor
         .registry
@@ -2772,9 +2831,13 @@ async fn the_key_you_press_decides_which_template_captures() {
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "n").await;
 
-    // The row fired `org-capture n`, which opened the prompt for that
-    // template. Finish it the way the user would.
-    submit_prompt(&mut editor, "a thought");
+    // OC.7b: the row fired `org-capture n`, which opens that template's
+    // capture BUFFER. Finish it the way the user would — type, then C-c C-c.
+    assert!(
+        editor.buffers.by_name("*org-capture:n*").is_some(),
+        "the buffer is keyed by the template the row chose"
+    );
+    finalize_capture(&mut editor, "a thought").await;
 
     assert_eq!(text_of(&editor, &notes), "* NOTE a thought\n");
     assert!(
@@ -2805,16 +2868,40 @@ async fn the_prompt_the_menu_opens_actually_files_the_note() {
         ),
     );
 
+    // Remembered before the capture: OC.7b leaves the pane on a different
+    // buffer afterwards (see below), so "the source is unchanged" has to be
+    // asked of the source by id rather than of whatever is active.
+    let source = editor.document_buffer_id;
+
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "t").await;
+    // OC.7b: the row opens the capture BUFFER, not a one-line prompt.
     assert!(
-        editor.pending_prompt_submit_action.is_some(),
-        "the row opened the capture prompt"
+        editor.buffers.by_name("*org-capture:t*").is_some(),
+        "the row opened the capture buffer"
     );
-    submit_prompt(&mut editor, "call the bank");
+    finalize_capture(&mut editor, "call the bank").await;
 
     assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
-    assert_eq!(text(&editor), "* One\n", "capture MOVES nothing");
+    let source_text = editor
+        .buffers
+        .document_handle(source)
+        .expect("the source buffer is still open")
+        .snapshot()
+        .text()
+        .to_string();
+    assert_eq!(source_text, "* One\n", "capture MOVES nothing");
+
+    // KNOWN GAP (OC.7d): finalize closes the capture buffer but does not
+    // return the pane to where the capture was fired from — `BufferDelete`
+    // leaves whatever the host falls back to, which is the scratch buffer.
+    // A guest cannot fix this today: `switch-buffer` is a picker-accept
+    // outcome, not an `effect`, so there is nothing for the plugin to emit.
+    // Asserted so the day it changes, this says so rather than going quiet.
+    assert_ne!(
+        editor.document_buffer_id, source,
+        "the pane does not yet return to the origin buffer — see OC.7d"
+    );
 }
 
 /// A broken template set means the menu does NOT open, and says why. An empty
@@ -2897,6 +2984,15 @@ async fn a_template_with_questions_collects_them_as_fields() {
     answer_field(&mut editor, "3", "cat").await;
     press_menu_key(&mut editor, "c").await;
 
+    // OC.7b: the menu still collects the answers first (emacs's order), but
+    // what it opens now is the capture BUFFER — so the file is written by
+    // `C-c C-c`, not by firing the row.
+    assert!(
+        editor.buffers.by_name("*org-capture:v*").is_some(),
+        "the fields menu opens the capture buffer with the answers substituted"
+    );
+    finalize_capture(&mut editor, "").await;
+
     assert_eq!(
         text_of(&editor, &vocab),
         "* chat :fc:\n- Context: le chat noir\n- T: cat\n",
@@ -2929,11 +3025,13 @@ async fn a_template_without_questions_still_captures_in_one_hop() {
 
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "t").await;
+    // OC.7b: no questions ⇒ the capture BUFFER opens directly, rather than a
+    // second menu or the one-line prompt this asserted before.
     assert!(
-        editor.pending_prompt_submit_action.is_some(),
-        "no questions, so the prompt opens directly rather than a second menu"
+        editor.buffers.by_name("*org-capture:t*").is_some(),
+        "the capture buffer opened"
     );
-    submit_prompt(&mut editor, "call the bank");
+    finalize_capture(&mut editor, "call the bank").await;
 
     assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
 }
@@ -2970,6 +3068,7 @@ async fn abandoning_the_fields_menu_writes_nothing() {
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "v").await;
     press_menu_key(&mut editor, "c").await;
+    finalize_capture(&mut editor, "").await;
     assert_eq!(
         text_of(&editor, &vocab),
         "* \n",
@@ -3874,4 +3973,155 @@ async fn tab_cycles_a_drawer_and_a_block_not_only_a_headline() {
         !cycles_at(&mut editor, 4),
         "plain body text opens no fold, so `<Tab>` declines"
     );
+}
+
+// ---- OC.7b: the capture BUFFER -------------------------------------------
+
+/// **Firing a capture opens a buffer holding the expanded template.**
+///
+/// The gap this closes: before OC.7b the template was never shown. `org-capture`
+/// returned `Effect::OpenPrompt` with `initial: String::new()`, so the user
+/// typed into an empty one-line minibuffer and found out what the template did
+/// only after filing it. Reported as "I don't see a capture buffer at all",
+/// and it was not an oversight — a plugin mode has no `on_activate` (the
+/// `modes` seam is declaration-only), so until OC.7a's `content` field a guest
+/// could not put a character into a buffer it opened.
+///
+/// Driven through the REAL effect the action returns, and applied, because an
+/// effect that is produced and dropped is indistinguishable from a broken
+/// feature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    let target = base.path().join("notes.org");
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\ntarget = {{ file = \"{}\" }}\nbody = \"\"\"\n* TODO %?\n  captured\n\"\"\"\n",
+            target.display()
+        ),
+    );
+
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-capture")
+        .expect("the capture action is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(
+        lattice_grammar::CommandInvocation::of(id)
+            .with_args(lattice_grammar::Args::String("t".to_string())),
+        &mut out,
+    );
+    // `OpenSyntheticBuffer` is RENDERER-applied — the `<leader>o:` wall this
+    // file's capture section already describes — so a headless Editor drops
+    // it. Apply it exactly as `lattice-ui-tui`'s arm does, which is also what
+    // makes this a test of the effect's CONTENT rather than of the renderer.
+    for effect in out.effects.clone() {
+        match effect {
+            lattice_grammar::Effect::OpenSyntheticBuffer {
+                name,
+                mode_id,
+                content,
+                cursor,
+                activate_minor,
+            } => editor.open_synthetic_buffer_seeded(
+                &name,
+                &mode_id,
+                content.as_deref(),
+                cursor,
+                activate_minor.as_deref(),
+            ),
+            other => {
+                editor.handle_effect(other);
+            }
+        }
+    }
+    editor.run_tick_pending();
+
+    // A real buffer, named for its template so a second capture of the same
+    // template returns to the note in progress.
+    let buffer = editor
+        .buffers
+        .by_name("*org-capture:t*")
+        .unwrap_or_else(|| panic!("no capture buffer. effects={:?}", out.effects));
+    let text = editor
+        .buffers
+        .document_handle(buffer)
+        .expect("a document")
+        .snapshot()
+        .buffer
+        .as_string();
+    assert!(
+        text.contains("* TODO") && text.contains("captured"),
+        "the buffer holds the EXPANDED template, not an empty prompt: {text:?}"
+    );
+    assert!(
+        !text.contains("%?"),
+        "`%?` is a caret position, not literal text: {text:?}"
+    );
+
+    // The capture-specific chords are live HERE...
+    let active = editor
+        .active_modes
+        .get(&buffer)
+        .expect("the capture buffer has modes");
+    assert!(
+        active.has_minor(ModeId::new("org-capture-mode")),
+        "the minor rides the buffer: {:?}",
+        active.minors()
+    );
+    assert_eq!(
+        active.major(),
+        Some(ModeId::new("org-mode")),
+        "…on an org-mode major, because a capture buffer IS an org buffer"
+    );
+    let modes: Vec<ModeId> = active.keymap_gated_ids();
+
+    let resolves = |chord: &str, modes: &[ModeId]| {
+        let seq = lattice_protocol::parse_chord_sequence(chord).expect("parses");
+        editor
+            .keymap
+            .resolve_trace(lattice_keymap::BindingMode::Normal, &seq, modes)
+            .hits
+            .last()
+            .map(|h| format!("{:?}", h.command))
+    };
+    assert!(
+        resolves("<C-c><C-c>", &modes).is_some(),
+        "C-c C-c files the capture"
+    );
+    assert!(
+        resolves("<C-c><C-k>", &modes).is_some(),
+        "C-c C-k aborts it"
+    );
+
+    // ...and they landed on the MINOR's layer, which is what scopes them to
+    // capture buffers.
+    //
+    // Asserted as the layer rather than as "unbound in a plain org buffer",
+    // because `resolve_trace` is a keymap query that does NOT apply the mode
+    // filter — it answers from every layer regardless of the `modes` it is
+    // handed, and K.1.c's per-keystroke filter is what actually scopes a
+    // chord to mode-active buffers. A test asserting absence here would be
+    // asserting against the wrong layer and would pass or fail for reasons
+    // unrelated to the binding.
+    //
+    // The layer IS the guarantee: `MinorMode(org-capture-mode)` is what the
+    // per-keystroke filter keys on, and it is the standing rule's requirement
+    // (feature keymaps at `MinorMode`, never `Builtin`, which fires in every
+    // buffer). `C-c C-c` on org's MAJOR would file every org file you touched.
+    for chord in ["<C-c><C-c>", "<C-c><C-k>"] {
+        let hit = resolves(chord, &modes).unwrap_or_default();
+        assert!(
+            hit.contains("MinorMode(ModeId(\"org-capture-mode\"))"),
+            "{chord} must be bound on the capture MINOR's layer, not on org's \
+             major or on Builtin: {hit}"
+        );
+    }
 }

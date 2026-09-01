@@ -140,6 +140,7 @@ mod capture_target;
 mod capture_templates;
 mod checkbox;
 mod clock;
+mod clock_scan;
 mod headline;
 mod links;
 mod refile;
@@ -2548,11 +2549,34 @@ impl Guest for Component {
         _path: String,
         text: String,
         tree: Option<&TreeSnapshot>,
-    ) -> Result<Vec<Entry>, String> {
+    ) -> Result<lattice::plugin_host::scanned_excerpt_source::ScanResult, String> {
+        // OA.14b: the clock spans are computed from the TEXT and are
+        // independent of the sections — a headline that no block admits still
+        // logged its time, and a report that only totalled admitted rows would
+        // under-report with nothing to show for it.
+        //
+        // Computed before the row walk so an early `Err` on the rows cannot
+        // silently take the clock report with it… except that it does: an
+        // `Err` skips the whole file, rows and clock alike. That is the right
+        // coupling — a file org could not read is a file it cannot honestly
+        // report time from either — and it is stated here because the two
+        // halves are otherwise independent enough to look separable.
+        let clock: Vec<lattice::plugin_host::scanned_excerpt_source::ClockSpan> =
+            clock_scan::scan(&text)
+                .into_iter()
+                .map(
+                    |s| lattice::plugin_host::scanned_excerpt_source::ClockSpan {
+                        line: s.line,
+                        outline: s.outline,
+                        day: s.day,
+                        minutes: s.minutes,
+                    },
+                )
+                .collect();
         // `begin` is contractually called first. Refusing rather than
         // defaulting makes a host that stops calling it fail loudly on the
         // first file instead of producing a silently mis-dated agenda.
-        SCAN.with_borrow(|state| {
+        let entries = SCAN.with_borrow(|state| {
             let Some(state) = state.as_ref() else {
                 return Err("org: scan before begin".to_string());
             };
@@ -2609,7 +2633,8 @@ impl Guest for Component {
                         })
                 })
                 .collect())
-        })
+        })?;
+        Ok(lattice::plugin_host::scanned_excerpt_source::ScanResult { entries, clock })
     }
 }
 

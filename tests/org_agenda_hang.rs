@@ -232,7 +232,7 @@ async fn which_file_wedges_the_guest_scan() {
                     eprintln!(
                         "  SLOW  #{i} {path:?} bytes={} rows={} {d:?}",
                         text.len(),
-                        rows.len()
+                        rows.entries.len()
                     );
                 }
             }
@@ -291,7 +291,7 @@ async fn how_long_does_the_wedging_file_take() {
         Ok(Ok(rows)) => eprintln!(
             ">>> COMPLETED in {:?} with {} rows",
             start.elapsed(),
-            rows.len()
+            rows.entries.len()
         ),
         Ok(Err(e)) => eprintln!(">>> ERRORED in {:?}: {e}", start.elapsed()),
         Err(_) => eprintln!(
@@ -350,7 +350,7 @@ async fn scan_time_versus_size() {
             text.len(),
             start.elapsed(),
             match &r {
-                Ok(Ok(rows)) => format!("{} rows", rows.len()),
+                Ok(Ok(rows)) => format!("{} rows", rows.entries.len()),
                 Ok(Err(e)) => format!("err: {e}"),
                 Err(_) => "TIMEOUT".to_string(),
             }

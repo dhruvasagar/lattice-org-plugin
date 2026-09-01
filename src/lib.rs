@@ -521,7 +521,9 @@ const DEFAULT_AGENDA_SECTIONS: &str = "";
 
 /// OA.11 — `org.agenda-custom-commands`. Empty for `DEFAULT_AGENDA_SECTIONS`'
 /// reason and one of its own: there is no built-in custom command. Unset means
-/// `<leader>oa` opens the default agenda, which is what it has always done.
+/// the dispatcher (OA.13) offers exactly one row — the built-in agenda — so a
+/// user who configures nothing still reaches it, one keystroke later than
+/// before.
 const DEFAULT_AGENDA_CUSTOM_COMMANDS: &str = "";
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
@@ -1629,7 +1631,19 @@ impl Guest for Component {
             activation_policy: ActivationPolicy::Universal,
             capabilities: ModeCapabilities::empty(),
             keymap: vec![
-                bind("<leader>oa", "org-agenda"),
+                // OA.13: `oa` opens the DISPATCHER, not the agenda directly.
+                //
+                // A deliberate behaviour change, and the emacs-faithful one:
+                // `C-c a` has always meant "choose an agenda", with `C-c a a`
+                // being the built-in one. That second `a` is why the menu puts
+                // the built-in agenda on `a` — the muscle memory people arrive
+                // with already spells it.
+                //
+                // `:org-agenda` still opens the default agenda directly, so
+                // nothing lost a way to get there; what moved is only what the
+                // CHORD does. Landed as its own slice so it can be reverted
+                // alone if it turns out to annoy.
+                bind("<leader>oa", "org-agenda-menu"),
                 // OM.11 bound this at `<leader>oc` on the org MAJOR, where it
                 // could only fire inside an org file. `org-capture-submit` is
                 // the second hop and is NOT bound — the host dispatches it on
@@ -1694,7 +1708,11 @@ impl Guest for Component {
                 // `a` and `c` are free beneath `<C-c>`: magit's are
                 // `<C-c><C-c>` / `<C-c><C-k>`, which continue on a CONTROL
                 // key, and `<C-c>g` / `<C-c>f` differ in the second letter.
-                bind("<C-c>a", "org-agenda"),
+                // OA.13: both spellings move together, because they are two
+                // spellings of one thing. `C-c a` opening a chooser is what
+                // emacs does, so this is the binding arriving hands already
+                // expect — the divergence was the OLD behaviour.
+                bind("<C-c>a", "org-agenda-menu"),
                 bind("<C-c>c", "org-capture-menu"),
             ],
             target_language: None,

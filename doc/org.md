@@ -213,7 +213,7 @@ same thing without leaving the editor.
 | `<leader>o$` | archive the subtree into `<this file>_archive` |
 | `<leader>or` | refile the subtree under a headline you pick |
 | `<leader>oc` | capture — opens the template menu, from any buffer |
-| `<leader>oa` | the agenda, from any buffer |
+| `<leader>oa` | choose an agenda, from any buffer |
 | `<Tab>` `<S-Tab>` | cycle this headline / the whole buffer |
 
 Each is one edit, so one `u` undoes it whole — demoting a subtree puts every
@@ -685,7 +685,7 @@ second line in a view whose job is to be scannable. Press `<CR>` for the rest.
 |---|---|
 | `:org-agenda` | build it over your configured agenda files |
 | `:org-agenda ~/notes` | build it over somewhere else instead |
-| `<leader>oa` | the same, from any buffer |
+| `<leader>oa` / `C-c a` | choose an agenda, from any buffer |
 | `<CR>` | jump to the entry's file and line |
 | `<Tab>` `<S-Tab>` | collapse or expand the block at the cursor / every block |
 | `gr` | re-scan |
@@ -846,6 +846,58 @@ says so in the first header** rather than showing you nothing — an empty agend
 and a genuinely empty agenda look identical, and "you have no tasks" is the
 worst thing this view can say incorrectly. One unusable section is skipped and
 the rest still render.
+
+### Named agendas
+
+One section set answers one question. `org.agenda-custom-commands` lets you keep
+several and pick between them — org's `org-agenda-custom-commands`, in the same
+TOML-in-a-string shape as everything else here:
+
+```toml
+[org]
+agenda-custom-commands = '''
+[[command]]
+key = "w"
+description = "Waiting on someone"
+
+  [[command.section]]
+  title = "Waiting"
+  when = "any"
+  match = "-CANCELLED+WAITING|HOLD/!"
+
+[[command]]
+key = "r"
+description = "Refile"
+
+  [[command.section]]
+  title = "Tasks to refile"
+  when = "any"
+  match = "REFILE"
+'''
+```
+
+| Key | Means |
+|---|---|
+| `key` | the keystroke that selects it. Required |
+| `description` | the menu row's label. Defaults to the key |
+| `[[command.section]]` | a block, exactly as under `org.agenda-sections` — same keys, same rules |
+
+**`<leader>oa` (or `C-c a`) opens the chooser**, and the built-in agenda is on
+`a`. That is a change: those chords used to open the agenda directly. It is
+what emacs does — `C-c a` has always meant "choose an agenda" and `C-c a a` the
+built-in one — so the spelling your fingers already know still works, one
+keystroke longer. `:org-agenda` still opens the default agenda with no menu at
+all.
+
+A command's sections are sections: `when`, `days`, `todo-only`,
+`min-priority` and `match` all mean what they mean above, because they are
+literally the same thing being read.
+
+Failure behaves the way the rest of this file does. A set that does not parse
+leaves you the default agenda and says so; one unusable command is skipped and
+named in the menu's footer while the others still work; and a key that names
+nothing tells you which keys *do* exist. A broken configuration costs you your
+layout, never your rows.
 
 ### What counts as a row
 

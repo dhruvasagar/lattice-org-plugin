@@ -2493,7 +2493,7 @@ async fn the_capture_chord_and_its_submit_hop_are_both_wired() {
     );
     assert!(
         bound("<leader>oa", &global_only),
-        "<leader>oa reaches the agenda from anywhere"
+        "<leader>oa reaches the agenda dispatcher from anywhere"
     );
 
     // The property the prefix choice rests on: the universal minor's
@@ -4283,6 +4283,62 @@ async fn a_broken_command_set_still_opens_the_menu_and_says_what_broke() {
     assert!(
         footer.contains("`b`") && footer.contains("someday"),
         "the footer names what was dropped and why, got {footer:?}"
+    );
+}
+
+/// OA.13: `<leader>oa` opens the DISPATCHER, not the agenda directly.
+///
+/// The behaviour change this slice exists for, driven through `press_chord`
+/// rather than by dispatching the action: a menu that builds correctly and
+/// cannot be opened by its chord is exactly the failure the capture-menu test
+/// was written to catch, and the chord IS the deliverable here.
+///
+/// Emacs-faithful rather than novel — `C-c a` has always meant "choose an
+/// agenda" — which is why the menu puts the built-in one on `a`: `C-c a a` is
+/// the spelling the muscle memory already has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_chord_opens_the_dispatcher() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    press_chord(&mut editor, "<leader>oa").await;
+
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the chord opened the dispatcher; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    assert_eq!(spec.title, "Agenda");
+    // `a` is the built-in agenda — the second keystroke of `C-c a a`, and the
+    // one that makes this change cost an unconfigured user a keystroke rather
+    // than a feature.
+    assert!(
+        spec.groups[0].items.iter().any(|i| i.key[0] == "a"),
+        "the built-in agenda is still one keystroke away"
+    );
+}
+
+/// OA.13: `C-c a` moves with it. Two spellings of one thing, so a test that
+/// only covered the leader chord would let them drift apart silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_emacs_agenda_chord_opens_the_dispatcher_too() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    press_chord(&mut editor, "<C-c>a").await;
+
+    let picker = editor.picker.as_ref().expect("the dispatcher opened");
+    assert_eq!(
+        picker.transient.as_ref().expect("in transient mode").title,
+        "Agenda"
     );
 }
 

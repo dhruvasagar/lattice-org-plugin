@@ -37,6 +37,30 @@ use lattice_plugin_loader::{discover, LoaderServices, PluginLoader};
 use lattice_protocol::parse_chord_sequence;
 use lattice_runtime::document::Document as _;
 
+/// Org's own view identity — the same strings its `MultibufferViewSpec`
+/// declares to the host.
+///
+/// The host no longer carries these. A scan view is generic machinery and the
+/// name is the plugin's, so org names its own; in production the plugin loader
+/// builds this same identity from org's declaration. A test that opened the
+/// view through a host-side `open_agenda` would be testing a constant that no
+/// longer exists.
+fn org_agenda_identity() -> lattice_multibuffer::providers::scan_view::ScanViewIdentity {
+    lattice_multibuffer::providers::scan_view::ScanViewIdentity {
+        provider: "agenda".to_string(),
+        buffer_name: "*agenda*".to_string(),
+        view_mode: None,
+        no_rows_message: "no plugin provides agenda rows".to_string(),
+    }
+}
+
+fn open_org_agenda(
+    editor: &mut Editor,
+    args: &lattice_grammar::Args,
+) -> lattice_mode::ProviderViewOutcome {
+    lattice_multibuffer::providers::scan_view::open_scan_view(editor, &org_agenda_identity(), args)
+}
+
 /// See `org_major_mode.rs` — `Editor::boot` auto-discovers plugins on a
 /// spawned task, which flakes ~1-in-6 against a developer's real
 /// `~/.config/lattice`. This is the documented seal.
@@ -269,7 +293,7 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
     drop(snapshot);
 
     // --- `:agenda <dir>` through the ordinary ex-command path.
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -386,10 +410,7 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agenda_declines_when_no_plugin_provides_rows() {
     let mut editor = boot_sealed_editor();
-    match lattice_multibuffer::providers::agenda::open_agenda(
-        &mut editor,
-        &lattice_grammar::Args::None,
-    ) {
+    match open_org_agenda(&mut editor, &lattice_grammar::Args::None) {
         lattice_mode::ProviderViewOutcome::Declined { message } => {
             assert!(
                 message.contains("no plugin provides agenda rows"),
@@ -450,7 +471,7 @@ async fn changing_a_todo_state_in_the_agenda_writes_the_source_document() {
         .discover_and_load(&plugins_dir, TrustTier::Bundled)
         .await;
     assert_eq!(loaded, 1);
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
+    let view = match open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     ) {
@@ -548,7 +569,7 @@ async fn a_headline_inside_a_source_block_is_not_a_row() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -630,7 +651,7 @@ async fn a_deadline_outranks_a_scheduled_written_before_it() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -726,10 +747,7 @@ async fn the_agenda_files_option_decides_what_is_scanned() {
     });
 
     // No argument: the roots must come from the option, through `roots()`.
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
-        &mut editor,
-        &lattice_grammar::Args::None,
-    );
+    let view = open_org_agenda(&mut editor, &lattice_grammar::Args::None);
     let view = match view {
         lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
         lattice_mode::ProviderViewOutcome::Declined { message } => {
@@ -830,7 +848,7 @@ async fn the_agenda_sections_option_replaces_the_built_in_blocks() {
             .to_string(),
     });
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -911,7 +929,7 @@ async fn a_malformed_section_set_falls_back_and_says_so_in_the_view() {
         spec: "org.agenda-sections=[[section]]\ntitle = ".to_string(),
     });
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -975,7 +993,7 @@ async fn agenda_rows_carry_per_excerpt_syntax_handles() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1068,7 +1086,7 @@ async fn the_agenda_folds_by_header_group_not_by_source_file() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1173,7 +1191,7 @@ async fn the_agenda_opens_collapsed_to_its_group_headers() {
         "sanity: the global default is 99, so 0 can only come from the mode"
     );
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1247,7 +1265,7 @@ async fn an_agenda_row_is_one_line_even_when_the_entry_has_a_planning_line() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1338,7 +1356,7 @@ async fn tab_cycles_a_block_in_the_agenda() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1468,7 +1486,7 @@ async fn agenda_rows_carry_org_semantic_colour() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1557,7 +1575,7 @@ async fn a_section_match_filters_by_tags_including_inherited_ones() {
             .to_string(),
     });
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     );
@@ -1648,7 +1666,7 @@ async fn a_custom_command_supplies_the_sections_its_scan_runs() {
     // Position 0 is the root the HOST reads; position 1 is the command key,
     // which it does not. This is the two-slot split from OA.11a, exercised the
     // way the dispatcher will use it.
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::List(vec![
             lattice_grammar::args::ArgValue::String(notes.display().to_string()),
@@ -1744,7 +1762,7 @@ async fn an_unknown_command_key_falls_back_and_names_the_ones_that_exist() {
             .to_string(),
     });
 
-    let view = lattice_multibuffer::providers::agenda::open_agenda(
+    let view = open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::List(vec![
             lattice_grammar::args::ArgValue::String(notes.display().to_string()),

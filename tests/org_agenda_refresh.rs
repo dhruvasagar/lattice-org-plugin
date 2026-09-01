@@ -15,6 +15,30 @@ use lattice_plugin_loader::{LoaderServices, PluginLoader};
 use lattice_protocol::parse_chord_sequence;
 use lattice_runtime::document::Document as _;
 
+/// Org's own view identity — the same strings its `MultibufferViewSpec`
+/// declares to the host.
+///
+/// The host no longer carries these. A scan view is generic machinery and the
+/// name is the plugin's, so org names its own; in production the plugin loader
+/// builds this same identity from org's declaration. A test that opened the
+/// view through a host-side `open_agenda` would be testing a constant that no
+/// longer exists.
+fn org_agenda_identity() -> lattice_multibuffer::providers::scan_view::ScanViewIdentity {
+    lattice_multibuffer::providers::scan_view::ScanViewIdentity {
+        provider: "agenda".to_string(),
+        buffer_name: "*agenda*".to_string(),
+        view_mode: None,
+        no_rows_message: "no plugin provides agenda rows".to_string(),
+    }
+}
+
+fn open_org_agenda(
+    editor: &mut Editor,
+    args: &lattice_grammar::Args,
+) -> lattice_mode::ProviderViewOutcome {
+    lattice_multibuffer::providers::scan_view::open_scan_view(editor, &org_agenda_identity(), args)
+}
+
 fn boot_sealed_editor() -> Editor {
     lattice_plugin_loader::disable_autoload();
     Editor::boot(CoreDocument::from_text("scratch\n"))
@@ -181,7 +205,7 @@ async fn gr_in_the_agenda_repopulates_the_view() {
         .await;
     assert_eq!(loaded, 1, "the org component loads");
 
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
+    let view = match open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     ) {
@@ -269,10 +293,7 @@ async fn gr_repopulates_when_the_roots_came_from_the_option() {
         spec: format!("org.agenda-files={}", notes.display()),
     });
 
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
-        &mut editor,
-        &lattice_grammar::Args::None,
-    ) {
+    let view = match open_org_agenda(&mut editor, &lattice_grammar::Args::None) {
         lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
         lattice_mode::ProviderViewOutcome::Declined { message } => {
             panic!("the agenda declined: {message}")
@@ -345,7 +366,7 @@ async fn a_second_gr_also_repopulates() {
             .await,
         1
     );
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
+    let view = match open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     ) {
@@ -401,7 +422,7 @@ async fn gr_after_an_edit_in_the_agenda_repopulates() {
             .await,
         1
     );
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
+    let view = match open_org_agenda(
         &mut editor,
         &lattice_grammar::Args::String(notes.display().to_string()),
     ) {
@@ -462,10 +483,7 @@ async fn gr_over_the_real_corpus() {
         spec: format!("org.agenda-files={}", corpus.display()),
     });
 
-    let view = match lattice_multibuffer::providers::agenda::open_agenda(
-        &mut editor,
-        &lattice_grammar::Args::None,
-    ) {
+    let view = match open_org_agenda(&mut editor, &lattice_grammar::Args::None) {
         lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
         other => panic!("{other:?}"),
     };

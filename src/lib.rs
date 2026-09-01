@@ -456,17 +456,6 @@ const CAPTURE_FINALIZE: u32 = 58;
 /// `WriteToFile`-on-create does not have.
 const CAPTURE_ABORT: u32 = 59;
 
-/// `<Tab>` / `<S-Tab>` in the AGENDA (OA.4).
-///
-/// Distinct from `CYCLE` / `CYCLE_GLOBAL`, which are `org-mode`'s, and the
-/// split is not bookkeeping. `org-cycle`'s body needs an org tree-sitter tree
-/// and matches org node kinds; the agenda is a multibuffer whose major is
-/// `multibuffer-mode`, so there is no org tree to consult and no headline
-/// under the cursor to cycle — its structure is BLOCKS. These emit the fold
-/// effects directly, which is all the agenda's structure supports and all it
-/// needs.
-const AGENDA_CYCLE: u32 = 60;
-const AGENDA_CYCLE_GLOBAL: u32 = 61;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -1709,18 +1698,14 @@ impl Guest for Component {
                 bind("<leader>ot", "org-todo-cycle"),
                 bind("<leader>oT", "org-todo-cycle-back"),
                 bind("<leader>o,", "org-priority-cycle"),
-                // OA.4: the agenda opens collapsed (`foldlevel` below) and
-                // had no key to open it again — `org-mode`'s `<Tab>` is on
-                // the MAJOR, and the agenda's major is `multibuffer-mode`, so
-                // it never fired here. Only the core `z` chords worked.
-                //
-                // A deliberate deviation from `evil-org-agenda`, which binds
-                // bare `<tab>` to `org-agenda-goto`. That stays reachable on
-                // `g TAB`, where the same config also binds it, and with
-                // one-line rows (OA.1) there is no subtree inside a row to
-                // cycle — blocks are the only structure the view has.
-                bind("<Tab>", "org-agenda-cycle"),
-                bind("<S-Tab>", "org-agenda-global-cycle"),
+                // OA.4b: `<Tab>` / `<S-Tab>` are NOT bound here. They come
+                // from the host's shared `foldable-view-mode`, which the
+                // agenda's native view mode pulls in by declaring
+                // `fold_toggle_action()` — the same chord magit, project
+                // search, the references view, `*problems*` and
+                // `*compilation*` get. This mode briefly carried its own
+                // copy; that was the third one in the tree, and four
+                // foldable views had none.
             ],
             target_language: None,
             // AF.2: the agenda opens COLLAPSED, to its section and date
@@ -1901,18 +1886,6 @@ impl Guest for Component {
             "Cycle the whole buffer: overview, contents, show-all",
             &spec(),
             CYCLE_GLOBAL,
-        );
-        register_action(
-            "org-agenda-cycle",
-            "Agenda: collapse or expand the block at the cursor",
-            &spec(),
-            AGENDA_CYCLE,
-        );
-        register_action(
-            "org-agenda-global-cycle",
-            "Agenda: collapse or expand every block",
-            &spec(),
-            AGENDA_CYCLE_GLOBAL,
         );
         register_action(
             "org-promote-headline",
@@ -4067,12 +4040,6 @@ impl GrammarCallbacks for Component {
             // `<S-Tab>` is whole-buffer, so it does not decline: org's global
             // cycle is meaningful wherever the cursor is.
             CYCLE_GLOBAL => Ok(vec![Effect::AppAction(AppEffect::CycleFoldsGlobal)]),
-            // OA.4. No `Declined` fallback, deliberately: `<Tab>` in a
-            // document falls through to jump-list-forward, which in a
-            // read-only agenda would take you out of the view you are
-            // reading. A block is always the thing to cycle here.
-            AGENDA_CYCLE => Ok(vec![Effect::AppAction(AppEffect::CycleFoldAtCursor)]),
-            AGENDA_CYCLE_GLOBAL => Ok(vec![Effect::AppAction(AppEffect::CycleFoldsGlobal)]),
             // OM.6.
             MOVE_SUBTREE_UP => Ok(move_subtree(&ctx, doc, tree, true)),
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, tree, false)),

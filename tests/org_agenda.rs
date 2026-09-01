@@ -1353,12 +1353,39 @@ async fn tab_cycles_a_block_in_the_agenda() {
         .get::<MultibufferRegistryHandle>()
         .map(|h| (*h).clone())
         .expect("the multibuffer registry is a boot service");
+    // PRODUCTION ORDER, and it is the whole point of this test: the provider
+    // activates the view when it CREATES it, which is before the scan lands.
+    // Activating after `settle_agenda` instead would let `activate_buffer`'s
+    // seed compute folds over an already-populated view — which is exactly
+    // what hid this bug the first time.
+    let _ = editor.activate_buffer(view);
+    // Drain the mode-activation cascade WHILE THE VIEW IS STILL EMPTY, which
+    // is what production does: `org-agenda-mode` activates on the next tick
+    // and the file scan lands long after. Ticking only after the scan let a
+    // re-activation seed the folds over an already-populated view, which is
+    // why the first two attempts at this test passed on the broken code.
+    editor.run_tick_pending();
     let status = settle_agenda(&mb, view).await;
     editor.run_tick_pending();
 
-    let _ = editor.activate_buffer(view);
     editor.cursor.line = 0;
     editor.cursor.byte = 0;
+
+    // OA.4d: the folds must exist from the async landing alone. The view is
+    // activated while the scan is still running, so `activate_buffer`'s seed
+    // computes folds over an EMPTY view; nothing typed into it afterwards, so
+    // the edit path never recomputes either. Reported as "there are no folds
+    // when org agenda is created, if I use redraw! only then the folds appear
+    // and after that <Tab> works".
+    //
+    // Asserted BEFORE any further tick so a fix that merely recomputes on the
+    // next keystroke does not pass: the rows arrived without one, and so must
+    // their folds.
+    assert!(
+        !editor.folds.is_empty(),
+        "the agenda's folds must follow its async population, with no redraw \
+         and no keypress; got {status:?}"
+    );
 
     // The jump list is what a fallen-through `<Tab>` would walk. Recording it
     // is how this test tells "cycled a fold" from "did the global thing".

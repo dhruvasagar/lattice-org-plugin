@@ -186,7 +186,7 @@ async fn which_file_wedges_the_guest_scan() {
     let source = snapshot.sources()[0].clone();
     drop(snapshot);
 
-    source.begin().await.expect("begin");
+    source.begin(&[]).await.expect("begin");
 
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -273,7 +273,7 @@ async fn how_long_does_the_wedging_file_take() {
     let snapshot = sources.load();
     let source = snapshot.sources()[0].clone();
     drop(snapshot);
-    source.begin().await.expect("begin");
+    source.begin(&[]).await.expect("begin");
 
     let text = std::fs::read_to_string(&file).unwrap();
     eprintln!(
@@ -327,7 +327,7 @@ async fn scan_time_versus_size() {
     let snapshot = sources.load();
     let source = snapshot.sources()[0].clone();
     drop(snapshot);
-    source.begin().await.expect("begin");
+    source.begin(&[]).await.expect("begin");
 
     for lines in [50usize, 100, 200, 400, 800] {
         let mut text = String::from("#+title: big\n* TODO a thing\n");

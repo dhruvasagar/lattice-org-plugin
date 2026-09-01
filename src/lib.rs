@@ -2383,7 +2383,14 @@ impl Guest for Component {
     /// identical rows under section 3, and the host — which sorts on that
     /// number and knows nothing else — would interleave them into a view with
     /// no coherent reading at all.
-    fn begin() -> u64 {
+    ///
+    /// OA.11a adds *the scan's arguments* — what this particular scan was
+    /// opened for. The host passes them through without reading them, so they
+    /// are org's own vocabulary (the agenda dispatcher names which custom
+    /// command to run). They are captured here with everything else that must
+    /// hold still for one scan, because `begin` is the one call guaranteed to
+    /// precede `roots` and every `scan`.
+    fn begin(args: Vec<String>) -> u64 {
         let today = today_epoch_day();
         let keywords = agenda::Keywords::from_spec(
             &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
@@ -2431,6 +2438,13 @@ impl Guest for Component {
                 s.title.hash(&mut h);
                 s.filter.hash(&mut h);
             }
+            // OA.11a: the args join them, and for the sharpest version of the
+            // same reason. Two custom commands ask two different questions of
+            // the same files; a scan that did not key on which one it was
+            // answering would serve the first command's cached rows under the
+            // second command's name, and every one of them would look
+            // plausible.
+            args.hash(&mut h);
             h.finish()
         };
         SCAN.set(Some(ScanState {
@@ -4595,6 +4609,11 @@ impl GrammarCallbacks for Component {
                         Args::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
                         _ => None,
                     },
+                    // OA.11a: `:org-agenda` runs the DEFAULT agenda, so it
+                    // names no command. The dispatcher (OA.12) is what fills
+                    // this in; keeping the ex-command's meaning unchanged is
+                    // what makes that a separate, revertable slice.
+                    scan_args: Vec::new(),
                 },
             ))]),
             other => Err(format!("org: unknown ex-command callback {other}")),

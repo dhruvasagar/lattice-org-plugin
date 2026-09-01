@@ -172,7 +172,7 @@ async fn a_single_guest_scan_stays_inside_its_epoch_budget() {
     let snapshot = sources.load();
     let source = snapshot.sources()[0].clone();
     drop(snapshot);
-    source.begin().await.expect("begin");
+    source.begin(&[]).await.expect("begin");
 
     // 17 KB — smaller than plenty of ordinary org files, and an order of
     // magnitude smaller than the one in the real corpus.
@@ -208,7 +208,7 @@ async fn a_single_guest_scan_stays_inside_its_epoch_budget() {
 ///
 /// `gr` runs `open_scan_view`, which empties the view SYNCHRONOUSLY
 /// (`crates/lattice-multibuffer/src/providers/agenda.rs:351`) and then spawns a
-/// scan whose first act is `source.begin().await`
+/// scan whose first act is `source.begin(&[]).await`
 /// (`crates/lattice-multibuffer/src/providers/agenda.rs:474`).
 ///
 /// `AgendaActor` serves one call at a time off one queue
@@ -245,7 +245,7 @@ async fn a_refresh_can_begin_while_a_scan_is_in_flight() {
     let snapshot = sources.load();
     let source = snapshot.sources()[0].clone();
     drop(snapshot);
-    source.begin().await.expect("begin");
+    source.begin(&[]).await.expect("begin");
 
     // One ordinary 21 KB org file. The reporter's corpus has files 13x this.
     let text = big_org(500, "big");
@@ -264,7 +264,7 @@ async fn a_refresh_can_begin_while_a_scan_is_in_flight() {
     // The user presses `gr`. The view is ALREADY blank by this point; the only
     // thing that can refill it is this call returning.
     let start = std::time::Instant::now();
-    let _ = source.begin().await;
+    let _ = source.begin(&[]).await;
     let waited = start.elapsed();
     scanning.abort();
 

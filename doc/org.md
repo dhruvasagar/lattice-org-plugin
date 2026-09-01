@@ -686,8 +686,9 @@ grouped into **sections**.
 
 ### Which files it scans
 
-Set `org.agenda-files`, one path per line. An entry is a **directory** (walked)
-or a **file** (scanned as given, whatever its extension):
+Set `org.agenda-files`, one path per line. An entry is a **directory** — the
+org files *in* it, not its subtree — or a **file**, scanned as given whatever
+its extension:
 
 ```toml
 [org]
@@ -702,6 +703,12 @@ agenda-files = """
 `~` is expanded; blank lines and `#` comments are ignored. A path that does not
 exist is skipped and the rest still scan — one bad entry must not cost you the
 whole agenda.
+
+**A directory is one level deep**, as in emacs. A `roam/`, `journal/` or
+`archive/` folder under your org directory is not scanned unless you say so —
+list it as its own entry when you want it. That is why there is no "recursive"
+setting: the list already says it. Hidden files and anything your `.gitignore`
+excludes stay out either way.
 
 **Unset, it scans the current project.** That is the old behaviour and it is
 still the right one for a repo with org files in it; the option is for the

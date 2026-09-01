@@ -282,6 +282,11 @@ const ROAM_DAILIES_GOTO_DATE_SUBMIT: u32 = 50;
 /// capture's two menus.
 const ORG_TRANSIENT_TODO: &str = "todo";
 
+/// OA.12 — the agenda dispatcher's discriminator, alongside `todo`. Same
+/// mechanism: one `transient-source::id()` per guest, so org's menus branch on
+/// what the open was FOR rather than registering a source each.
+const ORG_TRANSIENT_AGENDA: &str = "agenda";
+
 /// `org-table-mode` (OM.12).
 const TABLE_NEXT_CELL: u32 = 21;
 const TABLE_PREV_CELL: u32 = 22;
@@ -457,6 +462,20 @@ const CAPTURE_FINALIZE: u32 = 58;
 /// an abort has nothing to clean up. It is the property OR.6's
 /// `WriteToFile`-on-create does not have.
 const CAPTURE_ABORT: u32 = 59;
+
+/// OA.12 — the agenda dispatcher. `AGENDA_MENU` opens it; `AGENDA_COMMAND` is
+/// what a row fires, carrying the command's key in its own args.
+///
+/// Two actions rather than one, for `TODO_SELECT` / `TODO_SET`'s reason: the
+/// menu's rows fire the second with a key, and one action that sometimes opens
+/// a menu and sometimes opens an agenda would make a row's own args ambiguous.
+///
+/// `AGENDA_COMMAND` is also NOT `:org-agenda` with the key as its argument,
+/// and that is the OA.11a two-slot split showing up one layer higher: the
+/// ex-command's argument is a ROOT, so passing `w` there would set the scan
+/// root to a directory that does not exist and quietly scan nothing.
+const AGENDA_MENU: u32 = 60;
+const AGENDA_COMMAND: u32 = 61;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -2061,6 +2080,18 @@ impl Guest for Component {
             "Set the headline's TODO state to the one named in args",
             &spec(),
             TODO_SET,
+        );
+        register_action(
+            "org-agenda-menu",
+            "Choose an agenda from a menu, keyed the way org.agenda-custom-commands says",
+            &spec(),
+            AGENDA_MENU,
+        );
+        register_action(
+            "org-agenda-command",
+            "Open the agenda named in args, from org.agenda-custom-commands",
+            &spec(),
+            AGENDA_COMMAND,
         );
         register_action(
             "org-timestamp-up",
@@ -4220,6 +4251,42 @@ impl GrammarCallbacks for Component {
                     args: Args::String(ORG_TRANSIENT_TODO.to_string()),
                 },
             )]),
+            // OA.12: the agenda dispatcher, the same shape one menu over.
+            AGENDA_MENU => Ok(vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    args: Args::String(ORG_TRANSIENT_AGENDA.to_string()),
+                },
+            )]),
+            // OA.12: the chosen agenda rides the row's own args, and lands in
+            // the SCAN-ARG slot rather than the argument one. The argument is
+            // the root the host interprets; a command key sent there would
+            // become a directory that does not exist (OA.11a).
+            AGENDA_COMMAND => {
+                let key = match &ctx.args {
+                    Args::String(s) => s.trim().to_string(),
+                    _ => String::new(),
+                };
+                Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                    OpenProviderViewPayload {
+                        provider: "agenda".to_string(),
+                        // No root override: a custom command says WHICH agenda,
+                        // never WHERE. The files stay `org.agenda-files`, which
+                        // is the only place a user has said where their org
+                        // lives.
+                        argument: None,
+                        // An empty key is the default agenda rather than an
+                        // error — it is what the built-in row sends, and
+                        // `agenda_custom_commands::resolve` already treats a
+                        // blank key as "no command named".
+                        scan_args: if key.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![key]
+                        },
+                    },
+                ))])
+            }
             // The chosen state rides the row's own args (TR.2a).
             TODO_SET => {
                 // An empty string is a real choice — the menu's "(none)"
@@ -5536,6 +5603,111 @@ const CAPTURE_TRANSIENT: &str = "org-capture";
 /// cannot reach a state the file already contains is worse than a menu with a
 /// gap in its shortcuts, and dropping it would make the menu disagree with the
 /// buffer.
+/// OA.12 — the agenda dispatcher: one row per configured agenda, plus the
+/// built-in one.
+///
+/// **Built per open, never cached**, for the capture and TODO menus' reason:
+/// the rows come from `org.agenda-custom-commands`, and a `:set` must take
+/// effect on the next press.
+///
+/// **The built-in agenda is always a row**, and always first. It is what
+/// `<leader>oa` opened before OA.13 moved that chord to this menu, so a
+/// dispatcher without it would take a working agenda away from every user who
+/// has configured no commands — which is nearly all of them. It sends an empty
+/// key, which `agenda_custom_commands::resolve` already reads as "no command
+/// named".
+///
+/// **An unconfigured user still gets a menu**, rather than an error. This is
+/// the one place org's menus differ from `todo_menu`, which errs when there are
+/// no keywords, and the difference is not an oversight: a TODO menu with no
+/// states can do nothing at all, whereas an agenda dispatcher with no custom
+/// commands can still open the agenda. A menu that refuses to open when it has
+/// a working row is worse than a short menu.
+fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+        .trim()
+        .parse::<u32>()
+        .unwrap_or_else(|_| {
+            DEFAULT_AGENDA_SPAN
+                .parse()
+                .expect("the compiled-in default parses")
+        });
+    let source = option_or("agenda-custom-commands", DEFAULT_AGENDA_CUSTOM_COMMANDS);
+    // An unusable set costs the ROWS it describes, never the menu: the built-in
+    // agenda is still reachable, and the footer says what went wrong. Erring
+    // here would mean a typo in one command's `when` left you unable to open
+    // any agenda at all.
+    let parsed = agenda_custom_commands::parse(&source, span);
+
+    let mut items: Vec<TransientItem> = Vec::new();
+    // `a` rather than `<Space>`: emacs's `C-c a a` is the built-in agenda, and
+    // this menu is reached by the same `a`, so the second press repeating it is
+    // the muscle memory people arrive with.
+    items.push(TransientItem {
+        key: vec!["a".to_string()],
+        label: "Agenda".to_string(),
+        description: "the built-in blocks".to_string(),
+        kind: TransientItemKind::Action(TransientAction {
+            command: "org-agenda-command".to_string(),
+            args: WitArgs::String(String::new()),
+        }),
+    });
+
+    let mut footer = None;
+    match &parsed {
+        Ok(set) => {
+            for c in &set.commands {
+                items.push(TransientItem {
+                    key: vec![c.key.clone()],
+                    label: c.description.clone(),
+                    description: format!(
+                        "{} block{}",
+                        c.sections.len(),
+                        if c.sections.len() == 1 { "" } else { "s" }
+                    ),
+                    kind: TransientItemKind::Action(TransientAction {
+                        command: "org-agenda-command".to_string(),
+                        args: WitArgs::String(c.key.clone()),
+                    }),
+                });
+            }
+            // What the set could not use is named in the FOOTER rather than
+            // dropped in silence — the capture menu's rule, and this is the one
+            // place a missing row is noticeable, because the user is looking at
+            // the menu and counting.
+            if !set.skipped.is_empty() {
+                footer = Some(format!("skipped: {}", set.skipped.join("; ")));
+            }
+        }
+        // `Unset` is the ordinary case and says nothing; a broken set says so
+        // here, which is the one channel that reaches the user BEFORE they have
+        // opened an agenda. The section-title notice only lands after.
+        Err(e) => footer = e.notice(),
+    }
+
+    // A menu with no way out is a trap. `q` is the transient's own convention.
+    items.push(TransientItem {
+        key: vec!["q".to_string()],
+        label: "quit".to_string(),
+        description: String::new(),
+        kind: TransientItemKind::Dismiss,
+    });
+
+    Ok(TransientSpec {
+        title: "Agenda".to_string(),
+        groups: vec![TransientGroup {
+            label: String::new(),
+            items,
+        }],
+        footer,
+    })
+}
+
 fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
     use lattice::plugin_host::types::{
         Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
@@ -5695,6 +5867,13 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         if let Args::String(key) = &ctx.args {
             if key == ORG_TRANSIENT_TODO {
                 return todo_menu();
+            }
+            // OA.12: and the agenda dispatcher, for TK.6's reason — it has
+            // nothing to do with capture, so parsing capture-templates first
+            // would answer "no capture templates" to a user who pressed the
+            // agenda chord and has never configured a capture.
+            if key == ORG_TRANSIENT_AGENDA {
+                return agenda_menu();
             }
         }
 

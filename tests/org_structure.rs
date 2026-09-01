@@ -4141,3 +4141,247 @@ async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OA.12 — the agenda dispatcher
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Open the agenda dispatcher, the way OA.13's chord will.
+///
+/// By name rather than by chord because OA.12 ships the menu and OA.13 moves
+/// the chord onto it — landing them apart is what makes the behaviour change
+/// revertable on its own.
+async fn open_agenda_menu(editor: &mut Editor) {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-agenda-menu")
+        .expect("the agenda menu action is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
+    apply_renderer_effects(editor, out).await;
+}
+
+/// OA.12: one row per configured agenda, and the built-in one always first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_dispatcher_lists_the_configured_agendas() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "agenda-custom-commands",
+        "[[command]]\nkey = \"w\"\ndescription = \"Waiting\"\n\n\
+         \x20 [[command.section]]\n  title = \"Blocked\"\n  when = \"any\"\n  match = \"WAITING\"\n\n\
+         [[command]]\nkey = \"r\"\ndescription = \"Refile\"\n\n\
+         \x20 [[command.section]]\n  title = \"Inbox\"\n  when = \"any\"\n  match = \"REFILE\"\n",
+    );
+
+    open_agenda_menu(&mut editor).await;
+
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the menu opened; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    assert_eq!(spec.title, "Agenda");
+    let keys: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.key[0].as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["a", "w", "r", "q"],
+        "the built-in agenda leads, then the configured ones in declaration \
+         order, plus a way out"
+    );
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert!(labels.contains(&"Waiting") && labels.contains(&"Refile"));
+}
+
+/// OA.12: with nothing configured the menu still opens, and the built-in
+/// agenda is still reachable.
+///
+/// This is where the dispatcher deliberately differs from the TODO menu, which
+/// errs when it has no keywords. A TODO menu with no states can do nothing at
+/// all; an agenda dispatcher with no custom commands can still open the agenda,
+/// and a menu that refuses to open when it has a working row is worse than a
+/// short menu. It also matters because OA.13 puts `<leader>oa` on this menu —
+/// erring here would take the agenda away from every user who has configured
+/// no commands, which is nearly all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_agenda_dispatcher_still_offers_the_built_in_agenda_unconfigured() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    open_agenda_menu(&mut editor).await;
+
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the menu opens with no configuration; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    let keys: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.key[0].as_str())
+        .collect();
+    assert_eq!(keys, vec!["a", "q"], "the built-in agenda and a way out");
+    assert!(
+        spec.footer.is_none(),
+        "unset is the ordinary case and says nothing, got {:?}",
+        spec.footer
+    );
+}
+
+/// OA.12: a broken set costs the ROWS it describes, never the menu — and the
+/// footer says so.
+///
+/// Erring instead would mean a typo in one command's `when` left you unable to
+/// open any agenda at all. The footer is also the only channel that reaches the
+/// user BEFORE they have opened an agenda; the section-title notice lands only
+/// after, and only if that section has rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_command_set_still_opens_the_menu_and_says_what_broke() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "agenda-custom-commands",
+        "[[command]]\nkey = \"g\"\n\n\x20 [[command.section]]\n  title = \"Good\"\n  when = \"any\"\n\n\
+         [[command]]\nkey = \"b\"\n\n\x20 [[command.section]]\n  title = \"Bad\"\n  when = \"someday\"\n",
+    );
+
+    open_agenda_menu(&mut editor).await;
+
+    let picker = editor.picker.as_ref().expect("the menu still opens");
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    let keys: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.key[0].as_str())
+        .collect();
+    assert_eq!(keys, vec!["a", "g", "q"], "the good command survives");
+    let footer = spec.footer.as_deref().unwrap_or_default();
+    assert!(
+        footer.contains("`b`") && footer.contains("someday"),
+        "the footer names what was dropped and why, got {footer:?}"
+    );
+}
+
+/// OA.12: the key you press decides which agenda, and it lands in the SCAN-ARG
+/// slot rather than the root one.
+///
+/// This is the assertion the whole phase turns on, and it inspects the effect
+/// directly rather than trusting the harness: `apply_renderer_effects` has no
+/// arm for `OpenProviderView`, so a test that only pressed and looked at the
+/// editor would see nothing happen and could not tell that from a broken row.
+///
+/// The `argument` slot must stay EMPTY. It is the root the host interprets, and
+/// a command key sent there becomes a directory that does not exist — the scan
+/// then covers no files and the agenda is silently empty, which is the exact
+/// failure OA.11a's two-slot split exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_key_you_press_decides_which_agenda_and_is_not_taken_for_a_root() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "agenda-custom-commands",
+        "[[command]]\nkey = \"w\"\ndescription = \"Waiting\"\n\n\
+         \x20 [[command.section]]\n  title = \"Blocked\"\n  when = \"any\"\n  match = \"WAITING\"\n\n\
+         [[command]]\nkey = \"r\"\ndescription = \"Refile\"\n\n\
+         \x20 [[command.section]]\n  title = \"Inbox\"\n  when = \"any\"\n  match = \"REFILE\"\n",
+    );
+
+    open_agenda_menu(&mut editor).await;
+    // The SECOND configured command, so a first-wins bug cannot pass this.
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("r".to_string(), &mut out);
+
+    let opened = out
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            lattice_grammar::Effect::AppAction(
+                lattice_grammar::app_effect::AppEffect::OpenProviderView { provider, args },
+            ) => Some((provider.clone(), args.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the row opened a provider view; got effects {:?}",
+                out.effects
+            )
+        });
+
+    assert_eq!(opened.0, "agenda");
+    // Position 0 is the host's root slot and must be empty; position 1 is the
+    // guest's, carrying the key that was pressed.
+    assert_eq!(
+        opened.1,
+        lattice_grammar::Args::List(vec![
+            lattice_grammar::args::ArgValue::String(String::new()),
+            lattice_grammar::args::ArgValue::String("r".to_string()),
+        ]),
+        "the key rides the scan-arg slot with the root left empty"
+    );
+}
+
+/// OA.12: the built-in row sends NO command, which is what makes it the
+/// default agenda rather than an agenda named `a`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_built_in_row_opens_the_default_agenda_with_no_command() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    open_agenda_menu(&mut editor).await;
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("a".to_string(), &mut out);
+
+    let args = out
+        .effects
+        .iter()
+        .find_map(|e| match e {
+            lattice_grammar::Effect::AppAction(
+                lattice_grammar::app_effect::AppEffect::OpenProviderView { args, .. },
+            ) => Some(args.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the row opened a provider view; got effects {:?}",
+                out.effects
+            )
+        });
+
+    assert_eq!(
+        args,
+        lattice_grammar::Args::None,
+        "no root and no command — byte-for-byte what a bare `:org-agenda` \
+         sends, so the built-in row and the ex-command cannot diverge"
+    );
+}

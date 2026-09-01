@@ -1316,10 +1316,17 @@ async fn tab_cycles_a_block_in_the_agenda() {
     std::fs::write(
         notes.join("plan.org"),
         format!(
-            "* TODO Overdue thing\n  SCHEDULED: {}\n\
-             * TODO Another overdue\n  SCHEDULED: {}\n\
-             * TODO Undated thing\nbody\n",
+            // TWO overdue dates, two entries each: two blocks of two rows.
+            // Multi-row so folding actually hides something — a one-row group
+            // is not foldable at all (OA.4c) and would prove nothing — and
+            // two of them so "only the cursor's block moved" is assertable.
+            "* TODO Older one\n  SCHEDULED: {}\n\
+             * TODO Older two\n  SCHEDULED: {}\n\
+             * TODO Newer one\n  SCHEDULED: {}\n\
+             * TODO Newer two\n  SCHEDULED: {}\n",
             stamp(-3),
+            stamp(-3),
+            stamp(-2),
             stamp(-2),
         ),
     )
@@ -1357,21 +1364,39 @@ async fn tab_cycles_a_block_in_the_agenda() {
     // is how this test tells "cycled a fold" from "did the global thing".
     let jumps_before = editor.position_history.len();
 
-    let closed = |ed: &Editor| ed.folds.iter().filter(|f| f.closed).count();
-    let total_folds = editor.folds.len();
+    let snapshot = |ed: &Editor| -> Vec<(u32, u32, bool)> {
+        ed.folds
+            .iter()
+            .map(|f| (f.start_line, f.end_line, f.closed))
+            .collect()
+    };
+    let before = snapshot(&editor);
+    assert!(before.len() > 1, "several blocks to cycle; got {status:?}");
     assert!(
-        total_folds > 0,
-        "the agenda has blocks to cycle; got {status:?}"
+        before.iter().all(|f| f.2),
+        "the agenda opens collapsed, so every block starts closed: {before:?}"
     );
-    let closed_before = closed(&editor);
+
     press(&mut editor, "<Tab>");
     editor.run_tick_pending();
-    let closed_after = closed(&editor);
+    let after = snapshot(&editor);
 
-    assert_ne!(
-        closed_before, closed_after,
-        "`<Tab>` must change the fold state of the block at the cursor; \
-         got {closed_before} -> {closed_after}, status {status:?}"
+    // The BLOCK AT THE CURSOR, and only it. `CycleFoldAtCursor` falls back to
+    // a global cycle when no fold contains the cursor, so asserting merely
+    // "some fold changed" passes on that fallback — which is `<S-Tab>`'s job,
+    // not `<Tab>`'s, and is exactly the confusion this test exists to catch.
+    let changed: Vec<usize> = before
+        .iter()
+        .zip(&after)
+        .enumerate()
+        .filter(|(_, (b, a))| b.2 != a.2)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        changed,
+        vec![0],
+        "`<Tab>` must open ONLY the block under the cursor (line 0). \
+         before={before:?} after={after:?}"
     );
     assert_eq!(
         editor.position_history.len(),

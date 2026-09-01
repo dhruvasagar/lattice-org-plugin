@@ -81,12 +81,18 @@
 //! Making a section's rows a contiguous run is therefore just "give them the
 //! same leading digits", which is what [`sort_key_in_section`] does.
 //!
-//! ## The excerpt spans the planning line
+//! ## A row is one line (OA.1)
 //!
-//! `end_line` runs to the planning line when there is one, so the agenda row
-//! shows `SCHEDULED: <…>` under its headline rather than a bare title the
-//! user has to jump to the source to date. This is the one place OM.A1's
-//! trivial guest left `end_line == line` and the real semantics do not.
+//! `end_line == line`, always. The agenda is an index: one line per entry,
+//! carrying the keyword, priority, title and tags, and you press `<CR>` to go
+//! to the source when you want the rest.
+//!
+//! It used to run to the planning line so the row showed `SCHEDULED: <…>`
+//! beneath its headline. That was a reasonable default when a date had
+//! nowhere else to appear, but it makes every dated row two lines tall in a
+//! view whose whole job is to be scannable — and the date is what the row is
+//! GROUPED under, so it was being shown twice. The plan node is still read;
+//! only what the excerpt spans changed.
 
 use crate::lattice::plugin_host::tree_sitter::Node;
 use crate::timestamp::{self, Stamp};
@@ -246,11 +252,10 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
 
     // The section's OWN plan, by field — not "the next line", which is the
     // assumption this migration exists to delete.
+    //
+    // OA.1 deleted the plan's EXTENT along with the row that spanned it; the
+    // plan is still read for its date.
     let plan = section.child_by_field("plan");
-    let plan_span = plan
-        .as_ref()
-        .map(|p| p.byte_range())
-        .map(|range| (range.start.line, tree::last_content_line(&range)));
 
     // OT.5: the plan's entries, read as nodes. See `plan_date`.
     let from_plan = plan.as_ref().and_then(|p| plan_date(p, lines));
@@ -274,17 +279,11 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
         return None;
     }
 
-    let from_plan = dated.as_ref().map(|(_, _, p)| *p).unwrap_or(false);
     Some(Row {
         line: headline_line,
-        // When the date came from the plan the excerpt spans down to it, so the
-        // row shows `SCHEDULED: <…>` under its headline. Taken from the plan
-        // node's own extent rather than assumed to be one line — a plan
-        // carrying both DEADLINE and SCHEDULED spans two.
-        end_line: match (from_plan, plan_span) {
-            (true, Some((_, last))) => last,
-            _ => headline_line,
-        },
+        // OA.1: one line per entry. The plan is still parsed — it is where the
+        // date comes from — but the excerpt does not span down to it.
+        end_line: headline_line,
         date: dated.map(|(kind, stamp, _)| Dated {
             day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
             kind,
@@ -402,14 +401,11 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
         if dated.is_none() && headline.keyword.is_none() {
             continue;
         }
-        let spans_planning = dated.as_ref().map(|(_, _, s)| *s).unwrap_or(false);
         rows.push(Row {
             line: i as u32,
-            end_line: if spans_planning {
-                i as u32 + 1
-            } else {
-                i as u32
-            },
+            // OA.1: one line, matching `row_for_section`. The two paths must
+            // agree on the shape of a row as well as on what IS one.
+            end_line: i as u32,
             date: dated.map(|(kind, stamp, _)| Dated {
                 day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
                 kind,
@@ -786,13 +782,16 @@ mod tests {
     // ── what counts as a row ────────────────────────────────────────────
 
     #[test]
-    fn a_scheduled_headline_is_a_row_spanning_its_planning_line() {
+    fn a_scheduled_headline_is_a_one_line_row_dated_by_its_planning_line() {
         let rows = scan("* TODO Ship it\n  SCHEDULED: <2026-08-25 Tue>\nbody\n");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].line, 0);
+        // OA.1: the planning line DATES the row without being part of it.
+        // This asserted `end_line == 1` — the excerpt spanning down to show
+        // `SCHEDULED:` — which made every dated row two lines tall.
         assert_eq!(
-            rows[0].end_line, 1,
-            "the excerpt shows the date, not just the title"
+            rows[0].end_line, 0,
+            "the planning line is read for its date, not composed into the row"
         );
         assert_eq!(rows[0].date.expect("dated").kind, Kind::Scheduled);
         assert_eq!(

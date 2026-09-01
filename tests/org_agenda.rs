@@ -35,6 +35,7 @@ use lattice_multibuffer::{HeaderlineStatus, MultibufferRegistryHandle};
 use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{discover, LoaderServices, PluginLoader};
 use lattice_protocol::parse_chord_sequence;
+use lattice_runtime::document::Document as _;
 
 /// See `org_major_mode.rs` — `Editor::boot` auto-discovers plugins on a
 /// spawned task, which flakes ~1-in-6 against a developer's real
@@ -355,16 +356,21 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
         "one date group, two source documents"
     );
 
-    // The overdue deadline's excerpt spans its planning line, so the row
-    // shows the date rather than a bare title the user has to jump to read.
-    assert_eq!(
-        excerpts[0].end_line,
-        excerpts[0].start_line + 1,
-        "a scheduled/deadline row spans its planning line"
-    );
-    // …and a bare-timestamp row does not, because there is no planning line
-    // under it to show.
-    assert_eq!(excerpts[2].end_line, excerpts[2].start_line);
+    // OA.1: every row is one line, whether or not the entry has a planning
+    // line under it. This used to assert the opposite — a scheduled row spanned
+    // down to its `SCHEDULED:` — which made dated rows two lines tall and
+    // showed the date twice, since the row is already grouped under it.
+    for e in &excerpts {
+        assert_eq!(
+            e.start_line,
+            e.end_line,
+            "an agenda row is one line; got {:?}",
+            excerpts
+                .iter()
+                .map(|e| (e.start_line, e.end_line))
+                .collect::<Vec<_>>()
+        );
+    }
 
     match status {
         HeaderlineStatus::Complete { summary, .. } => {
@@ -574,10 +580,9 @@ async fn a_headline_inside_a_source_block_is_not_a_row() {
             .collect::<Vec<_>>()
     );
     assert_eq!(excerpts[0].start_line, 0, "the real task is the row");
-    assert_eq!(
-        excerpts[0].end_line, 1,
-        "and its excerpt spans down to its planning line"
-    );
+    // OA.1: one line. The planning line is parsed for its date and not
+    // composed into the view.
+    assert_eq!(excerpts[0].end_line, 0, "and its excerpt is one line");
 }
 
 /// OT.5: two planning entries on one line, and which of them dates the row is
@@ -1199,5 +1204,91 @@ async fn the_agenda_opens_collapsed_to_its_group_headers() {
         99,
         "and the global setting is untouched, so search and diff still open \
          expanded — they share the multibuffer major"
+    );
+}
+
+/// OA.1: an agenda row is ONE line.
+///
+/// `end_line` used to run down to the planning line so the row showed
+/// `SCHEDULED: <…>` under its headline. That made every dated row two lines
+/// tall in a view whose job is to be scannable, and showed the date twice —
+/// the row is already GROUPED under it.
+///
+/// Asserted on the composed view, not on `Row`: what matters is how many lines
+/// the user sees, and the excerpt→composed step is where a spanning row would
+/// still show up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agenda_row_is_one_line_even_when_the_entry_has_a_planning_line() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    // Two dated entries, each with its date on a planning line beneath the
+    // headline — the shape that used to compose four rows for two entries.
+    std::fs::write(
+        notes.join("plan.org"),
+        format!(
+            "* TODO Ship it\n  SCHEDULED: {}\n* TODO Reply to Ana\n  DEADLINE: {}\n",
+            stamp(1),
+            stamp(2),
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+
+    assert_eq!(excerpts.len(), 2, "two entries, two rows: {status:?}");
+    for e in &excerpts {
+        assert_eq!(
+            e.start_line,
+            e.end_line,
+            "an agenda excerpt spans one line; got {:?}",
+            excerpts
+                .iter()
+                .map(|e| (e.start_line, e.end_line))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // The composed view is what the user reads: two headlines, and no
+    // `SCHEDULED:` / `DEADLINE:` line among them.
+    let composed = handle.snapshot().buffer.as_string();
+    let lines: Vec<&str> = composed
+        .lines()
+        .filter(|l: &&str| !l.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2, "composed: {composed:?}");
+    assert!(
+        !composed.contains("SCHEDULED:") && !composed.contains("DEADLINE:"),
+        "the planning line must not be composed into the agenda: {composed:?}"
     );
 }

@@ -675,6 +675,12 @@ network traffic you did not ask for.
 `:org-agenda` collects your headlines across every org file into one view,
 grouped into **sections**.
 
+**One line per entry.** A row is the headline — its keyword, priority, title
+and tags — and nothing else. A `SCHEDULED:` or `DEADLINE:` line dates the row
+and decides which block it lands in, but is not shown under it: the row is
+already grouped by that date, and repeating it would cost every dated entry a
+second line in a view whose job is to be scannable. Press `<CR>` for the rest.
+
 | | |
 |---|---|
 | `:org-agenda` | build it over your configured agenda files |

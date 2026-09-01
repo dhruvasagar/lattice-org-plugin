@@ -78,8 +78,12 @@ struct RawSet {
     section: Vec<RawSection>,
 }
 
+/// `pub(crate)` because `agenda_custom_commands` deserialises the SAME shape:
+/// a custom command's `[[command.section]]` is a section in every respect, and
+/// a second declaration of it would be two places for `todo-only` to be spelled
+/// and one of them to be spelled wrong.
 #[derive(Deserialize)]
-struct RawSection {
+pub(crate) struct RawSection {
     #[serde(default)]
     title: String,
     /// `overdue` | `days` | `undated` | `any`. Lower-cased before matching, so
@@ -164,9 +168,29 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedSet, SectionError>
     let raw: RawSet =
         toml::from_str(source).map_err(|e| SectionError::Malformed(e.message().to_string()))?;
 
-    let mut sections: Vec<Section> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for (i, s) in raw.section.into_iter().enumerate() {
+    let sections = sections_from_raw(raw.section, default_days, &mut skipped);
+
+    if sections.is_empty() {
+        return Err(SectionError::Empty);
+    }
+    Ok(ParsedSet { sections, skipped })
+}
+
+/// Turn deserialised sections into validated ones, naming what was dropped.
+///
+/// Shared with `agenda_custom_commands`, which parses the identical shape one
+/// level deeper. The validation rules — a section needs a title, an unknown
+/// `when` costs that section and not the set, a bad `match` likewise — are the
+/// user-facing contract, and having them in one place is what stops a custom
+/// command's sections from quietly obeying different ones.
+pub(crate) fn sections_from_raw(
+    raw: Vec<RawSection>,
+    default_days: u32,
+    skipped: &mut Vec<String>,
+) -> Vec<Section> {
+    let mut sections: Vec<Section> = Vec::new();
+    for (i, s) in raw.into_iter().enumerate() {
         let title = s.title.trim().to_string();
         if title.is_empty() {
             // Named by position, since there is no title to name it by. A
@@ -223,11 +247,7 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedSet, SectionError>
             },
         });
     }
-
-    if sections.is_empty() {
-        return Err(SectionError::Empty);
-    }
-    Ok(ParsedSet { sections, skipped })
+    sections
 }
 
 fn parse_when(raw: &str, days: Option<u32>, default_days: u32) -> Option<When> {

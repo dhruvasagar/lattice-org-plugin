@@ -1586,3 +1586,198 @@ async fn a_section_match_filters_by_tags_including_inherited_ones() {
          got {composed:?}"
     );
 }
+
+/// **OA.11 — a named agenda's sections are what its scan runs.**
+///
+/// The end-to-end assertion for the whole of phase 4's mechanism: the view is
+/// opened with a command KEY in the scan-arg slot OA.11a added, the host routes
+/// it to `begin` without reading it, and org resolves it against
+/// `org.agenda-custom-commands` into a different section set.
+///
+/// Driven through the REAL component rather than the unit tests, for AS.2's
+/// reason and one sharper: the unit tests prove the parser, and the parser was
+/// never the doubtful part. What is doubtful is whether a key typed into a menu
+/// survives the boundary, the actor and the generation key to change which rows
+/// a scan produces. A set that parses in a unit test but never crosses the ABI
+/// is a set nobody's agenda uses.
+///
+/// The command's `match` uses a tag, so this also pins that a custom command's
+/// sections went through the SAME validation as `org.agenda-sections`' — they
+/// share `RawSection` precisely so they cannot drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_custom_command_supplies_the_sections_its_scan_runs() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        "* WAITING Blocked on legal                                        :WAITING:\n\
+         * TODO Ordinary task\n\
+         * TODO Another ordinary task\n",
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.todo-keywords=TODO WAITING | DONE".to_string(),
+    });
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-custom-commands=[[command]]\n\
+               key = \"w\"\n\
+               description = \"Waiting\"\n\
+               \n\
+               [[command.section]]\n\
+               title = \"Blocked\"\n\
+               when = \"any\"\n\
+               match = \"WAITING\"\n"
+            .to_string(),
+    });
+
+    // Position 0 is the root the HOST reads; position 1 is the command key,
+    // which it does not. This is the two-slot split from OA.11a, exercised the
+    // way the dispatcher will use it.
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::List(vec![
+            lattice_grammar::args::ArgValue::String(notes.display().to_string()),
+            lattice_grammar::args::ArgValue::String("w".to_string()),
+        ]),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
+
+    // ONE row: the command's single section takes only the `:WAITING:` entry,
+    // and the two ordinary TODOs are inside no configured block. The default
+    // agenda would have shown all three, so the count alone separates "the
+    // command ran" from "the command was ignored".
+    assert_eq!(
+        excerpts.len(),
+        1,
+        "only the command's section admits a row; got {status:?} titles={titles:?}"
+    );
+    assert_eq!(
+        titles[0], "Blocked",
+        "under the COMMAND's own section title, not a default one"
+    );
+    assert!(
+        !titles.iter().any(|t| t.contains("Unscheduled")),
+        "no built-in block survived, got {titles:?}"
+    );
+}
+
+/// **OA.11 — a key that names nothing falls back, and says which keys exist.**
+///
+/// Distinct from a malformed set, and the notice says so: the configuration
+/// parsed, so what the user has is a stale binding or a typo in the key. Naming
+/// the keys that DO exist is the shortest path from the symptom to the fix, and
+/// it is information only this code has.
+///
+/// The fallback matters more than the message. Three separate ways of failing
+/// to find a command — unset option, broken TOML, unknown key — all have to
+/// land on a working agenda, because an empty agenda and a correct-but-empty
+/// agenda look identical and "you have no tasks" is the worst thing this view
+/// can say incorrectly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_command_key_falls_back_and_names_the_ones_that_exist() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    // An OVERDUE row, deliberately. The notice rides the FIRST section's title
+    // and a section with no rows renders no header at all, so a fixture with
+    // nothing overdue would show the fallback working and the notice missing —
+    // a real (inherited) limitation, recorded in `agenda_custom_commands`'
+    // header, and not the thing this test is for.
+    std::fs::write(
+        notes.join("work.org"),
+        format!(
+            "* TODO Late thing\n  SCHEDULED: {}\n* TODO Undated thing\n",
+            stamp(-3)
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-custom-commands=[[command]]\n\
+               key = \"w\"\n\
+               \n\
+               [[command.section]]\n\
+               title = \"Blocked\"\n\
+               when = \"any\"\n"
+            .to_string(),
+    });
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::List(vec![
+            lattice_grammar::args::ArgValue::String(notes.display().to_string()),
+            lattice_grammar::args::ArgValue::String("nope".to_string()),
+        ]),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+    let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
+
+    assert!(
+        !excerpts.is_empty(),
+        "the agenda still works — a bad key costs your layout, never your rows; \
+         got {status:?}"
+    );
+    assert!(
+        titles[0].contains("no command `nope`"),
+        "the first header names what went wrong, got {titles:?}"
+    );
+    assert!(
+        titles[0].contains("have: w"),
+        "…and the keys that do exist, got {titles:?}"
+    );
+}

@@ -130,6 +130,7 @@ wit_bindgen::generate!({
 });
 
 mod agenda;
+mod agenda_custom_commands;
 mod agenda_match;
 mod agenda_sections;
 mod archive;
@@ -498,6 +499,11 @@ const DEFAULT_AGENDA_SPAN: &str = "7";
 /// silently stop matching the string every `:describe-option` shows. Unset
 /// meaning "the defaults" keeps one definition of what the defaults are.
 const DEFAULT_AGENDA_SECTIONS: &str = "";
+
+/// OA.11 — `org.agenda-custom-commands`. Empty for `DEFAULT_AGENDA_SECTIONS`'
+/// reason and one of its own: there is no built-in custom command. Unset means
+/// `<leader>oa` opens the default agenda, which is what it has always done.
+const DEFAULT_AGENDA_CUSTOM_COMMANDS: &str = "";
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -1100,6 +1106,23 @@ impl Guest for Component {
              optionally `days`, `todo-only` and `min-priority`. A `days` \
              section with no `days` uses `org.agenda-span`. Unset gives the \
              built-in set: Overdue, Agenda, Unscheduled, Priority A.",
+        );
+        // OA.11: named agendas, as TOML in a string — `agenda-sections`' shape
+        // one level deeper, and its `[[command.section]]` deserialises through
+        // the SAME `RawSection`, so a command's blocks obey exactly the section
+        // rules documented above. See `agenda_custom_commands`.
+        let _ = register_option(
+            "agenda-custom-commands",
+            OptionType::String,
+            DEFAULT_AGENDA_CUSTOM_COMMANDS,
+            "Named agendas, as TOML: one `[[command]]` per agenda with a `key`, \
+             an optional `description`, and one or more `[[command.section]]` \
+             blocks in `org.agenda-sections`' shape. The key is what selects it. \
+             A command whose key names nothing, or a set that does not parse, \
+             falls back to the default agenda and says so in the first header — \
+             a broken configuration costs you your layout, never your rows. \
+             Unset means the default agenda, which is what nearly everyone \
+             wants.",
         );
         // OR.4: the corpus root. UNSET by default, and that default is the
         // feature's contract — see `roam_scan::roam_directory`.
@@ -2410,6 +2433,23 @@ impl Guest for Component {
         // subscription to stay honest.
         let sections =
             agenda_sections::resolve(&option_or("agenda-sections", DEFAULT_AGENDA_SECTIONS), span);
+        // OA.11: …unless the view was opened for a NAMED agenda, in which case
+        // that command's sections are the ones this scan runs. `args` is what
+        // OA.11a carries from the view; empty is the default agenda, which is
+        // the overwhelmingly common case and stays exactly as it was.
+        //
+        // The default set is computed either way and handed in as the
+        // fallback, rather than being resolved lazily inside the branch: every
+        // way of failing to find a command — unset option, broken TOML, a key
+        // naming nothing — has to land on a WORKING agenda, and threading one
+        // fallback through one call is what makes that structural instead of
+        // three branches that each have to remember.
+        let sections = agenda_custom_commands::resolve(
+            &args,
+            &option_or("agenda-custom-commands", DEFAULT_AGENDA_CUSTOM_COMMANDS),
+            span,
+            sections,
+        );
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host

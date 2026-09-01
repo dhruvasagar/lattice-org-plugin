@@ -2448,6 +2448,10 @@ impl Guest for Component {
                             group,
                             label,
                             sort_key,
+                            // OA.6 fills this. Empty means "say nothing about
+                            // colour", and the row paints from the source
+                            // file's grammar as it always has.
+                            spans: Vec::new(),
                         })
                 })
                 .collect())

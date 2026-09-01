@@ -1292,3 +1292,90 @@ async fn an_agenda_row_is_one_line_even_when_the_entry_has_a_planning_line() {
         "the planning line must not be composed into the agenda: {composed:?}"
     );
 }
+
+/// OA.4: `<Tab>` cycles the block under the cursor in the agenda.
+///
+/// The agenda opens collapsed (`foldlevel = 0`, AF.2) and had no key to open
+/// it again. `org-cycle` is bound on the `org-mode` MAJOR and the agenda's
+/// major is `multibuffer-mode`, so it never fired here — only the core `z`
+/// chords worked. `<Tab>` also has a global default (jump-list forward), which
+/// in a read-only agenda would move you out of the view you are reading, so
+/// the binding has to actually shadow it rather than fall through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tab_cycles_a_block_in_the_agenda() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("plan.org"),
+        format!(
+            "* TODO Overdue thing\n  SCHEDULED: {}\n\
+             * TODO Another overdue\n  SCHEDULED: {}\n\
+             * TODO Undated thing\nbody\n",
+            stamp(-3),
+            stamp(-2),
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    editor.run_tick_pending();
+
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+
+    // The jump list is what a fallen-through `<Tab>` would walk. Recording it
+    // is how this test tells "cycled a fold" from "did the global thing".
+    let jumps_before = editor.position_history.len();
+
+    let closed = |ed: &Editor| ed.folds.iter().filter(|f| f.closed).count();
+    let total_folds = editor.folds.len();
+    assert!(
+        total_folds > 0,
+        "the agenda has blocks to cycle; got {status:?}"
+    );
+    let closed_before = closed(&editor);
+    press(&mut editor, "<Tab>");
+    editor.run_tick_pending();
+    let closed_after = closed(&editor);
+
+    assert_ne!(
+        closed_before, closed_after,
+        "`<Tab>` must change the fold state of the block at the cursor; \
+         got {closed_before} -> {closed_after}, status {status:?}"
+    );
+    assert_eq!(
+        editor.position_history.len(),
+        jumps_before,
+        "`<Tab>` must not fall through to the global jump-list-forward"
+    );
+}

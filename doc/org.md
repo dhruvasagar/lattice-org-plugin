@@ -687,8 +687,13 @@ second line in a view whose job is to be scannable. Press `<CR>` for the rest.
 | `:org-agenda ~/notes` | build it over somewhere else instead |
 | `<leader>oa` | the same, from any buffer |
 | `<CR>` | jump to the entry's file and line |
+| `<Tab>` `<S-Tab>` | collapse or expand the block at the cursor / every block |
 | `gr` | re-scan |
 | `<leader>ot` `<leader>oT` `<leader>o,` | change the TODO state or priority, **from the agenda** |
+
+The agenda opens **collapsed to its blocks**, so `<Tab>` is how you open one.
+Emacs binds `<Tab>` in the agenda to "go to this entry" instead; that is on
+`g TAB` here, which is where evil-org-agenda also puts it.
 
 ### Which files it scans
 

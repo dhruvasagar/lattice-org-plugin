@@ -98,7 +98,9 @@ async fn which_file_wedges_the_host_parse() {
     // The same candidate set the agenda walks, in the same order.
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
         for path in entries {
@@ -141,12 +143,7 @@ async fn which_file_wedges_the_host_parse() {
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
             Ok(d) => {
                 if d.as_millis() > 100 {
-                    eprintln!(
-                        "  SLOW  #{i} {:?} bytes={} took {:?}",
-                        path,
-                        text.len(),
-                        d
-                    );
+                    eprintln!("  SLOW  #{i} {:?} bytes={} took {:?}", path, text.len(), d);
                 }
             }
             Err(_) => {
@@ -193,7 +190,9 @@ async fn which_file_wedges_the_guest_scan() {
 
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
         for path in entries {
@@ -230,7 +229,11 @@ async fn which_file_wedges_the_guest_scan() {
             Ok(Ok(rows)) => {
                 let d = start.elapsed();
                 if d.as_millis() > 300 {
-                    eprintln!("  SLOW  #{i} {path:?} bytes={} rows={} {d:?}", text.len(), rows.len());
+                    eprintln!(
+                        "  SLOW  #{i} {path:?} bytes={} rows={} {d:?}",
+                        text.len(),
+                        rows.len()
+                    );
                 }
             }
             Ok(Err(e)) => eprintln!("  ERR   #{i} {path:?}: {e}"),
@@ -273,7 +276,11 @@ async fn how_long_does_the_wedging_file_take() {
     source.begin().await.expect("begin");
 
     let text = std::fs::read_to_string(&file).unwrap();
-    eprintln!(">>> scanning {file:?} ({} bytes, {} lines)", text.len(), text.lines().count());
+    eprintln!(
+        ">>> scanning {file:?} ({} bytes, {} lines)",
+        text.len(),
+        text.lines().count()
+    );
     let start = std::time::Instant::now();
     match tokio::time::timeout(
         std::time::Duration::from_secs(600),
@@ -281,9 +288,16 @@ async fn how_long_does_the_wedging_file_take() {
     )
     .await
     {
-        Ok(Ok(rows)) => eprintln!(">>> COMPLETED in {:?} with {} rows", start.elapsed(), rows.len()),
+        Ok(Ok(rows)) => eprintln!(
+            ">>> COMPLETED in {:?} with {} rows",
+            start.elapsed(),
+            rows.len()
+        ),
         Ok(Err(e)) => eprintln!(">>> ERRORED in {:?}: {e}", start.elapsed()),
-        Err(_) => eprintln!(">>> STILL RUNNING after {:?} — no fuel trap, no epoch trap", start.elapsed()),
+        Err(_) => eprintln!(
+            ">>> STILL RUNNING after {:?} — no fuel trap, no epoch trap",
+            start.elapsed()
+        ),
     }
 }
 

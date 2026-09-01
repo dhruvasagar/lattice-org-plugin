@@ -308,7 +308,9 @@ async fn gr_repopulates_when_the_roots_came_from_the_option() {
     let status = settle_agenda(&mb, view).await;
     let after = mb.handle(view).unwrap().excerpts().len();
     let composed = mb.handle(view).unwrap().snapshot().buffer.as_string();
-    eprintln!("OPTION-PATH AFTER-REFRESH excerpts={after} status={status:?}\ncomposed=<<<{composed}>>>");
+    eprintln!(
+        "OPTION-PATH AFTER-REFRESH excerpts={after} status={status:?}\ncomposed=<<<{composed}>>>"
+    );
     assert_eq!(
         after, 3,
         "`gr` must re-scan and repopulate the agenda, got {status:?}"
@@ -430,7 +432,10 @@ async fn gr_after_an_edit_in_the_agenda_repopulates() {
     eprintln!("EDIT-THEN-REFRESH excerpts={n} status={status:?} composed=<<<{composed}>>>");
     let on_disk = std::fs::read_to_string(notes.join("only.org")).unwrap();
     eprintln!("ON-DISK=<<<{on_disk}>>>");
-    assert!(n > 0, "the agenda emptied after an edit + refresh: {status:?}");
+    assert!(
+        n > 0,
+        "the agenda emptied after an edit + refresh: {status:?}"
+    );
 }
 
 /// Against the REAL corpus the user's `org.agenda-files` points at.

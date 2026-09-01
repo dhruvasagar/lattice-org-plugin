@@ -120,7 +120,10 @@ fn press(editor: &mut Editor, keys: &str) {
 /// — the shape of the file that wedges the real corpus
 /// (`roam/20250912175738-aicrete_bcmi.org`, 284 KB, 9737 lines).
 fn big_org(blocks: usize, title: &str) -> String {
-    let mut text = format!("#+title: {title}\n* TODO {title}\n  SCHEDULED: {}\n", stamp(0));
+    let mut text = format!(
+        "#+title: {title}\n* TODO {title}\n  SCHEDULED: {}\n",
+        stamp(0)
+    );
     for i in 0..blocks {
         text.push_str("     {\n\t \"key\": \"value\",\n\t \"n\": ");
         text.push_str(&i.to_string());

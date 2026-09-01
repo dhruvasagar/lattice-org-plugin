@@ -160,6 +160,25 @@ pub struct Row {
     /// sweep up every undated plain headline in the corpus, which is most of
     /// them.
     pub keyword: Option<String>,
+    /// OA.8: the headline's tags, **including inherited ones**.
+    ///
+    /// Inheritance is org's default (`org-use-tag-inheritance` is `t`) and
+    /// the reason a match like `-CANCELLED` works at all: you cancel a
+    /// project by tagging the project, and every task under it is meant to
+    /// disappear from the agenda without being touched. Filtering on own-tags
+    /// only would quietly keep them.
+    ///
+    /// Ancestors first, then the headline's own, deduped. Order is not
+    /// semantic — a match is a set test — but a stable order keeps the field
+    /// comparable in tests.
+    pub tags: Vec<String>,
+    /// OA.8: the headline's own `:PROPERTIES:` drawer, as `(key, value)`.
+    ///
+    /// NOT inherited. Org's property inheritance is off by default
+    /// (`org-use-property-inheritance` is `nil`), and the one property a real
+    /// agenda config matches on — `STYLE="habit"` — describes the headline it
+    /// sits on rather than its subtree.
+    pub properties: Vec<(String, String)>,
 }
 
 impl Row {
@@ -215,32 +234,109 @@ impl Keywords {
 pub fn scan_tree(root: &Node, text: &str, keywords: &Keywords) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
-    walk_sections(root, &lines, keywords, &mut rows);
+    walk_sections(root, &lines, keywords, &[], &mut rows);
     rows
 }
 
 /// Recurse through `(section)` nodes, which nest: a subsection is a `section`
 /// child of its parent, so a flat pass over the root's children would see only
 /// top-level headlines and quietly drop every nested one.
-fn walk_sections(node: &Node, lines: &[&str], keywords: &Keywords, rows: &mut Vec<Row>) {
+fn walk_sections(
+    node: &Node,
+    lines: &[&str],
+    keywords: &Keywords,
+    // OA.8: the tags every ancestor section contributes. Threaded down rather
+    // than looked up, because the walk already knows the chain and a parent
+    // lookup per row would re-walk it.
+    inherited: &[String],
+    rows: &mut Vec<Row>,
+) {
     for i in 0..node.named_child_count() {
         let Some(child) = node.named_child(i) else {
             continue;
         };
         if child.kind() == "section" {
-            if let Some(row) = row_for_section(&child, lines, keywords) {
+            let own = own_tags(&child, lines, keywords);
+            let mut chain: Vec<String> = inherited.to_vec();
+            for t in own {
+                if !chain.contains(&t) {
+                    chain.push(t);
+                }
+            }
+            if let Some(row) = row_for_section(&child, lines, keywords, &chain) {
                 rows.push(row);
             }
+            // Subsections inherit this section's chain, not the caller's.
+            walk_sections(&child, lines, keywords, &chain, rows);
+            continue;
         }
         // Recurse either way: a `section` holds its subsections, and a file may
         // open with leading content before the first headline, so sections are
         // not always direct children of the root.
-        walk_sections(&child, lines, keywords, rows);
+        walk_sections(&child, lines, keywords, inherited, rows);
     }
 }
 
+/// The tags a section's own headline declares, before inheritance.
+fn own_tags(section: &Node, lines: &[&str], keywords: &Keywords) -> Vec<String> {
+    let Some(headline) = section.child_by_field("headline") else {
+        return Vec::new();
+    };
+    let line = headline.byte_range().start.line as usize;
+    let Some(text) = lines.get(line).copied() else {
+        return Vec::new();
+    };
+    todo::parse(text, &keywords.all)
+        .map(|h| h.tags.iter().map(|t| t.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The `(key, value)` pairs of a section's own `:PROPERTIES:` drawer.
+///
+/// Read from the LINES rather than from the drawer's nodes: the pinned
+/// tree-sitter-org models the drawer but not the `:key: value` inside it, so
+/// the node gives the extent and the text gives the content — the same split
+/// `plan_date` makes for timestamps.
+fn own_properties(section: &Node, lines: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for i in 0..section.named_child_count() {
+        let Some(child) = section.named_child(i) else {
+            continue;
+        };
+        if child.kind() != "property_drawer" {
+            continue;
+        }
+        let range = child.byte_range();
+        let last = tree::last_content_line(&range);
+        for l in range.start.line..=last {
+            let Some(text) = lines.get(l as usize).copied() else {
+                continue;
+            };
+            let t = text.trim();
+            // `:KEY: value`. The drawer's own `:PROPERTIES:` / `:END:` have no
+            // second colon and fall out here rather than needing naming.
+            let Some(rest) = t.strip_prefix(':') else {
+                continue;
+            };
+            let Some((key, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if key.is_empty() {
+                continue;
+            }
+            out.push((key.to_string(), value.trim().to_string()));
+        }
+    }
+    out
+}
+
 /// The agenda row one section contributes, if it contributes one.
-fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Option<Row> {
+fn row_for_section(
+    section: &Node,
+    lines: &[&str],
+    keywords: &Keywords,
+    tags: &[String],
+) -> Option<Row> {
     let headline = section.child_by_field("headline")?;
     let headline_line = headline.byte_range().start.line;
     let headline_text = lines.get(headline_line as usize).copied()?;
@@ -290,6 +386,8 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
         }),
         priority: parsed.priority,
         keyword: parsed.keyword.map(str::to_string),
+        tags: tags.to_vec(),
+        properties: own_properties(section, lines),
     })
 }
 
@@ -451,10 +549,25 @@ fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
 pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
+    // OA.8: the ancestor tag chain, by headline LEVEL. The tree path gets this
+    // from the section nesting; here the stars are the only structure there
+    // is, so a headline at level N inherits from the most recent headline at
+    // each level below N. Same answer, reconstructed rather than walked.
+    let mut chain: Vec<(usize, Vec<String>)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let Some(headline) = todo::parse(line, &keywords.all) else {
             continue;
         };
+        let level = headline.stars.len();
+        chain.retain(|(l, _)| *l < level);
+        let mut tags: Vec<String> = chain.iter().flat_map(|(_, t)| t.clone()).collect();
+        let own: Vec<String> = headline.tags.iter().map(|t| t.to_string()).collect();
+        for t in &own {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        chain.push((level, own));
         if keywords.is_done(headline.keyword) {
             continue;
         }
@@ -482,6 +595,12 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
             }),
             priority: headline.priority,
             keyword: headline.keyword.map(str::to_string),
+            tags,
+            // The text path reads no drawers: the pinned grammar is what
+            // gives a drawer its extent, and guessing one from `:PROPERTIES:`
+            // to `:END:` would re-introduce exactly the line-offset assumption
+            // this fallback already carries one of.
+            properties: Vec::new(),
         });
     }
     rows
@@ -849,6 +968,63 @@ mod tests {
         assert_eq!(jan - dec, 1);
     }
 
+    // ── OA.8: tags, and what they inherit ───────────────────────────────
+
+    /// Org's default is `org-use-tag-inheritance = t`, and this slice keeps
+    /// it. The reason is what a match is FOR: you cancel a project by tagging
+    /// the project, and `-CANCELLED` is expected to remove its tasks from the
+    /// agenda without any of them being touched. Own-tags-only would quietly
+    /// keep every one of them.
+    #[test]
+    fn tags_inherit_from_ancestors() {
+        let rows = scan(
+            "* Project :work:\n\
+             ** TODO Do the thing :urgent:\n\
+             *** TODO Deeper\n",
+        );
+        let tags: Vec<&[String]> = rows.iter().map(|r| r.tags.as_slice()).collect();
+        assert_eq!(rows.len(), 2, "the plain ancestor is not itself a row");
+        assert_eq!(tags[0], ["work".to_string(), "urgent".to_string()]);
+        assert_eq!(
+            tags[1],
+            ["work".to_string(), "urgent".to_string()],
+            "a third level inherits the whole chain, not just its parent"
+        );
+    }
+
+    /// A sibling must not inherit from the subtree beside it — the chain is
+    /// popped by LEVEL, which is the only structure the text path has.
+    #[test]
+    fn a_sibling_does_not_inherit_its_neighbours_tags() {
+        let rows = scan(
+            "* One :alpha:\n\
+             ** TODO Under one\n\
+             * Two :beta:\n\
+             ** TODO Under two\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].tags, ["alpha".to_string()]);
+        assert_eq!(
+            rows[1].tags,
+            ["beta".to_string()],
+            "level 1 popped `alpha` before `beta` was pushed"
+        );
+    }
+
+    /// A tag repeated down the chain appears once: a match is a set test, and
+    /// a duplicate would only ever be a surprise in a test's output.
+    #[test]
+    fn an_inherited_tag_repeated_on_the_child_is_not_duplicated() {
+        let rows = scan("* P :work:\n** TODO Task :work:\n");
+        assert_eq!(rows[0].tags, ["work".to_string()]);
+    }
+
+    #[test]
+    fn a_headline_with_no_tags_anywhere_carries_none() {
+        let rows = scan("* TODO Plain\n");
+        assert!(rows[0].tags.is_empty());
+    }
+
     // ── OA.6: how a row is coloured ─────────────────────────────────────
 
     fn kws() -> Vec<String> {
@@ -1071,6 +1247,8 @@ mod tests {
             date: Some(Dated { day, kind }),
             priority,
             keyword: Some("TODO".to_string()),
+            tags: Vec::new(),
+            properties: Vec::new(),
         };
         // AS.1 packs a section rank above the day term. Rank 0 throughout
         // here: this test is about ordering WITHIN a section, and the
@@ -1122,6 +1300,8 @@ mod tests {
             }),
             priority: None,
             keyword: Some("TODO".to_string()),
+            tags: Vec::new(),
+            properties: Vec::new(),
         };
         let sort_key = |r: &Row| sort_key_in_section(r, 0, 0);
         assert!(sort_key(&row(1969, 12, 31)) < sort_key(&row(1970, 1, 1)));
@@ -1198,6 +1378,8 @@ mod tests {
             }),
             priority,
             keyword: keyword.map(str::to_string),
+            tags: Vec::new(),
+            properties: Vec::new(),
         }
     }
 

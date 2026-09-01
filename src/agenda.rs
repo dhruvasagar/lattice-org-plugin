@@ -724,6 +724,15 @@ pub struct Filter {
     /// Highest priority letter admitted, inclusive: `Some('A')` takes only
     /// `[#A]`, `Some('B')` takes `[#A]` and `[#B]`.
     pub min_priority: Option<char>,
+    /// OA.10: org's tags/todo match, the thing that makes a section say
+    /// something other than "everything with a date".
+    ///
+    /// `None` is the ordinary case and admits every row — a section that does
+    /// not mention tags is not a section that requires none.
+    ///
+    /// Data like the rest of the filter, so it survives being written in a
+    /// config file; see `agenda_match`.
+    pub r#match: Option<crate::agenda_match::MatchExpr>,
 }
 
 /// The date window a section admits.
@@ -793,6 +802,15 @@ impl Section {
                 return false;
             }
         }
+        // OA.10: last, because it is the most expensive test and the cheap
+        // ones above have already rejected most rows.
+        if let Some(m) = &self.filter.r#match {
+            if !m.admits(&row.tags, &row.properties, row.keyword.as_deref(), |kw| {
+                keywords.is_done(kw)
+            }) {
+                return false;
+            }
+        }
         true
     }
 }
@@ -821,6 +839,7 @@ pub fn default_sections(span: u32) -> Vec<Section> {
                 when: When::Overdue,
                 todo_only: true,
                 min_priority: None,
+                r#match: None,
             },
         },
         Section {
@@ -829,6 +848,7 @@ pub fn default_sections(span: u32) -> Vec<Section> {
                 when: When::Days(span),
                 todo_only: false,
                 min_priority: None,
+                r#match: None,
             },
         },
         Section {
@@ -837,6 +857,7 @@ pub fn default_sections(span: u32) -> Vec<Section> {
                 when: When::Undated,
                 todo_only: true,
                 min_priority: None,
+                r#match: None,
             },
         },
         Section {
@@ -845,6 +866,7 @@ pub fn default_sections(span: u32) -> Vec<Section> {
                 when: When::Any,
                 todo_only: true,
                 min_priority: Some('A'),
+                r#match: None,
             },
         },
     ]
@@ -1445,6 +1467,7 @@ mod tests {
                 when: When::Any,
                 todo_only: true,
                 min_priority: Some('B'),
+                r#match: None,
             },
         }];
         let took = |p: Option<char>| {
@@ -1470,6 +1493,7 @@ mod tests {
                     when: When::Days(0),
                     todo_only: true,
                     min_priority: None,
+                    r#match: None,
                 },
             },
             Section {
@@ -1478,6 +1502,7 @@ mod tests {
                     when: When::Days(7),
                     todo_only: true,
                     min_priority: None,
+                    r#match: None,
                 },
             },
         ];

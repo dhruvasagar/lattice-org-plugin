@@ -130,6 +130,7 @@ wit_bindgen::generate!({
 });
 
 mod agenda;
+mod agenda_match;
 mod agenda_sections;
 mod archive;
 mod capture;

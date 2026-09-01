@@ -97,6 +97,11 @@ struct RawSection {
     todo_only: Option<bool>,
     #[serde(default, rename = "min-priority")]
     min_priority: Option<String>,
+    /// OA.10: org's tags/todo match — `"-CANCELLED+WAITING|HOLD/!"`. Absent
+    /// means the section does not constrain tags, which is not the same as
+    /// requiring none.
+    #[serde(default)]
+    r#match: Option<String>,
 }
 
 /// A parsed set, plus what was dropped getting there.
@@ -193,6 +198,19 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedSet, SectionError>
                 }
             }
         };
+        // OA.10: a malformed match costs THIS section and names it, the same
+        // as an unknown `when`. Failing the whole set would let one typo in
+        // one block cost you every other one.
+        let r#match = match s.r#match.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(src) => match crate::agenda_match::parse(src) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    skipped.push(format!("`{title}` has a bad `match`: {}", e.message()));
+                    continue;
+                }
+            },
+        };
         sections.push(Section {
             title,
             filter: Filter {
@@ -201,6 +219,7 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedSet, SectionError>
                 // "everything in the window" is the less surprising silence.
                 todo_only: s.todo_only.unwrap_or(false),
                 min_priority,
+                r#match,
             },
         });
     }
@@ -410,5 +429,56 @@ min-priority = "AA"
 
         let resolved = resolve("[[section]]\nwhen = \"any\"\n", SPAN);
         assert!(resolved[0].title.contains("no usable sections"));
+    }
+
+    /// OA.10: a section's `match` reaches `Filter` as parsed data.
+    #[test]
+    fn a_section_match_parses_into_the_filter() {
+        let set = parse(
+            "[[section]]\ntitle = \"Waiting\"\nwhen = \"any\"\nmatch = \"-CANCELLED+WAITING|HOLD/!\"\n",
+            7,
+        )
+        .expect("parses");
+        let m = set.sections[0]
+            .filter
+            .r#match
+            .as_ref()
+            .expect("the match reached the filter");
+        assert_eq!(m.alternatives.len(), 2, "`|` is two alternatives");
+        assert_eq!(m.todo, crate::agenda_match::TodoMatch::NotDone);
+    }
+
+    /// A bad match costs its own section and names it — the same shape an
+    /// unknown `when` already has. Failing the whole set would let one typo
+    /// in one block cost every other block too.
+    #[test]
+    fn a_bad_match_skips_its_section_and_says_which() {
+        let set = parse(
+            "[[section]]\ntitle = \"Good\"\nwhen = \"any\"\n\n\
+             [[section]]\ntitle = \"Bad\"\nwhen = \"any\"\nmatch = \"{^work}\"\n",
+            7,
+        )
+        .expect("the set still parses");
+        assert_eq!(set.sections.len(), 1, "the good one survives");
+        assert_eq!(set.sections[0].title, "Good");
+        assert_eq!(set.skipped.len(), 1);
+        assert!(
+            set.skipped[0].contains("Bad") && set.skipped[0].contains("match"),
+            "the notice names the section and the problem: {:?}",
+            set.skipped[0]
+        );
+    }
+
+    /// Absent and empty both mean "does not constrain tags", which is not the
+    /// same as "requires none".
+    #[test]
+    fn an_absent_match_constrains_nothing() {
+        for body in [
+            "[[section]]\ntitle = \"A\"\nwhen = \"any\"\n",
+            "[[section]]\ntitle = \"A\"\nwhen = \"any\"\nmatch = \"\"\n",
+        ] {
+            let set = parse(body, 7).expect("parses");
+            assert!(set.sections[0].filter.r#match.is_none(), "on {body:?}");
+        }
     }
 }

@@ -1509,3 +1509,80 @@ async fn agenda_rows_carry_org_semantic_colour() {
         .collect();
     assert_eq!(covered, vec!["TODO", "[#A]", ":work:"], "line was {line:?}");
 }
+
+/// OA.10: a section's `match` filters rows by org's tags/todo syntax.
+///
+/// The end of phase 3's chain, and the reason each earlier link exists: the
+/// row must carry inherited tags (OA.8), the match must survive being written
+/// in TOML (OA.9), and the section must evaluate it.
+///
+/// Uses an INHERITED exclusion, because that is the shape a real config
+/// relies on: you cancel a project by tagging the project, and its tasks are
+/// expected to leave the agenda untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_section_match_filters_by_tags_including_inherited_ones() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("plan.org"),
+        "* Live project\n\
+         ** TODO Keep me\n\
+         * Dead project :CANCELLED:\n\
+         ** TODO Drop me\n\
+         * TODO Also keep me\n",
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    // One block, undated TODOs, excluding anything under a cancelled parent.
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-sections=[[section]]\n\
+               title = \"Open\"\n\
+               when = \"undated\"\n\
+               todo-only = true\n\
+               match = \"-CANCELLED/!\"\n"
+            .to_string(),
+    });
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let composed = handle.snapshot().buffer.as_string();
+
+    assert!(
+        composed.contains("Keep me") && composed.contains("Also keep me"),
+        "got {composed:?}, status {status:?}"
+    );
+    assert!(
+        !composed.contains("Drop me"),
+        "`Drop me` inherits :CANCELLED: from its parent and must be excluded; \
+         got {composed:?}"
+    );
+}

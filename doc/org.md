@@ -788,9 +788,44 @@ min-priority = "B"
 | `days` | for `when = "days"`: how far forward. Defaults to `org.agenda-span` |
 | `todo-only` | only headlines carrying a TODO keyword. Default `false`, which also admits plain dated headlines — appointments |
 | `min-priority` | a single letter: `"B"` admits `[#A]` and `[#B]`. Unprioritised is unranked, not urgent, so it is never admitted |
+| `match` | org's tags/todo query — `"-CANCELLED+WAITING\|HOLD/!"`. Absent means the block does not ask about tags, which is not the same as requiring none |
 
 `when = "overdue"` and `when = "days"` group their rows **by day**, with a date
 header each. `undated` and `any` render one header — their own title.
+
+### Matching on tags
+
+`match` takes org's own query syntax, so a block can say what it is about
+rather than only when:
+
+```toml
+[[section]]
+title = "Waiting on someone"
+when = "any"
+match = "-CANCELLED+WAITING|HOLD/!"
+```
+
+| Piece | Means |
+|---|---|
+| `work` | has the tag |
+| `-work` | does not |
+| `a+b` | both — juxtaposition is AND |
+| `a\|b` | either — `\|` is the *lowest* precedence, so `-a+b\|c` reads `(-a AND b) OR c` |
+| `/!` | only headlines in a not-done TODO state |
+| `/NEXT` | keyword is `NEXT`; `/!NEXT` additionally requires it be a not-done one |
+| `STYLE="habit"` | a property equals a value; `<>` for not-equal. Values must be quoted |
+
+**Tags inherit.** A task under a headline tagged `:CANCELLED:` carries that tag
+too, so `-CANCELLED` removes the whole subtree without you touching any of it —
+which is org's default (`org-use-tag-inheritance`) and the reason that idiom
+works. Properties do **not** inherit; `STYLE="habit"` asks about the headline
+itself.
+
+Anything org supports that this does not — regexp tags like `{^work}`, numeric
+comparisons like `LEVEL>2` — is refused with a message naming it, and that
+block is skipped while the rest of your set still loads. A query that quietly
+meant something narrower than it says would hide rows, which is the one thing
+this view must not do.
 
 The same string works from `init.rs`, which is the same option by another door:
 

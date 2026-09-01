@@ -456,7 +456,6 @@ const CAPTURE_FINALIZE: u32 = 58;
 /// `WriteToFile`-on-create does not have.
 const CAPTURE_ABORT: u32 = 59;
 
-
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
 /// scatter notes across the filesystem; being told to set it once is better
@@ -753,6 +752,37 @@ mod todo_theme {
             "todo.done",
             "Default for a done TODO state with no style of its own.",
             &spec("org.todo", Some("overlay"), false, false, true),
+        );
+
+        // OA.6: the other two things an agenda row says about itself. Both
+        // are real org semantics that the org GRAMMAR does not carry — which
+        // is why an agenda painted from the source file's tree-sitter parse
+        // showed neither — so they get elements of their own to be styled and
+        // overridden through, like the keywords above.
+        let _ = register_element(
+            "priority",
+            "A headline's `[#A]` priority cookie.",
+            &ThemeStyleSpec {
+                inherit: None,
+                fg: Some(ColorRef::Palette("red".to_string())),
+                bg: None,
+                modifiers: ModifierSet {
+                    bold: Some(true),
+                    ..unset()
+                },
+                scale: None,
+            },
+        );
+        let _ = register_element(
+            "tag",
+            "A headline's trailing `:tag:` list.",
+            &ThemeStyleSpec {
+                inherit: None,
+                fg: Some(ColorRef::Palette("overlay".to_string())),
+                bg: None,
+                modifiers: unset(),
+                scale: None,
+            },
         );
 
         for k in &kws.all {
@@ -2432,6 +2462,9 @@ impl Guest for Component {
                 Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, &state.keywords),
                 None => agenda::scan_file(&text, &state.keywords),
             };
+            // OA.6 reads a row's own line to colour it; both scan paths report
+            // 0-based line numbers into this same split.
+            let lines: Vec<&str> = text.lines().collect();
             // AS.1: one row, zero or more entries. A row is a candidate and
             // each section decides whether it wants it, so an overdue `[#A]`
             // TODO is emitted three times and a headline nothing wants is
@@ -2440,6 +2473,26 @@ impl Guest for Component {
             Ok(rows
                 .into_iter()
                 .flat_map(|row| {
+                    // OA.6: computed ONCE per row. `entries_for_row` fans a
+                    // row out across every section that admits it — an
+                    // overdue `[#A]` lands in three — and they all render the
+                    // same source line, so recomputing per entry would parse
+                    // the same headline three times for identical spans.
+                    let spans: Vec<crate::lattice::plugin_host::types::DisplaySpan> = lines
+                        .get(row.line as usize)
+                        .map(|line| {
+                            agenda::headline_spans(line, &state.keywords.all)
+                                .into_iter()
+                                .map(|(start, end, slot)| {
+                                    crate::lattice::plugin_host::types::DisplaySpan {
+                                        start,
+                                        end,
+                                        slot,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     agenda::entries_for_row(&row, &state.sections, &state.keywords, state.today)
                         .into_iter()
                         .map(move |(group, label, sort_key)| Entry {
@@ -2448,10 +2501,7 @@ impl Guest for Component {
                             group,
                             label,
                             sort_key,
-                            // OA.6 fills this. Empty means "say nothing about
-                            // colour", and the row paints from the source
-                            // file's grammar as it always has.
-                            spans: Vec::new(),
+                            spans: spans.clone(),
                         })
                 })
                 .collect())

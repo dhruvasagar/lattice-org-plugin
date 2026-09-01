@@ -293,6 +293,76 @@ fn row_for_section(section: &Node, lines: &[&str], keywords: &Keywords) -> Optio
     })
 }
 
+/// OA.6: how a headline row is coloured, as byte spans into its own line.
+///
+/// The org GRAMMAR does not carry any of this — which is exactly why an agenda
+/// painted from the source file's tree-sitter parse looked like org text that
+/// happened to be out of order. Which word is a TODO keyword depends on
+/// `org.todo-keywords`, a runtime option; a priority cookie and a tag list are
+/// headline structure the pinned grammar does not model. All three are org
+/// semantics, so org is what says them.
+///
+/// Offsets are into `line`, because that is the contract: a guest cannot know
+/// where its row lands until the host has interleaved every file's rows.
+///
+/// Slots are NAMES, resolved host-side against the theme, so a user's
+/// `org-todo-keyword-faces` override reaches an agenda row by the same path it
+/// reaches the file — and an unknown keyword renders plain rather than
+/// failing the row.
+pub fn headline_spans(line: &str, keywords: &[String]) -> Vec<(u32, u32, String)> {
+    let Some(h) = todo::parse(line, keywords) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    // `parse` hands back SUBSLICES of `line`, so their offsets are exact
+    // rather than re-derived — a second walk would be a second chance to
+    // disagree with the first about what a keyword is.
+    if let Some(kw) = h.keyword {
+        if let Some(at) = subslice_offset(line, kw) {
+            out.push((at as u32, (at + kw.len()) as u32, format!("org.todo.{kw}")));
+        }
+    }
+    // The priority is a `char`, not a subslice, so it is located rather than
+    // offset — `[#A]` is unambiguous and cannot repeat before itself.
+    if let Some(p) = h.priority {
+        let cookie = format!("[#{p}]");
+        if let Some(at) = line.find(&cookie) {
+            out.push((
+                at as u32,
+                (at + cookie.len()) as u32,
+                "org.priority".to_string(),
+            ));
+        }
+    }
+    // One span over the whole `:a:b:` run rather than one per tag: it renders
+    // identically, and the colons belong to the list rather than to either
+    // neighbour.
+    if let (Some(first), Some(last)) = (h.tags.first(), h.tags.last()) {
+        if let (Some(start), Some(end)) =
+            (subslice_offset(line, first), subslice_offset(line, last))
+        {
+            // Widen to the enclosing colons.
+            let open = line[..start].rfind(':').unwrap_or(start);
+            let close = end + last.len();
+            let close = line[close..]
+                .find(':')
+                .map(|i| close + i + 1)
+                .unwrap_or(close);
+            out.push((open as u32, close as u32, "org.tag".to_string()));
+        }
+    }
+    out
+}
+
+/// Byte offset of `needle` within `haystack`, when `needle` IS a subslice of
+/// it. Address arithmetic rather than a search, so a title that repeats its
+/// own keyword cannot move the span.
+fn subslice_offset(haystack: &str, needle: &str) -> Option<usize> {
+    let base = haystack.as_ptr() as usize;
+    let at = needle.as_ptr() as usize;
+    (at >= base && at + needle.len() <= base + haystack.len()).then(|| at - base)
+}
+
 /// The date a section's `plan` carries, from the plan's own nodes.
 ///
 /// ## What the tree gives here, and what it does not (OT.5)
@@ -777,6 +847,82 @@ mod tests {
         let jan = timestamp::epoch_day(2027, 1, 1);
         assert!(dec < jan);
         assert_eq!(jan - dec, 1);
+    }
+
+    // ── OA.6: how a row is coloured ─────────────────────────────────────
+
+    fn kws() -> Vec<String> {
+        vec!["TODO".to_string(), "NEXT".to_string(), "DONE".to_string()]
+    }
+
+    #[test]
+    fn spans_cover_the_keyword_priority_and_tags() {
+        let line = "* TODO [#A] Ship it :work:urgent:";
+        let spans = headline_spans(line, &kws());
+        let named: Vec<(&str, &str)> = spans
+            .iter()
+            .map(|(s, e, slot)| (&line[*s as usize..*e as usize], slot.as_str()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("TODO", "org.todo.TODO"),
+                ("[#A]", "org.priority"),
+                (":work:urgent:", "org.tag"),
+            ]
+        );
+    }
+
+    /// The keyword span must come from the parse's own subslice, not from a
+    /// search — a title that repeats the keyword would otherwise move it.
+    #[test]
+    fn a_title_repeating_the_keyword_does_not_move_the_span() {
+        let line = "* TODO write the TODO parser";
+        let spans = headline_spans(line, &kws());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            (spans[0].0, spans[0].1),
+            (2, 6),
+            "the FIRST TODO, the state"
+        );
+    }
+
+    /// A headline with none of the three says nothing about colour, and an
+    /// empty list is what "let the grammar decide" looks like on the wire.
+    #[test]
+    fn a_plain_headline_asks_for_no_colour() {
+        assert!(headline_spans("* Just a heading", &kws()).is_empty());
+    }
+
+    /// Not a headline at all — the body lines a scan also walks past.
+    #[test]
+    fn a_non_headline_asks_for_no_colour() {
+        assert!(headline_spans("  SCHEDULED: <2026-09-01 Tue>", &kws()).is_empty());
+        assert!(headline_spans("", &kws()).is_empty());
+    }
+
+    /// An unconfigured word is not a keyword, so it gets no span rather than
+    /// an `org.todo.<word>` slot that resolves to nothing.
+    #[test]
+    fn an_unconfigured_first_word_is_not_a_keyword() {
+        let spans = headline_spans("* MAYBE think about it", &kws());
+        assert!(spans.is_empty(), "got {spans:?}");
+    }
+
+    /// Multibyte titles: the spans are BYTE offsets, and a span landing
+    /// mid-scalar would be dropped host-side and cost the row its colour.
+    #[test]
+    fn spans_are_byte_offsets_past_a_multibyte_title() {
+        let line = "* TODO café ☕ :home:";
+        let spans = headline_spans(line, &kws());
+        for (start, end, _) in &spans {
+            assert!(
+                line.is_char_boundary(*start as usize) && line.is_char_boundary(*end as usize),
+                "span {start}..{end} must land on char boundaries in {line:?}"
+            );
+        }
+        let tag = spans.last().expect("the tag span");
+        assert_eq!(&line[tag.0 as usize..tag.1 as usize], ":home:");
     }
 
     // ── what counts as a row ────────────────────────────────────────────

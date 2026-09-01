@@ -1431,3 +1431,81 @@ async fn tab_cycles_a_block_in_the_agenda() {
         "`<Tab>` must not fall through to the global jump-list-forward"
     );
 }
+
+/// OA.6: an agenda row is coloured by ORG's semantics, not by the source
+/// file's grammar.
+///
+/// Which word is a TODO keyword depends on `org.todo-keywords`, a runtime
+/// option; a priority cookie and a tag list are headline structure the pinned
+/// grammar does not model. So a row painted from the file's tree-sitter parse
+/// showed none of them, and the agenda read as org text that happened to be
+/// out of order.
+///
+/// Asserted on the EditorS extra-highlights — the end of the pipe — because
+/// every step between the guest and there is a place the spans could be
+/// dropped: validation, the cache, the composed-row translation, the drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agenda_rows_carry_org_semantic_colour() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("plan.org"),
+        format!("* TODO [#A] Ship it :work:\n  SCHEDULED: {}\n", stamp(-1)),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = lattice_multibuffer::providers::agenda::open_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    );
+    let view = match view {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let _ = editor.activate_buffer(view);
+    let status = settle_agenda(&mb, view).await;
+    editor.run_tick_pending();
+
+    let spans: Vec<Vec<lattice_syntax::StyledSpan>> = editor
+        .buffer_locals
+        .get(&view)
+        .and_then(|l| l.get::<lattice_host::modes::ExtraHighlights>())
+        .map(|e| e.0.clone())
+        .unwrap_or_default();
+    let first = spans.first().cloned().unwrap_or_default();
+    assert!(
+        !first.is_empty(),
+        "the row must carry org's own spans; got {spans:?}, status {status:?}"
+    );
+
+    // The keyword, the priority cookie and the tag list — the three things
+    // the grammar cannot tell the host about.
+    let composed = mb.handle(view).unwrap().snapshot().buffer.as_string();
+    let line = composed.lines().next().unwrap_or_default();
+    let covered: Vec<&str> = first
+        .iter()
+        .map(|s| &line[s.start.min(line.len())..s.end.min(line.len())])
+        .collect();
+    assert_eq!(covered, vec!["TODO", "[#A]", ":work:"], "line was {line:?}");
+}

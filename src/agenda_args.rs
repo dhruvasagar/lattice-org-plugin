@@ -1,0 +1,393 @@
+//! OA.19 — the agenda view's own arguments, as data.
+//!
+//! Slice plan: `lattice/docs/dev/operations/slice-plans/org-agenda.md` phase 6.
+//!
+//! `scan_args` (OA.11a) carries per-view arguments from the opener to `begin`.
+//! It held exactly one positional value — the custom-command key — and phase 6
+//! adds two more kinds: a span the user walked to, and the filters they
+//! narrowed by. Three features inventing three encodings in the same `Vec<String>`
+//! is the outcome this module exists to prevent.
+//!
+//! ## The grammar
+//!
+//! ```text
+//!   ["r"]                            the `r` agenda, as today
+//!   ["r", "span=7", "offset=1"]      …one span forward
+//!   ["", "tag:work", "file:a.org"]   the default agenda, filtered
+//! ```
+//!
+//! A **bare token is the command key**, which is what every existing caller
+//! sends and what the OA.12 transient will keep sending. Backward compatibility
+//! here is not politeness: the transient is a guest export that builds its rows
+//! from configuration, and making it re-learn an encoding to say the same thing
+//! would be churn with no user on the other end of it.
+//!
+//! ## Why an unknown argument is ignored
+//!
+//! A view that refuses to open because it did not recognise one argument is a
+//! worse failure than one that opens slightly wrong: the agenda is where you
+//! find out what you are meant to be doing, and "it did not open" answers
+//! nothing. An unrecognised key is dropped and named in `problems`, which
+//! OA.22's headerline is the place to surface. `gr` is the recovery either way.
+
+/// What a filter narrows on.
+///
+/// Kept as data rather than folded into a `match` string at parse time because
+/// the two are not the same thing: a `file:` term is not expressible in org's
+/// tags/todo syntax at all, and a `tag:` term has to survive round-tripping
+/// back into `scan_args` when the user narrows again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterTerm {
+    /// `tag:work` — the row must carry it. Case-sensitive, as org's tag
+    /// matching is everywhere else.
+    Tag(String),
+    /// `file:notes.org` — the row's source file. Matched on the file NAME, not
+    /// the full path: the user filtered from a row they were looking at, and
+    /// the name is what they saw.
+    File(String),
+}
+
+/// The agenda view's arguments, parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewArgs {
+    /// The custom-command key, or empty for the default agenda.
+    pub command: String,
+    /// The span in days this view is showing, overriding `org.agenda-span`.
+    /// `None` leaves the option in charge, which is what a fresh agenda does.
+    pub span: Option<u32>,
+    /// How many spans forward (or back) of today the view is anchored.
+    /// `0` is today, which is where every agenda opens.
+    pub offset: i32,
+    /// The filters the user has narrowed by, in the order they added them.
+    pub filters: Vec<FilterTerm>,
+    /// Arguments that were not understood, named for the headerline. Never
+    /// fatal — see the module header.
+    pub problems: Vec<String>,
+}
+
+impl ViewArgs {
+    /// The default agenda, unwalked and unfiltered. `const` so it can seed a
+    /// `thread_local` without a lazy init.
+    pub const fn new() -> Self {
+        Self {
+            command: String::new(),
+            span: None,
+            offset: 0,
+            filters: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+
+    /// Parse what the opener handed the scan.
+    pub fn parse(args: &[String]) -> Self {
+        let mut out = ViewArgs::default();
+        for raw in args {
+            let arg = raw.trim();
+            if arg.is_empty() {
+                continue;
+            }
+            // `key:value` before `key=value`: `tag:` and `file:` are the two
+            // that read naturally with a colon, and a path can contain `=`.
+            if let Some((key, value)) = arg.split_once(':') {
+                match key {
+                    "tag" if !value.is_empty() => {
+                        out.filters.push(FilterTerm::Tag(value.to_string()));
+                        continue;
+                    }
+                    "file" if !value.is_empty() => {
+                        out.filters.push(FilterTerm::File(value.to_string()));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((key, value)) = arg.split_once('=') {
+                match key {
+                    "span" => match value.parse::<u32>() {
+                        Ok(n) => out.span = Some(n),
+                        Err(_) => out
+                            .problems
+                            .push(format!("span `{value}` is not a day count")),
+                    },
+                    "offset" => match value.parse::<i32>() {
+                        Ok(n) => out.offset = n,
+                        Err(_) => out
+                            .problems
+                            .push(format!("offset `{value}` is not a number")),
+                    },
+                    _ => out.problems.push(format!("unknown view argument `{key}`")),
+                }
+                continue;
+            }
+            // A bare token. The FIRST one is the command key; a second is a
+            // mistake worth naming rather than silently letting the later win,
+            // because "my agenda opened the wrong command" is hard to trace
+            // back to an argument list nobody prints.
+            if out.command.is_empty() {
+                out.command = arg.to_string();
+            } else {
+                out.problems
+                    .push(format!("ignoring a second command key `{arg}`"));
+            }
+        }
+        out
+    }
+
+    /// Render back to `scan_args`, so a chord can re-open the view with one
+    /// thing changed and everything else carried along.
+    ///
+    /// The inverse of [`Self::parse`] for everything it understood; `problems`
+    /// are dropped, because re-emitting an argument the parse already rejected
+    /// would make a typo permanent.
+    pub fn to_args(&self) -> Vec<String> {
+        // The command key stays positional and FIRST, so the output is
+        // something `parse` reads back identically and something a human
+        // reading a log recognises.
+        let mut out = vec![self.command.clone()];
+        if let Some(span) = self.span {
+            out.push(format!("span={span}"));
+        }
+        if self.offset != 0 {
+            out.push(format!("offset={}", self.offset));
+        }
+        for f in &self.filters {
+            out.push(match f {
+                FilterTerm::Tag(t) => format!("tag:{t}"),
+                FilterTerm::File(f) => format!("file:{f}"),
+            });
+        }
+        out
+    }
+
+    /// The command key as `agenda_custom_commands::resolve` wants it — a slice
+    /// whose first element is the key, or empty for the default agenda.
+    pub fn command_args(&self) -> Vec<String> {
+        if self.command.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.command.clone()]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bare_key_still_selects_its_command() {
+        // The compatibility that lets every existing caller keep working. The
+        // OA.12 transient sends exactly this and has no reason to stop.
+        let a = ViewArgs::parse(&args(&["r"]));
+        assert_eq!(a.command, "r");
+        assert_eq!(a.command_args(), vec!["r".to_string()]);
+        assert!(a.problems.is_empty());
+        assert_eq!(a.offset, 0, "a fresh agenda is anchored on today");
+        assert_eq!(a.span, None, "and takes its span from the option");
+    }
+
+    #[test]
+    fn no_args_at_all_is_the_default_agenda() {
+        let a = ViewArgs::parse(&[]);
+        assert_eq!(a.command, "");
+        assert!(
+            a.command_args().is_empty(),
+            "which resolve reads as unnamed"
+        );
+    }
+
+    #[test]
+    fn span_and_offset_parse_and_offset_may_be_negative() {
+        let a = ViewArgs::parse(&args(&["", "span=7", "offset=-2"]));
+        assert_eq!(a.span, Some(7));
+        assert_eq!(a.offset, -2, "`b` walks backwards");
+        assert!(a.problems.is_empty());
+    }
+
+    #[test]
+    fn filters_keep_the_order_they_were_added_in() {
+        // `\` narrows an existing filter rather than replacing it, so the list
+        // is a conjunction and its order is what the user built.
+        let a = ViewArgs::parse(&args(&["r", "tag:work", "file:notes.org", "tag:urgent"]));
+        assert_eq!(
+            a.filters,
+            vec![
+                FilterTerm::Tag("work".into()),
+                FilterTerm::File("notes.org".into()),
+                FilterTerm::Tag("urgent".into()),
+            ]
+        );
+        assert_eq!(a.command, "r", "…alongside the command, not instead of it");
+    }
+
+    #[test]
+    fn an_unknown_argument_is_named_and_dropped_rather_than_fatal() {
+        // A view that refuses to open because it did not recognise one
+        // argument answers nothing. The agenda is where you find out what you
+        // are meant to be doing.
+        let a = ViewArgs::parse(&args(&["r", "sideways=3", "span=nope"]));
+        assert_eq!(a.command, "r", "the rest of the arguments still apply");
+        assert_eq!(a.span, None);
+        assert_eq!(a.problems.len(), 2, "{:?}", a.problems);
+        assert!(a.problems[0].contains("sideways"), "{:?}", a.problems);
+        assert!(a.problems[1].contains("span"), "{:?}", a.problems);
+    }
+
+    #[test]
+    fn a_second_bare_key_is_named_rather_than_silently_winning() {
+        // "My agenda opened the wrong command" is hard to trace back to an
+        // argument list nobody prints.
+        let a = ViewArgs::parse(&args(&["r", "n"]));
+        assert_eq!(a.command, "r", "the first wins");
+        assert!(a.problems[0].contains('n'), "{:?}", a.problems);
+    }
+
+    #[test]
+    fn arguments_round_trip_so_a_chord_can_change_one_thing() {
+        // Every phase-6 chord is "re-open this view with one argument
+        // different", so what `to_args` writes must parse back to what it
+        // meant — otherwise walking a span would quietly drop a filter.
+        let original = ViewArgs::parse(&args(&[
+            "r",
+            "span=30",
+            "offset=2",
+            "tag:work",
+            "file:a.org",
+        ]));
+        let round = ViewArgs::parse(&original.to_args());
+        assert_eq!(round, original);
+    }
+
+    #[test]
+    fn a_default_view_round_trips_to_something_parse_reads_back() {
+        // The empty command is still emitted positionally, so the output is
+        // never mistaken for a filter and never shifts what follows it.
+        let a = ViewArgs {
+            command: String::new(),
+            span: None,
+            offset: 0,
+            filters: vec![FilterTerm::Tag("work".into())],
+            problems: Vec::new(),
+        };
+        assert_eq!(a.to_args(), vec!["".to_string(), "tag:work".to_string()]);
+        assert_eq!(ViewArgs::parse(&a.to_args()), a);
+    }
+
+    #[test]
+    fn a_rejected_argument_is_not_re_emitted() {
+        // Re-emitting one would make a typo permanent: every subsequent chord
+        // carries the arguments forward, so a bad one would survive every
+        // refresh until the view was closed.
+        let a = ViewArgs::parse(&args(&["r", "sideways=3"]));
+        assert!(!a.problems.is_empty());
+        assert!(
+            !a.to_args().iter().any(|s| s.contains("sideways")),
+            "got {:?}",
+            a.to_args()
+        );
+    }
+}
+
+#[cfg(test)]
+mod span_walk_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    /// What the OA.20 handlers do, as data — so the arithmetic is testable
+    /// without a host, an editor or a scan. The handlers themselves are a
+    /// `match` over which of these to apply and one `OpenProviderView`.
+    fn later(v: &mut ViewArgs) {
+        v.offset = v.offset.saturating_add(1);
+    }
+    fn earlier(v: &mut ViewArgs) {
+        v.offset = v.offset.saturating_sub(1);
+    }
+    fn today(v: &mut ViewArgs) {
+        v.offset = 0;
+    }
+    fn span_view(v: &mut ViewArgs, days: u32) {
+        v.span = Some(days);
+        v.offset = 0;
+    }
+
+    #[test]
+    fn f_then_b_returns_to_where_it_started() {
+        // An off-by-one in the offset arithmetic is invisible in either
+        // direction alone: walking forward "works" and walking back "works",
+        // and only the round trip shows they disagree.
+        let start = ViewArgs::parse(&["r".to_string(), "span=7".to_string()]);
+        let mut v = start.clone();
+        later(&mut v);
+        assert_eq!(v.offset, 1);
+        earlier(&mut v);
+        assert_eq!(v, start, "f then b is the identity");
+    }
+
+    #[test]
+    fn walking_carries_the_command_and_filters_along() {
+        // The reason the arguments are one list: a span chord must not drop
+        // the agenda you are in or the filter you narrowed by.
+        let mut v = ViewArgs::parse(&[
+            "r".to_string(),
+            "tag:work".to_string(),
+            "file:a.org".to_string(),
+        ]);
+        later(&mut v);
+        let round = ViewArgs::parse(&v.to_args());
+        assert_eq!(round.command, "r");
+        assert_eq!(round.filters.len(), 2);
+        assert_eq!(round.offset, 1);
+    }
+
+    #[test]
+    fn today_resets_where_you_are_not_what_you_are_looking_at() {
+        // `.` is "take me home", not "forget my view". Losing a week view to
+        // get back to today would make the key cost more than it gives.
+        let mut v =
+            ViewArgs::parse(&["".to_string(), "span=7".to_string(), "offset=3".to_string()]);
+        today(&mut v);
+        assert_eq!(v.offset, 0);
+        assert_eq!(v.span, Some(7), "the span survives");
+    }
+
+    #[test]
+    fn changing_the_span_re_anchors_on_today() {
+        // An `offset=2` held across a day→month switch means two MONTHS out,
+        // which is never what the person pressing `v m` meant.
+        let mut v = ViewArgs::parse(&["".to_string(), "offset=2".to_string()]);
+        span_view(&mut v, 30);
+        assert_eq!(v.span, Some(30));
+        assert_eq!(v.offset, 0);
+    }
+
+    #[test]
+    fn walking_far_out_saturates_rather_than_wrapping() {
+        // A held key is a real input. Wrapping would put the agenda centuries
+        // away from today with no way back but `.`, and the row labels
+        // ("overdue by N day(s)") would be nonsense on the way.
+        let mut v = ViewArgs::parse(&["".to_string(), format!("offset={}", i32::MAX)]);
+        later(&mut v);
+        assert_eq!(v.offset, i32::MAX);
+        let mut v = ViewArgs::parse(&["".to_string(), format!("offset={}", i32::MIN)]);
+        earlier(&mut v);
+        assert_eq!(v.offset, i32::MIN);
+    }
+
+    #[test]
+    fn the_daily_agenda_still_walks_a_day_at_a_time() {
+        // `span = 0` is the daily view and the one people walk most. The
+        // anchor moves by `span.max(1)` days, so a step of zero — which is
+        // what a literal reading gives — would make `f` a no-op on exactly
+        // that view. Pinned as the arithmetic `begin` performs.
+        let step = |span: u32, offset: i32| i64::from(offset) * i64::from(span.max(1));
+        assert_eq!(step(0, 1), 1, "one day forward, not zero");
+        assert_eq!(step(0, -2), -2);
+        assert_eq!(step(7, 1), 7, "a week view walks a week");
+        assert_eq!(step(30, 2), 60);
+    }
+}

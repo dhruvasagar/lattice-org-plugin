@@ -130,6 +130,7 @@ wit_bindgen::generate!({
 });
 
 mod agenda;
+mod agenda_args;
 mod agenda_custom_commands;
 mod agenda_match;
 mod agenda_sections;
@@ -478,6 +479,20 @@ const CAPTURE_ABORT: u32 = 59;
 /// root to a directory that does not exist and quietly scan nothing.
 const AGENDA_MENU: u32 = 60;
 const AGENDA_COMMAND: u32 = 61;
+
+/// OA.20 — span walking. `f` / `b` move the view one span forward or back,
+/// `.` returns it to today, and `v d w m y` set the span itself.
+///
+/// Emacs' keys (`org-agenda-later` / `org-agenda-earlier` / `org-agenda-goto-today`
+/// / `org-agenda-day-view` and friends), because this is muscle memory and the
+/// UX-follows-convention rule applies to a surface people arrive at with habits.
+const AGENDA_LATER: u32 = 62;
+const AGENDA_EARLIER: u32 = 63;
+const AGENDA_TODAY: u32 = 64;
+const AGENDA_SPAN_DAY: u32 = 65;
+const AGENDA_SPAN_WEEK: u32 = 66;
+const AGENDA_SPAN_MONTH: u32 = 67;
+const AGENDA_SPAN_YEAR: u32 = 68;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -1842,6 +1857,17 @@ impl Guest for Component {
                 bind("<leader>ot", "org-todo-cycle"),
                 bind("<leader>oT", "org-todo-cycle-back"),
                 bind("<leader>o,", "org-priority-cycle"),
+                // OA.20: emacs' span-walking keys. Bare letters, which is safe
+                // here and nowhere else — the agenda is read-only, so `f` and
+                // `b` are not shadowing an edit, and this mode activates on
+                // agenda views alone.
+                bind("f", "org-agenda-later"),
+                bind("b", "org-agenda-earlier"),
+                bind(".", "org-agenda-today"),
+                bind("vd", "org-agenda-day-view"),
+                bind("vw", "org-agenda-week-view"),
+                bind("vm", "org-agenda-month-view"),
+                bind("vy", "org-agenda-year-view"),
                 // OA.4b: `<Tab>` / `<S-Tab>` are NOT bound here. They come
                 // from the host's shared `foldable-view-mode`, which the
                 // agenda's native view mode pulls in by declaring
@@ -2162,6 +2188,29 @@ impl Guest for Component {
             &spec(),
             AGENDA_COMMAND,
         );
+        for (name, doc, id) in [
+            (
+                "org-agenda-later",
+                "Move the agenda one span forward",
+                AGENDA_LATER,
+            ),
+            (
+                "org-agenda-earlier",
+                "Move the agenda one span back",
+                AGENDA_EARLIER,
+            ),
+            (
+                "org-agenda-today",
+                "Return the agenda to today",
+                AGENDA_TODAY,
+            ),
+            ("org-agenda-day-view", "Show one day", AGENDA_SPAN_DAY),
+            ("org-agenda-week-view", "Show one week", AGENDA_SPAN_WEEK),
+            ("org-agenda-month-view", "Show one month", AGENDA_SPAN_MONTH),
+            ("org-agenda-year-view", "Show one year", AGENDA_SPAN_YEAR),
+        ] {
+            register_action(name, doc, &spec(), id);
+        }
         register_action(
             "org-timestamp-up",
             "Step the timestamp component under the cursor forward",
@@ -2514,16 +2563,39 @@ impl Guest for Component {
     /// hold still for one scan, because `begin` is the one call guaranteed to
     /// precede `roots` and every `scan`.
     fn begin(args: Vec<String>) -> u64 {
-        let today = today_epoch_day();
+        // OA.19: the view's own arguments, parsed once. A bare token is still
+        // the custom-command key, so every existing caller is unaffected.
+        //
+        // `view.problems` is deliberately NOT logged here. A guest
+        // `logging::log` call makes the component IMPORT `logging`, which
+        // org's multi-seam linker does not wire — the whole component then
+        // fails to instantiate, which has cost this plugin a debug cycle more
+        // than once. The problems ride to OA.22's headerline instead, which is
+        // where a user would look for "why is my agenda not what I asked for"
+        // anyway.
+        let view = agenda_args::ViewArgs::parse(&args);
         let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
-        let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
-            .trim()
-            .parse::<u32>()
-            .unwrap_or_else(|_| {
-                DEFAULT_AGENDA_SPAN
-                    .parse()
-                    .expect("the compiled-in default parses")
-            });
+        // OA.20: `org.agenda-span` is what a FRESH agenda opens at; a view the
+        // user has walked carries its own. Navigation must never rewrite the
+        // option — glancing at next week would otherwise change what every
+        // future agenda means.
+        let span = view.span.unwrap_or_else(|| {
+            option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_else(|_| {
+                    DEFAULT_AGENDA_SPAN
+                        .parse()
+                        .expect("the compiled-in default parses")
+                })
+        });
+        // The day the scan is anchored to. Every label is relative to it
+        // ("tomorrow", "overdue by 2 day(s)"), so shifting it IS what walking a
+        // span means — the view keeps its shape and moves.
+        //
+        // `max(1)` because the daily agenda is `span = 0`: a step of zero days
+        // would make `f` a no-op on exactly the view people walk most.
+        let today = today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1));
         // AS.2: the user's set if `org.agenda-sections` holds one, the
         // built-ins otherwise. Parsed on read and never cached, the
         // `capture-templates` precedent — `:set org.agenda-sections=…` must
@@ -2541,7 +2613,7 @@ impl Guest for Component {
         // naming nothing — has to land on a WORKING agenda, and threading one
         // fallback through one call is what makes that structural instead of
         // three branches that each have to remember.
-        let sections = agenda_custom_commands::resolve(&args, span, sections);
+        let sections = agenda_custom_commands::resolve(&view.command_args(), span, sections);
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host
@@ -2579,6 +2651,10 @@ impl Guest for Component {
             args.hash(&mut h);
             h.finish()
         };
+        // OA.20: what the next span/filter chord modifies. The agenda is
+        // `reuse: true`, so there is one view and one slot is the accurate
+        // model; a chord reads this, changes one argument and re-opens.
+        VIEW_ARGS.replace(view);
         SCAN.set(Some(ScanState {
             today,
             keywords,
@@ -2695,6 +2771,20 @@ struct ScanState {
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.
     sections: Vec<agenda::Section>,
+}
+
+thread_local! {
+    /// OA.20: the arguments the agenda view on screen was opened with.
+    ///
+    /// A span or filter chord is "re-open this view with one argument
+    /// different", so it has to know what the others were. The agenda is
+    /// `reuse: true` — one view, re-scanned in place — so a single slot is the
+    /// accurate model rather than a convenient one.
+    ///
+    /// Written by `begin`, which is the only thing that knows a scan is
+    /// starting and with what.
+    static VIEW_ARGS: std::cell::RefCell<agenda_args::ViewArgs> =
+        const { std::cell::RefCell::new(agenda_args::ViewArgs::new()) };
 }
 
 thread_local! {
@@ -4358,6 +4448,48 @@ impl GrammarCallbacks for Component {
             // the SCAN-ARG slot rather than the argument one. The argument is
             // the root the host interprets; a command key sent there would
             // become a directory that does not exist (OA.11a).
+            // OA.20: every span chord is the same move — take the view's own
+            // arguments, change one, re-open. `reuse: true` means the same
+            // buffer re-scans in place, so this is the whole implementation.
+            AGENDA_LATER | AGENDA_EARLIER | AGENDA_TODAY | AGENDA_SPAN_DAY | AGENDA_SPAN_WEEK
+            | AGENDA_SPAN_MONTH | AGENDA_SPAN_YEAR => {
+                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                match callback {
+                    AGENDA_LATER => view.offset = view.offset.saturating_add(1),
+                    AGENDA_EARLIER => view.offset = view.offset.saturating_sub(1),
+                    // `.` resets the OFFSET, not the span: "take me back to
+                    // today" is about where you are, not about how much you
+                    // were looking at, and losing a week view to get home
+                    // would make the key cost more than it gives.
+                    AGENDA_TODAY => view.offset = 0,
+                    // Changing the span re-anchors on today. A `offset=2` held
+                    // across a day→month switch means two MONTHS out, which is
+                    // never what the person pressing `v m` meant.
+                    AGENDA_SPAN_DAY => {
+                        view.span = Some(0);
+                        view.offset = 0;
+                    }
+                    AGENDA_SPAN_WEEK => {
+                        view.span = Some(7);
+                        view.offset = 0;
+                    }
+                    AGENDA_SPAN_MONTH => {
+                        view.span = Some(30);
+                        view.offset = 0;
+                    }
+                    _ => {
+                        view.span = Some(365);
+                        view.offset = 0;
+                    }
+                }
+                Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                    OpenProviderViewPayload {
+                        provider: "agenda".to_string(),
+                        argument: None,
+                        scan_args: view.to_args(),
+                    },
+                ))])
+            }
             AGENDA_COMMAND => {
                 let key = match &ctx.args {
                     Args::String(s) => s.trim().to_string(),

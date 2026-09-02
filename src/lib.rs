@@ -501,12 +501,6 @@ const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
 /// it (TC.5).
 const DEFAULT_CAPTURE_TEMPLATES: [capture_templates::RawTemplate; 0] = [];
 
-/// AF.3: `org-agenda-files`, and empty by default for the reason
-/// `DEFAULT_CAPTURE_FILE` gives — a default would name files the user never
-/// chose. Empty means "no opinion", and the host then scans the project root
-/// exactly as it did before this option existed.
-const DEFAULT_AGENDA_FILES: &str = "";
-
 /// AS.1: how many days past today the dated section spans. A string because it
 /// reaches the option seam alongside its peers and `option_or` is the one
 /// accessor; parsed with a fallback so a typo'd `:set org.agenda-span=soon`
@@ -531,7 +525,10 @@ struct Component;
 /// manifest may not declare `config`) or the option was somehow not registered.
 /// `get_option` returning `none` must degrade to working defaults rather than
 /// disabling the keys.
-const DEFAULT_TODO_KEYWORDS: &str = "TODO | DONE";
+/// TK.2: the compiled default, as the LIST the option now is (TC.7). One
+/// sequence line, which is emacs' own default reduced to what org needs to
+/// function before anyone configures anything.
+const DEFAULT_TODO_KEYWORDS: [&str; 1] = ["TODO | DONE"];
 const DEFAULT_HIGHEST_PRIORITY: &str = "C";
 
 /// IM.7: images are OFF by default.
@@ -565,30 +562,59 @@ fn option_or(name: &str, default: &str) -> String {
     get_option(name).unwrap_or_else(|| default.to_string())
 }
 
-/// Split `org.agenda-files` into paths.
+/// TC.7: a `list<string>` option's value, or an empty list.
 ///
-/// One per line. Blank lines and `#` comments are dropped so the option can be
-/// annotated — a list of file paths is the kind of configuration people explain
-/// to themselves in six months.
+/// The three line-format options are declared lists now, so "one per line,
+/// blank lines and `#` comments dropped" is not a rule anyone has to implement
+/// — a list has elements, and an element that is not there is not an element.
+/// What is left is trimming, which a config file will always want.
+fn string_list(name: &str) -> Vec<String> {
+    match crate::config_shape::read_option::<Vec<String>>(name) {
+        Some(Ok(list)) => list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        // The host validated the write, so an `Err` here means the schema and
+        // `from_value` disagree — a bug, not a user's typo. Degrade to empty
+        // rather than trapping; every caller already handles "nothing set".
+        _ => Vec::new(),
+    }
+}
+
+/// AF.3: `org-agenda-files`, one path per element.
+fn agenda_files() -> Vec<String> {
+    string_list("agenda-files")
+}
+
+/// TK.2: `org.todo-keywords`, one SEQUENCE LINE per element.
 ///
-/// Free of the WIT and of any host type, so the parsing is unit-testable
-/// without a running editor.
-fn agenda_files(raw: &str) -> Vec<String> {
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect()
+/// The lines keep emacs' own grammar — `sequence: TODO(t) NEXT(n) | DONE(d)`,
+/// with its fast-select keys and logging specs — because that grammar is org's
+/// public spelling rather than an encoding worked around, and an emacs config
+/// pasted into `lattice.toml` has to keep meaning what it meant. What TC.7
+/// changed is the container: a list of lines instead of one newline-joined
+/// string, so `:describe-option` says `list<string>` and a TOML array is what
+/// a user writes.
+fn todo_keyword_lines() -> Vec<String> {
+    let lines = string_list("todo-keywords");
+    if lines.is_empty() {
+        DEFAULT_TODO_KEYWORDS
+            .iter()
+            .map(|l| l.to_string())
+            .collect()
+    } else {
+        lines
+    }
 }
 
 fn todo_keywords() -> Vec<String> {
-    let spec = get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string());
-    let parsed = todo::parse_keywords(&spec);
+    let parsed = todo::parse_keywords(&todo_keyword_lines().join("\n"));
     // A user who sets the option to nothing gets the default rather than a
     // dead key: an empty sequence would make `<leader>ot` cycle between one
     // state and itself.
     if parsed.is_empty() {
-        todo::parse_keywords(DEFAULT_TODO_KEYWORDS)
+        todo::parse_keywords(&DEFAULT_TODO_KEYWORDS.join("\n"))
     } else {
         parsed
     }
@@ -945,15 +971,16 @@ impl Guest for Component {
     /// Runs before `register_languages` — the loader drains `theme` first —
     /// which is what lets TK.4's generated query name these elements.
     fn register_theme_elements() {
-        todo_theme::register(&todo::parse_todo_keywords(
-            &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
-        ));
+        todo_theme::register(&todo::parse_todo_keywords(&todo_keyword_lines().join("\n")));
         // TK.5: the user's own per-keyword styles, applied as overrides so
         // they sit ABOVE the theme. Applied here rather than anywhere else
         // because this is the one export where the `theme` import is live —
         // the seam's store is dropped when this returns.
-        let (styles, _problems) =
-            todo::parse_keyword_styles(&get_option("todo-keyword-styles").unwrap_or_default());
+        let (styles, _problems) = todo::styles_from_declared(
+            crate::config_shape::read_option::<todo::DeclaredStyles>("todo-keyword-styles")
+                .and_then(Result::ok)
+                .unwrap_or_default(),
+        );
         todo_theme::apply_overrides(&styles);
     }
 
@@ -1007,14 +1034,25 @@ impl Guest for Component {
     }
 
     fn register_options() {
-        let _ = register_option(
+        // TK.2 / TC.7: a LIST of sequence lines, not one newline-joined string.
+        //
+        // The lines keep emacs' own grammar — that grammar is org's public
+        // spelling rather than an encoding worked around, and an emacs config
+        // pasted here has to keep meaning what it meant. Decomposing it into a
+        // record per keyword would have typed the parenthetical specs at the
+        // cost of the one property this option was ported to have. What TC.7
+        // changed is the container: `:describe-option` says `list<string>`, and
+        // a TOML array is what a user writes.
+        let _ = crate::config_shape::register_option::<Vec<String>>(
             "todo-keywords",
-            OptionType::String,
-            DEFAULT_TODO_KEYWORDS,
-            "TODO keywords, one sequence per line, in emacs' \
+            &DEFAULT_TODO_KEYWORDS
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+            "TODO keywords, one sequence per element, in emacs' \
              `org-todo-keywords` syntax:\n\n\
-             \x20 sequence: TODO(t) NEXT(n) | DONE(d)\n\
-             \x20 type: PROJECT TO-READ READING(!/!)\n\n\
+             \x20 \"sequence: TODO(t) NEXT(n) | DONE(d)\"\n\
+             \x20 \"type: PROJECT TO-READ READING(!/!)\"\n\n\
              `|` separates not-done from done. `(t)` is a fast-select key. \
              `(@)` / `(!)` / `(@/!)` are logging specs \u{2014} parsed, not yet \
              acted on. A bare list with no `sequence:` / `type:` prefix is a \
@@ -1023,22 +1061,27 @@ impl Guest for Component {
              at load, so a change needs a reload to recolour (emacs is the \
              same).",
         );
-        let _ = register_option(
+        // TK.5 / TC.7: per-keyword colours, a declared record list.
+        //
+        // The fit is exact rather than convenient: the modifiers were already
+        // tri-state (`Some(true)` sets, `Some(false)` clears an inherited one,
+        // `None` leaves it alone), which is precisely what an optional boolean
+        // field in a schema means. `no-bold` — the spelling that existed only
+        // because a line format has no way to write "false" — becomes
+        // `bold = false`, which is what it always meant.
+        let _ = crate::config_shape::register_option::<todo::DeclaredStyles>(
             "todo-keyword-styles",
-            OptionType::String,
-            "",
-            "Per-keyword colours, one per line \u{2014} the org-shaped spelling of \
-             `org-todo-keyword-faces`:\n\n\
-             \x20 TODO: fg=red bold\n\
-             \x20 WAITING: fg=orange italic\n\
-             \x20 CANCELLED: fg=overlay dim\n\n\
-             `fg=` / `bg=` take a palette key (which follows a colourscheme \
-             swap) or a literal `#rrggbb`. Modifiers are `bold`, `italic`, \
-             `underline`, `dim`, and `no-bold` and friends to CLEAR one \
-             inherited from the state's default. These are applied as theme \
-             OVERRIDES, so they beat the active colourscheme \u{2014} but \
-             `:colorscheme` replaces the override set, so a swap drops them \
-             until the next reload.",
+            &Vec::new(),
+            "Per-keyword colours \u{2014} the org-shaped spelling of \
+             `org-todo-keyword-faces`. One `[[org.todo-keyword-styles]]` per \
+             keyword with a `keyword` and any of `fg`, `bg`, `bold`, `italic`, \
+             `underline`, `dim`.\n\n\
+             `fg` / `bg` take a palette key (which follows a colourscheme swap) \
+             or a literal `#rrggbb`. A modifier set to `false` CLEARS one \
+             inherited from the state's default; omitted leaves it alone. These \
+             are applied as theme OVERRIDES, so they beat the active \
+             colourscheme \u{2014} but `:colorscheme` replaces the override set, \
+             so a swap drops them until the next reload.",
         );
         let _ = register_option(
             "highest-priority",
@@ -1089,14 +1132,13 @@ impl Guest for Component {
         // `:describe-option` shows a blob and `:set` cannot edit a multi-line
         // value meaningfully. If a list kind ever lands, this declaration
         // migrates and the meaning does not change.
-        let _ = register_option(
+        let _ = crate::config_shape::register_option::<Vec<String>>(
             "agenda-files",
-            OptionType::String,
-            DEFAULT_AGENDA_FILES,
-            "Files and directories the agenda scans, one path per line. A \
-             directory is walked; a file is scanned whatever its extension. \
-             `~` is expanded. Blank lines and `#` comments are ignored. Unset \
-             scans the project root, as before.",
+            &Vec::new(),
+            "Which files the agenda scans \u{2014} one path per element. A \
+             directory means the org files directly in it, not its whole \
+             subtree. Unset scans the project root, which is what nearly \
+             everyone wants until they keep org files somewhere else.",
         );
         // AS.1: the dated section's window. Registered as a String rather than
         // an Integer to sit beside every other org option behind the one
@@ -1188,10 +1230,7 @@ impl Guest for Component {
             highlights: Some(format!(
                 "{}\n{}",
                 include_str!("../queries/highlights.scm"),
-                todo_query::rules(&todo::parse_todo_keywords(
-                    &get_option("todo-keywords")
-                        .unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string())
-                ))
+                todo_query::rules(&todo::parse_todo_keywords(&todo_keyword_lines().join("\n")))
             )),
             folds: Some(include_str!("../queries/folds.scm").to_string()),
             // The language a `#+begin_src` block names, so its body is
@@ -2419,7 +2458,7 @@ impl Guest for Component {
     /// `~` is NOT expanded here. The host expands, so one implementation serves
     /// every source and a guest cannot get it wrong per-plugin.
     fn roots() -> Vec<String> {
-        agenda_files(&option_or("agenda-files", DEFAULT_AGENDA_FILES))
+        agenda_files()
     }
 
     /// OM.A3: the mode the host activates on the agenda view, so org's TODO
@@ -2461,9 +2500,7 @@ impl Guest for Component {
     /// precede `roots` and every `scan`.
     fn begin(args: Vec<String>) -> u64 {
         let today = today_epoch_day();
-        let keywords = agenda::Keywords::from_spec(
-            &get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string()),
-        );
+        let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
         let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
             .trim()
             .parse::<u32>()
@@ -5750,7 +5787,7 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
         TransientSpec,
     };
 
-    let kws = todo::parse_todo_keywords(&option_or("todo-keywords", DEFAULT_TODO_KEYWORDS));
+    let kws = todo::parse_todo_keywords(&todo_keyword_lines().join("\n"));
     if kws.all.is_empty() {
         // An `err` echoes with the plugin named and the menu stays shut,
         // which says more than an empty menu does.
@@ -6237,45 +6274,57 @@ mod agenda_files_tests {
 
     /// The two shapes one list carries — a directory and a single file — plus
     /// the annotation people add to configuration they will re-read in six
-    /// months. This is Dhruva's own emacs config, transcribed: `org-directory`
-    /// as a directory, `anniversaries.org` as a file.
+    /// TC.7 made `org.agenda-files` a `list<string>`, and most of what these
+    /// tests covered went with the line format.
+    ///
+    /// "One path per line, blanks and `#` comments dropped" was a rule this
+    /// module implemented because a newline-joined string is the only container
+    /// a string option has. A list has elements; an element that is not there
+    /// is not an element, and a comment lives beside the array in the TOML
+    /// where it is a comment rather than something to parse around. What is
+    /// left is trimming, which a config file will always want.
+    ///
+    /// The separator test went too, and its disappearance is the point: it
+    /// existed because a path may contain a colon or a comma, so splitting on
+    /// either would silently cut one in half. A list cannot have that bug.
     #[test]
-    fn one_path_per_line_with_comments_and_blanks_ignored() {
-        let raw = "\n\
-            # everything I keep\n\
-            ~/src/dhruvasagar/org-files\n\
-            \n\
-            # and the one that lives elsewhere\n\
-            ~/src/dhruvasagar/org-files/anniversaries.org\n";
+    fn blank_elements_are_dropped_and_the_rest_are_trimmed() {
         assert_eq!(
-            agenda_files(raw),
-            vec![
-                "~/src/dhruvasagar/org-files".to_string(),
-                "~/src/dhruvasagar/org-files/anniversaries.org".to_string(),
-            ]
+            string_list_of(&["  ~/org  ", "", "   ", "~/org/anniversaries.org"]),
+            vec!["~/org".to_string(), "~/org/anniversaries.org".to_string(),]
         );
     }
 
-    /// Unset, or nothing but blanks and comments, is "no opinion" — NOT "scan
-    /// nothing". The host falls back to the project root, which is what keeps
-    /// a user who has configured nothing on exactly the old behaviour.
+    /// Unset, or nothing but blanks, is "no opinion" — NOT "scan nothing". The
+    /// host falls back to the project root, which is what keeps a user who has
+    /// configured nothing on exactly the old behaviour.
     #[test]
     fn an_empty_option_is_no_opinion() {
-        assert!(agenda_files("").is_empty());
-        assert!(agenda_files("   \n\n  # only a note\n").is_empty());
+        assert!(string_list_of(&[]).is_empty());
+        assert!(string_list_of(&["", "   "]).is_empty());
     }
 
-    /// A path may contain a colon or a comma, which is why the separator is a
-    /// newline. Splitting on either would have silently cut these in half.
+    /// A path containing a colon or a comma survives, because a list element
+    /// is never split. The old line format needed a test for this; a list
+    /// cannot get it wrong, and the assertion is kept as the record of why the
+    /// separator question is closed.
     #[test]
-    fn a_path_may_contain_separators_other_formats_would_have_used() {
-        let raw = "/tmp/notes: drafts\n/tmp/a,b/notes.org\n";
+    fn a_path_may_contain_what_a_separator_based_format_would_have_cut() {
         assert_eq!(
-            agenda_files(raw),
+            string_list_of(&["/tmp/notes: drafts", "/tmp/a,b/notes.org"]),
             vec![
                 "/tmp/notes: drafts".to_string(),
                 "/tmp/a,b/notes.org".to_string()
             ]
         );
+    }
+
+    /// `string_list`'s resolution without a host to read an option from.
+    fn string_list_of(items: &[&str]) -> Vec<String> {
+        items
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 }

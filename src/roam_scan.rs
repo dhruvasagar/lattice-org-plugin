@@ -24,7 +24,7 @@
 use crate::lattice::plugin_host::config::get_option;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::tree_sitter;
-use crate::{roam, roam_index, roam_tree, todo, DEFAULT_TODO_KEYWORDS};
+use crate::{roam, roam_index, roam_tree, todo};
 
 /// The corpus root, or `None` when roam is not configured.
 ///
@@ -80,8 +80,7 @@ fn expand_tilde(path: &str) -> String {
 
 /// The configured TODO keywords, so a headline's title loses its keyword.
 fn todo_keywords() -> Vec<String> {
-    let spec = get_option("todo-keywords").unwrap_or_else(|| DEFAULT_TODO_KEYWORDS.to_string());
-    todo::parse_todo_keywords(&spec).names()
+    todo::parse_todo_keywords(&crate::todo_keyword_lines().join("\n")).names()
 }
 
 /// Index one file, given its path. Returns whether anything changed.

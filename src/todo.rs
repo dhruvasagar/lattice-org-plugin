@@ -285,7 +285,13 @@ fn parse_keyword(
 /// `("WAITING" :foreground "orange" :weight bold)`; here it is
 /// `WAITING: fg=orange bold`, one keyword per line, matching how
 /// `org.todo-keywords` is written rather than importing elisp's punctuation.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// TC.7 made it a DECLARED shape rather than a line format, and the fit is
+/// exact: the tri-state modifiers were already `Option<bool>`, which is
+/// precisely what an optional boolean field in a schema means. `no-bold` — the
+/// spelling that existed only because a line format has no way to write
+/// "false" — becomes `bold = false`, which is what it always meant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, lattice_plugin_sdk::ConfigShape)]
 pub struct KeywordStyle {
     /// A palette key (`orange`) or a literal `#rrggbb`.
     pub fg: Option<String>,
@@ -299,72 +305,66 @@ pub struct KeywordStyle {
     pub dim: Option<bool>,
 }
 
-/// Parse `org.todo-keyword-styles`.
+/// One `[[org.todo-keyword-styles]]` entry: which keyword, and how it looks.
 ///
-/// ```text
-/// TODO: fg=red bold
-/// WAITING: fg=orange italic
-/// CANCELLED: fg=overlay dim no-bold
-/// ```
+/// A record with the style INLINE rather than nested under a `style` field.
+/// The nesting would be structurally tidier and worse to write — every entry
+/// would carry a level of indentation that exists only to name something the
+/// option's name already names.
+#[derive(Debug, Clone, PartialEq, Eq, lattice_plugin_sdk::ConfigShape)]
+pub struct RawKeywordStyle {
+    /// The TODO keyword this styles — `WAITING`.
+    pub keyword: String,
+    /// A palette key (`orange`) or a literal `#rrggbb`.
+    pub fg: Option<String>,
+    /// Background, same forms as `fg`.
+    pub bg: Option<String>,
+    /// `true` sets it, `false` CLEARS one inherited from the state's default,
+    /// absent leaves it alone.
+    pub bold: Option<bool>,
+    /// As `bold`.
+    pub italic: Option<bool>,
+    /// As `bold`.
+    pub underline: Option<bool>,
+    /// As `bold`.
+    pub dim: Option<bool>,
+}
+
+/// The declared shape of `org.todo-keyword-styles`.
+pub type DeclaredStyles = Vec<RawKeywordStyle>;
+
+/// Resolve the declared styles, naming what could not be used.
 ///
-/// Returns `(keyword, style)` pairs plus one message per refused line. A bad
-/// line costs itself and nothing else, for the same proportionality reason a
-/// bad conceal rule does: this is cosmetic configuration, and losing every
-/// colour over one typo is the disproportionate answer.
-pub fn parse_keyword_styles(spec: &str) -> (Vec<(String, KeywordStyle)>, Vec<String>) {
+/// The only rule left that a schema cannot express: a blank `keyword`, which
+/// satisfies `required` and names nothing.
+pub fn styles_from_declared(raw: DeclaredStyles) -> (Vec<(String, KeywordStyle)>, Vec<String>) {
     let mut out = Vec::new();
     let mut problems = Vec::new();
-    for (i, raw) in spec.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+    for (i, r) in raw.into_iter().enumerate() {
+        let keyword = r.keyword.trim().to_string();
+        if keyword.is_empty() {
+            problems.push(format!("entry {}: blank `keyword`", i + 1));
             continue;
         }
-        let Some((name, rest)) = line.split_once(':') else {
-            problems.push(format!("line {}: expected `KEYWORD: …`", i + 1));
-            continue;
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            problems.push(format!("line {}: no keyword before `:`", i + 1));
-            continue;
-        }
-        let mut st = KeywordStyle::default();
-        let mut bad = None;
-        for word in rest.split_whitespace() {
-            match word {
-                "bold" => st.bold = Some(true),
-                "no-bold" => st.bold = Some(false),
-                "italic" => st.italic = Some(true),
-                "no-italic" => st.italic = Some(false),
-                "underline" => st.underline = Some(true),
-                "no-underline" => st.underline = Some(false),
-                "dim" => st.dim = Some(true),
-                "no-dim" => st.dim = Some(false),
-                _ => match word.split_once('=') {
-                    Some(("fg", v)) if !v.is_empty() => st.fg = Some(v.to_string()),
-                    Some(("bg", v)) if !v.is_empty() => st.bg = Some(v.to_string()),
-                    _ => {
-                        bad = Some(word.to_string());
-                        break;
-                    }
-                },
-            }
-        }
-        if let Some(w) = bad {
-            problems.push(format!(
-                "line {}: `{w}` is not `fg=…`, `bg=…` or a modifier",
-                i + 1
-            ));
-            continue;
-        }
-        if st == KeywordStyle::default() {
-            problems.push(format!("line {}: `{name}` declares no style", i + 1));
-            continue;
-        }
-        out.push((name.to_string(), st));
+        out.push((
+            keyword,
+            KeywordStyle {
+                fg: r.fg,
+                bg: r.bg,
+                bold: r.bold,
+                italic: r.italic,
+                underline: r.underline,
+                dim: r.dim,
+            },
+        ));
     }
     (out, problems)
 }
+
+/// TC.7 removed `parse_keyword_styles`. The line format it read
+/// (`WAITING: fg=orange italic`) is gone: `org.todo-keyword-styles` declares a
+/// record list now, so there is no text to parse — and no place a hand-rolled
+/// message could beat the host's `[2].fg: expected string, got integer`.
 
 /// The configured keyword list, e.g. `"TODO NEXT | DONE"`.
 ///
@@ -642,18 +642,54 @@ mod tests {
         assert!(set_keyword("plain prose", &kw, "DONE").is_none());
     }
 
-    // ---- TK.5: `org.todo-keyword-styles` ----
+    // ---- TK.5 / TC.7: `org.todo-keyword-styles` ----
+    //
+    // The line format is gone; the option declares a record list. What these
+    // test is the resolution that survives it — the tri-state modifiers, and
+    // the one rule a schema cannot express.
+
+    fn style(keyword: &str) -> RawKeywordStyle {
+        RawKeywordStyle {
+            keyword: keyword.to_string(),
+            fg: None,
+            bg: None,
+            bold: None,
+            italic: None,
+            underline: None,
+            dim: None,
+        }
+    }
 
     #[test]
-    fn tk5_the_emacs_config_transcribes_line_by_line() {
-        // Dhruva's own org-todo-keyword-faces, in this spelling.
-        let (styles, problems) = parse_keyword_styles(
-            "TODO: fg=red bold\n\
-             NEXT: fg=blue bold\n\
-             DONE: fg=green bold\n\
-             WAITING: fg=orange bold\n\
-             CANCELLED: fg=overlay dim",
-        );
+    fn tk5_the_emacs_config_transcribes_entry_by_entry() {
+        // Dhruva's own `org-todo-keyword-faces`, in this spelling.
+        let (styles, problems) = styles_from_declared(vec![
+            RawKeywordStyle {
+                fg: Some("red".into()),
+                bold: Some(true),
+                ..style("TODO")
+            },
+            RawKeywordStyle {
+                fg: Some("blue".into()),
+                bold: Some(true),
+                ..style("NEXT")
+            },
+            RawKeywordStyle {
+                fg: Some("green".into()),
+                bold: Some(true),
+                ..style("DONE")
+            },
+            RawKeywordStyle {
+                fg: Some("orange".into()),
+                bold: Some(true),
+                ..style("WAITING")
+            },
+            RawKeywordStyle {
+                fg: Some("overlay".into()),
+                dim: Some(true),
+                ..style("CANCELLED")
+            },
+        ]);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(styles.len(), 5);
         let get = |n: &str| styles.iter().find(|(k, _)| k == n).unwrap().1.clone();
@@ -663,11 +699,20 @@ mod tests {
         assert_eq!(get("CANCELLED").fg.as_deref(), Some("overlay"));
     }
 
-    /// The three-way modifier matters: a keyword inheriting a bold parent
-    /// must be able to turn bold OFF, which a plain bool cannot express.
+    /// The three-way modifier matters: a keyword inheriting a bold parent must
+    /// be able to turn bold OFF, which a plain bool cannot express.
+    ///
+    /// This is where the shape got BETTER rather than merely typed. The line
+    /// format needed a `no-bold` spelling because text has no way to write
+    /// "false"; `bold = false` is what it always meant, and now it says so.
     #[test]
     fn tk5_a_modifier_can_be_cleared_not_just_set() {
-        let (styles, _) = parse_keyword_styles("DONE: no-bold no-dim italic");
+        let (styles, _) = styles_from_declared(vec![RawKeywordStyle {
+            bold: Some(false),
+            dim: Some(false),
+            italic: Some(true),
+            ..style("DONE")
+        }]);
         let st = &styles[0].1;
         assert_eq!(st.bold, Some(false), "cleared, not merely unset");
         assert_eq!(st.dim, Some(false));
@@ -677,43 +722,80 @@ mod tests {
 
     #[test]
     fn tk5_a_literal_colour_is_allowed_beside_palette_keys() {
-        let (styles, problems) = parse_keyword_styles("TODO: fg=#ff8800\nNEXT: fg=blue");
+        let (styles, problems) = styles_from_declared(vec![
+            RawKeywordStyle {
+                fg: Some("#ff8800".into()),
+                ..style("TODO")
+            },
+            RawKeywordStyle {
+                fg: Some("blue".into()),
+                ..style("NEXT")
+            },
+        ]);
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(styles[0].1.fg.as_deref(), Some("#ff8800"));
         assert_eq!(styles[1].1.fg.as_deref(), Some("blue"));
     }
 
+    /// The one rule left that the schema cannot express: a `keyword` that is
+    /// present (so `required` is satisfied) and blank (so it names nothing).
+    ///
+    /// Everything this test used to cover alongside it — an unknown modifier,
+    /// an entry declaring nothing — is now refused by the host before it gets
+    /// here, with a path saying which entry and which field. `sparkly` cannot
+    /// be written at all: there is no field it could be.
     #[test]
-    fn tk5_a_bad_line_costs_only_itself() {
-        let (styles, problems) =
-            parse_keyword_styles("TODO: fg=red\nNEXT: sparkly\nDONE: fg=green");
+    fn tk5_a_blank_keyword_costs_only_itself() {
+        let (styles, problems) = styles_from_declared(vec![
+            RawKeywordStyle {
+                fg: Some("red".into()),
+                ..style("TODO")
+            },
+            RawKeywordStyle {
+                fg: Some("blue".into()),
+                ..style("   ")
+            },
+            RawKeywordStyle {
+                fg: Some("green".into()),
+                ..style("DONE")
+            },
+        ]);
         assert_eq!(
             styles.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
             ["TODO", "DONE"]
         );
         assert_eq!(problems.len(), 1);
-        assert!(problems[0].contains("sparkly"), "{problems:?}");
-    }
-
-    #[test]
-    fn tk5_a_line_that_declares_nothing_is_refused() {
-        let (styles, problems) = parse_keyword_styles("TODO:");
-        assert!(styles.is_empty());
-        assert_eq!(problems.len(), 1);
-    }
-
-    #[test]
-    fn tk5_blank_and_comment_lines_are_ignored() {
-        let (styles, problems) = parse_keyword_styles("\n# my colours\nTODO: fg=red\n\n");
-        assert_eq!(styles.len(), 1);
-        assert!(problems.is_empty(), "{problems:?}");
+        assert!(problems[0].contains("entry 2"), "{problems:?}");
     }
 
     #[test]
     fn tk5_an_unset_option_is_no_styles_and_no_complaints() {
-        let (styles, problems) = parse_keyword_styles("");
+        let (styles, problems) = styles_from_declared(Vec::new());
         assert!(styles.is_empty());
         assert!(problems.is_empty());
+    }
+
+    /// The declared shape is the documentation now — `:describe-option` renders
+    /// it and `lattice.toml` is validated against it — so a renamed field is a
+    /// user-visible change rather than an internal one.
+    #[test]
+    fn tk5_the_declared_shape_is_what_the_option_promises() {
+        use lattice_plugin_sdk::shape::{ConfigShape, Schema};
+        let Schema::List(inner) = <DeclaredStyles as ConfigShape>::schema() else {
+            panic!("the option is a list");
+        };
+        let Schema::Record(fields) = inner.as_ref() else {
+            panic!("each entry is a record");
+        };
+        assert_eq!(
+            fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["keyword", "fg", "bg", "bold", "italic", "underline", "dim"],
+        );
+        assert!(fields[0].required, "`keyword` is the one field required");
+        assert!(
+            fields[1..].iter().all(|f| !f.required),
+            "everything else is a modifier a user may omit"
+        );
     }
 
     // ---- TK.2: the `org-todo-keywords` grammar ----

@@ -739,11 +739,13 @@ async fn the_agenda_files_option_decides_what_is_scanned() {
     assert_eq!(loaded, 1, "the org component loads");
 
     editor.handle_effect(lattice_grammar::Effect::SetOption {
-        spec: format!(
-            "org.agenda-files={}\n# a comment the option must ignore\n{}",
-            notes.display(),
-            loose.display()
-        ),
+        // TC.7: the option is a `list<string>` now, so a `:set` spec is
+        // separated (comma or newline) rather than line-formatted. The `#`
+        // comment this fixture used to carry is gone with the format that
+        // needed it — a comment belongs beside the TOML array in
+        // `lattice.toml`, where it is a comment rather than something the
+        // option has to parse around.
+        spec: format!("org.agenda-files={},{}", notes.display(), loose.display()),
     });
 
     // No argument: the roots must come from the option, through `roots()`.

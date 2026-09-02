@@ -1313,16 +1313,26 @@ async fn the_keyword_sequence_comes_from_the_option() {
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* Task\n").await;
 
-    // The plugin's options are namespaced by its id.
-    assert_eq!(
-        editor
-            .config
-            .get_string_by_name("org.todo-keywords")
-            .as_deref(),
-        Some("TODO | DONE"),
+    // TC.7 made this a `list<string>`, so the `String` downcast behind
+    // `get_string_by_name` no longer answers — the option is a list of
+    // SEQUENCE LINES now. Asserted through the shape it actually has rather
+    // than pinned to the exact serialisation, which is the config layer's to
+    // change.
+    let declared = editor
+        .config
+        .lookup("org.todo-keywords")
+        .map(|o| o.get_formatted())
+        .unwrap_or_default();
+    assert!(
+        declared.contains("TODO | DONE"),
         "the config seam registered the option under the plugin's namespace, \
-         with the declared default"
+         with the declared default: {declared:?}"
     );
+    // The path `:set org.todo-keywords=…` is backed by (per config.wit).
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=PROPOSED ACCEPTED")
+        .expect("the option accepts a new sequence");
     // The path `:set org.todo-keywords=…` is backed by (per config.wit).
     editor
         .config
@@ -4262,11 +4272,17 @@ async fn a_broken_command_set_still_opens_the_menu_and_says_what_broke() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    // TC.7 moved the `when` typo this test used to a different stage: `when`
+    // is an `enum-of` in the declared shape, so `:set` refuses the whole value
+    // before it lands — see `an_unknown_when_is_refused_at_set_with_the_valid_forms`.
+    // What still reaches the guest's own skipping is everything the SCHEMA
+    // cannot express, and `match` is the clearest: `LEVEL>2` is well-typed
+    // TOML and a documented-unsupported match.
     set_org_option(
         &mut editor,
         "agenda-custom-commands",
-        "[[command]]\nkey = \"g\"\n\n\x20 [[command.section]]\n  title = \"Good\"\n  when = \"any\"\n\n\
-         [[command]]\nkey = \"b\"\n\n\x20 [[command.section]]\n  title = \"Bad\"\n  when = \"someday\"\n",
+        "[[command]]\nkey = \"g\"\n\n\x20 [[command.section]]\n  title = \"Good\"\n  when = \"any\"\n  match = \"WAITING\"\n\n\
+         [[command]]\nkey = \"b\"\n\n\x20 [[command.section]]\n  title = \"Bad\"\n  when = \"any\"\n  match = \"LEVEL>2\"\n",
     );
 
     open_agenda_menu(&mut editor).await;
@@ -4281,8 +4297,59 @@ async fn a_broken_command_set_still_opens_the_menu_and_says_what_broke() {
     assert_eq!(keys, vec!["a", "g", "q"], "the good command survives");
     let footer = spec.footer.as_deref().unwrap_or_default();
     assert!(
-        footer.contains("`b`") && footer.contains("someday"),
+        footer.contains("`b`") && footer.contains("LEVEL>2"),
         "the footer names what was dropped and why, got {footer:?}"
+    );
+}
+
+/// The other half, after TC.7: a typo in a CLOSED set is refused where it is
+/// typed, with the valid spellings inline.
+///
+/// This is the better failure and the reason `when` became an `enum-of` — the
+/// user is told at `:set` rather than discovering later that an agenda they
+/// wrote is not the one they get. The option keeps the value it had, so a typo
+/// costs nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_when_is_refused_at_set_with_the_valid_forms() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    let before = editor
+        .config
+        .lookup("org.agenda-custom-commands")
+        .map(|o| o.get_formatted())
+        .unwrap_or_default();
+
+    set_org_option(
+        &mut editor,
+        "agenda-custom-commands",
+        "[[command]]\nkey = \"b\"\n\n\x20 [[command.section]]\n  title = \"Bad\"\n  when = \"someday\"\n",
+    );
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("org.agenda-custom-commands"),
+        "the echo names the option at fault: {msg:?}"
+    );
+    assert!(
+        msg.contains("someday") && msg.contains("overdue"),
+        "…and lists what IS valid, which is the whole advantage of a closed \
+         set over a free string: {msg:?}"
+    );
+    assert_eq!(
+        editor
+            .config
+            .lookup("org.agenda-custom-commands")
+            .map(|o| o.get_formatted())
+            .unwrap_or_default(),
+        before,
+        "a refused set leaves the previous value alone"
     );
 }
 

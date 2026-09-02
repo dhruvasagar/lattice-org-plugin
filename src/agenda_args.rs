@@ -159,6 +159,47 @@ impl ViewArgs {
         out
     }
 
+    /// Whether `path` survives the `file:` filters.
+    ///
+    /// Matched on the file NAME rather than the full path: the user filtered
+    /// from a row they were looking at, and the name is what they saw. Several
+    /// `file:` terms are an OR — narrowing to two files is a sensible thing to
+    /// ask for, and an AND would be unsatisfiable.
+    pub fn admits_file(&self, path: &str) -> bool {
+        let names: Vec<&String> = self
+            .filters
+            .iter()
+            .filter_map(|f| match f {
+                FilterTerm::File(n) => Some(n),
+                FilterTerm::Tag(_) => None,
+            })
+            .collect();
+        if names.is_empty() {
+            return true;
+        }
+        let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        names
+            .iter()
+            .any(|n| base == n.as_str() || path == n.as_str())
+    }
+
+    /// Whether `tags` satisfies the `tag:` filters.
+    ///
+    /// Several `tag:` terms are an AND: `\` NARROWS an existing filter, which
+    /// is the whole reason it is a separate key from `/`.
+    pub fn admits_tags(&self, tags: &[String]) -> bool {
+        self.filters.iter().all(|f| match f {
+            FilterTerm::Tag(t) => tags.iter().any(|x| x == t),
+            FilterTerm::File(_) => true,
+        })
+    }
+
+    /// Whether any filter is active at all — what OA.22's headerline asks, and
+    /// what lets the scan skip the work entirely when none is.
+    pub fn is_filtered(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
     /// The command key as `agenda_custom_commands::resolve` wants it — a slice
     /// whose first element is the key, or empty for the default agenda.
     pub fn command_args(&self) -> Vec<String> {
@@ -389,5 +430,96 @@ mod span_walk_tests {
         assert_eq!(step(0, -2), -2);
         assert_eq!(step(7, 1), 7, "a week view walks a week");
         assert_eq!(step(30, 2), 60);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn v(items: &[&str]) -> ViewArgs {
+        ViewArgs::parse(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn tags(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_filter_admits_everything() {
+        let a = v(&["r"]);
+        assert!(!a.is_filtered());
+        assert!(a.admits_tags(&[]));
+        assert!(a.admits_file("/anywhere/notes.org"));
+    }
+
+    #[test]
+    fn tag_terms_narrow_rather_than_widen() {
+        // `\` NARROWS, which is the whole reason it is a separate key from
+        // `/`. Two tag terms are an AND; treating them as an OR would make
+        // every press of `\` show MORE, which is the opposite of the gesture.
+        let a = v(&["", "tag:work", "tag:urgent"]);
+        assert!(a.admits_tags(&tags(&["work", "urgent", "other"])));
+        assert!(!a.admits_tags(&tags(&["work"])), "one of two is not both");
+        assert!(!a.admits_tags(&tags(&["urgent"])));
+    }
+
+    #[test]
+    fn tag_matching_is_case_sensitive_like_everywhere_else_in_org() {
+        let a = v(&["", "tag:refile"]);
+        assert!(a.admits_tags(&tags(&["refile"])));
+        assert!(!a.admits_tags(&tags(&["REFILE"])));
+    }
+
+    #[test]
+    fn file_terms_widen_rather_than_narrow() {
+        // The opposite of tags, and deliberately: narrowing to two files is a
+        // sensible thing to ask for, and an AND would be unsatisfiable — a row
+        // comes from exactly one file.
+        let a = v(&["", "file:a.org", "file:b.org"]);
+        assert!(a.admits_file("/org/a.org"));
+        assert!(a.admits_file("/elsewhere/b.org"));
+        assert!(!a.admits_file("/org/c.org"));
+    }
+
+    #[test]
+    fn a_file_filter_matches_the_name_the_user_saw() {
+        // They filtered from a row they were looking at; the name is what was
+        // on screen, not the absolute path the host resolved it to.
+        let a = v(&["", "file:notes.org"]);
+        assert!(a.admits_file("/home/me/org/notes.org"));
+        assert!(a.admits_file("notes.org"));
+        assert!(
+            !a.admits_file("/home/me/org/other-notes.org"),
+            "a suffix is not a name — `other-notes.org` is a different file"
+        );
+    }
+
+    #[test]
+    fn the_two_kinds_of_filter_are_independent() {
+        // A `file:` term must not gate a tag test or vice versa, or narrowing
+        // by one would silently drop the other.
+        let a = v(&["", "tag:work", "file:a.org"]);
+        assert!(
+            a.admits_tags(&tags(&["work"])),
+            "the file term is not a tag test"
+        );
+        assert!(a.admits_file("/x/a.org"), "the tag term is not a file test");
+        assert!(!a.admits_tags(&tags(&["home"])));
+        assert!(!a.admits_file("/x/b.org"));
+    }
+
+    #[test]
+    fn a_filter_composes_with_a_command_rather_than_replacing_it() {
+        // `r` then `/work` is refile AND work. Getting this wrong silently
+        // shows one of the two, which looks like a working feature.
+        let a = v(&["r", "tag:work"]);
+        assert_eq!(a.command, "r");
+        assert_eq!(a.command_args(), vec!["r".to_string()]);
+        assert!(a.is_filtered());
+        // …and it survives the round trip every chord makes, which is what
+        // makes `gr` preserve the filter for free.
+        assert_eq!(ViewArgs::parse(&a.to_args()), a);
     }
 }

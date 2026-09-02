@@ -494,6 +494,22 @@ const AGENDA_SPAN_WEEK: u32 = 66;
 const AGENDA_SPAN_MONTH: u32 = 67;
 const AGENDA_SPAN_YEAR: u32 = 68;
 
+/// OA.21 — filtering. `/` narrows by tag, `\` adds another term, `|` clears.
+/// Emacs' keys again.
+///
+/// Emacs' `<` (restrict to the file at the cursor) is NOT here, and the reason
+/// is a missing seam rather than a decision: the agenda is a multibuffer, so
+/// `document.path()` answers for the VIEW, and which source file the excerpt
+/// under the cursor came from is host-side knowledge with no guest-facing
+/// seam. The `file:` filter term itself is live — it parses, it round-trips
+/// and `scan` applies it — so `<` is one seam away rather than one feature
+/// away. Registering a chord that silently did nothing was the alternative,
+/// and it is the failure class this codebase keeps paying for.
+const AGENDA_FILTER_TAG: u32 = 69;
+const AGENDA_FILTER_TAG_ADD: u32 = 70;
+const AGENDA_FILTER_TAG_SUBMIT: u32 = 71;
+const AGENDA_FILTER_CLEAR: u32 = 73;
+
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
 /// scatter notes across the filesystem; being told to set it once is better
@@ -1868,6 +1884,11 @@ impl Guest for Component {
                 bind("vw", "org-agenda-week-view"),
                 bind("vm", "org-agenda-month-view"),
                 bind("vy", "org-agenda-year-view"),
+                // OA.21: emacs' filter keys. `/` replaces the tag filter,
+                // `\` narrows it further, `|` clears everything.
+                bind("/", "org-agenda-filter-by-tag"),
+                bind("\\", "org-agenda-filter-add-tag"),
+                bind("|", "org-agenda-filter-clear"),
                 // OA.4b: `<Tab>` / `<S-Tab>` are NOT bound here. They come
                 // from the host's shared `foldable-view-mode`, which the
                 // agenda's native view mode pulls in by declaring
@@ -2203,6 +2224,26 @@ impl Guest for Component {
                 "org-agenda-today",
                 "Return the agenda to today",
                 AGENDA_TODAY,
+            ),
+            (
+                "org-agenda-filter-by-tag",
+                "Narrow the agenda to a tag (replacing any tag filter)",
+                AGENDA_FILTER_TAG,
+            ),
+            (
+                "org-agenda-filter-add-tag",
+                "Narrow the agenda by one more tag",
+                AGENDA_FILTER_TAG_ADD,
+            ),
+            (
+                "org-agenda-filter-submit",
+                "Apply the tag typed at the filter prompt",
+                AGENDA_FILTER_TAG_SUBMIT,
+            ),
+            (
+                "org-agenda-filter-clear",
+                "Drop every agenda filter",
+                AGENDA_FILTER_CLEAR,
             ),
             ("org-agenda-day-view", "Show one day", AGENDA_SPAN_DAY),
             ("org-agenda-week-view", "Show one week", AGENDA_SPAN_WEEK),
@@ -2664,10 +2705,21 @@ impl Guest for Component {
     }
 
     fn scan(
-        _path: String,
+        path: String,
         text: String,
         tree: Option<&TreeSnapshot>,
     ) -> Result<lattice::plugin_host::scanned_excerpt_source::ScanResult, String> {
+        // OA.21: a `file:` filter is answerable here and nowhere else — this
+        // is the only place that knows which file the rows came from. Answered
+        // FIRST because it is the cheapest possible rejection: a filtered-out
+        // file is not parsed, not walked and not clocked.
+        let view = VIEW_ARGS.with_borrow(Clone::clone);
+        if !view.admits_file(&path) {
+            return Ok(lattice::plugin_host::scanned_excerpt_source::ScanResult {
+                entries: Vec::new(),
+                clock: Vec::new(),
+            });
+        }
         // OA.14b: the clock spans are computed from the TEXT and are
         // independent of the sections — a headline that no block admits still
         // logged its time, and a report that only totalled admitted rows would
@@ -2709,12 +2761,22 @@ impl Guest for Component {
             // the extra ones would be unreachable, and a corpus of them is not
             // free to build or to carry back across the seam.
             let admit_tag_only = state.sections.iter().any(|s| s.filter.r#match.is_some());
-            let rows = match tree {
+            let mut rows = match tree {
                 Some(snapshot) => {
                     agenda::scan_tree(&snapshot.root(), &text, &state.keywords, admit_tag_only)
                 }
                 None => agenda::scan_file(&text, &state.keywords, admit_tag_only),
             };
+            // OA.21: a `tag:` filter narrows every block at once, which is
+            // what makes it a FILTER rather than another section. Applied to
+            // the rows rather than folded into each section's `match` because
+            // the two compose differently: a section's match says what that
+            // block is FOR, the filter says what you are looking at right now,
+            // and `r` then `/work` has to mean refile AND work rather than one
+            // of them silently winning.
+            if view.is_filtered() {
+                rows.retain(|row| view.admits_tags(&row.tags));
+            }
             // OA.6 reads a row's own line to colour it; both scan paths report
             // 0-based line numbers into this same split.
             let lines: Vec<&str> = text.lines().collect();
@@ -2771,6 +2833,17 @@ struct ScanState {
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.
     sections: Vec<agenda::Section>,
+}
+
+thread_local! {
+    /// OA.21: whether the filter prompt now open REPLACES the tag filter or
+    /// narrows it.
+    ///
+    /// `/` and `\` open the same prompt and submit through the same action —
+    /// the host's prompt seam carries text back, not which key opened it — so
+    /// the distinction has to be remembered here. One slot, because one prompt
+    /// is open at a time.
+    static FILTER_REPLACES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 thread_local! {
@@ -4482,6 +4555,60 @@ impl GrammarCallbacks for Component {
                         view.offset = 0;
                     }
                 }
+                Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                    OpenProviderViewPayload {
+                        provider: "agenda".to_string(),
+                        argument: None,
+                        scan_args: view.to_args(),
+                    },
+                ))])
+            }
+            // OA.21: `/` and `\` prompt; the difference is whether the answer
+            // REPLACES the tag filter or narrows it, which the submit handler
+            // reads back off the prompt's own action name.
+            AGENDA_FILTER_TAG | AGENDA_FILTER_TAG_ADD => {
+                let replacing = callback == AGENDA_FILTER_TAG;
+                FILTER_REPLACES.replace(replacing);
+                Ok(vec![Effect::OpenPrompt(
+                    lattice::plugin_host::types::OpenPromptPayload {
+                        prompt: if replacing {
+                            "Filter by tag: ".to_string()
+                        } else {
+                            "Also filter by tag: ".to_string()
+                        },
+                        initial: String::new(),
+                        on_submit_action: "org-agenda-filter-submit".to_string(),
+                        buffer_name: None,
+                    },
+                )])
+            }
+            AGENDA_FILTER_TAG_SUBMIT => {
+                let tag = submitted_text(&ctx.args)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                if FILTER_REPLACES.get() {
+                    view.filters
+                        .retain(|f| !matches!(f, agenda_args::FilterTerm::Tag(_)));
+                }
+                // An empty answer CLEARS rather than filtering by nothing:
+                // `/` then `<CR>` is how a person backs out, and a filter on
+                // the empty tag would match no row and read as a broken agenda.
+                if !tag.is_empty() {
+                    view.filters.push(agenda_args::FilterTerm::Tag(tag));
+                }
+                Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                    OpenProviderViewPayload {
+                        provider: "agenda".to_string(),
+                        argument: None,
+                        scan_args: view.to_args(),
+                    },
+                ))])
+            }
+            AGENDA_FILTER_CLEAR => {
+                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                view.filters.clear();
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {
                         provider: "agenda".to_string(),

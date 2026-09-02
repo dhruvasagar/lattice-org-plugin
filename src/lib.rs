@@ -235,6 +235,15 @@ const SET_TAGS: u32 = 14;
 /// prompt's text once the user submits.
 const SET_TAGS_SUBMIT: u32 = 15;
 
+/// OA.26 — the two remaining consumers of OA.23's seam.
+///
+/// `org-agenda-goto` jumps from a row to the headline it came from;
+/// `<` restricts the agenda to the file the row under the cursor lives in.
+/// Both ask the seam the same question — "which file is this row from" — which
+/// is why they land together.
+const AGENDA_GOTO: u32 = 78;
+const AGENDA_FILTER_FILE: u32 = 79;
+
 /// OA.25 — `<leader>os` / `<leader>od`, and their submit halves.
 ///
 /// Four actions rather than two because collecting a date is asynchronous:
@@ -1946,6 +1955,14 @@ impl Guest for Component {
                 bind("/", "org-agenda-filter-by-tag"),
                 bind("\\", "org-agenda-filter-add-tag"),
                 bind("|", "org-agenda-filter-clear"),
+                // OA.26: `<` restricts to the row's file, as emacs' `<` locks
+                // the agenda to a file. `<CR>` goes to the headline — emacs
+                // spells that `RET` (`org-agenda-switch-to`); its `TAB` peer
+                // is not free here, the shared `foldable-view-mode` owns it.
+                // `<lt>`, vim's spelling for a literal `<` — a bare one is an
+                // unterminated special-key form and the binding never parses.
+                bind("<lt>", "org-agenda-filter-by-file"),
+                bind("<CR>", "org-agenda-goto"),
                 // OA.4b: `<Tab>` / `<S-Tab>` are NOT bound here. They come
                 // from the host's shared `foldable-view-mode`, which the
                 // agenda's native view mode pulls in by declaring
@@ -2301,6 +2318,17 @@ impl Guest for Component {
                 "org-agenda-filter-clear",
                 "Drop every agenda filter",
                 AGENDA_FILTER_CLEAR,
+            ),
+            // OA.26: the two remaining consumers of OA.23's seam.
+            (
+                "org-agenda-goto",
+                "Jump to the headline this agenda row came from",
+                AGENDA_GOTO,
+            ),
+            (
+                "org-agenda-filter-by-file",
+                "Restrict the agenda to the file the row under the cursor is in",
+                AGENDA_FILTER_FILE,
             ),
             ("org-agenda-day-view", "Show one day", AGENDA_SPAN_DAY),
             ("org-agenda-week-view", "Show one week", AGENDA_SPAN_WEEK),
@@ -4913,6 +4941,64 @@ impl GrammarCallbacks for Component {
                 if !tag.is_empty() {
                     view.filters.push(agenda_args::FilterTerm::Tag(tag));
                 }
+                Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
+                    OpenProviderViewPayload {
+                        provider: "agenda".to_string(),
+                        argument: None,
+                        scan_args: view.to_args(),
+                    },
+                ))])
+            }
+            // OA.26 — jump from a row to the headline it came from.
+            //
+            // The most-used key in emacs' agenda, and the seam answers it
+            // directly: `excerpt-source` gives the file and the LINE, which is
+            // exactly `OpenBufferAt`'s payload. Nothing here needs the
+            // composed coordinates the row is displayed at.
+            AGENDA_GOTO => {
+                let Some(loc) = row_source(&ctx) else {
+                    // Not a row — a header, a separator, or a plain buffer
+                    // someone bound this in. `Effect::None` rather than
+                    // `Declined`: `<CR>` declining would re-run the builtin
+                    // first-non-blank-of-next-line motion, which in a
+                    // read-only view is a silent no-op that looks identical
+                    // and in an editable one is a surprise.
+                    return Ok(vec![Effect::None]);
+                };
+                Ok(vec![Effect::OpenBufferAt(
+                    lattice::plugin_host::types::OpenBufferAtPayload {
+                        path: Some(loc.path),
+                        position: Position {
+                            line: loc.line,
+                            byte: 0,
+                        },
+                        force: false,
+                    },
+                )])
+            }
+            // OA.26 — `<`, restrict the agenda to the row's own file.
+            //
+            // OA.21 shipped the `file:` filter term and could not bind it:
+            // the term needs a path, and a guest acting in a multibuffer had
+            // no way to learn which file a row came from. That is the gap
+            // OA.23 closed.
+            //
+            // REPLACES any existing file filter rather than adding to it.
+            // `file:` terms are an OR, so accumulating them would widen the
+            // view on a key whose whole name is "restrict" — press it twice on
+            // two rows and you would be looking at more than when you started.
+            AGENDA_FILTER_FILE => {
+                let Some(loc) = row_source(&ctx) else {
+                    return Ok(vec![Effect::None]);
+                };
+                // The NAME, not the path: `file:` matches on the file name
+                // (see `agenda_args`), so a full path would match nothing and
+                // read as a key that empties the agenda.
+                let name = loc.path.rsplit('/').next().unwrap_or(&loc.path).to_string();
+                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                view.filters
+                    .retain(|f| !matches!(f, agenda_args::FilterTerm::File(_)));
+                view.filters.push(agenda_args::FilterTerm::File(name));
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {
                         provider: "agenda".to_string(),

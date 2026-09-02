@@ -146,6 +146,24 @@ fn press(editor: &mut Editor, keys: &str) -> String {
 }
 
 /// Apply the effects an outcome carries, returning an `OpenPrompt`'s `initial`.
+/// `press`, but returning the outcome rather than a prompt's initial — for
+/// chords that produce an effect instead of opening a prompt.
+fn press_raw(editor: &mut Editor, keys: &str) -> lattice_host::dispatch::DispatchOutcome {
+    let expanded = editor.keymap.expand_leader(keys);
+    let seq = parse_chord_sequence(&expanded).expect("parses");
+    let mut partial: Vec<KeyChord> = Vec::new();
+    let mut resolved = None;
+    for c in seq {
+        resolved = Some(editor.dispatch_chord(c, &mut partial));
+    }
+    match resolved {
+        Some(lattice_host::action::Action::Invoke(inv)) => {
+            editor.dispatch(lattice_host::action::Action::Invoke(inv))
+        }
+        _ => lattice_host::dispatch::DispatchOutcome::default(),
+    }
+}
+
 fn apply_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) -> String {
     let mut seen_initial = String::new();
     for effect in out.effects {
@@ -158,6 +176,15 @@ fn apply_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutco
             } => {
                 seen_initial = initial.clone();
                 editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
+            }
+            lattice_grammar::Effect::OpenBufferAt {
+                path,
+                position,
+                force,
+            } => {
+                editor.do_edit(path.clone(), force);
+                editor.run_tick_pending();
+                editor.cursor = position;
             }
             lattice_grammar::Effect::ApplyEdit {
                 target,
@@ -524,5 +551,130 @@ async fn setting_a_deadline_in_the_agenda_writes_the_source_document() {
         "the agenda must not grow a row — the planning line is outside the \
          excerpt, and a pixel change to content the user did not edit is the \
          thing the UX contract vetoes"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OA.26 — the rest of OA.23's consumers
+// ─────────────────────────────────────────────────────────────
+
+/// Build an agenda over `notes/` with two dated files, and return the pieces a
+/// row-acting test needs.
+async fn agenda_over_two_files(
+    base: &std::path::Path,
+) -> (Editor, lattice_core::BufferId, MultibufferRegistryHandle) {
+    let plugins_dir = base.join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().expect("caller checked"));
+    let notes = base.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("alpha.org"),
+        format!("* TODO From alpha\n  SCHEDULED: {}\n", today_stamp()),
+    )
+    .unwrap();
+    std::fs::write(
+        notes.join("beta.org"),
+        format!("* TODO From beta\n  SCHEDULED: {}\n", today_stamp()),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base)
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    expand_plugin_keymaps(&editor);
+    let view = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+    settle_agenda(&mb, view).await;
+    (editor, view, mb)
+}
+
+/// `<CR>` on a row opens the FILE it came from, at the headline's own line —
+/// not the composed line the row is displayed at. The two coordinate spaces
+/// are unrelated, so a test whose row sits at composed 0 and source 0 would
+/// pass on an implementation that confused them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enter_on_a_row_opens_the_file_it_came_from() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, mb) = agenda_over_two_files(base.path()).await;
+    let handle = mb.handle(view).unwrap();
+    assert_eq!(handle.excerpts().len(), 2, "one row per file");
+
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+    let out = press_raw(&mut editor, "<CR>");
+    apply_effects(&mut editor, out);
+    editor.run_tick_pending();
+
+    let path = editor
+        .document
+        .snapshot()
+        .path()
+        .map(|p| p.to_path_buf())
+        .expect("the row's file is open and focused");
+    assert!(
+        path.ends_with("alpha.org") || path.ends_with("beta.org"),
+        "landed in one of the two source files, got {path:?}"
+    );
+    assert_ne!(
+        editor.active_pane_buffer_id(),
+        view,
+        "the agenda is no longer what the pane shows"
+    );
+}
+
+/// `<` restricts the agenda to the row's own file — the key OA.21 shipped the
+/// `file:` term for and could not bind, because a guest in a multibuffer had
+/// no way to learn which file a row came from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn angle_restricts_the_agenda_to_the_rows_file() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, mb) = agenda_over_two_files(base.path()).await;
+    assert_eq!(mb.handle(view).unwrap().excerpts().len(), 2);
+
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+    let out = press_raw(&mut editor, "<lt>");
+    apply_effects(&mut editor, out);
+    editor.run_tick_pending();
+
+    // The re-opened view is the same named buffer; settle its new scan.
+    let restricted = editor
+        .services
+        .get::<lattice_mode::BufferStoreHandle>()
+        .expect("the buffer store is a service")
+        .find_by_name("*agenda*")
+        .expect("the agenda re-opened under its own name");
+    settle_agenda(&mb, restricted).await;
+    assert_eq!(
+        mb.handle(restricted).unwrap().excerpts().len(),
+        1,
+        "only the row's own file survives the restriction"
     );
 }

@@ -3515,9 +3515,9 @@ fn clock_stop(
 /// Two paths, and the second is why this is not limited to the buffer you are
 /// in. When the target is the CURRENT buffer it is an ordinary clock-in at that
 /// line, so the change shows immediately and unsaved edits are respected. When
-/// it is elsewhere the entry is reached the way capture reaches its target —
-/// `read-file` for the characters, `parse-file` for the structure, and ONE
-/// `WriteToFile`. `clock::Logbook` needs neither a buffer nor a cursor, only a
+/// it is elsewhere the entry is reached with `read-file` for the characters and
+/// ONE `WriteToFile` — but NOT `parse-file`, which this seam cannot afford; see
+/// the note at the call site. `clock::Logbook` needs neither a buffer nor a
 /// line accessor, so the drawer primitive works over file text unchanged.
 fn clock_resume(buffer_id: u32, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let Some((path, line)) = CLOCK_GOTO_TARGET.with(|c| c.borrow().clone()) else {
@@ -3542,8 +3542,26 @@ fn clock_resume(buffer_id: u32, doc: &Document, tree: Option<&TreeSnapshot>) -> 
     let file_lines: Vec<String> = on_disk.lines().map(str::to_string).collect();
     let count = file_lines.len() as u32;
     let accessor = |n: u32| file_lines.get(n as usize).cloned();
-    let snapshot = lattice::plugin_host::tree_sitter::parse_file(&path);
-    let hl = headline::Headlines::new(snapshot.as_ref(), &accessor, count);
+    // OC.9 fix: the TEXT scan, not a tree — this seam is synchronous.
+    //
+    // `apply-ex-command` runs on the grammar trampoline, which is the dispatch
+    // thread, and `parse-file` reads the file and runs tree-sitter over it
+    // host-side while the guest blocks. The epoch deadline is wall-clock, so it
+    // fires, the guest traps, and the plugin is QUARANTINED — `:org-clock-resume`
+    // did nothing at all, with no effect and no echo, which reads as a dead
+    // command rather than a budget it blew.
+    //
+    // The three other `parse-file` callers (the scan seam, the roam index, the
+    // find-node picker) are all async actors, where a parse is the right trade.
+    // This one was the odd one out and always was.
+    //
+    // What it costs: `Headlines` falls back to matching `^\*+ `, so a headline
+    // inside a `#+BEGIN_SRC` block would be taken for a real one. Not reachable
+    // here — the target is a line the user themselves clocked into from a live
+    // buffer, so a headline exists at it by construction. That is a much
+    // narrower exposure than the agenda's, which is why the agenda keeps its
+    // tree and this does not.
+    let hl = headline::Headlines::new(None, &accessor, count);
     let lb = clock::Logbook::new(&hl);
 
     // The buffer is the record (D4), so "already running" is answered by the

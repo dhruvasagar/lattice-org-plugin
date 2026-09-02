@@ -4508,3 +4508,79 @@ async fn the_built_in_row_opens_the_default_agenda_with_no_command() {
          sends, so the built-in row and the ex-command cannot diverge"
     );
 }
+
+/// Submit a `:` line the way the renderer does — dispatch, then drain the
+/// `next_actions` it left. `out.effects` is a RECORD of what happened, not a
+/// to-do list; re-applying it here would double every edit.
+fn ex(editor: &mut Editor, line: &str) {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line(line, &mut out);
+    for action in out.next_actions {
+        let _ = editor.dispatch(action);
+    }
+    editor.run_tick_pending();
+}
+
+/// OM.14 — every org action is reachable from the `:` line.
+///
+/// Actions were the one `CommandKind` the ex-command parser refused, answering
+/// `Unknown` — so `:org-todo-cycle` reported "unknown command" for a command
+/// that is registered, listed by `:describe-command`, and bound to a chord.
+/// Motions, operators and text-objects were all already reachable.
+///
+/// The consequence was that org's fifty-odd actions could be driven by chords
+/// and by nothing else: no scripting, no `:` history, no discovery by typing
+/// part of the name. This is the acid test — a chord and a `:` line reaching
+/// the same handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_actions_are_reachable_from_the_ex_line() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-todo-cycle");
+    assert_eq!(
+        text(&editor),
+        "* TODO Task\nbody\n",
+        "`:org-todo-cycle` did what `<leader>ot` does (editor said: {:?})",
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+
+    // A structure action too, so the pass is not one lucky handler.
+    ex(&mut editor, "org-demote-headline");
+    assert_eq!(text(&editor), "** TODO Task\nbody\n");
+}
+
+/// The remainder of the line reaches the action as its argument.
+///
+/// An action's argument shape is the registrant's business and there is no
+/// `parse_ex_args` for actions to declare one with, so the contract is to hand
+/// over what was typed. `org-todo-set` is the case that needs it: the menu
+/// dispatches it with a state, and from `:` the state is what you type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ex_line_action_receives_its_argument() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\n").await;
+    set_org_option(
+        &mut editor,
+        "todo-keywords",
+        "sequence: TODO(t) NEXT(n) | DONE(d)",
+    );
+
+    goto_line(&mut editor, 0);
+    ex(&mut editor, "org-todo-set NEXT");
+    assert_eq!(
+        text(&editor),
+        "* NEXT Task\n",
+        "the argument crossed (editor said: {:?})",
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+}

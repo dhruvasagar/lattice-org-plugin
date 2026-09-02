@@ -29,7 +29,7 @@ wit-bindgen = "0.58"
 # tables are exactly where a hand-rolled parser gets a user's template subtly
 # wrong, and a template that parses to the wrong thing is worse than one that
 # fails to parse.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
 # TC.4: `#[derive(ConfigShape)]` — a Rust struct as a config schema and value,
 # plus the arena flattening the WIT config seam takes. WIT-agnostic pure Rust,
 # so it compiles to wasm32-wasip2 like the rest of the component.
@@ -64,6 +64,11 @@ rmp-serde = "1.3"
 lattice-wit = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-wit" }
 
 [dev-dependencies]
+# TC.6: the production path never parses TOML — the options are declared shapes
+# now — but TOML is still the nicest way to WRITE a fixture, and the alternative
+# is pages of nested `Value::record([...])` in which a test's intent disappears.
+# `config_shape::from_toml` turns a fixture into the tree the code receives.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 lattice-core = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-core" }
 # MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
 # naming the option's declaration type (`FoldMethodOption`) — it lives here.

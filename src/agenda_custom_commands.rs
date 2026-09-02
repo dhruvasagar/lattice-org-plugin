@@ -80,33 +80,38 @@
 //!
 //! Design: `docs/dev/architecture/org-agenda.md` §8.
 
-use serde::Deserialize;
+use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 use crate::agenda::Section;
 use crate::agenda_sections::{self, RawSection};
 
-// ---- The on-the-wire shape, deserialised then validated ----
+// ---- The on-the-wire shape, declared then validated ----
 
-#[derive(Deserialize)]
-struct RawSet {
-    #[serde(default)]
-    command: Vec<RawCommand>,
-}
-
-#[derive(Deserialize)]
-struct RawCommand {
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+pub(crate) struct RawCommand {
     /// The dispatcher key. A STRING rather than a char: emacs keys these with
     /// `" "` and `"C-a"` as readily as `"w"`, and a char would refuse the first
     /// spelling a user copies out of their old config.
-    #[serde(default)]
-    key: String,
+    pub(crate) key: String,
     /// What the dispatcher row reads. Falls back to the key when absent —
     /// a row you cannot identify is worse than a terse one.
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    section: Vec<RawSection>,
+    pub(crate) description: Option<String>,
+    /// The blocks this agenda is, in order. The SAME shape
+    /// `org.agenda-sections` declares — one declaration, so `todo-only` cannot
+    /// be spelled two ways and one of them be wrong.
+    ///
+    /// `Option<Vec<_>>` rather than a bare `Vec`, because optionality comes
+    /// from the TYPE and a required list would mean a command with no blocks
+    /// could not be written at all — TOML has no spelling for an empty
+    /// array-of-tables. Absent is an empty list, which is then skipped by name
+    /// below: "`n` has no usable sections" is a better answer than a shape
+    /// error, because a command with no blocks is a mistake a user makes while
+    /// editing rather than a malformed file.
+    pub(crate) section: Option<Vec<RawSection>>,
 }
+
+/// The declared shape of `org.agenda-custom-commands`.
+pub type Declared = Vec<RawCommand>;
 
 /// One configured agenda: a key to reach it by, a name, and the blocks it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,16 +177,14 @@ impl CommandError {
 /// `default_days` is `org.agenda-span`, used by any `when = "days"` section
 /// that does not name its own — so the span option stays meaningful inside a
 /// custom command exactly as it is inside `org.agenda-sections`.
-pub fn parse(source: &str, default_days: u32) -> Result<ParsedCommands, CommandError> {
-    if source.trim().is_empty() {
+pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands, CommandError> {
+    if raw.is_empty() {
         return Err(CommandError::Unset);
     }
-    let raw: RawSet =
-        toml::from_str(source).map_err(|e| CommandError::Malformed(e.message().to_string()))?;
 
     let mut commands: Vec<CustomCommand> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for (i, c) in raw.command.into_iter().enumerate() {
+    for (i, c) in raw.into_iter().enumerate() {
         let key = c.key.trim().to_string();
         if key.is_empty() {
             // Named by position, since there is no key to name it by. A
@@ -202,8 +205,11 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedCommands, CommandE
         // command. The notices are namespaced by key so a user reading them
         // knows WHICH agenda complained.
         let mut section_skips: Vec<String> = Vec::new();
-        let sections =
-            agenda_sections::sections_from_raw(c.section, default_days, &mut section_skips);
+        let sections = agenda_sections::sections_from_raw(
+            c.section.unwrap_or_default(),
+            default_days,
+            &mut section_skips,
+        );
         skipped.extend(section_skips.into_iter().map(|s| format!("`{key}`: {s}")));
         if sections.is_empty() {
             // A command with no usable sections would open an empty agenda,
@@ -211,10 +217,9 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedCommands, CommandE
             skipped.push(format!("`{key}` has no usable sections"));
             continue;
         }
-        let description = if c.description.trim().is_empty() {
-            key.clone()
-        } else {
-            c.description.trim().to_string()
+        let description = match c.description.as_deref().map(str::trim) {
+            Some(d) if !d.is_empty() => d.to_string(),
+            _ => key.clone(),
         };
         commands.push(CustomCommand {
             key,
@@ -233,6 +238,15 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedCommands, CommandE
 ///
 /// `args` is what OA.11a carries from the view: empty means the default
 /// agenda, and a first element is a custom command's key. `fallback` is the
+/// Read `org.agenda-custom-commands` and resolve it.
+pub fn read(default_days: u32) -> Result<ParsedCommands, CommandError> {
+    match crate::config_shape::read_option::<Declared>("agenda-custom-commands") {
+        Some(Ok(raw)) => from_declared(raw, default_days),
+        Some(Err(e)) => Err(CommandError::Malformed(e.to_string())),
+        None => Err(CommandError::Unset),
+    }
+}
+
 /// `org.agenda-sections` set the default agenda uses, already resolved.
 ///
 /// One function so `begin` has a single call and cannot accidentally skip the
@@ -240,10 +254,17 @@ pub fn parse(source: &str, default_days: u32) -> Result<ParsedCommands, CommandE
 /// three ways to end up with no sections (unset option, broken option, a key
 /// naming nothing) and all three must land on a working agenda that says what
 /// happened.
-pub fn resolve(
+pub fn resolve(args: &[String], default_days: u32, fallback: Vec<Section>) -> Vec<Section> {
+    // Split so the RULES are testable without a host. Reading the option needs
+    // one; deciding what to do with what was read does not, and that decision
+    // is the part with three ways to go wrong.
+    resolve_with(args, read(default_days), fallback)
+}
+
+/// [`resolve`]'s decision, given an already-read set.
+pub fn resolve_with(
     args: &[String],
-    source: &str,
-    default_days: u32,
+    set: Result<ParsedCommands, CommandError>,
     fallback: Vec<Section>,
 ) -> Vec<Section> {
     let Some(key) = args.first().map(|k| k.trim()).filter(|k| !k.is_empty()) else {
@@ -251,7 +272,7 @@ pub fn resolve(
         // never configured a custom command must see nothing about them.
         return fallback;
     };
-    match parse(source, default_days) {
+    match set {
         Ok(set) => match set.by_key(key) {
             Some(command) => command.sections.clone(),
             // The key named nothing. This is NOT the same as a broken config,
@@ -289,9 +310,23 @@ fn with_notice(mut sections: Vec<Section>, notice: Option<String>) -> Vec<Sectio
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::agenda::{default_sections, When};
+
+    /// The fixtures below are TOML because TOML is the nicest way to WRITE
+    /// one — the production path never parses it (TC.6 took `toml` out of the
+    /// shipped component; it is a dev-dependency now). This turns a fixture
+    /// into the declared value the code under test actually receives, so the
+    /// fixtures did not have to be retyped as nested `Value::record([...])`,
+    /// where a test's intent disappears.
+    fn parsedcommands_from(src: &str, default_days: u32) -> Result<ParsedCommands, CommandError> {
+        from_declared(
+            crate::config_shape::from_toml::<Declared>(src, "command"),
+            default_days,
+        )
+    }
 
     const SPAN: u32 = 7;
 
@@ -321,7 +356,7 @@ description = "Refile"
 
     #[test]
     fn a_set_parses_into_commands_in_order() {
-        let set = parse(TWO, SPAN).unwrap();
+        let set = parsedcommands_from(TWO, SPAN).unwrap();
         assert!(set.skipped.is_empty(), "got {:?}", set.skipped);
         assert_eq!(
             set.commands
@@ -340,7 +375,7 @@ description = "Refile"
 
     #[test]
     fn a_command_is_found_by_its_key_exactly() {
-        let set = parse(TWO, SPAN).unwrap();
+        let set = parsedcommands_from(TWO, SPAN).unwrap();
         assert_eq!(
             set.by_key("w").unwrap().description,
             "Waiting and Postponed"
@@ -354,8 +389,7 @@ description = "Refile"
     /// is worse than a terse one.
     #[test]
     fn a_command_without_a_description_is_named_by_its_key() {
-        let set = parse(
-            "[[command]]\nkey = \"x\"\n\n  [[command.section]]\n  title = \"T\"\n  when = \"any\"\n",
+        let set = parsedcommands_from("[[command]]\nkey = \"x\"\n\n  [[command.section]]\n  title = \"T\"\n  when = \"any\"\n",
             SPAN,
         )
         .unwrap();
@@ -366,7 +400,13 @@ description = "Refile"
     /// cost the whole feature.
     #[test]
     fn an_unusable_command_is_skipped_and_named() {
-        let set = parse(
+        // TC.6 moved the structural cases to the host: a command with no `key`
+        // at all, or a section whose `when` is not one of the four, is refused
+        // at the boundary with a path now rather than skipped silently. What is
+        // left is what a schema cannot say — a key that is present and blank, a
+        // command whose sections are all unusable, and a bad `min-priority`
+        // inside one.
+        let set = parsedcommands_from(
             r#"
 [[command]]
 key = "g"
@@ -375,7 +415,8 @@ key = "g"
   when = "any"
 
 [[command]]
-description = "no key"
+key = "   "
+description = "blank key"
   [[command.section]]
   title = "T"
   when = "any"
@@ -387,8 +428,9 @@ description = "no sections"
 [[command]]
 key = "b"
   [[command.section]]
-  title = "Bad when"
-  when = "someday"
+  title = "Bad priority"
+  when = "any"
+  min-priority = "AA"
 "#,
             SPAN,
         )
@@ -407,7 +449,7 @@ key = "b"
         assert!(
             set.skipped
                 .iter()
-                .any(|s| s.contains("`b`") && s.contains("someday")),
+                .any(|s| s.contains("`b`") && s.contains("min-priority")),
             "a bad section inside a command names the command: {:?}",
             set.skipped
         );
@@ -417,7 +459,7 @@ key = "b"
     /// rows of which one does nothing is indistinguishable from a broken menu.
     #[test]
     fn a_duplicate_key_keeps_the_first_and_says_so() {
-        let set = parse(
+        let set = parsedcommands_from(
             "[[command]]\nkey = \"w\"\ndescription = \"first\"\n\
              \n  [[command.section]]\n  title = \"A\"\n  when = \"any\"\n\
              \n[[command]]\nkey = \"w\"\ndescription = \"second\"\n\
@@ -433,19 +475,27 @@ key = "b"
     /// Unset is not an error to the user — it is how nearly everyone runs.
     #[test]
     fn unset_and_blank_are_not_a_complaint() {
-        assert_eq!(parse("", SPAN), Err(CommandError::Unset));
-        assert_eq!(parse("  \n\n", SPAN), Err(CommandError::Unset));
+        assert_eq!(parsedcommands_from("", SPAN), Err(CommandError::Unset));
+        assert_eq!(
+            parsedcommands_from("  \n\n", SPAN),
+            Err(CommandError::Unset)
+        );
         assert_eq!(CommandError::Unset.notice(), None);
     }
 
     #[test]
     fn a_set_with_nothing_usable_is_empty_not_malformed() {
-        assert_eq!(parse("[[command]]\n", SPAN), Err(CommandError::Empty));
-        assert_eq!(parse("other = 1\n", SPAN), Err(CommandError::Empty));
-        assert!(matches!(
-            parse("[[command]]\nkey = ", SPAN),
-            Err(CommandError::Malformed(_))
-        ));
+        // A blank key is the case that still gets here: present, so `required`
+        // is satisfied, and unreachable, which the schema has no way to say.
+        assert_eq!(
+            parsedcommands_from("[[command]]\nkey = \"\"\n", SPAN),
+            Err(CommandError::Empty)
+        );
+        // …as is a command with a key and no usable sections.
+        assert_eq!(
+            parsedcommands_from("[[command]]\nkey = \"n\"\n", SPAN),
+            Err(CommandError::Empty)
+        );
     }
 
     // ---- `resolve`: which agenda a scan actually runs ----
@@ -457,12 +507,16 @@ key = "b"
     fn no_command_named_is_the_default_agenda_in_silence() {
         let defaults = default_sections(SPAN);
         assert_eq!(
-            resolve(&[], TWO, SPAN, defaults.clone()),
+            resolve_with(&[], parsedcommands_from(TWO, SPAN), defaults.clone()),
             defaults,
             "no args"
         );
         assert_eq!(
-            resolve(&["  ".to_string()], TWO, SPAN, defaults.clone()),
+            resolve_with(
+                &["  ".to_string()],
+                parsedcommands_from(TWO, SPAN),
+                defaults.clone()
+            ),
             defaults,
             "a blank key is not a key"
         );
@@ -471,7 +525,11 @@ key = "b"
     /// The headline: a named command's sections are what the scan runs.
     #[test]
     fn a_named_command_supplies_its_own_sections() {
-        let sections = resolve(&["w".to_string()], TWO, SPAN, default_sections(SPAN));
+        let sections = resolve_with(
+            &["w".to_string()],
+            parsedcommands_from(TWO, SPAN),
+            default_sections(SPAN),
+        );
         assert_eq!(
             sections
                 .iter()
@@ -492,7 +550,11 @@ key = "b"
     #[test]
     fn an_unknown_key_falls_back_and_names_what_does_exist() {
         let defaults = default_sections(SPAN);
-        let sections = resolve(&["zzz".to_string()], TWO, SPAN, defaults.clone());
+        let sections = resolve_with(
+            &["zzz".to_string()],
+            parsedcommands_from(TWO, SPAN),
+            defaults.clone(),
+        );
         assert_eq!(sections.len(), defaults.len(), "the agenda still works");
         assert!(
             sections[0].title.contains("no command `zzz`"),
@@ -517,11 +579,17 @@ key = "b"
     /// AS.2's rule, inherited whole.
     #[test]
     fn a_malformed_set_falls_back_to_the_default_agenda_and_says_so() {
+        // `Malformed` is constructed rather than provoked: after TC.6 no input
+        // to `from_declared` can produce one — a value that does not fit the
+        // declared shape is refused by the HOST, and `read` turns that refusal,
+        // path and all, into this variant. What is still worth pinning is what
+        // the agenda DOES with one.
         let defaults = default_sections(SPAN);
-        let sections = resolve(
+        let sections = resolve_with(
             &["w".to_string()],
-            "[[command]]\nkey = ",
-            SPAN,
+            Err(CommandError::Malformed(
+                "[0].section[1].when: expected one of overdue | days | undated | any".to_string(),
+            )),
             defaults.clone(),
         );
         assert_eq!(sections.len(), defaults.len());
@@ -548,7 +616,11 @@ key = "b"
     #[test]
     fn a_key_with_no_configuration_at_all_says_so() {
         let defaults = default_sections(SPAN);
-        let sections = resolve(&["w".to_string()], "", SPAN, defaults.clone());
+        let sections = resolve_with(
+            &["w".to_string()],
+            parsedcommands_from("", SPAN),
+            defaults.clone(),
+        );
         assert_eq!(
             sections, defaults,
             "unset is not an error, so there is no notice even here — the \

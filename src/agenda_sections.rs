@@ -66,46 +66,59 @@
 //!
 //! Design: `docs/dev/architecture/org-mode.md` §6.1a.
 
-use serde::Deserialize;
+use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 use crate::agenda::{default_sections, Filter, Section, When};
 
-// ---- The on-the-wire shape, deserialised then validated ----
+// ---- The on-the-wire shape, declared then validated ----
 
-#[derive(Deserialize)]
-struct RawSet {
-    #[serde(default)]
-    section: Vec<RawSection>,
+/// When a section's rows are dated. A closed set, so the schema says
+/// `enum-of` and a typo is refused with the four valid spellings inline —
+/// where before an unknown `when` cost that section silently.
+///
+/// Case-sensitive now, which the string form was not (`"Any"` used to work).
+/// That is the trade: an exact closed set buys the listing error and, later,
+/// a `:customize` picker instead of a text field. The error names all four, so
+/// a user who writes `"Any"` is told what to write instead rather than losing
+/// a section without explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ConfigShapeDerive)]
+pub(crate) enum RawWhen {
+    /// Scheduled or deadlined before today.
+    Overdue,
+    /// Dated within the next `days` (or `org.agenda-span`).
+    Days,
+    /// Rows with no date at all.
+    Undated,
+    /// Every row, dated or not.
+    Any,
 }
 
-/// `pub(crate)` because `agenda_custom_commands` deserialises the SAME shape:
-/// a custom command's `[[command.section]]` is a section in every respect, and
-/// a second declaration of it would be two places for `todo-only` to be spelled
+/// `pub(crate)` because `agenda_custom_commands` declares the SAME shape: a
+/// custom command's `[[command.section]]` is a section in every respect, and a
+/// second declaration of it would be two places for `todo-only` to be spelled
 /// and one of them to be spelled wrong.
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
 pub(crate) struct RawSection {
-    #[serde(default)]
-    title: String,
-    /// `overdue` | `days` | `undated` | `any`. Lower-cased before matching, so
-    /// `"Any"` works — a config file is prose to the person writing it.
-    #[serde(default)]
-    when: String,
+    /// The block's header text.
+    pub(crate) title: String,
+    /// Which rows the block collects.
+    pub(crate) when: RawWhen,
     /// Only meaningful for `when = "days"`. Absent means "use
     /// `org.agenda-span`", which is what keeps that option meaningful once a
     /// user writes their own sections.
-    #[serde(default)]
-    days: Option<u32>,
-    /// Dashed, matching org's own `:`-keyword spellings rather than inventing
-    /// a snake_case variant of a name users already read elsewhere.
-    #[serde(default, rename = "todo-only")]
-    todo_only: Option<bool>,
-    #[serde(default, rename = "min-priority")]
-    min_priority: Option<String>,
+    ///
+    /// `i64` because the schema's integer kind is signed and has no bounds; a
+    /// negative day count is refused below, where a rule the schema cannot
+    /// express belongs.
+    pub(crate) days: Option<i64>,
+    /// Restrict the block to rows carrying a TODO keyword.
+    pub(crate) todo_only: Option<bool>,
+    /// Drop rows whose priority is below this letter.
+    pub(crate) min_priority: Option<String>,
     /// OA.10: org's tags/todo match — `"-CANCELLED+WAITING|HOLD/!"`. Absent
     /// means the section does not constrain tags, which is not the same as
     /// requiring none.
-    #[serde(default)]
-    r#match: Option<String>,
+    pub(crate) r#match: Option<String>,
 }
 
 /// A parsed set, plus what was dropped getting there.
@@ -125,8 +138,9 @@ pub enum SectionError {
     /// Unset or blank — the ordinary case, and not an error to the user. The
     /// built-in set is the documented default.
     Unset,
-    /// The TOML did not parse. Carries the parser's own message: the line and
-    /// column in it are the whole value of reporting this at all.
+    /// The stored value did not fit the declared shape in a way the host's own
+    /// validation did not catch. Carries the message with its PATH: the
+    /// location is the whole value of reporting this at all.
     Malformed(String),
     /// It parsed, but nothing in it was usable.
     Empty,
@@ -161,20 +175,29 @@ impl SectionError {
 ///
 /// `default_days` is `org.agenda-span`, used by any `when = "days"` section
 /// that does not name its own.
-pub fn parse(source: &str, default_days: u32) -> Result<ParsedSet, SectionError> {
-    if source.trim().is_empty() {
+pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedSet, SectionError> {
+    if raw.is_empty() {
         return Err(SectionError::Unset);
     }
-    let raw: RawSet =
-        toml::from_str(source).map_err(|e| SectionError::Malformed(e.message().to_string()))?;
-
     let mut skipped: Vec<String> = Vec::new();
-    let sections = sections_from_raw(raw.section, default_days, &mut skipped);
+    let sections = sections_from_raw(raw, default_days, &mut skipped);
 
     if sections.is_empty() {
         return Err(SectionError::Empty);
     }
     Ok(ParsedSet { sections, skipped })
+}
+
+/// The declared shape of `org.agenda-sections`.
+pub type Declared = Vec<RawSection>;
+
+/// Read `org.agenda-sections` and resolve it.
+pub fn read(default_days: u32) -> Result<ParsedSet, SectionError> {
+    match crate::config_shape::read_option::<Declared>("agenda-sections") {
+        Some(Ok(raw)) => from_declared(raw, default_days),
+        Some(Err(e)) => Err(SectionError::Malformed(e.to_string())),
+        None => Err(SectionError::Unset),
+    }
 }
 
 /// Turn deserialised sections into validated ones, naming what was dropped.
@@ -200,13 +223,19 @@ pub(crate) fn sections_from_raw(
             skipped.push(format!("section {} has no `title`", i + 1));
             continue;
         }
-        let Some(when) = parse_when(&s.when, s.days, default_days) else {
-            skipped.push(format!(
-                "`{title}` has an unknown `when = \"{}\"` (expected overdue, days, undated or any)",
-                s.when
-            ));
-            continue;
+        // An unknown `when` cannot reach here any more — it is an `enum-of` in
+        // the declared shape, so the host refuses it with the four valid
+        // spellings inline. What CAN still be wrong is a negative day count,
+        // which the schema's integer kind has no way to exclude.
+        let days = match s.days {
+            None => None,
+            Some(d) if d >= 0 => Some(d as u32),
+            Some(d) => {
+                skipped.push(format!("`{title}` has a negative `days = {d}`"));
+                continue;
+            }
         };
+        let when = when_of(s.when, days, default_days);
         let min_priority = match s.min_priority.as_deref().map(str::trim) {
             None | Some("") => None,
             Some(p) => {
@@ -250,13 +279,17 @@ pub(crate) fn sections_from_raw(
     sections
 }
 
-fn parse_when(raw: &str, days: Option<u32>, default_days: u32) -> Option<When> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "overdue" => Some(When::Overdue),
-        "days" => Some(When::Days(days.unwrap_or(default_days))),
-        "undated" => Some(When::Undated),
-        "any" => Some(When::Any),
-        _ => None,
+/// The declared `when` plus its day count, as the filter's own enum.
+///
+/// Total, where the string version it replaces had a `None` arm for "not one of
+/// the four" — the schema now guarantees it is. `days` only reaches `When::Days`;
+/// on the other three it is ignored, exactly as before.
+fn when_of(raw: RawWhen, days: Option<u32>, default_days: u32) -> When {
+    match raw {
+        RawWhen::Overdue => When::Overdue,
+        RawWhen::Days => When::Days(days.unwrap_or(default_days)),
+        RawWhen::Undated => When::Undated,
+        RawWhen::Any => When::Any,
     }
 }
 
@@ -266,8 +299,15 @@ fn parse_when(raw: &str, days: Option<u32>, default_days: u32) -> Option<When> {
 /// One function so `begin` has a single call and cannot accidentally skip the
 /// fallback — an agenda with an empty section list shows nothing at all, and
 /// "you have no tasks" is the worst thing this view can say incorrectly.
-pub fn resolve(source: &str, default_days: u32) -> Vec<Section> {
-    match parse(source, default_days) {
+pub fn resolve(default_days: u32) -> Vec<Section> {
+    // Split so the RULES are testable without a host: reading the option needs
+    // one, deciding what to do with what was read does not.
+    resolve_with(read(default_days), default_days)
+}
+
+/// [`resolve`]'s decision, given an already-read set.
+pub fn resolve_with(set: Result<ParsedSet, SectionError>, default_days: u32) -> Vec<Section> {
+    match set {
         Ok(set) => {
             // A partial set is used as-is: the sections that parsed are what
             // the user asked for, and the skips ride in `set.skipped` for a
@@ -294,14 +334,28 @@ fn with_notice(mut sections: Vec<Section>, notice: Option<String>) -> Vec<Sectio
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// The fixtures below are TOML because TOML is the nicest way to WRITE
+    /// one — the production path never parses it (TC.6 took `toml` out of the
+    /// shipped component; it is a dev-dependency now). This turns a fixture
+    /// into the declared value the code under test actually receives, so the
+    /// fixtures did not have to be retyped as nested `Value::record([...])`,
+    /// where a test's intent disappears.
+    fn parsedset_from(src: &str, default_days: u32) -> Result<ParsedSet, SectionError> {
+        from_declared(
+            crate::config_shape::from_toml::<Declared>(src, "section"),
+            default_days,
+        )
+    }
 
     const SPAN: u32 = 7;
 
     #[test]
     fn a_full_set_parses_into_sections_in_order() {
-        let set = parse(
+        let set = parsedset_from(
             r#"
 [[section]]
 title = "Overdue"
@@ -357,7 +411,7 @@ min-priority = "b"
     /// keeps that option meaningful once a user writes their own sections.
     #[test]
     fn a_days_section_without_its_own_count_inherits_the_span() {
-        let set = parse("[[section]]\ntitle = \"Week\"\nwhen = \"days\"\n", 9).unwrap();
+        let set = parsedset_from("[[section]]\ntitle = \"Week\"\nwhen = \"days\"\n", 9).unwrap();
         assert_eq!(set.sections[0].filter.when, When::Days(9));
     }
 
@@ -365,18 +419,27 @@ min-priority = "b"
     /// cost the whole feature.
     #[test]
     fn an_unusable_section_is_skipped_and_named() {
-        let set = parse(
+        // TC.6 moved the STRUCTURAL cases out of this test and into the host.
+        // A section with no `title` at all, or a `when` that is not one of the
+        // four, no longer reaches here: `title` is a required field and `when`
+        // is an `enum-of`, so the option is refused at the boundary with a path
+        // and the four valid spellings. What is left is what a schema cannot
+        // say — a title that is present and blank, a negative day count, a
+        // priority that is not one letter.
+        let set = parsedset_from(
             r#"
 [[section]]
 title = "Good"
 when = "any"
 
 [[section]]
+title = "   "
 when = "any"
 
 [[section]]
-title = "Bad when"
-when = "someday"
+title = "Bad days"
+when = "days"
+days = -3
 
 [[section]]
 title = "Bad priority"
@@ -390,27 +453,40 @@ min-priority = "AA"
         assert_eq!(set.sections[0].title, "Good");
         assert_eq!(set.skipped.len(), 3, "got {:?}", set.skipped);
         assert!(set.skipped[0].contains("section 2"));
-        assert!(set.skipped[1].contains("Bad when") && set.skipped[1].contains("someday"));
+        assert!(set.skipped[1].contains("Bad days") && set.skipped[1].contains("-3"));
         assert!(set.skipped[2].contains("Bad priority"));
     }
 
     /// Unset is not an error to the user — it is how nearly everyone runs.
     #[test]
     fn unset_and_blank_are_the_default_set_without_a_complaint() {
-        assert_eq!(parse("", SPAN), Err(SectionError::Unset));
-        assert_eq!(parse("   \n\n", SPAN), Err(SectionError::Unset));
+        assert_eq!(parsedset_from("", SPAN), Err(SectionError::Unset));
+        assert_eq!(parsedset_from("   \n\n", SPAN), Err(SectionError::Unset));
         assert_eq!(SectionError::Unset.notice(), None);
-        assert_eq!(resolve("", SPAN), default_sections(SPAN));
+        assert_eq!(
+            resolve_with(parsedset_from("", SPAN), SPAN),
+            default_sections(SPAN)
+        );
     }
 
     /// Malformed falls back to the defaults AND says so in the first header —
     /// the only channel this code owns, since the guest cannot log.
     #[test]
     fn a_malformed_set_falls_back_to_defaults_and_says_so() {
-        let err = parse("[[section]]\ntitle = ", SPAN).unwrap_err();
-        assert!(matches!(err, SectionError::Malformed(_)), "got {err:?}");
+        // `Malformed` is constructed rather than provoked, because after TC.6
+        // there is no input to this function that can produce it: a value that
+        // does not fit the declared shape is refused by the HOST, and `read`
+        // turns that refusal — carrying its path — into this variant. What is
+        // still worth pinning is what the agenda DOES with one, which is the
+        // whole point of the fallback.
+        let err = SectionError::Malformed("[1].title: expected string, got integer".to_string());
+        assert!(
+            err.notice().is_some_and(|n| n.contains("[1].title")),
+            "the notice carries the path the host reported: {:?}",
+            err.notice()
+        );
 
-        let resolved = resolve("[[section]]\ntitle = ", SPAN);
+        let resolved = resolve_with(Err(err), SPAN);
         let defaults = default_sections(SPAN);
         assert_eq!(
             resolved.len(),
@@ -440,22 +516,20 @@ min-priority = "AA"
     /// fix is different: the TOML is fine, the sections are not.
     #[test]
     fn a_set_with_no_usable_sections_is_empty_not_malformed() {
-        assert_eq!(
-            parse("[[section]]\nwhen = \"any\"\n", SPAN),
-            Err(SectionError::Empty)
-        );
-        // An array of nothing is the same class.
-        assert_eq!(parse("other = 1\n", SPAN), Err(SectionError::Empty));
+        // A blank title is the case that still gets here — present, so
+        // `required` is satisfied, and meaningless, which the schema has no
+        // way to say.
+        let blank = "[[section]]\ntitle = \"\"\nwhen = \"any\"\n";
+        assert_eq!(parsedset_from(blank, SPAN), Err(SectionError::Empty));
 
-        let resolved = resolve("[[section]]\nwhen = \"any\"\n", SPAN);
+        let resolved = resolve_with(parsedset_from(blank, SPAN), SPAN);
         assert!(resolved[0].title.contains("no usable sections"));
     }
 
     /// OA.10: a section's `match` reaches `Filter` as parsed data.
     #[test]
     fn a_section_match_parses_into_the_filter() {
-        let set = parse(
-            "[[section]]\ntitle = \"Waiting\"\nwhen = \"any\"\nmatch = \"-CANCELLED+WAITING|HOLD/!\"\n",
+        let set = parsedset_from("[[section]]\ntitle = \"Waiting\"\nwhen = \"any\"\nmatch = \"-CANCELLED+WAITING|HOLD/!\"\n",
             7,
         )
         .expect("parses");
@@ -473,7 +547,7 @@ min-priority = "AA"
     /// in one block cost every other block too.
     #[test]
     fn a_bad_match_skips_its_section_and_says_which() {
-        let set = parse(
+        let set = parsedset_from(
             "[[section]]\ntitle = \"Good\"\nwhen = \"any\"\n\n\
              [[section]]\ntitle = \"Bad\"\nwhen = \"any\"\nmatch = \"{^work}\"\n",
             7,
@@ -497,7 +571,7 @@ min-priority = "AA"
             "[[section]]\ntitle = \"A\"\nwhen = \"any\"\n",
             "[[section]]\ntitle = \"A\"\nwhen = \"any\"\nmatch = \"\"\n",
         ] {
-            let set = parse(body, 7).expect("parses");
+            let set = parsedset_from(body, 7).expect("parses");
             assert!(set.sections[0].filter.r#match.is_none(), "on {body:?}");
         }
     }

@@ -517,21 +517,11 @@ const DEFAULT_AGENDA_FILES: &str = "";
 /// value: the unbounded view is exactly what AS.1 replaced, and it is the one
 /// that buries today under a year of someone's recurring reminders.
 const DEFAULT_AGENDA_SPAN: &str = "7";
-
-/// AS.2: the section set, empty by default — which means the built-in one.
-///
-/// Empty rather than the built-in set spelled out as TOML, because the two
-/// would then be a pair that can drift: a change to `default_sections` would
-/// silently stop matching the string every `:describe-option` shows. Unset
-/// meaning "the defaults" keeps one definition of what the defaults are.
-const DEFAULT_AGENDA_SECTIONS: &str = "";
-
-/// OA.11 — `org.agenda-custom-commands`. Empty for `DEFAULT_AGENDA_SECTIONS`'
-/// reason and one of its own: there is no built-in custom command. Unset means
-/// the dispatcher (OA.13) offers exactly one row — the built-in agenda — so a
-/// user who configures nothing still reaches it, one keystroke later than
-/// before.
-const DEFAULT_AGENDA_CUSTOM_COMMANDS: &str = "";
+/// AS.2 / OA.11: `org.agenda-sections` and `org.agenda-custom-commands` are
+/// STRUCTURED options (TC.6), so their defaults are empty LISTS rather than
+/// empty strings — and an empty list is a legal value of `list<record>`, which
+/// is what lets each register before anyone configures it. Both are declared
+/// inline at their registration; there is no constant to keep in sync.
 
 const GRAMMAR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/grammar.wasm"));
 
@@ -1122,37 +1112,35 @@ impl Guest for Component {
              agenda. Overdue items are shown by their own section regardless, \
              so a short span does not hide a missed deadline.",
         );
-        // AS.2: the section set, as TOML in a string — `capture-templates`'
-        // shape and its reason (an option is `boolean | integer | string`, so
-        // an array-of-tables cannot reach one at all). One option serves both
-        // config homes: `lattice.toml` sets it, and `init.rs` sets the same
-        // string through `config::set_option`. See `agenda_sections`.
-        let _ = register_option(
+        // AS.2 / TC.6: the section set, a STRUCTURED option. It was TOML in a
+        // string for `capture-templates`' reason and is a declared shape for
+        // the same one — see `agenda_sections`. `when` is an `enum-of`, so a
+        // typo is refused with the four valid spellings inline rather than
+        // costing that block silently.
+        let _ = crate::config_shape::register_option::<agenda_sections::Declared>(
             "agenda-sections",
-            OptionType::String,
-            DEFAULT_AGENDA_SECTIONS,
-            "The agenda's blocks, as TOML: one `[[section]]` per block with a \
+            &Vec::new(),
+            "The agenda's blocks: one `[[org.agenda-sections]]` per block with a \
              `title`, a `when` (`overdue`, `days`, `undated` or `any`), and \
-             optionally `days`, `todo-only` and `min-priority`. A `days` \
-             section with no `days` uses `org.agenda-span`. Unset gives the \
-             built-in set: Overdue, Agenda, Unscheduled, Priority A.",
+             optionally `days`, `todo-only`, `min-priority` and `match`. A \
+             `days` block with no `days` uses `org.agenda-span`. Unset gives \
+             the built-in set: Overdue, Agenda, Unscheduled, Priority A.",
         );
-        // OA.11: named agendas, as TOML in a string — `agenda-sections`' shape
-        // one level deeper, and its `[[command.section]]` deserialises through
-        // the SAME `RawSection`, so a command's blocks obey exactly the section
-        // rules documented above. See `agenda_custom_commands`.
-        let _ = register_option(
+        // OA.11 / TC.6: named agendas — `agenda-sections`' shape one level
+        // deeper, and its `section` field IS `RawSection`, so a command's
+        // blocks obey exactly the rules documented above. One declaration, so
+        // there is no second place for `todo-only` to be spelled differently.
+        let _ = crate::config_shape::register_option::<agenda_custom_commands::Declared>(
             "agenda-custom-commands",
-            OptionType::String,
-            DEFAULT_AGENDA_CUSTOM_COMMANDS,
-            "Named agendas, as TOML: one `[[command]]` per agenda with a `key`, \
-             an optional `description`, and one or more `[[command.section]]` \
-             blocks in `org.agenda-sections`' shape. The key is what selects it. \
-             A command whose key names nothing, or a set that does not parse, \
-             falls back to the default agenda and says so in the first header — \
-             a broken configuration costs you your layout, never your rows. \
-             Unset means the default agenda, which is what nearly everyone \
-             wants.",
+            &Vec::new(),
+            "Named agendas: one `[[org.agenda-custom-commands]]` per agenda \
+             with a `key`, an optional `description`, and one or more `section` \
+             blocks in `org.agenda-sections`' shape. The key is what selects \
+             it. A command whose key names nothing, or a set that does not fit \
+             the shape, falls back to the default agenda and says so in the \
+             first header — a broken configuration costs you your layout, never \
+             your rows. Unset means the default agenda, which is what nearly \
+             everyone wants.",
         );
         // OR.4: the corpus root. UNSET by default, and that default is the
         // feature's contract — see `roam_scan::roam_directory`.
@@ -2489,8 +2477,7 @@ impl Guest for Component {
         // `capture-templates` precedent — `:set org.agenda-sections=…` must
         // land on the next scan, and a cache would need an `OptionChanged`
         // subscription to stay honest.
-        let sections =
-            agenda_sections::resolve(&option_or("agenda-sections", DEFAULT_AGENDA_SECTIONS), span);
+        let sections = agenda_sections::resolve(span);
         // OA.11: …unless the view was opened for a NAMED agenda, in which case
         // that command's sections are the ones this scan runs. `args` is what
         // OA.11a carries from the view; empty is the default agenda, which is
@@ -2502,12 +2489,7 @@ impl Guest for Component {
         // naming nothing — has to land on a WORKING agenda, and threading one
         // fallback through one call is what makes that structural instead of
         // three branches that each have to remember.
-        let sections = agenda_custom_commands::resolve(
-            &args,
-            &option_or("agenda-custom-commands", DEFAULT_AGENDA_CUSTOM_COMMANDS),
-            span,
-            sections,
-        );
+        let sections = agenda_custom_commands::resolve(&args, span, sections);
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host
@@ -5692,12 +5674,11 @@ fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
                 .parse()
                 .expect("the compiled-in default parses")
         });
-    let source = option_or("agenda-custom-commands", DEFAULT_AGENDA_CUSTOM_COMMANDS);
     // An unusable set costs the ROWS it describes, never the menu: the built-in
     // agenda is still reachable, and the footer says what went wrong. Erring
     // here would mean a typo in one command's `when` left you unable to open
     // any agenda at all.
-    let parsed = agenda_custom_commands::parse(&source, span);
+    let parsed = agenda_custom_commands::read(span);
 
     let mut items: Vec<TransientItem> = Vec::new();
     // `a` rather than `<Space>`: emacs's `C-c a a` is the built-in agenda, and

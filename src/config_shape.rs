@@ -109,3 +109,35 @@ pub fn register_option<T: ConfigShape>(name: &str, default: &T, doc: &str) -> bo
         doc,
     )
 }
+
+/// Test-only: a TOML fixture as a declared value.
+///
+/// The production path never parses TOML — that is TC.6's whole point, and why
+/// `toml` is a dev-dependency now rather than something shipped inside the
+/// component. But TOML is still the nicest way to WRITE a fixture, and the
+/// alternative is pages of nested `Value::record([...])` in which a test's
+/// intent disappears. So the fixtures stay as they were and this turns them
+/// into the tree the code under test actually receives.
+///
+/// `wrapper` is the array-of-tables key the fixture nests under (`section`,
+/// `command`, `template`), because a TOML document cannot be an array and the
+/// declared shape is a list.
+#[cfg(test)]
+pub(crate) fn from_toml<T: ConfigShape>(src: &str, wrapper: &str) -> T {
+    fn convert(v: &toml::Value) -> Value {
+        match v {
+            toml::Value::String(s) => Value::Str(s.clone()),
+            toml::Value::Integer(i) => Value::Int(*i),
+            toml::Value::Boolean(b) => Value::Bool(*b),
+            toml::Value::Array(items) => Value::List(items.iter().map(convert).collect()),
+            toml::Value::Table(t) => Value::record(t.iter().map(|(k, v)| (k.clone(), convert(v)))),
+            other => panic!("fixture has no config-value shape: {other:?}"),
+        }
+    }
+    let doc: toml::Table = toml::from_str(src).expect("the fixture is valid TOML");
+    let list = doc
+        .get(wrapper)
+        .cloned()
+        .unwrap_or(toml::Value::Array(Vec::new()));
+    T::from_value(&convert(&list)).expect("the fixture fits the declared shape")
+}

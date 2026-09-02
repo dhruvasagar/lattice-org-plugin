@@ -892,17 +892,28 @@ async fn the_agenda_sections_option_replaces_the_built_in_blocks() {
 /// header.
 ///
 /// The guest cannot log — calling `logging::log` makes the component import
-/// `logging`, which org's multi-seam linker does not wire, so the whole
-/// component fails to instantiate (tried and reverted; see
-/// `agenda_sections`' module header). The section titles are the only channel
-/// this code owns, and an agenda that silently ignores your config is exactly
-/// the silent-failure class this codebase keeps paying for.
+//// **TC.6 — a value that does not fit the declared shape is refused when it is
+/// SET, not when the agenda is drawn.**
 ///
-/// Falling back rather than showing nothing is the other half: an empty
-/// agenda and a correct-but-empty agenda look identical, and "you have no
-/// tasks" is the worst thing this view can say incorrectly.
+/// This test used to assert the opposite, and the change is the point of the
+/// slice. `org.agenda-sections` was a string holding TOML: any text at all was
+/// a legal value, so a malformed set was stored, and the breakage surfaced a
+/// scan later as a complaint prefixed onto the first section header. That was
+/// the best available answer while the host had no idea what the string meant.
+///
+/// It now declares a `list<record>` schema, so the host validates on WRITE.
+/// `:set org.agenda-sections=<garbage>` fails at the command line, where the
+/// user is looking, and the option keeps the value it had. The agenda then
+/// draws its ordinary default set with nothing to complain about — because
+/// nothing about the *stored* configuration is wrong.
+///
+/// The fallback machinery is not gone and is still worth having: `read` turns a
+/// host refusal into `SectionError::Malformed` carrying its path, and
+/// `agenda_sections`' unit tests pin what the view does with one. What changed
+/// is that reaching it now requires a schema and a `from_value` that disagree,
+/// which would be a bug rather than a user's typo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_malformed_section_set_falls_back_and_says_so_in_the_view() {
+async fn a_malformed_section_set_is_refused_when_it_is_set() {
     let Some(wasm) = org_plugin_wasm() else {
         eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
         return;
@@ -949,16 +960,14 @@ async fn a_malformed_section_set_falls_back_and_says_so_in_the_view() {
     let excerpts = handle.excerpts();
     let titles: Vec<String> = excerpts.iter().map(|e| e.header.title.clone()).collect();
 
-    // The row is still there — a broken config costs you your layout, never
-    // your tasks.
+    // The row is still there — a rejected `:set` costs you nothing at all now,
+    // not even your layout.
     assert_eq!(excerpts.len(), 1, "got {status:?} titles={titles:?}");
     assert!(
-        titles[0].contains("org.agenda-sections"),
-        "the view names the broken option, got {titles:?}"
-    );
-    assert!(
-        titles[0].contains("Overdue"),
-        "…and is still the built-in block it fell back to, got {titles:?}"
+        titles[0].starts_with("Overdue"),
+        "the built-in block, with no complaint prefixed: the stored \
+         configuration is not broken, the rejected write never landed. Got \
+         {titles:?}"
     );
 }
 

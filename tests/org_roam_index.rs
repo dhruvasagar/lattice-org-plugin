@@ -75,6 +75,12 @@ fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::Disp
             lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);
             }
+            // OR.11b: with templates configured the accept opens the chooser
+            // rather than writing. Without this arm the effect is printed and
+            // dropped, and a working flow reads as a create that did nothing.
+            lattice_grammar::Effect::OpenTransient { source, args } => {
+                editor.open_named_transient(source, args);
+            }
             lattice_grammar::Effect::OpenBufferAt {
                 path,
                 position,
@@ -141,7 +147,7 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
         dir.join("plugin.toml"),
         format!(
             "id = \"org\"\n\
-             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\"]\n\
+             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\", \"transient-source\"]\n\
              capabilities = [\"fs:write:{}\", \"state:write\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n\
              default_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\n",
@@ -167,6 +173,13 @@ fn loader_over_editor(editor: &Editor, host: Arc<PluginHost>) -> PluginLoader {
             // `drain_picker` reports `NotWired` — the source would silently not
             // exist.
             picker_registry: Some(editor.picker_registry.clone()),
+            // OR.11b: the create-from-template flow opens a transient, and
+            // without somewhere to register it the source is `NotWired` — the
+            // menu then reports `unknown source` and the create does nothing.
+            transient_registry: editor
+                .services
+                .get::<lattice_picker::TransientSourceRegistryHandle>()
+                .map(|h| (*h).clone()),
             // MV.3: the agenda is a plugin-owned view now, so the loader
             // needs somewhere to register its opener and somewhere to put its
             // excerpts. Both come off the editor's own service registry —
@@ -1089,8 +1102,14 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             }
         }
     }
+    // The dispatched action's OWN outcome carries effects too, and dropping it
+    // is invisible for `WriteToFile` — which `handle_effect` applies inline —
+    // but fatal for `OpenTransient`, which is the renderer's to apply. The
+    // create flow produces exactly that, so a working chooser looked like an
+    // accept that did nothing.
     for action in out.next_actions {
-        let _ = editor.dispatch(action);
+        let nested = editor.dispatch(action);
+        apply_accept_effects(editor, nested);
     }
 }
 
@@ -1979,4 +1998,175 @@ async fn the_emacs_prefix_reaches_the_same_roam_commands() {
         );
         assert_eq!(a, b, "`{emacs}` and `{vim}` must reach the same command");
     }
+}
+
+/// OR.11a + OR.11b — a note made from a template gets the template, expanded.
+///
+/// The bug this closes: `roam_capture.rs` was committed with `expand_fields`
+/// and a full test module, and `mod roam_capture;` was never added to
+/// `lib.rs`. The file did not compile, the function had no caller, and its
+/// tests never ran — so a template's `#+title: ${title}` reached the user's
+/// note verbatim. Tests passing in isolation is exactly why it looked done.
+///
+/// The flow is emacs org-roam's: pick a title the corpus does not have, choose
+/// a template, and the note is written from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_templated_note_expands_its_fields() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+
+    // A template using BOTH placeholder syntaxes, so the ordering is covered:
+    // `${}` for the node being made, `%` for the capture context.
+    // A single-line TOML basic string with `\n` escapes rather than a `"""`
+    // block: a `:set` spec is one line by construction, and a block string in
+    // it is the kind of thing that parses in a fixture file and not here.
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: concat!(
+            "org.roam-capture-templates=[[template]]\n",
+            "key = \"d\"\n",
+            "description = \"Default note\"\n",
+            "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n",
+            "#+title: ${title}\\n\\nfrom ${slug}\\n\"\n",
+        )
+        .to_string(),
+    });
+    assert!(
+        editor
+            .last_message
+            .as_ref()
+            .map(|m| !m.text.contains("expected") && !m.text.contains("error"))
+            .unwrap_or(true),
+        "the template set was accepted: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+
+    let _ = open_find_node(&mut editor).await;
+    let rows = query_picker(&mut editor, "Zettelkasten");
+    assert_eq!(rows, vec!["Create note: Zettelkasten"], "{rows:?}");
+
+    // Accept now opens the CHOOSER rather than writing — that is the flow
+    // change, and asserting it here is what would catch a regression back to
+    // writing the stub without asking.
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..80 {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let spec = editor
+        .picker
+        .as_ref()
+        .and_then(|p| p.transient.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "the template chooser opened (last message: {:?})",
+                editor.last_message.as_ref().map(|m| &m.text)
+            )
+        });
+    assert!(
+        spec.title.contains("Zettelkasten"),
+        "the menu names the node it is making: {:?}",
+        spec.title
+    );
+
+    // Pick the template.
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("d".to_string(), &mut out);
+    apply_accept_effects(&mut editor, out);
+
+    let draft_text = |editor: &Editor| -> Option<String> {
+        let mut ids = Vec::new();
+        editor.buffers.for_each(|entry| ids.push(entry.id));
+        ids.into_iter().find_map(|id| {
+            let handle = editor.buffers.document_handle(id)?;
+            let path = handle.snapshot().path.clone()?;
+            if !path.to_string_lossy().contains("zettelkasten") {
+                return None;
+            }
+            Some(lattice_runtime::Document::text(handle.as_ref()))
+        })
+    };
+    let mut text = None;
+    for _ in 0..240 {
+        editor.run_tick_pending();
+        text = draft_text(&editor);
+        if text.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let text = text.unwrap_or_else(|| {
+        panic!(
+            "the template wrote a draft (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+
+    assert!(
+        !text.contains("${"),
+        "no placeholder survives into the user's note — the whole bug: {text:?}"
+    );
+    assert!(
+        text.contains("#+title: Zettelkasten"),
+        "`${{title}}` became the typed title: {text:?}"
+    );
+    assert!(
+        text.contains("from zettelkasten"),
+        "`${{slug}}` became the slug: {text:?}"
+    );
+    let id_line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(":ID:"))
+        .expect("`${id}` became an :ID: line");
+    let id = id_line.split_whitespace().nth(1).unwrap_or_default();
+    assert_eq!(id.split('-').count(), 5, "a real v4 id: {id:?}");
+}
+
+/// With NO templates configured, creating a note still writes the built-in
+/// stub and shows no menu.
+///
+/// The back-compat half, and the reason the option defaults to empty: making
+/// the feature depend on configuration would break note creation for every
+/// user who has never heard of templates, to add a menu with one row in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_templates_a_note_is_still_the_built_in_stub() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    let _ = open_find_node(&mut editor).await;
+    let _ = query_picker(&mut editor, "Zettelkasten");
+
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..40 {
+        editor.run_tick_pending();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_none(),
+        "no menu is shown when nothing is configured"
+    );
 }

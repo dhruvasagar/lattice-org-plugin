@@ -168,7 +168,6 @@ mod roam_index;
 mod roam_scan;
 mod roam_templates;
 mod roam_tree;
-mod table;
 mod timestamp;
 mod todo;
 mod tree;
@@ -332,20 +331,13 @@ const ORG_TRANSIENT_ROAM: &str = "roam";
 /// what the open was FOR rather than registering a source each.
 const ORG_TRANSIENT_AGENDA: &str = "agenda";
 
-/// `org-table-mode` (OM.12).
-const TABLE_NEXT_CELL: u32 = 21;
-const TABLE_PREV_CELL: u32 = 22;
-const TABLE_ALIGN: u32 = 23;
-
-/// Row / column structure (OM.13).
-const TABLE_ROW_UP: u32 = 24;
-const TABLE_ROW_DOWN: u32 = 25;
-const TABLE_COL_LEFT: u32 = 26;
-const TABLE_COL_RIGHT: u32 = 27;
-const TABLE_INSERT_ROW: u32 = 28;
-const TABLE_INSERT_COL: u32 = 29;
-const TABLE_DELETE_ROW: u32 = 30;
-const TABLE_DELETE_COL: u32 = 31;
+// TB.2: 21..=31 were `org-table-mode`'s eleven generic table callbacks.
+// They are the host's now — `table-mode` in `lattice-mode` owns pipe-table
+// editing for markdown and org alike (see that mode's docs for why the host
+// is the only owner that can serve both). The ids are left as a GAP rather
+// than reused: a callback id is a wire value between this guest's
+// registration and the host's dispatch, and shifting the ones above it to
+// close a hole would silently re-point every action after it.
 
 /// `<leader>o$` (OM.6b) — the first action in this plugin that writes to a
 /// file other than the one it fired in.
@@ -2107,35 +2099,35 @@ impl Guest for Component {
             }],
         });
 
-        // OM.12 — `org-table-mode`, the third mode.
+        // OM.12 / TB.2 — `org-table-mode`, the third mode.
         //
-        // Its `<Tab>` sits ABOVE `org-mode`'s in the layer order, and declines
-        // when the cursor is not in a table. That makes the chain two hops:
-        // table → headline cycle → whatever `<Tab>` natively means. The chain
-        // only actually works because the dispatcher was fixed to peel ONE
-        // keymap layer per decline (lattice `b9f6e3f6`); before that a decline
-        // dropped every mode layer at once and skipped org-mode entirely.
+        // It used to own the whole pipe-table surface, and its `<Tab>` sat
+        // above `org-mode`'s to make the chain two hops: table → headline
+        // cycle → whatever `<Tab>` natively means. TB.2 moved that surface to
+        // the host's `table-mode`, which sits in the same place in the layer
+        // order and declines the same way — the chain is unchanged, one of
+        // its links just lives somewhere else now.
         register_mode(&ModeDeclaration {
             id: "org-table-mode".to_string(),
             kind: ModeKind::Minor,
             activation_policy: ActivationPolicy::Majors(vec!["org-mode".to_string()]),
             capabilities: ModeCapabilities::empty(),
-            keymap: vec![
-                bind("<Tab>", "org-table-next-cell"),
-                bind("<S-Tab>", "org-table-prev-cell"),
-                bind("<leader>o|", "org-table-align"),
-                // OM.13. Deliberately the outliner's directional letters
-                // (`K`/`J` move, `H`/`L` for columns) so one mnemonic covers
-                // subtrees and table rows alike.
-                bind("<leader>tK", "org-table-row-up"),
-                bind("<leader>tJ", "org-table-row-down"),
-                bind("<leader>tH", "org-table-column-left"),
-                bind("<leader>tL", "org-table-column-right"),
-                bind("<leader>tr", "org-table-insert-row"),
-                bind("<leader>tc", "org-table-insert-column"),
-                bind("<leader>tdr", "org-table-delete-row"),
-                bind("<leader>tdc", "org-table-delete-column"),
-            ],
+            // TB.2: EMPTY, and deliberately still declared.
+            //
+            // Every chord this carried was generic — `<Tab>` walks cells in a
+            // markdown table exactly as it does in an org one — so all eleven
+            // moved to the host's `table-mode`, which activates on both
+            // majors. Org users keep the same keys; markdown users get them
+            // without installing this plugin, which is the whole point.
+            //
+            // What is left is the mode's REASON: this is where table
+            // behaviour that is genuinely org's goes, and `#+TBLFM:` formulas
+            // are the large one waiting. Deleting the mode and re-adding it
+            // then would rename an entry in the plugin's mode list to buy
+            // nothing; keeping it is what makes the split legible to whoever
+            // picks that up. An empty keymap pushes no layer, so it costs a
+            // registry entry and a `:describe-mode` page saying so.
+            keymap: vec![],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.
             options: vec![],
@@ -2300,60 +2292,12 @@ impl Guest for Component {
             &spec(),
             META_RETURN,
         );
-        register_action(
-            "org-table-next-cell",
-            "Move to the next table cell, aligning the table",
-            &spec(),
-            TABLE_NEXT_CELL,
-        );
-        register_action(
-            "org-table-prev-cell",
-            "Move to the previous table cell, aligning the table",
-            &spec(),
-            TABLE_PREV_CELL,
-        );
-        for (name, doc_text, cb) in [
-            ("org-table-row-up", "Move this table row up", TABLE_ROW_UP),
-            (
-                "org-table-row-down",
-                "Move this table row down",
-                TABLE_ROW_DOWN,
-            ),
-            (
-                "org-table-column-left",
-                "Move this column left",
-                TABLE_COL_LEFT,
-            ),
-            (
-                "org-table-column-right",
-                "Move this column right",
-                TABLE_COL_RIGHT,
-            ),
-            (
-                "org-table-insert-row",
-                "Insert a row below",
-                TABLE_INSERT_ROW,
-            ),
-            (
-                "org-table-insert-column",
-                "Insert a column after",
-                TABLE_INSERT_COL,
-            ),
-            ("org-table-delete-row", "Delete this row", TABLE_DELETE_ROW),
-            (
-                "org-table-delete-column",
-                "Delete this column",
-                TABLE_DELETE_COL,
-            ),
-        ] {
-            register_action(name, doc_text, &spec(), cb);
-        }
-        register_action(
-            "org-table-align",
-            "Align the table under the cursor",
-            &spec(),
-            TABLE_ALIGN,
-        );
+        // TB.2: the eleven `org-table-*` actions are gone. Pipe-table
+        // editing is the host's `table-mode` now — `action:table-align`,
+        // `action:table-next-cell` and the rest — because the surface is
+        // markdown's as much as org's and only the host can serve both.
+        // Registering ours too would be the duplication the move removed,
+        // wearing the `:` line as a disguise.
         register_action(
             "org-open-link",
             "Open the link under the cursor: file, URL, or another headline",
@@ -4923,9 +4867,10 @@ impl GrammarCallbacks for Component {
             // headline it cycles; anywhere else it DECLINES, and the
             // dispatcher re-resolves as if org-mode's layer were not there —
             // falling through to whatever `<Tab>` natively means (jump-list
-            // forward). When `org-table-mode` arrives it binds `<Tab>` above
-            // this one and declines outside a table, making the chain two
-            // hops with no change here.
+            // forward). The host's `table-mode` binds `<Tab>` above this one
+            // and declines outside a table, making the chain two hops with no
+            // change here — it was `org-table-mode`'s binding until TB.2, and
+            // moving it changed which crate declines, not the chain.
             CYCLE => Ok(cycle_at_cursor(&ctx, doc, tree)),
             // `<S-Tab>` is whole-buffer, so it does not decline: org's global
             // cycle is meaningful wherever the cursor is.
@@ -4961,10 +4906,6 @@ impl GrammarCallbacks for Component {
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
-            TABLE_NEXT_CELL => Ok(table_move(&ctx, doc, tree, 1)),
-            TABLE_PREV_CELL => Ok(table_move(&ctx, doc, tree, -1)),
-            TABLE_ALIGN => Ok(table_move(&ctx, doc, tree, 0)),
-            TABLE_ROW_UP..=TABLE_DELETE_COL => Ok(table_structure(&ctx, doc, tree, callback)),
             OPEN_LINK => Ok(open_link(&ctx, doc, Effect::None)),
             FOLLOW_LINK => Ok(open_link(&ctx, doc, Effect::Declined)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
@@ -6330,204 +6271,6 @@ fn follow_id(id: &str) -> Vec<Effect> {
         )),
         None => warn(format!("org: no note with id {id}")),
     }
-}
-
-/// OM.12 — align the table under the cursor and step `delta` cells.
-///
-/// `delta == 0` aligns without moving (`<leader>o|`).
-///
-/// **Declines when the cursor is not in a table**, which is what makes
-/// `<Tab>` compose: `org-table-mode` sits above `org-mode`, so a decline here
-/// falls to org's headline cycle, and a decline there falls to whatever
-/// `<Tab>` natively means. Three outcomes from one key, and none of them a
-/// host special case.
-///
-/// Alignment is whole-table and lands as ONE edit: a column's width is the
-/// widest cell in it, so touching one cell can change every row, and a
-/// half-aligned table is a worse state than either end.
-fn table_move(
-    ctx: &ActionContext,
-    doc: &Document,
-    tree: Option<&TreeSnapshot>,
-    delta: i32,
-) -> Vec<Effect> {
-    let line = |n: u32| doc.line(n);
-    let count = doc.line_count();
-    // OT.7: a `| a | b |` line inside a `#+BEGIN_SRC` block is block content,
-    // and `is_table_line` cannot tell. Declining there is what leaves `<Tab>`
-    // to fall through to org's headline cycle and then to its native meaning.
-    let tables = table::Tables::new(tree, &line, count);
-    let Some((first, last)) = tables.bounds(ctx.cursor.line) else {
-        return vec![Effect::Declined];
-    };
-
-    let rows: Vec<table::Row> = (first..=last)
-        .filter_map(|i| line(i).and_then(|t| table::parse_row(&t)))
-        .collect();
-    if rows.is_empty() {
-        return vec![Effect::Declined];
-    }
-    let aligned = table::align(&rows);
-
-    // Where the caret lands. Stepping past the last cell of a row moves to
-    // the next row's first cell, which is what makes `<Tab>` walk a table
-    // rather than stalling at its right edge.
-    let here = ctx.cursor.line;
-    let row_index = (here - first) as usize;
-    let cell = line(here)
-        .map(|t| table::cell_at(&t, ctx.cursor.byte as usize))
-        .unwrap_or(0);
-    let (mut target_row, mut target_cell) = (row_index, cell as i32 + delta);
-    if delta != 0 {
-        let cells_here = match rows.get(row_index) {
-            Some(table::Row::Cells(c)) => c.len() as i32,
-            _ => 1,
-        };
-        if target_cell >= cells_here {
-            target_row = (row_index + 1).min(rows.len().saturating_sub(1));
-            target_cell = 0;
-        } else if target_cell < 0 {
-            target_row = row_index.saturating_sub(1);
-            target_cell = match rows.get(target_row) {
-                Some(table::Row::Cells(c)) => c.len() as i32 - 1,
-                _ => 0,
-            };
-        }
-    }
-    let target_line = first + target_row as u32;
-    let byte = aligned
-        .get(target_row)
-        .map(|t| table::cell_start(t, target_cell.max(0) as usize))
-        .unwrap_or(0) as u32;
-
-    let last_len = line(last).map(|t| t.len()).unwrap_or(0) as u32;
-    replace_lines(
-        ctx,
-        first,
-        last,
-        last_len,
-        aligned.join("\n"),
-        Position {
-            line: target_line,
-            byte,
-        },
-    )
-}
-
-/// OM.13 — move, insert and delete table rows and columns.
-///
-/// Every one of these is whole-table: a structural change re-aligns, because
-/// a moved column takes its width with it and leaving the rest ragged would
-/// look broken. One edit, so `u` restores the table in a step.
-///
-/// Declines off a table, so the `<leader>t…` chords stay available to
-/// anything else that wants them outside one.
-fn table_structure(
-    ctx: &ActionContext,
-    doc: &Document,
-    tree: Option<&TreeSnapshot>,
-    action: u32,
-) -> Vec<Effect> {
-    let line = |n: u32| doc.line(n);
-    let count = doc.line_count();
-    // OT.7, as on `table_move`.
-    let tables = table::Tables::new(tree, &line, count);
-    let Some((first, last)) = tables.bounds(ctx.cursor.line) else {
-        return vec![Effect::Declined];
-    };
-    let mut rows: Vec<table::Row> = (first..=last)
-        .filter_map(|i| line(i).and_then(|t| table::parse_row(&t)))
-        .collect();
-    if rows.is_empty() {
-        return vec![Effect::Declined];
-    }
-
-    let row = (ctx.cursor.line - first) as usize;
-    let col = line(ctx.cursor.line)
-        .map(|t| table::cell_at(&t, ctx.cursor.byte as usize))
-        .unwrap_or(0);
-
-    // Where the caret should end up. A move follows its row or column —
-    // losing the cursor after moving a row is what makes the key feel broken.
-    let (mut new_row, mut new_col) = (row, col);
-    let changed = match action {
-        TABLE_ROW_UP => {
-            let ok = row > 0 && table::swap_rows(&mut rows, row, row - 1);
-            if ok {
-                new_row = row - 1;
-            }
-            ok
-        }
-        TABLE_ROW_DOWN => {
-            let ok = table::swap_rows(&mut rows, row, row + 1);
-            if ok {
-                new_row = row + 1;
-            }
-            ok
-        }
-        TABLE_COL_LEFT => {
-            let ok = col > 0 && table::swap_columns(&mut rows, col, col - 1);
-            if ok {
-                new_col = col - 1;
-            }
-            ok
-        }
-        TABLE_COL_RIGHT => {
-            let ok = table::swap_columns(&mut rows, col, col + 1);
-            if ok {
-                new_col = col + 1;
-            }
-            ok
-        }
-        TABLE_INSERT_ROW => {
-            table::insert_row(&mut rows, row);
-            new_row = row + 1;
-            true
-        }
-        TABLE_INSERT_COL => {
-            table::insert_column(&mut rows, col);
-            new_col = col + 1;
-            true
-        }
-        TABLE_DELETE_ROW => {
-            let ok = table::delete_row(&mut rows, row);
-            if ok {
-                new_row = row.min(rows.len().saturating_sub(1));
-            }
-            ok
-        }
-        TABLE_DELETE_COL => {
-            let ok = table::delete_column(&mut rows, col);
-            if ok {
-                new_col = col.min(table::column_count(&rows).saturating_sub(1));
-            }
-            ok
-        }
-        _ => false,
-    };
-    if !changed {
-        // Refused (the last row, a separator, an edge) — consume rather than
-        // decline: the user is in a table and meant a table command.
-        return vec![Effect::None];
-    }
-
-    let aligned = table::align(&rows);
-    let last_len = line(last).map(|t| t.len()).unwrap_or(0) as u32;
-    let byte = aligned
-        .get(new_row)
-        .map(|t| table::cell_start(t, new_col))
-        .unwrap_or(0) as u32;
-    replace_lines(
-        ctx,
-        first,
-        last,
-        last_len,
-        aligned.join("\n"),
-        Position {
-            line: first + new_row as u32,
-            byte,
-        },
-    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

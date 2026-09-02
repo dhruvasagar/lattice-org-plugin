@@ -1622,6 +1622,23 @@ impl Guest for Component {
                 // second hop and is NOT bound — it is invoked by the picker's
                 // accept, never typed.
                 bind("<leader>or", "org-refile"),
+                // OM.13 — the emacs spellings, letter for letter.
+                //
+                // These commands existed with the vim spelling alone, and
+                // `<C-c>` gained an emacs peer only for the slices that
+                // happened to touch it (schedule/deadline at OA.25, the clock
+                // at OA.27). A half-copied set is the failure
+                // `prefer-minor-modes-over-duplication` names: the gap
+                // announces itself to nobody, and `<C-c><C-t>` was reported as
+                // broken rather than absent.
+                //
+                // Safe for `<C-c>`'s usual reason — only ever a PREFIX here, so
+                // `<C-c>` alone stays vim's interrupt.
+                bind("<C-c><C-w>", "org-refile"),
+                bind("<C-c><C-o>", "org-open-link"),
+                bind("<C-c><C-x><C-a>", "org-archive-subtree"),
+                bind("<C-c><C-x><C-v>", "org-toggle-inline-images"),
+                bind("<C-c>*", "org-toggle-heading"),
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
@@ -1768,6 +1785,21 @@ impl Guest for Component {
                 bind("<leader>od", "org-deadline"),
                 bind("<C-c><C-s>", "org-schedule"),
                 bind("<C-c><C-d>", "org-deadline"),
+                // OM.13 — the rest of emacs' headline set. `C-c C-t` is the
+                // one people reach for first and the one that was missing.
+                //
+                // It opens the MENU, not the cycle, and that is emacs': with
+                // `org-use-fast-todo-selection` on — which is what defining
+                // `(t)` keys in `org-todo-keywords` turns on — `C-c C-t`
+                // offers the states and you pick one. Cycling to a state four
+                // presses away is the thing fast-select exists to replace.
+                //
+                // `<leader>ot` stays the cycle. The two are different verbs and
+                // both are wanted: cycling is faster when the next state IS the
+                // one you want, which is most of the time.
+                bind("<C-c><C-t>", "org-todo-select"),
+                bind("<C-c><C-q>", "org-set-tags"),
+                bind("<C-c>,", "org-priority-cycle"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.
@@ -2006,6 +2038,14 @@ impl Guest for Component {
                 bind("<leader>od", "org-deadline"),
                 bind("<C-c><C-s>", "org-schedule"),
                 bind("<C-c><C-d>", "org-deadline"),
+                // OM.13 — and the same headline set here, because the agenda
+                // is a place you edit a headline FROM. Repeated bind lines,
+                // one set of handlers: `org-todo-mode` cannot activate on a
+                // `multibuffer-mode` major, which is the constraint recorded
+                // at OA.25.
+                bind("<C-c><C-t>", "org-todo-select"),
+                bind("<leader>oS", "org-todo-select"),
+                bind("<C-c>,", "org-priority-cycle"),
                 // OA.20: emacs' span-walking keys. Bare letters, which is safe
                 // here and nowhere else — the agenda is read-only, so `f` and
                 // `b` are not shadowing an edit, and this mode activates on
@@ -2816,7 +2856,12 @@ impl Guest for Component {
                     .parse()
                     .expect("the compiled-in default parses")
             });
-        agenda_args::describe(&view, default_span)
+        // The SAME anchor the scan uses — `today + offset * span` — because a
+        // header that computed the window differently would eventually
+        // disagree with the rows under it.
+        let span = view.span.unwrap_or(default_span);
+        let anchor = today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1));
+        agenda_args::describe(&view, default_span, anchor)
     }
 
     fn begin(args: Vec<String>) -> u64 {

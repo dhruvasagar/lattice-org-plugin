@@ -51,7 +51,7 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
         dir.join("plugin.toml"),
         "id = \"org\"\n\
          provides = [\"scanned-excerpt-source\", \"multibuffer-view-source\", \"modes\", \
-         \"grammar\", \"language\", \"help\", \"config\"]\n\
+         \"grammar\", \"language\", \"help\", \"config\", \"transient-source\"]\n\
          default_modes = [\"org-todo-mode\", \"org-global-mode\"]\n\
          editor_capabilities = [\"tree-sitter\"]\n",
     )
@@ -83,6 +83,12 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             keymap: Some(editor.keymap.clone()),
             help_topics: Some(editor.help_topics.clone()),
             config_registry: Some(editor.config.clone()),
+            // OM.13: the TODO menu is a transient, and without somewhere to
+            // register the source `<C-c><C-t>` reports `unknown source`.
+            transient_registry: editor
+                .services
+                .get::<lattice_picker::TransientSourceRegistryHandle>()
+                .map(|h| (*h).clone()),
             agenda_registry: editor
                 .services
                 .get::<lattice_mode::ScannedExcerptSourceRegistryHandle>()
@@ -176,6 +182,11 @@ fn apply_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutco
             } => {
                 seen_initial = initial.clone();
                 editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
+            }
+            // A menu build is a guest call parked on the async-landed wake, so
+            // the caller settles it after applying this.
+            lattice_grammar::Effect::OpenTransient { source, args } => {
+                editor.open_named_transient(source, args);
             }
             lattice_grammar::Effect::OpenBufferAt {
                 path,
@@ -729,8 +740,15 @@ async fn a_filtered_agendas_headerline_names_the_filter() {
     settle_agenda(&mb, view).await;
     let plain = headerline_of(&mb, view);
     assert!(
-        plain.starts_with("[agenda]"),
-        "an ordinary agenda keeps the plain header, got {plain:?}"
+        plain.contains("[agenda: 20"),
+        "an unfiltered agenda still says WHEN it is looking — the window is \
+         what `f`/`b` change and the only thing that says where you are: \
+         {plain:?}"
+    );
+    assert!(
+        !plain.contains('+'),
+        "…and names no filter, so the filtered case below is a difference: \
+         {plain:?}"
     );
 
     // Now the same corpus, narrowed by a tag.
@@ -751,6 +769,31 @@ async fn a_filtered_agendas_headerline_names_the_filter() {
         said.contains("+work"),
         "the header names the filter that is narrowing the view, got {said:?}"
     );
+
+    // …and the label is what the theme accents. Without this the phrase renders
+    // in the same colour as the counts beside it, which is the part that means
+    // least — see `multibuffer.status.query`.
+    let accent = headerline_emphasis(&mb, filtered).expect("the label is accented");
+    assert!(
+        accent.contains("+work") && said.contains(&accent),
+        "the accent is a substring of the summary, and names the filter: \
+         {accent:?} in {said:?}"
+    );
+}
+
+/// The substring the renderer paints with `multibuffer.status.query`.
+fn headerline_emphasis(
+    mb: &MultibufferRegistryHandle,
+    view: lattice_core::BufferId,
+) -> Option<String> {
+    match &*mb
+        .handle(view)
+        .expect("the view is registered")
+        .headerline()
+    {
+        HeaderlineStatus::Complete { emphasis, .. } => emphasis.clone(),
+        other => panic!("the scan has not settled: {other:?}"),
+    }
 }
 
 fn headerline_of(mb: &MultibufferRegistryHandle, view: lattice_core::BufferId) -> String {
@@ -762,4 +805,211 @@ fn headerline_of(mb: &MultibufferRegistryHandle, view: lattice_core::BufferId) -
         HeaderlineStatus::Complete { summary, .. } => summary.clone(),
         other => panic!("the scan has not settled: {other:?}"),
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OM.13 — `C-c C-t`, and the agenda's filter round-trip
+// ─────────────────────────────────────────────────────────────
+
+/// Drain until a parked transient build has seated its menu.
+async fn settle_transient(
+    editor: &mut Editor,
+) -> Option<std::sync::Arc<lattice_picker::TransientSpec>> {
+    for _ in 0..100 {
+        editor.run_tick_pending();
+        if let Some(spec) = editor.picker.as_ref().and_then(|p| p.transient.clone()) {
+            return Some(spec);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// `C-c C-t` offers the configured states, in a file.
+///
+/// The menu, not the cycle — emacs' own behaviour once fast-select is on, and
+/// what makes reaching a state four presses away one keystroke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ctrl_t_offers_the_configured_states() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO ship it\n").await;
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.todo-keywords=sequence: TODO(t) NEXT(n) | DONE(d)".to_string(),
+    });
+
+    goto_line(&mut editor, 0);
+    let out = press_raw(&mut editor, "<C-c><C-t>");
+    apply_effects(&mut editor, out);
+    let spec = settle_transient(&mut editor).await.unwrap_or_else(|| {
+        panic!(
+            "`<C-c><C-t>` opened the state menu (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert!(
+        labels.contains(&"NEXT") && labels.contains(&"DONE"),
+        "every configured state is offered, so any is one keystroke away: {labels:?}"
+    );
+
+    // And picking one sets it — a menu that lists states and cannot apply one
+    // is the same non-feature as no menu.
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("n".to_string(), &mut out);
+    apply_effects(&mut editor, out);
+    editor.run_tick_pending();
+    assert_eq!(text(&editor), "* NEXT ship it\n");
+}
+
+/// The same key, in the agenda — the surface you reported it failing on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ctrl_t_offers_the_states_in_the_agenda_too() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, mb) = agenda_over_two_files(base.path()).await;
+    let handle = mb.handle(view).unwrap();
+
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+    let out = press_raw(&mut editor, "<C-c><C-t>");
+    apply_effects(&mut editor, out);
+    let spec = settle_transient(&mut editor).await.unwrap_or_else(|| {
+        panic!(
+            "`<C-c><C-t>` opened the state menu in the agenda (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+    assert!(
+        spec.groups[0].items.iter().any(|i| i.label == "DONE"),
+        "the agenda offers the same states a file does"
+    );
+
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("d".to_string(), &mut out);
+    apply_effects(&mut editor, out);
+    editor.run_tick_pending();
+
+    let source = handle.excerpts()[0].source;
+    let text = handle.source_text(source).expect("the source is attached");
+    assert!(
+        text.starts_with("* DONE "),
+        "the pick landed in the SOURCE file, not only in the view: {text:?}"
+    );
+}
+
+/// OA.21 — `/` narrows by tag and `|` clears every filter.
+///
+/// Written now because the keys shipped at OA.21 with NO integration test, and
+/// "how do I reset the filter" is the question an untested clear produces. A
+/// filter you cannot undo is worse than no filter: the agenda keeps showing a
+/// subset and nothing on screen says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tag_filter_narrows_and_the_pipe_clears_it() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().unwrap());
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("only.org"),
+        format!(
+            "* TODO Tagged one :work:\n  SCHEDULED: {}\n* TODO Untagged one\n  SCHEDULED: {}\n",
+            today_stamp(),
+            today_stamp()
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    expand_plugin_keymaps(&editor);
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+
+    let open = |editor: &mut Editor, args: Vec<&str>| {
+        match lattice_multibuffer::providers::scan_view::open_scan_view(
+            editor,
+            &org_agenda_identity(),
+            &lattice_grammar::Args::List(
+                args.into_iter()
+                    .map(|a| lattice_grammar::args::ArgValue::String(a.to_string()))
+                    .collect(),
+            ),
+        ) {
+            lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+            lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+        }
+    };
+
+    let root = notes.display().to_string();
+    let view = open(&mut editor, vec![&root]);
+    settle_agenda(&mb, view).await;
+    assert_eq!(
+        mb.handle(view).unwrap().excerpts().len(),
+        2,
+        "both rows before any filter"
+    );
+
+    // Narrow, the way `/` does — the chord opens a prompt, and the submit
+    // re-scans with the tag appended.
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    let out = press_raw(&mut editor, "/");
+    apply_effects(&mut editor, out);
+    submit_prompt(&mut editor, "work");
+    let narrowed = editor
+        .services
+        .get::<lattice_mode::BufferStoreHandle>()
+        .unwrap()
+        .find_by_name("*agenda*")
+        .expect("the agenda re-opened");
+    settle_agenda(&mb, narrowed).await;
+    assert_eq!(
+        mb.handle(narrowed).unwrap().excerpts().len(),
+        1,
+        "only the tagged row survives the filter"
+    );
+
+    // …and `|` puts them back. THE question this test exists to answer.
+    let _ = editor.activate_buffer(narrowed);
+    editor.cursor.line = 0;
+    let out = press_raw(&mut editor, "|");
+    apply_effects(&mut editor, out);
+    let cleared = editor
+        .services
+        .get::<lattice_mode::BufferStoreHandle>()
+        .unwrap()
+        .find_by_name("*agenda*")
+        .expect("the agenda re-opened");
+    settle_agenda(&mb, cleared).await;
+    assert_eq!(
+        mb.handle(cleared).unwrap().excerpts().len(),
+        2,
+        "`|` restores every row — a filter you cannot undo is worse than none"
+    );
 }

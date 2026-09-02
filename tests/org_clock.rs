@@ -702,3 +702,77 @@ async fn the_old_flat_clock_chords_are_gone() {
         "`<leader>oi` no longer clocks in — it is free for an insert group"
     );
 }
+
+/// OM.13 — every emacs spelling reaches the same command as its vim peer.
+///
+/// **The regression this exists to catch is an ABSENCE.** `<C-c>` gained an
+/// emacs peer only for the slices that happened to touch it — schedule and
+/// deadline at OA.25, the clock at OA.27 — so `<C-c><C-t>`, the key an org
+/// user reaches for first, was never bound and got reported as broken rather
+/// than missing. A half-copied set announces its gaps to nobody.
+///
+/// So the pairs are enumerated HERE rather than asserted one slice at a time:
+/// a command that gains a vim chord and no emacs one now fails a test instead
+/// of waiting to be noticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_emacs_spelling_reaches_its_vim_peer() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor(base.path(), "* TODO Task\n").await;
+
+    let resolve = |keys: &str| -> Option<String> {
+        let expanded = editor.keymap.expand_leader(keys);
+        let seq = parse_chord_sequence(&expanded).expect("parses");
+        let modes: Vec<lattice_mode::ModeId> = editor
+            .mode_registry
+            .load()
+            .iter_meta()
+            .map(|(id, _)| id)
+            .collect();
+        editor
+            .keymap
+            .resolve_trace(lattice_keymap::BindingMode::Normal, &seq, &modes)
+            .hits
+            .last()
+            .map(|h| format!("{:?}", h.command))
+    };
+
+    for (emacs, vim) in [
+        // Headline editing — `org-todo-mode`.
+        // `C-c C-t` is fast-SELECT, as in emacs — the menu, not the cycle.
+        ("<C-c><C-t>", "<leader>oS"),
+        ("<C-c><C-q>", "<leader>o:"),
+        ("<C-c>,", "<leader>o,"),
+        ("<C-c><C-s>", "<leader>os"),
+        ("<C-c><C-d>", "<leader>od"),
+        // Structure — the `org-mode` major.
+        ("<C-c><C-w>", "<leader>or"),
+        ("<C-c><C-o>", "<leader>oo"),
+        ("<C-c><C-x><C-a>", "<leader>o$"),
+        ("<C-c><C-x><C-v>", "<leader>oI"),
+        ("<C-c>*", "<leader>o*"),
+        // The clock — OA.27.
+        ("<C-c><C-x><C-i>", "<leader>oxi"),
+        ("<C-c><C-x><C-o>", "<leader>oxo"),
+        ("<C-c><C-x><C-q>", "<leader>oxq"),
+        ("<C-c><C-x><C-j>", "<leader>oxj"),
+        ("<C-c><C-x><C-x>", "<leader>oxr"),
+        // Global — `org-global-mode`.
+        ("<C-c>a", "<leader>oa"),
+        ("<C-c>c", "<leader>oc"),
+        ("<C-c>nf", "<leader>onf"),
+    ] {
+        let a = resolve(emacs);
+        let b = resolve(vim);
+        assert!(
+            a.is_some(),
+            "`{emacs}` resolves to nothing — a declared binding that never \
+             expands into a keymap layer reaches nothing, and an emacs user \
+             reads that as the command being broken"
+        );
+        assert_eq!(a, b, "`{emacs}` and `{vim}` must reach the same command");
+    }
+}

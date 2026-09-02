@@ -179,6 +179,21 @@ pub struct Row {
     /// agenda config matches on — `STYLE="habit"` — describes the headline it
     /// sits on rather than its subtree.
     pub properties: Vec<(String, String)>,
+    /// Whether this row belongs to an **agenda search**.
+    ///
+    /// True for a headline that is dated or carries a not-done keyword — what
+    /// "your tasks and appointments" means, and what every row was before this
+    /// field existed.
+    ///
+    /// False for a row that exists only because some section carries a
+    /// `match`: an undated, keyword-less or DONE headline that a tags search
+    /// can legitimately want. Org has two different searches here — `agenda`
+    /// is dated, `tags` is a query over every headline — and collapsing them
+    /// into one row stream is what made `tags "refile"` return one row out of
+    /// sixty-three. A section with no `match` refuses these, so the built-in
+    /// agenda and every dated / todo-only block see exactly what they saw
+    /// before.
+    pub in_agenda: bool,
 }
 
 impl Row {
@@ -231,11 +246,58 @@ impl Keywords {
 /// exposes node kinds and ranges but no node text, and reading a TODO keyword
 /// through one boundary crossing per headline would cost far more than the
 /// whole-file string the host already hands over — see `scanned-excerpt-source.wit`.
-pub fn scan_tree(root: &Node, text: &str, keywords: &Keywords) -> Vec<Row> {
+pub fn scan_tree(root: &Node, text: &str, keywords: &Keywords, admit_tag_only: bool) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
-    walk_sections(root, &lines, keywords, &[], &mut rows);
+    // `#+FILETAGS:` seeds the inheritance chain, so every headline in the file
+    // carries them. Org's own rule, and the one `refile.org` depends on: its
+    // entries are tagged by the FILE, not one by one, so a scan that only read
+    // headline tags saw an untagged file and `tags "refile"` found nothing.
+    let file_tags = file_tags(&lines);
+    walk_sections(
+        root,
+        &lines,
+        keywords,
+        &file_tags,
+        admit_tag_only,
+        &mut rows,
+    );
     rows
+}
+
+/// The tags a `#+FILETAGS:` directive declares, in `:a:b:` or bare-word form.
+///
+/// Read from the leading directive block rather than the tree: the grammar does
+/// not model in-buffer settings, and `roam.rs` reads `#+filetags:` the same way
+/// for the same reason. Case-insensitive on the KEYWORD (`#+FILETAGS:` /
+/// `#+filetags:` both occur in a real corpus) and case-preserving on the tags,
+/// which are matched exactly.
+fn file_tags(lines: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        let trimmed = line.trim_start();
+        // Directives live before the first headline; stop there rather than
+        // scanning a whole file for a line that cannot appear in it.
+        if trimmed.starts_with('*') {
+            break;
+        }
+        let Some(rest) = trimmed.strip_prefix("#+") else {
+            continue;
+        };
+        let Some((key, value)) = rest.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("filetags") {
+            continue;
+        }
+        for tag in value.split([':', ' ', '\t']) {
+            let tag = tag.trim();
+            if !tag.is_empty() && !out.contains(&tag.to_string()) {
+                out.push(tag.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Recurse through `(section)` nodes, which nest: a subsection is a `section`
@@ -249,6 +311,7 @@ fn walk_sections(
     // than looked up, because the walk already knows the chain and a parent
     // lookup per row would re-walk it.
     inherited: &[String],
+    admit_tag_only: bool,
     rows: &mut Vec<Row>,
 ) {
     for i in 0..node.named_child_count() {
@@ -263,17 +326,17 @@ fn walk_sections(
                     chain.push(t);
                 }
             }
-            if let Some(row) = row_for_section(&child, lines, keywords, &chain) {
+            if let Some(row) = row_for_section(&child, lines, keywords, &chain, admit_tag_only) {
                 rows.push(row);
             }
             // Subsections inherit this section's chain, not the caller's.
-            walk_sections(&child, lines, keywords, &chain, rows);
+            walk_sections(&child, lines, keywords, &chain, admit_tag_only, rows);
             continue;
         }
         // Recurse either way: a `section` holds its subsections, and a file may
         // open with leading content before the first headline, so sections are
         // not always direct children of the root.
-        walk_sections(&child, lines, keywords, inherited, rows);
+        walk_sections(&child, lines, keywords, inherited, admit_tag_only, rows);
     }
 }
 
@@ -336,15 +399,17 @@ fn row_for_section(
     lines: &[&str],
     keywords: &Keywords,
     tags: &[String],
+    // Whether any active section carries a `match`. When none does, this walk
+    // produces exactly the rows it always produced — the extra ones would be
+    // unreachable, and a corpus-sized pile of them is not free.
+    admit_tag_only: bool,
 ) -> Option<Row> {
     let headline = section.child_by_field("headline")?;
     let headline_line = headline.byte_range().start.line;
     let headline_text = lines.get(headline_line as usize).copied()?;
 
     let parsed = todo::parse(headline_text, &keywords.all)?;
-    if keywords.is_done(parsed.keyword) {
-        return None;
-    }
+    let is_done = keywords.is_done(parsed.keyword);
 
     // The section's OWN plan, by field — not "the next line", which is the
     // assumption this migration exists to delete.
@@ -368,14 +433,29 @@ fn row_for_section(
     // returned `None` here and left the agenda — so `* TODO Write the thing`
     // was unreachable from the view whose job is to show your tasks. It is a
     // row now, with `date: None`, and the SECTIONS decide whether anything
-    // wants it. A headline with neither a date NOR a keyword is still not a
-    // row: that is ordinary prose structure, and admitting it would make the
-    // agenda a table of contents.
-    if dated.is_none() && parsed.keyword.is_none() {
+    // wants it.
+    //
+    // A headline with neither a date NOR a keyword, or one in a DONE state, is
+    // not an AGENDA row: that is ordinary prose structure or finished work, and
+    // admitting either to the dated view would make the agenda a table of
+    // contents. That was the whole rule until a `match` needed to mean what org
+    // means by it — `tags "refile"` is a query over every headline, not a
+    // filter over the agenda's, and answering it from the agenda's rows
+    // returned one of sixty-three.
+    //
+    // So such a headline becomes a row when some section is a tags search AND
+    // it carries something a match could possibly admit. Both halves matter:
+    // the first keeps the default agenda's cost and output exactly as they
+    // were, the second stops a corpus of prose headlines from becoming rows
+    // that no match can ever take.
+    let in_agenda = !is_done && (dated.is_some() || parsed.keyword.is_some());
+    let properties = own_properties(section, lines);
+    if !in_agenda && !(admit_tag_only && (!tags.is_empty() || !properties.is_empty())) {
         return None;
     }
 
     Some(Row {
+        in_agenda,
         line: headline_line,
         // OA.1: one line per entry. The plan is still parsed — it is where the
         // date comes from — but the excerpt does not span down to it.
@@ -387,7 +467,7 @@ fn row_for_section(
         priority: parsed.priority,
         keyword: parsed.keyword.map(str::to_string),
         tags: tags.to_vec(),
-        properties: own_properties(section, lines),
+        properties,
     })
 }
 
@@ -546,9 +626,14 @@ fn plan_date(plan: &Node, lines: &[&str]) -> Option<(Kind, Stamp)> {
 /// org itself [`scan_tree`] is the real path — this one carries the old
 /// line-offset assumption, and its bug, and is reached only when there is
 /// nothing better.
-pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
+pub fn scan_file(text: &str, keywords: &Keywords, admit_tag_only: bool) -> Vec<Row> {
     let lines: Vec<&str> = text.lines().collect();
     let mut rows = Vec::new();
+    // The tree path's `#+FILETAGS:` seed, reconstructed the same way. The two
+    // paths must agree on a row's TAGS as well as on what is a row, or
+    // `tags "refile"` would answer differently depending on whether the host
+    // happened to have an org grammar loaded.
+    let file_tags = file_tags(&lines);
     // OA.8: the ancestor tag chain, by headline LEVEL. The tree path gets this
     // from the section nesting; here the stars are the only structure there
     // is, so a headline at level N inherits from the most recent headline at
@@ -560,7 +645,12 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
         };
         let level = headline.stars.len();
         chain.retain(|(l, _)| *l < level);
-        let mut tags: Vec<String> = chain.iter().flat_map(|(_, t)| t.clone()).collect();
+        let mut tags: Vec<String> = file_tags.clone();
+        for t in chain.iter().flat_map(|(_, t)| t.clone()) {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
         let own: Vec<String> = headline.tags.iter().map(|t| t.to_string()).collect();
         for t in &own {
             if !tags.contains(t) {
@@ -568,9 +658,6 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
             }
         }
         chain.push((level, own));
-        if keywords.is_done(headline.keyword) {
-            continue;
-        }
         // The planning line is the one immediately below the headline, and
         // ONLY that one. Scanning further would let a `SCHEDULED:` written
         // inside the body — or worse, one belonging to a child headline whose
@@ -578,13 +665,19 @@ pub fn scan_file(text: &str, keywords: &Keywords) -> Vec<Row> {
         let planning = lines.get(i + 1).copied().unwrap_or("");
         let dated = date_for(line, planning);
         // AS.1, mirroring `row_for_section`: undated is a row when it carries
-        // a keyword, and not a row otherwise. The two paths must agree on what
-        // IS a row or the agenda would gain and lose whole sections depending
-        // on whether the host happened to have an org grammar loaded.
-        if dated.is_none() && headline.keyword.is_none() {
+        // a keyword, and not a row otherwise — plus the tags-search rows a
+        // `match` needs. The two paths must agree on what IS a row or the
+        // agenda would gain and lose whole sections depending on whether the
+        // host happened to have an org grammar loaded.
+        let is_done = keywords.is_done(headline.keyword);
+        let in_agenda = !is_done && (dated.is_some() || headline.keyword.is_some());
+        // No properties on this path (see the field below), so tags are the
+        // only thing a match could take.
+        if !in_agenda && !(admit_tag_only && !tags.is_empty()) {
             continue;
         }
         rows.push(Row {
+            in_agenda,
             line: i as u32,
             // OA.1: one line, matching `row_for_section`. The two paths must
             // agree on the shape of a row as well as on what IS one.
@@ -783,6 +876,13 @@ pub struct Section {
 
 impl Section {
     fn admits(&self, row: &Row, keywords: &Keywords, today: i64) -> bool {
+        // A row that is not an agenda row exists only for a tags search. A
+        // section with no `match` is an agenda search and must never see one —
+        // which is what keeps the built-in blocks, and any `when = "any"`
+        // section a user writes, showing exactly what they showed before.
+        if !row.in_agenda && self.filter.r#match.is_none() {
+            return false;
+        }
         if !self.filter.when.admits(row, today) {
             return false;
         }
@@ -930,7 +1030,7 @@ mod tests {
     }
 
     fn scan(text: &str) -> Vec<Row> {
-        scan_file(text, &keywords())
+        scan_file(text, &keywords(), false)
     }
 
     /// OT.5's twin: what the TEXT path answers for the same input the tree
@@ -1264,6 +1364,7 @@ mod tests {
     #[test]
     fn day_dominates_kind_dominates_priority() {
         let row = |day, kind, priority| Row {
+            in_agenda: true,
             line: 0,
             end_line: 0,
             date: Some(Dated { day, kind }),
@@ -1314,6 +1415,7 @@ mod tests {
     #[test]
     fn sort_keys_stay_ordered_for_dates_before_the_epoch() {
         let row = |y, m, d| Row {
+            in_agenda: true,
             line: 0,
             end_line: 0,
             date: Some(Dated {
@@ -1392,6 +1494,7 @@ mod tests {
 
     fn r(day: Option<i64>, priority: Option<char>, keyword: Option<&str>) -> Row {
         Row {
+            in_agenda: true,
             line: 0,
             end_line: 0,
             date: day.map(|day| Dated {
@@ -1574,7 +1677,7 @@ mod tests {
         let k = Keywords::from_spec("PROPOSED ACCEPTED SHIPPED");
         assert!(!k.is_done(Some("SHIPPED")));
         assert_eq!(
-            scan_file("* SHIPPED It\n  SCHEDULED: <2026-08-25 Tue>\n", &k).len(),
+            scan_file("* SHIPPED It\n  SCHEDULED: <2026-08-25 Tue>\n", &k, false).len(),
             1
         );
     }
@@ -1600,9 +1703,159 @@ mod tests {
                       * TODO Fake task inside a block\n  SCHEDULED: <2026-08-25 Tue>\n\
                       #+END_SRC\n";
         assert_eq!(
-            scan_file(corpus, &k).len(),
+            scan_file(corpus, &k, false).len(),
             2,
             "the text scan cannot see the block, so it invents a second row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tags_search_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn kw() -> Keywords {
+        // MEETING after the `|` is a DONE state, which is what a real
+        // configuration says and what made `tags "refile"` return one row of
+        // sixty-three: an inbox of meetings read as an inbox of finished work.
+        Keywords::from_spec("sequence: TODO NEXT | DONE\nsequence: WAITING | CANCELLED MEETING")
+    }
+
+    const CORPUS: &str = "\
+#+TITLE: Refile
+#+FILETAGS: :refile:
+* TODO Still to do
+* MEETING Standup
+* A plain captured note
+* DONE Finished
+";
+
+    fn tags_section(m: &str) -> Section {
+        Section {
+            title: "Refile".to_string(),
+            filter: Filter {
+                when: When::Any,
+                todo_only: false,
+                min_priority: None,
+                r#match: Some(crate::agenda_match::parse(m).expect("the match parses")),
+            },
+        }
+    }
+
+    fn agenda_section() -> Section {
+        Section {
+            title: "Everything".to_string(),
+            filter: Filter {
+                when: When::Any,
+                todo_only: false,
+                min_priority: None,
+                r#match: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_filetags_directive_reaches_every_headline() {
+        // `refile.org` tags its entries by the FILE, not one by one. A scan
+        // that read only headline tags saw an untagged file, so `tags "refile"`
+        // matched nothing at all — the first of the three reasons that command
+        // was empty.
+        let rows = scan_file(CORPUS, &kw(), true);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert!(
+                row.tags.iter().any(|t| t == "refile"),
+                "every row inherits the file tag, got {:?}",
+                row.tags
+            );
+        }
+    }
+
+    #[test]
+    fn a_tags_search_sees_what_the_agenda_does_not() {
+        // The rule, end to end. `tags "refile"` is a query over every headline
+        // — org's own semantics — so it takes the undated plain note and the
+        // MEETING that is a done state, neither of which is an agenda row.
+        let rows = scan_file(CORPUS, &kw(), true);
+        let section = tags_section("refile");
+        let taken: Vec<&Row> = rows
+            .iter()
+            .filter(|r| section.admits(r, &kw(), 0))
+            .collect();
+        assert_eq!(
+            taken.len(),
+            4,
+            "all four headlines, as emacs' `tags` search shows them"
+        );
+        assert!(
+            taken
+                .iter()
+                .any(|r| r.keyword.as_deref() == Some("MEETING")),
+            "a done state is still a tags-search hit"
+        );
+        assert!(
+            taken.iter().any(|r| r.keyword.is_none()),
+            "so is a plain headline with no keyword"
+        );
+    }
+
+    #[test]
+    fn a_section_without_a_match_never_sees_a_tags_only_row() {
+        // The half that keeps the built-in agenda exactly as it was. Even with
+        // the extra rows in the stream, an agenda search takes only agenda
+        // rows — so a `when = "any"` block a user writes cannot turn into a
+        // table of contents.
+        let rows = scan_file(CORPUS, &kw(), true);
+        let section = agenda_section();
+        let taken: Vec<&Row> = rows
+            .iter()
+            .filter(|r| section.admits(r, &kw(), 0))
+            .collect();
+        assert_eq!(taken.len(), 1, "got {:?}", taken);
+        assert_eq!(taken[0].keyword.as_deref(), Some("TODO"));
+    }
+
+    #[test]
+    fn no_match_anywhere_means_no_extra_rows_are_built_at_all() {
+        // The cost half. When nothing is a tags search the extra rows are
+        // unreachable, so they are never produced — a corpus of prose
+        // headlines is not free to build or to carry back across the seam.
+        let rows = scan_file(CORPUS, &kw(), false);
+        assert_eq!(rows.len(), 1, "got {rows:?}");
+        assert!(rows.iter().all(|r| r.in_agenda));
+    }
+
+    #[test]
+    fn a_tag_only_row_is_produced_only_when_a_match_could_take_it() {
+        // The second half of the bound: a headline with no tags and no
+        // properties cannot be admitted by any match, so building a row for it
+        // would be pure cost.
+        let untagged = "* A plain note\n* Another one\n";
+        assert!(scan_file(untagged, &kw(), true).is_empty());
+    }
+
+    #[test]
+    fn both_scan_paths_agree_on_what_a_row_is() {
+        // The tree path and the text fallback must not disagree, or the agenda
+        // would gain and lose whole sections depending on whether the host
+        // happened to have an org grammar loaded. Asserted on the text path's
+        // own output shape here; the tree path is covered by the driver tests.
+        let with = scan_file(CORPUS, &kw(), true);
+        let without = scan_file(CORPUS, &kw(), false);
+        assert_eq!(with.iter().filter(|r| r.in_agenda).count(), without.len());
+    }
+
+    #[test]
+    fn tag_matching_is_case_sensitive_which_a_config_has_to_respect() {
+        // Recorded rather than fixed: org matches tags exactly, so `REFILE`
+        // does not find `:refile:`. Worth a test because the two spellings sat
+        // in one config file and only one of them worked.
+        let rows = scan_file(CORPUS, &kw(), true);
+        let upper = tags_section("REFILE");
+        assert!(
+            !rows.iter().any(|r| upper.admits(r, &kw(), 0)),
+            "an uppercase match does not find a lowercase tag"
         );
     }
 }

@@ -1788,7 +1788,24 @@ impl Guest for Component {
                 bind("<C-c><C-k>", "org-capture-abort"),
             ],
             target_language: None,
-            options: vec![],
+            // The capture buffer opens EXPANDED, overriding the `foldlevel=0`
+            // its `org-mode` major declares.
+            //
+            // That default is right for a FILE — emacs ships
+            // `#+STARTUP: overview` and a large outline opening as a wall of
+            // text is unreadable — and wrong for a capture, which is a handful
+            // of lines the user is about to type into. Opening it collapsed
+            // hides the template you are filling in, which is the one thing on
+            // screen you need to see.
+            //
+            // A minor layers above its major, so this wins where it activates
+            // and nowhere else: org files keep opening collapsed. org-roam
+            // capture rides the same mode and gets the same answer.
+            options: vec![ModeOptionOverride {
+                name: "foldlevel".to_string(),
+                value: "99".to_string(),
+                priority: OverridePriority::Normal,
+            }],
         });
 
         // OM.A3 — `org-agenda-mode`, the fourth mode.
@@ -1835,31 +1852,29 @@ impl Guest for Component {
                 // foldable views had none.
             ],
             target_language: None,
-            // AF.2: the agenda opens COLLAPSED, to its section and date
-            // headers.
+            // AF.2 REVERSED: the agenda opens EXPANDED.
             //
-            // The agenda's major is `multibuffer-mode`, not `org-mode`, so it
-            // never saw the `foldlevel=0` the org major declares and fell back
-            // to the global 99 — a view whose entire structure is blocks,
-            // opening with every block expanded.
+            // It opened collapsed, on the reasoning that a view whose entire
+            // structure is blocks should show its blocks. That reasoning was
+            // about the view; the agenda's job is task tracking, planning and
+            // scheduling, and for those the rows ARE the content — a plan you
+            // have to expand four folds to read is a plan you do not read.
+            // Emacs's own agenda opens with every entry visible for the same
+            // reason, and `<Tab>` / `<S-Tab>` still collapse from there when a
+            // block is in the way.
             //
-            // Declared HERE rather than on the multibuffer major, and the
-            // scoping is the point: `multibuffer-mode` is also project search,
-            // project diff and the references view, none of which should open
-            // collapsed. `org-agenda-mode` activates on agenda views and
-            // nothing else, so it is the narrowest mode that owns the question.
+            // Still declared HERE rather than on the multibuffer major, and
+            // the scoping is still the point: `multibuffer-mode` is also
+            // project search, project diff and the references view.
+            // `org-agenda-mode` activates on agenda views and nothing else, so
+            // it is the narrowest mode that owns the question — and the
+            // override stays rather than being deleted because the global
+            // default it would fall back to is not the agenda's to depend on.
             //
-            // What a closed group shows is its header row, its FIRST row, and
-            // a `⋯ N lines` summary — not the header alone. A fold's head is a
-            // content row and an agenda header is a virtual row outside the
-            // fold, so "collapse to the header alone" is not expressible in
-            // the fold model; one row of preview per block is arguably the
-            // better read regardless.
-            //
-            // A layer, so `:setlocal foldlevel=99` in the agenda still wins.
+            // A layer, so `:setlocal foldlevel=0` in the agenda still wins.
             options: vec![ModeOptionOverride {
                 name: "foldlevel".to_string(),
-                value: "0".to_string(),
+                value: "99".to_string(),
                 priority: OverridePriority::Normal,
             }],
         });
@@ -2613,9 +2628,16 @@ impl Guest for Component {
             // carries the "planning line is the next line" assumption — which
             // is the bug the tree path exists to fix, so it is a fallback and
             // not a peer.
+            // Whether any section this scan runs is a TAGS SEARCH. When none
+            // is, both walks produce exactly the rows they always produced —
+            // the extra ones would be unreachable, and a corpus of them is not
+            // free to build or to carry back across the seam.
+            let admit_tag_only = state.sections.iter().any(|s| s.filter.r#match.is_some());
             let rows = match tree {
-                Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, &state.keywords),
-                None => agenda::scan_file(&text, &state.keywords),
+                Some(snapshot) => {
+                    agenda::scan_tree(&snapshot.root(), &text, &state.keywords, admit_tag_only)
+                }
+                None => agenda::scan_file(&text, &state.keywords, admit_tag_only),
             };
             // OA.6 reads a row's own line to colour it; both scan paths report
             // 0-based line numbers into this same split.

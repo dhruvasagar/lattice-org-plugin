@@ -1160,21 +1160,26 @@ async fn the_agenda_folds_by_header_group_not_by_source_file() {
     );
 }
 
-/// **AF.2: the agenda buffer opens collapsed.**
+/// **AF.2 reversed: the agenda buffer opens EXPANDED.**
 ///
-/// The agenda's major is `multibuffer-mode`, not `org-mode`, so it never saw
-/// the `foldlevel=0` the org major declares and fell back to the global 99 —
-/// a view whose entire structure is blocks, opening with every block expanded.
+/// It opened collapsed, on the reasoning that a view whose entire structure is
+/// blocks should show its blocks. That reasoning was about the view; the
+/// agenda's job is task tracking, planning and scheduling, and for those the
+/// ROWS are the content — a plan you have to expand four folds to read is a
+/// plan you do not read. Emacs's agenda opens with every entry visible for the
+/// same reason.
 ///
-/// Two halves, and the second is what makes this about SCOPING rather than
-/// about folding: the agenda resolves `foldlevel=0`, and the user's global
-/// setting is untouched, so project search and project diff — which share the
-/// `multibuffer-mode` major — still open expanded.
+/// The test is kept rather than deleted, and the second half is why: it was
+/// always about SCOPING more than about folding. The agenda resolves 99 from
+/// its own mode, and the user's global setting is untouched — so a future
+/// change that reached for `multibuffer-mode` instead would still be caught,
+/// because project search and project diff share that major and must keep
+/// their own answer.
 ///
-/// Also worth pinning because a MINOR mode's option override is a path nothing
+/// Also worth pinning because a MINOR mode's option override is a path little
 /// else in this plugin exercises: `org-mode`'s overrides ride a major.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_agenda_opens_collapsed_to_its_group_headers() {
+async fn the_agenda_opens_expanded_to_its_rows() {
     let Some(wasm) = org_plugin_wasm() else {
         eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
         return;
@@ -1199,7 +1204,9 @@ async fn the_agenda_opens_collapsed_to_its_group_headers() {
             .get_typed::<lattice_config::core_options::FoldLevel>()
             .expect("registered"),
         99,
-        "sanity: the global default is 99, so 0 can only come from the mode"
+        "sanity: the global default. `org-agenda-mode` declares 99 too, so \
+         this test cannot tell them apart on the number alone — which is why \
+         the SCOPING assertion below is the load-bearing one"
     );
 
     let view = open_org_agenda(
@@ -1222,8 +1229,8 @@ async fn the_agenda_opens_collapsed_to_its_group_headers() {
 
     assert_eq!(
         *editor.resolved_option::<lattice_config::core_options::FoldLevel>(view),
-        0,
-        "the agenda opens collapsed to its blocks; got {status:?}"
+        99,
+        "the agenda opens expanded, showing its rows; got {status:?}"
     );
     assert_eq!(
         *editor
@@ -1231,8 +1238,9 @@ async fn the_agenda_opens_collapsed_to_its_group_headers() {
             .get_typed::<lattice_config::core_options::FoldLevel>()
             .expect("registered"),
         99,
-        "and the global setting is untouched, so search and diff still open \
-         expanded — they share the multibuffer major"
+        "and the global setting is untouched — the answer comes from \
+         `org-agenda-mode`, not from the multibuffer major that project \
+         search and project diff also use"
     );
 }
 
@@ -1324,12 +1332,16 @@ async fn an_agenda_row_is_one_line_even_when_the_entry_has_a_planning_line() {
 
 /// OA.4: `<Tab>` cycles the block under the cursor in the agenda.
 ///
-/// The agenda opens collapsed (`foldlevel = 0`, AF.2) and had no key to open
-/// it again. `org-cycle` is bound on the `org-mode` MAJOR and the agenda's
-/// major is `multibuffer-mode`, so it never fired here — only the core `z`
-/// chords worked. `<Tab>` also has a global default (jump-list forward), which
-/// in a read-only agenda would move you out of the view you are reading, so
-/// the binding has to actually shadow it rather than fall through.
+/// `org-cycle` is bound on the `org-mode` MAJOR and the agenda's major is
+/// `multibuffer-mode`, so it never fired here — only the core `z` chords
+/// worked. `<Tab>` also has a global default (jump-list forward), which in a
+/// read-only agenda would move you out of the view you are reading, so the
+/// binding has to actually shadow it rather than fall through.
+///
+/// The agenda now opens EXPANDED (AF.2 reversed — the rows are the content of
+/// a planning view), so `<Tab>` here CLOSES a block rather than opening one.
+/// Which direction it moves is not what this test is about; that it moves
+/// exactly one block, the one under the cursor, is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tab_cycles_a_block_in_the_agenda() {
     let Some(wasm) = org_plugin_wasm() else {
@@ -1429,8 +1441,8 @@ async fn tab_cycles_a_block_in_the_agenda() {
     let before = snapshot(&editor);
     assert!(before.len() > 1, "several blocks to cycle; got {status:?}");
     assert!(
-        before.iter().all(|f| f.2),
-        "the agenda opens collapsed, so every block starts closed: {before:?}"
+        before.iter().all(|f| !f.2),
+        "the agenda opens expanded, so every block starts open: {before:?}"
     );
 
     press(&mut editor, "<Tab>");

@@ -523,3 +523,143 @@ mod filter_tests {
         assert_eq!(ViewArgs::parse(&a.to_args()), a);
     }
 }
+
+/// OA.22 — what this view IS, for its headerline.
+///
+/// A filtered agenda that looks like an unfiltered one is a trap: "nothing
+/// scheduled" under a filter the user forgot is this view saying "you have no
+/// tasks" when they have plenty, and that is the single worst thing it can say
+/// incorrectly.
+///
+/// The host prefixes its own counts, so this names only what the host cannot
+/// know: which command, which span, and what is filtering it. Empty when the
+/// view is the plain default agenda for today — there is nothing to warn about,
+/// and a header that says "default" on every ordinary agenda is noise the eye
+/// learns to skip, which is how it would come to skip the one that mattered.
+///
+/// `problems` is LAST and always shown. It is the only channel a bad view
+/// argument has: a guest `logging::log` call makes the component import
+/// `logging`, which org's multi-seam linker does not wire on every seam, and
+/// the whole component then fails to instantiate. Dropping the argument
+/// silently would show the default agenda while looking like the one asked for.
+pub fn describe(view: &ViewArgs, default_span: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !view.command.is_empty() {
+        parts.push(view.command.clone());
+    }
+    // The span only when it is not what a fresh agenda would have shown —
+    // naming the default on every agenda is the noise described above.
+    if let Some(span) = view.span.filter(|s| *s != default_span) {
+        parts.push(match span {
+            1 => "day".to_string(),
+            7 => "week".to_string(),
+            n => format!("{n} days"),
+        });
+    }
+    // Where you are, when you are not at today. `0` is the ordinary case and
+    // says nothing; anything else is a place you navigated to and can forget
+    // you are standing in.
+    if view.offset != 0 {
+        parts.push(match view.offset {
+            1 => "next".to_string(),
+            -1 => "previous".to_string(),
+            n if n > 0 => format!("+{n}"),
+            n => format!("{n}"),
+        });
+    }
+    for f in &view.filters {
+        parts.push(match f {
+            // `+work` and `file:notes.org` — org's own spellings, so what the
+            // header shows is what the user would type to reproduce it.
+            FilterTerm::Tag(t) => format!("+{t}"),
+            FilterTerm::File(f) => format!("file:{f}"),
+        });
+    }
+    for p in &view.problems {
+        parts.push(format!("⚠ {p}"));
+    }
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod describe_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The plain default agenda says nothing. A header that reads "default" on
+    /// every ordinary agenda is noise, and an eye that learns to skip it skips
+    /// the one that mattered too.
+    #[test]
+    fn the_ordinary_agenda_has_nothing_to_say() {
+        assert_eq!(describe(&ViewArgs::parse(&args(&[])), 7), "");
+    }
+
+    /// The case the slice exists for: a filter must be visible, because
+    /// "nothing scheduled" under a forgotten one is a lie.
+    #[test]
+    fn a_filter_is_always_named() {
+        let v = ViewArgs::parse(&args(&["", "tag:work"]));
+        assert_eq!(describe(&v, 7), "+work");
+        let v = ViewArgs::parse(&args(&["", "tag:work", "file:notes.org"]));
+        assert_eq!(describe(&v, 7), "+work · file:notes.org");
+    }
+
+    #[test]
+    fn a_command_names_itself() {
+        let v = ViewArgs::parse(&args(&["waiting"]));
+        assert_eq!(describe(&v, 7), "waiting");
+    }
+
+    /// The span appears only when it is NOT what a fresh agenda would show.
+    #[test]
+    fn the_span_is_named_only_when_it_is_not_the_default() {
+        let v = ViewArgs::parse(&args(&["", "span=7"]));
+        assert_eq!(describe(&v, 7), "", "7 IS the default here");
+        let v = ViewArgs::parse(&args(&["", "span=1"]));
+        assert_eq!(describe(&v, 7), "day");
+        let v = ViewArgs::parse(&args(&["", "span=30"]));
+        assert_eq!(describe(&v, 7), "30 days");
+    }
+
+    /// Where you are, when it is not today — a place you navigated to and can
+    /// forget you are standing in.
+    #[test]
+    fn an_offset_says_where_you_are() {
+        let v = ViewArgs::parse(&args(&["", "offset=1"]));
+        assert_eq!(describe(&v, 7), "next");
+        let v = ViewArgs::parse(&args(&["", "offset=-1"]));
+        assert_eq!(describe(&v, 7), "previous");
+        let v = ViewArgs::parse(&args(&["", "offset=3"]));
+        assert_eq!(describe(&v, 7), "+3");
+    }
+
+    /// A bad argument has nowhere else to go — the guest cannot log without
+    /// making the whole component fail to instantiate.
+    #[test]
+    fn an_unrecognised_argument_is_reported_here_or_nowhere() {
+        let v = ViewArgs::parse(&args(&["", "spam=1"]));
+        assert!(!v.problems.is_empty(), "the parser recorded it");
+        let said = describe(&v, 7);
+        assert!(
+            said.contains("⚠") && said.contains("spam"),
+            "the headerline names it: {said:?}"
+        );
+    }
+
+    /// Everything at once, in a stable order: command, span, offset, filters,
+    /// then problems last.
+    #[test]
+    fn the_parts_come_in_a_stable_order() {
+        let v = ViewArgs::parse(&args(&[
+            "waiting", "span=1", "offset=2", "tag:work", "nope=1",
+        ]));
+        assert_eq!(
+            describe(&v, 7),
+            "waiting · day · +2 · +work · ⚠ unknown view argument `nope`"
+        );
+    }
+}

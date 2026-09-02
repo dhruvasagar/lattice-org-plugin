@@ -678,3 +678,88 @@ async fn angle_restricts_the_agenda_to_the_rows_file() {
         "only the row's own file survives the restriction"
     );
 }
+
+/// OA.22 — the headerline says what you are looking at.
+///
+/// The end-to-end half: `src/agenda_args.rs` tests the phrase, this tests that
+/// the phrase crosses the seam and lands where the user reads it. A filtered
+/// agenda that looks unfiltered is the trap the slice exists to close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filtered_agendas_headerline_names_the_filter() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().unwrap());
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("only.org"),
+        format!("* TODO Ship it :work:\n  SCHEDULED: {}\n", today_stamp()),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+
+    // Unfiltered first: the plain form, so the filtered one is a difference
+    // rather than a string that was always there.
+    let view = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::List(vec![lattice_grammar::args::ArgValue::String(
+            notes.display().to_string(),
+        )]),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+    };
+    settle_agenda(&mb, view).await;
+    let plain = headerline_of(&mb, view);
+    assert!(
+        plain.starts_with("[agenda]"),
+        "an ordinary agenda keeps the plain header, got {plain:?}"
+    );
+
+    // Now the same corpus, narrowed by a tag.
+    let filtered = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::List(vec![
+            lattice_grammar::args::ArgValue::String(notes.display().to_string()),
+            lattice_grammar::args::ArgValue::String("tag:work".to_string()),
+        ]),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+    };
+    settle_agenda(&mb, filtered).await;
+    let said = headerline_of(&mb, filtered);
+    assert!(
+        said.contains("+work"),
+        "the header names the filter that is narrowing the view, got {said:?}"
+    );
+}
+
+fn headerline_of(mb: &MultibufferRegistryHandle, view: lattice_core::BufferId) -> String {
+    match &*mb
+        .handle(view)
+        .expect("the view is registered")
+        .headerline()
+    {
+        HeaderlineStatus::Complete { summary, .. } => summary.clone(),
+        other => panic!("the scan has not settled: {other:?}"),
+    }
+}

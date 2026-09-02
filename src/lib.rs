@@ -2716,6 +2716,25 @@ impl Guest for Component {
     /// command to run). They are captured here with everything else that must
     /// hold still for one scan, because `begin` is the one call guaranteed to
     /// precede `roots` and every `scan`.
+    /// OA.22: what this view is, for its headerline.
+    ///
+    /// Re-parses rather than reading what `begin` stashed. The two calls are
+    /// adjacent and parsing is cheap, and a `describe` that depended on `begin`
+    /// having run would answer for the PREVIOUS scan if the host ever reordered
+    /// them — a header naming a filter that is no longer on is worse than none.
+    fn describe(args: Vec<String>) -> String {
+        let view = agenda_args::ViewArgs::parse(&args);
+        let default_span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_else(|_| {
+                DEFAULT_AGENDA_SPAN
+                    .parse()
+                    .expect("the compiled-in default parses")
+            });
+        agenda_args::describe(&view, default_span)
+    }
+
     fn begin(args: Vec<String>) -> u64 {
         // OA.19: the view's own arguments, parsed once. A bare token is still
         // the custom-command key, so every existing caller is unaffected.

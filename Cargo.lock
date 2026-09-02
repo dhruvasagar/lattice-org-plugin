@@ -3341,6 +3341,7 @@ dependencies = [
  "lattice-picker",
  "lattice-plugin-host",
  "lattice-plugin-loader",
+ "lattice-plugin-sdk",
  "lattice-protocol",
  "lattice-runtime",
  "lattice-syntax",
@@ -3463,6 +3464,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "lattice-plugin-sdk-derive",
+ "rmp-serde",
+ "serde",
+]
+
+[[package]]
+name = "lattice-plugin-sdk-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "lattice-plugin-trace"
 version = "0.1.0"
 dependencies = [
@@ -3493,6 +3512,7 @@ name = "lattice-runtime"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "futures",
  "globset",
  "lattice-cells",
  "lattice-core",

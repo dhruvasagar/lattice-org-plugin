@@ -141,6 +141,7 @@ mod capture_templates;
 mod checkbox;
 mod clock;
 mod clock_scan;
+mod config_shape;
 mod headline;
 mod links;
 mod refile;
@@ -493,7 +494,12 @@ const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
 /// OC.2: the template SET. Empty by default and deliberately so — the same
 /// reasoning as `DEFAULT_CAPTURE_FILE`. A default set would name files the
 /// user never chose, and capture would scatter notes into them.
-const DEFAULT_CAPTURE_TEMPLATES: &str = "";
+/// No templates by default, for `DEFAULT_CAPTURE_FILE`'s reason: a default
+/// would name files the user never chose. An empty LIST rather than an empty
+/// string now — the option's value is a list, and an empty one is a legal value
+/// of `list<record>`, which is what lets it register before anyone configures
+/// it (TC.5).
+const DEFAULT_CAPTURE_TEMPLATES: [capture_templates::RawTemplate; 0] = [];
 
 /// AF.3: `org-agenda-files`, and empty by default for the reason
 /// `DEFAULT_CAPTURE_FILE` gives — a default would name files the user never
@@ -1050,21 +1056,23 @@ impl Guest for Component {
             DEFAULT_HIGHEST_PRIORITY,
             "The last priority letter `<leader>o,` cycles to. `C` gives A, B, C.",
         );
-        // OC.2: the template SET, a string whose value is TOML. Forced, not
-        // preferred — an option is `boolean | integer | string` and a template
-        // is a record, so an array-of-tables cannot reach an option at all.
-        // The cost is stated in the design fragment: `:describe-option` shows a
-        // blob and `:set` cannot meaningfully edit it. If structured options
-        // ever land the declaration migrates and the template language does
-        // not change, which is why the language is defined by the parser here
-        // rather than by the option's shape.
-        let _ = register_option(
+        // OC.2 / TC.5: the template SET, a STRUCTURED option — it declares its
+        // schema and its value crosses as a tree.
+        //
+        // It used to be TOML inside a string, and that file's header said why:
+        // an option was `boolean | integer | string`, a template is a record,
+        // and an array-of-tables could not reach an option at all. It also said
+        // what would happen if structured options ever landed — "the
+        // declaration migrates and the template language does not change" —
+        // and that is exactly this. The language is the same; what moved is who
+        // parses it and who reports a bad field.
+        let _ = crate::config_shape::register_option::<capture_templates::Declared>(
             "capture-templates",
-            OptionType::String,
-            DEFAULT_CAPTURE_TEMPLATES,
-            "Your capture templates, as TOML: one `[[template]]` per entry with \
-             `key`, `description`, `target = { file = \"…\", headline = \"…\" }` \
-             and a `body`. Unset means `<leader>oc` says so rather than guessing.",
+            &DEFAULT_CAPTURE_TEMPLATES.to_vec(),
+            "Your capture templates: one `[[org.capture-templates]]` per entry \
+             with `key`, `description`, `target = { file = \"…\", headline = \"…\" }`, \
+             a `body` and an optional `clock-in`. Unset means `<leader>oc` says \
+             so rather than guessing. `:describe-option` shows the full shape.",
         );
         let _ = register_option(
             "capture-file",
@@ -3460,8 +3468,18 @@ fn archive_subtree(
 /// Falls back to the single `capture-file` / `capture-template` pair when
 /// `capture-templates` is unset, so an existing config keeps working unchanged.
 fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, Effect> {
-    let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
-    if source.trim().is_empty() {
+    let set = match capture_templates::read() {
+        Ok(set) => Some(set),
+        // "Unset" is not a failure — it is the OM.11 fallback path below.
+        Err(capture_templates::TemplateError::Unset) => None,
+        Err(e) => {
+            return Err(Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: e.message(),
+            }));
+        }
+    };
+    let Some(set) = set else {
         // The OM.11 path. A capture file that was never set is the one thing
         // capture refuses over: creating `capture.org` in whichever directory
         // the editor started in scatters notes somewhere the user never named.
@@ -3482,14 +3500,8 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
             // `clock-in` key, so it never clocks.
             clock_in: false,
         });
-    }
+    };
 
-    let set = capture_templates::parse(&source).map_err(|e| {
-        Effect::Echo(EchoPayload {
-            level: EchoLevel::Warn,
-            text: e.message(),
-        })
-    })?;
     // The skips are NOT surfaced here. They ride back on `ParsedSet` and
     // OC.3's menu echoes them once, at open, which is where a missing row is
     // actually noticeable; echoing on every capture would be noise.
@@ -5921,12 +5933,11 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         }
 
         // An `err` echoes with the plugin named and the menu does not open —
-        // which is right for every one of these: an unset option, a set whose
-        // TOML does not parse, and a set with nothing usable in it are all
-        // things the user must fix before a menu means anything. A menu that
-        // opens empty says none of that.
-        let source = option_or("capture-templates", DEFAULT_CAPTURE_TEMPLATES);
-        let set = capture_templates::parse(&source).map_err(|e| e.message())?;
+        // which is right for every one of these: an unset option, a value that
+        // does not fit the declared shape, and a set with nothing usable in it
+        // are all things the user must fix before a menu means anything. A menu
+        // that opens empty says none of that.
+        let set = capture_templates::read().map_err(|e| e.message())?;
 
         if let Args::String(key) = &ctx.args {
             if !key.is_empty() {

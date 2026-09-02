@@ -1,20 +1,28 @@
-//! OC.2 — the capture template set, and where it is declared.
+//! OC.2 / TC.5 — the capture template set, and where it is declared.
 //!
-//! `org.capture-templates` is a **string option whose value is TOML**. That is
-//! forced rather than preferred: a template is a record — key, description,
-//! target, body — and an option is `boolean | integer | string`, with list
-//! support restricted to scalar elements. An array-of-tables cannot reach an
-//! option at all.
+//! `org.capture-templates` is a **structured option**: it declares a schema and
+//! its value crosses as a tree. Until TC.3 it could not be — an option was
+//! `boolean | integer | string`, a template is a record, and an array-of-tables
+//! could not reach an option at all — so it was TOML inside a string with a
+//! parser in this file. That parser is gone; what is left here is the part a
+//! schema cannot express.
 //!
-//! What makes it tolerable is that TOML carries the payload verbatim: a `'''`
-//! literal block preserves newlines and nested `"""` blocks, so the option
-//! value re-parses here with bodies intact. `init.rs` sets the identical string
-//! as a Rust raw literal — one format, both homes, no third place to look.
+//! The declared shape:
+//!
+//! ```text
+//! list<record {
+//!     key:         string,
+//!     description: string?,
+//!     target:      record { file: string, headline: string? },
+//!     body:        string?,
+//!     clock-in:    bool?,
+//! }>
+//! ```
+//!
+//! and in `lattice.toml` it is written as itself, natively:
 //!
 //! ```toml
-//! [org]
-//! capture-templates = '''
-//! [[template]]
+//! [[org.capture-templates]]
 //! key = "t"
 //! description = "todo"
 //! target = { file = "~/org/refile.org" }
@@ -22,18 +30,38 @@
 //! * TODO %?
 //! %U
 //! """
-//! '''
 //! ```
+//!
+//! `init.rs` builds the same tree from a Rust struct through the SDK derive.
+//! The two homes no longer share one string; what they share is the schema,
+//! which is declared once and shown by `:describe-option`.
+//!
+//! **Structure is now the host's problem, semantics stay ours.** A missing
+//! `key`, a `target` that is not a record, a `clock-in` that is not a boolean —
+//! all rejected before this file sees them, with a path
+//! (`capture-templates[2].target.file: expected string, got integer`). What
+//! remains below is the checking a schema has no way to express: a key that is
+//! blank after trimming, and two templates claiming the same key.
+//!
+//! **One behaviour deliberately changed.** Before, a template missing its `key`
+//! or its `target` was SKIPPED and named in `skipped`, on the principle that one
+//! typo should not cost the feature. That principle was compelling when the
+//! alternative was a parser error with no location. It is not compelling
+//! against `[2].key: required field is missing` — a silently absent menu row is
+//! the failure that sends a user looking in the wrong place, and now that the
+//! message says exactly which template and which field, refusing is the kinder
+//! answer. Duplicate keys are still a skip, because there the value IS usable
+//! and the only question is which row wins.
 //!
 //! **Parsed on read, never cached.** `:set org.capture-templates=…` must take
 //! effect on the next capture, and a cache would need an `OptionChanged`
 //! subscription to stay honest — the `todo-keywords` precedent (OM.7). The set
-//! is parsed when the menu opens and when a capture is submitted, both of which
-//! are explicit user actions and neither of which is on a typing path.
+//! is read when the menu opens and when a capture is submitted, both explicit
+//! user actions and neither on a typing path.
 //!
 //! Design: `docs/dev/architecture/org-capture.md` §2 and §4.
 
-use serde::Deserialize;
+use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 /// Where a capture lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +117,9 @@ pub enum TemplateError {
     /// are different problems with different fixes, and a menu that says the
     /// wrong one sends the user looking in the wrong place.
     Unset,
-    /// The TOML did not parse. Carries the parser's own message, because the
-    /// line and column in it are the whole value of reporting this at all.
+    /// The stored value did not fit the declared shape in a way the host's
+    /// own validation did not catch. Carries the message with its PATH,
+    /// because the location is the whole value of reporting this at all.
     Malformed(String),
     /// It parsed, but every template in it was rejected.
     Empty,
@@ -111,100 +140,102 @@ impl TemplateError {
     }
 }
 
-// ---- The on-the-wire shape, deserialised then validated ----
+// ---- The on-the-wire shape, declared then validated ----
+//
+// `#[derive(ConfigShape)]` gives these a schema, a `to_value` and a
+// `from_value`. Field names cross kebab-cased, so `clock_in` is `clock-in` on
+// the wire — matching org's own `:clock-in` rather than inventing a snake-case
+// spelling for a key users already know.
+//
+// Optionality is the TYPE's: `Option<String>` is a field a user may omit,
+// `String` is one they may not. `description` and `body` are optional because
+// they have sensible empty defaults; `key` and `target` are not, because a
+// template without either is not a template.
 
-#[derive(Deserialize)]
-struct RawSet {
-    #[serde(default)]
-    template: Vec<RawTemplate>,
+/// `target = { file = "…", headline = "…" }`.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+pub struct RawTarget {
+    /// The file the capture is written to.
+    pub file: String,
+    /// Insert under this headline's subtree instead of appending to the file.
+    pub headline: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct RawTemplate {
-    #[serde(default)]
-    key: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    target: Option<RawTarget>,
-    #[serde(default)]
-    body: String,
-    /// `clock-in = true`. Dashed, matching org's `:clock-in` rather than
-    /// inventing a snake-case spelling for a key users already know.
-    #[serde(default, rename = "clock-in")]
-    clock_in: bool,
+/// One `[[org.capture-templates]]` entry, as declared.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+pub struct RawTemplate {
+    /// The keystroke that selects this template in the capture menu.
+    pub key: String,
+    /// What the menu row says.
+    pub description: Option<String>,
+    /// Where the capture lands.
+    pub target: RawTarget,
+    /// The template text, with `%?` / `%U` / `%^{…}` placeholders.
+    pub body: Option<String>,
+    /// Start a clock on the entry this template captures (org's `:clock-in`).
+    pub clock_in: Option<bool>,
 }
 
-#[derive(Deserialize)]
-struct RawTarget {
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    headline: Option<String>,
-}
+/// The declared shape of `org.capture-templates`, for the registration call.
+pub type Declared = Vec<RawTemplate>;
 
-/// Parse the option's value into the template set.
+/// Read the option's value into the template set.
 ///
-/// Two failure levels, deliberately different:
+/// Structural failure cannot reach here — the host validated the tree against
+/// the schema before it was stored, and reports a path. What this does is the
+/// rest: trim, reject a blank key, resolve the two target shapes, and refuse a
+/// duplicate key.
 ///
-/// - **The whole set is malformed** ⇒ `Err`. The user's configuration does not
-///   parse, and offering a menu built from the half of it that happened to
-///   survive would be guessing at what they meant.
-/// - **One template is unusable** (no key, no target file) ⇒ skipped, named in
-///   `skipped`, and the rest survive. One typo should not cost the feature.
-///
-/// A **duplicate key** is the same class: the first wins, the later one is
-/// skipped and named. The menu cannot resolve two rows on one keystroke, and
-/// silently firing whichever came last is worse than saying so.
-pub fn parse(source: &str) -> Result<ParsedSet, TemplateError> {
-    if source.trim().is_empty() {
+/// A **duplicate key** is a skip rather than an error: the first wins, the later
+/// one is named in `skipped`. The menu cannot resolve two rows on one keystroke,
+/// and silently firing whichever came last is worse than saying so — but the set
+/// as a whole is still usable, which is what separates this from the structural
+/// failures the host now catches.
+pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
+    if raw.is_empty() {
         return Err(TemplateError::Unset);
     }
-    let raw: RawSet =
-        toml::from_str(source).map_err(|e| TemplateError::Malformed(e.message().to_string()))?;
 
     let mut templates: Vec<Template> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for t in raw.template {
+    for t in raw {
         let key = t.key.trim().to_string();
+        let description = t.description.unwrap_or_default().trim().to_string();
         if key.is_empty() {
+            // Present but blank — `key = ""` satisfies `required` and means
+            // nothing. The schema cannot say "non-empty"; this can.
             skipped.push(format!(
-                "a template with no `key` ({})",
-                if t.description.trim().is_empty() {
+                "a template with a blank `key` ({})",
+                if description.is_empty() {
                     "unnamed"
                 } else {
-                    t.description.trim()
+                    &description
                 }
             ));
             continue;
         }
-        let Some(target) = t.target else {
-            skipped.push(format!("`{key}` has no `target`"));
-            continue;
-        };
-        let file = target.file.trim().to_string();
+        let file = t.target.file.trim().to_string();
         if file.is_empty() {
-            skipped.push(format!("`{key}` has no `target.file`"));
+            skipped.push(format!("`{key}` has a blank `target.file`"));
             continue;
         }
         if let Some(prior) = templates.iter().find(|p| p.key == key) {
             skipped.push(format!(
-                "`{key}` is already taken by \"{}\"; skipping \"{}\"",
+                "`{key}` is already taken by \"{}\"; skipping \"{description}\"",
                 prior.description,
-                t.description.trim()
             ));
             continue;
         }
-        let target = match target.headline.map(|h| h.trim().to_string()) {
+        let target = match t.target.headline.map(|h| h.trim().to_string()) {
             Some(headline) if !headline.is_empty() => Target::FileHeadline { file, headline },
             _ => Target::File { file },
         };
         templates.push(Template {
             key,
-            description: t.description.trim().to_string(),
+            description,
             target,
-            body: t.body,
-            clock_in: t.clock_in,
+            body: t.body.unwrap_or_default(),
+            clock_in: t.clock_in.unwrap_or(false),
         });
     }
 
@@ -212,6 +243,21 @@ pub fn parse(source: &str) -> Result<ParsedSet, TemplateError> {
         return Err(TemplateError::Empty);
     }
     Ok(ParsedSet { templates, skipped })
+}
+
+/// Read `org.capture-templates` and resolve it into a usable set.
+///
+/// The one entry point production code uses; `from_declared` is split out so
+/// the resolution rules are testable without a host.
+pub fn read() -> Result<ParsedSet, TemplateError> {
+    match crate::config_shape::read_option::<Declared>("capture-templates") {
+        Some(Ok(raw)) => from_declared(raw),
+        // The host validated the write, so this is the residue a schema cannot
+        // express. Carry the path it came with rather than flattening it to
+        // "malformed" — the location is the whole value of reporting it.
+        Some(Err(e)) => Err(TemplateError::Malformed(e.to_string())),
+        None => Err(TemplateError::Unset),
+    }
 }
 
 /// A parsed set plus what it could not use. The skips ride along rather than
@@ -233,44 +279,53 @@ impl ParsedSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lattice_plugin_sdk::shape::{ConfigShape, Schema, Value};
+
+    fn t(
+        key: &str,
+        description: &str,
+        file: &str,
+        headline: Option<&str>,
+        body: &str,
+    ) -> RawTemplate {
+        RawTemplate {
+            key: key.to_string(),
+            description: Some(description.to_string()),
+            target: RawTarget {
+                file: file.to_string(),
+                headline: headline.map(str::to_string),
+            },
+            body: Some(body.to_string()),
+            clock_in: None,
+        }
+    }
 
     /// The shape a real nine-template org config has, trimmed to the cases
     /// that differ: a plain file target, a headline target, a multi-line body,
     /// and a `%^{}` prompt (unexpanded here — OC.4 does that).
-    const REAL_SET: &str = r#"
-[[template]]
-key = "t"
-description = "todo"
-target = { file = "~/org/refile.org" }
-body = """
-* TODO %?
-%U
-%a
-"""
-
-[[template]]
-key = "m"
-description = "Meeting"
-target = { file = "~/org/refile.org", headline = "Meetings" }
-body = """
-* MEETING with %? :meeting:
-%U
-"""
-
-[[template]]
-key = "v"
-description = "Vocab (French)"
-target = { file = "~/org/vocab-french.org", headline = "Vocabulary" }
-body = """
-* %^{Word} :fc:
-- Context: %^{Context sentence}
-- Translation: %^{Translation}
-"""
-"#;
+    fn real_set() -> Declared {
+        vec![
+            t("t", "todo", "~/org/refile.org", None, "* TODO %?\n%U\n%a\n"),
+            t(
+                "m",
+                "Meeting",
+                "~/org/refile.org",
+                Some("Meetings"),
+                "* MEETING with %? :meeting:\n%U\n",
+            ),
+            t(
+                "v",
+                "Vocab (French)",
+                "~/org/vocab-french.org",
+                Some("Vocabulary"),
+                "* %^{Word} :fc:\n- Context: %^{Context sentence}\n",
+            ),
+        ]
+    }
 
     #[test]
-    fn a_real_template_set_round_trips() {
-        let set = parse(REAL_SET).expect("it parses");
+    fn a_real_template_set_resolves() {
+        let set = from_declared(real_set()).expect("it resolves");
         assert!(set.skipped.is_empty(), "nothing skipped: {:?}", set.skipped);
         assert_eq!(set.templates.len(), 3);
 
@@ -294,157 +349,173 @@ body = """
         assert_eq!(m.target.file(), "~/org/refile.org");
     }
 
-    /// The reason the option can be a string at all: a `"""` body keeps its
-    /// newlines through the TOML-inside-TOML round trip. If this ever stopped
-    /// holding, every multi-line template would silently collapse to one line.
+    /// A multi-line body survives the crossing. This used to be the reason the
+    /// option COULD be a string — a `"""` block keeps its newlines through the
+    /// TOML-inside-TOML round trip — and it is now the field a TREE could
+    /// plausibly regress instead. The test outlives the mechanism it was
+    /// written for, which is why it is still here.
     #[test]
     fn a_bodys_newlines_survive_the_option() {
-        let set = parse(REAL_SET).unwrap();
-        let v = set.by_key("v").unwrap();
-        assert_eq!(
-            v.body,
-            "* %^{Word} :fc:\n- Context: %^{Context sentence}\n- Translation: %^{Translation}\n"
-        );
+        let set = from_declared(real_set()).expect("it resolves");
+        let body = &set.by_key("t").expect("todo").body;
+        assert!(body.contains('\n'), "the body kept its newlines: {body:?}");
+        assert_eq!(body.lines().count(), 3);
+        assert!(body.starts_with("* TODO %?"));
     }
 
-    /// Unset and malformed are different problems with different fixes, so
-    /// they are different errors — a menu that says "not configured" about a
-    /// typo sends the user looking in the wrong place.
     #[test]
-    fn unset_and_malformed_are_distinct() {
-        assert_eq!(parse(""), Err(TemplateError::Unset));
-        assert_eq!(parse("   \n  "), Err(TemplateError::Unset));
-
-        let err = parse("[[template]\nkey = \"t\"").expect_err("malformed TOML");
-        let TemplateError::Malformed(msg) = err else {
-            panic!("expected a parse error, got {err:?}");
+    fn the_declared_shape_is_what_the_option_promises() {
+        // The schema IS the documentation now — `:describe-option` renders it
+        // and `lattice.toml` is validated against it — so a field renamed or a
+        // required/optional flipped is a user-visible change, not an internal
+        // one.
+        let Schema::List(inner) = <Declared as ConfigShape>::schema() else {
+            panic!("the option is a list of templates");
         };
-        assert!(!msg.is_empty(), "the parser's own message is carried");
-    }
-
-    /// One bad template costs that template, not the feature.
-    #[test]
-    fn a_malformed_entry_is_skipped_by_key_with_the_others_intact() {
-        let set = parse(
-            r#"
-[[template]]
-key = "t"
-description = "todo"
-target = { file = "/tmp/a.org" }
-body = "* TODO %?"
-
-[[template]]
-key = "x"
-description = "no target at all"
-body = "* X"
-
-[[template]]
-key = ""
-description = "no key"
-target = { file = "/tmp/a.org" }
-body = "* Y"
-
-[[template]]
-key = "n"
-description = "note"
-target = { file = "/tmp/a.org" }
-body = "* %?"
-"#,
-        )
-        .expect("the set parses");
+        let Schema::Record(fields) = inner.as_ref() else {
+            panic!("each template is a record");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
-            set.templates
-                .iter()
-                .map(|t| t.key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["t", "n"]
+            names,
+            vec!["key", "description", "target", "body", "clock-in"],
+            "field names cross kebab-cased — `clock-in`, matching org's own \
+             `:clock-in` rather than a snake-case spelling invented here"
         );
-        assert_eq!(set.skipped.len(), 2);
-        assert!(
-            set.skipped[0].contains("`x`"),
-            "the skip names the key: {:?}",
-            set.skipped
-        );
-        assert!(
-            set.skipped[1].contains("no key"),
-            "a keyless template is named by its description instead: {:?}",
-            set.skipped
-        );
-    }
-
-    /// The menu cannot resolve two rows on one keystroke. First wins, and the
-    /// loser is named — silently firing whichever came last would make the
-    /// menu's behaviour depend on declaration order nobody was told mattered.
-    #[test]
-    fn a_duplicate_key_keeps_the_first_and_names_both() {
-        let set = parse(
-            r#"
-[[template]]
-key = "t"
-description = "todo"
-target = { file = "/tmp/a.org" }
-body = "* TODO %?"
-
-[[template]]
-key = "t"
-description = "task"
-target = { file = "/tmp/b.org" }
-body = "* TASK %?"
-"#,
-        )
-        .unwrap();
-        assert_eq!(set.templates.len(), 1);
-        assert_eq!(set.by_key("t").unwrap().description, "todo");
-        assert!(
-            set.skipped[0].contains("todo") && set.skipped[0].contains("task"),
-            "the warning names both: {:?}",
-            set.skipped
-        );
-    }
-
-    /// A set whose every template is unusable is `Empty`, not an empty menu.
-    /// A menu with no rows tells the user nothing about why.
-    #[test]
-    fn a_set_with_nothing_usable_is_an_error_not_an_empty_menu() {
+        let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
-            parse("[[template]]\nkey = \"\"\nbody = \"x\"\n"),
+            required,
+            vec![true, false, true, false, false],
+            "`key` and `target` are the two a template cannot do without"
+        );
+    }
+
+    #[test]
+    fn unset_is_distinct_from_a_set_with_nothing_usable() {
+        // "You have not configured capture" and "your configuration is broken"
+        // are different problems with different fixes, and a menu that says the
+        // wrong one sends the user looking in the wrong place.
+        assert_eq!(from_declared(vec![]), Err(TemplateError::Unset));
+        assert_eq!(
+            from_declared(vec![t("", "", "~/org/x.org", None, "")]),
             Err(TemplateError::Empty)
         );
-        // Well-formed TOML with no templates at all is the same outcome.
-        assert_eq!(parse("# just a comment\n"), Err(TemplateError::Empty));
+        assert!(TemplateError::Unset
+            .message()
+            .contains("no capture templates"));
+        assert!(TemplateError::Empty
+            .message()
+            .contains("no usable templates"));
     }
 
-    /// A blank `headline` is a plain file target rather than a headline target
-    /// that can never match — `headline = ""` in a hand-written config is an
-    /// unfinished edit, not a request to search for the empty headline.
     #[test]
-    fn a_blank_headline_degrades_to_the_plain_file_target() {
-        let set = parse(
-            "[[template]]\nkey = \"t\"\ntarget = { file = \"/tmp/a.org\", headline = \"  \" }\nbody = \"x\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            set.by_key("t").unwrap().target,
-            Target::File {
-                file: "/tmp/a.org".into()
-            }
+    fn a_blank_key_is_skipped_by_name_with_the_others_intact() {
+        // A blank key is what the SCHEMA cannot catch: `key = ""` satisfies
+        // `required` and means nothing. The structural cases it CAN catch — a
+        // missing `key`, a `target` that is not a record — never reach here at
+        // all now; the host refuses the write with a path.
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/refile.org", None, "* TODO"),
+            t("  ", "nameless", "~/org/x.org", None, ""),
+            t("n", "note", "~/org/notes.org", None, "* %?"),
+        ])
+        .expect("the usable ones survive");
+        assert_eq!(set.templates.len(), 2, "one typo does not cost the feature");
+        assert!(set.by_key("t").is_some());
+        assert!(set.by_key("n").is_some());
+        assert_eq!(set.skipped.len(), 1);
+        assert!(
+            set.skipped[0].contains("nameless"),
+            "the skip names the row so it can be found: {:?}",
+            set.skipped
         );
     }
 
-    /// Every error carries a message that names the option, so the echo is
-    /// actionable without the user having to guess which setting is at fault.
     #[test]
-    fn every_error_names_the_option() {
-        for e in [
-            TemplateError::Unset,
-            TemplateError::Malformed("expected `]`".into()),
-            TemplateError::Empty,
-        ] {
-            assert!(
-                e.message().contains("capture-templates"),
-                "the echo names the option: {}",
-                e.message()
-            );
+    fn a_blank_target_file_is_skipped_by_key() {
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/refile.org", None, ""),
+            t("b", "broken", "   ", None, ""),
+        ])
+        .expect("the usable one survives");
+        assert_eq!(set.templates.len(), 1);
+        assert!(
+            set.skipped[0].contains("`b`") && set.skipped[0].contains("target.file"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_keeps_the_first_and_names_both() {
+        // The menu cannot resolve two rows on one keystroke, and silently
+        // firing whichever came last is worse than saying so. Still a SKIP
+        // rather than an error: the set is usable, and the only question is
+        // which row wins.
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/refile.org", None, "* TODO"),
+            t("t", "task", "~/org/other.org", None, "* TASK"),
+        ])
+        .expect("the first survives");
+        assert_eq!(set.templates.len(), 1);
+        assert_eq!(set.by_key("t").expect("first").description, "todo");
+        assert_eq!(set.skipped.len(), 1);
+        assert!(set.skipped[0].contains("todo"), "{:?}", set.skipped);
+        assert!(set.skipped[0].contains("task"), "{:?}", set.skipped);
+    }
+
+    #[test]
+    fn a_blank_headline_degrades_to_the_plain_file_target() {
+        let set = from_declared(vec![t("t", "todo", "~/org/x.org", Some("   "), "")])
+            .expect("it resolves");
+        assert_eq!(
+            set.templates[0].target,
+            Target::File {
+                file: "~/org/x.org".into()
+            },
+            "a whitespace headline is no headline, not a headline named \"   \""
+        );
+    }
+
+    #[test]
+    fn an_omitted_optional_field_takes_its_empty_default() {
+        // `description`, `body` and `clock-in` are `Option<_>` in the declared
+        // shape, so a user may leave them out. What they must NOT do is arrive
+        // as the string "None" or as a missing template.
+        let set = from_declared(vec![RawTemplate {
+            key: "t".to_string(),
+            description: None,
+            target: RawTarget {
+                file: "~/org/x.org".to_string(),
+                headline: None,
+            },
+            body: None,
+            clock_in: None,
+        }])
+        .expect("it resolves");
+        assert_eq!(set.templates[0].description, "");
+        assert_eq!(set.templates[0].body, "");
+        assert!(!set.templates[0].clock_in);
+    }
+
+    #[test]
+    fn a_declared_template_round_trips_through_the_tree() {
+        // The contract the derive rests on. If `to_value` and `from_value`
+        // disagreed, a template would change on the way through the option and
+        // nothing else here would notice.
+        let raw = real_set();
+        let value = raw.to_value();
+        assert_eq!(<Declared as ConfigShape>::from_value(&value), Ok(raw));
+
+        // …and a value of the wrong shape is refused with a path, which is the
+        // message a user now gets instead of a parser's line number.
+        let mut bad = real_set().to_value();
+        if let Value::List(items) = &mut bad {
+            if let Value::Record(map) = &mut items[1] {
+                map.insert("key".to_string(), Value::Int(7));
+            }
         }
+        let err = <Declared as ConfigShape>::from_value(&bad).expect_err("refused");
+        assert_eq!(err.path, "[1].key");
     }
 }

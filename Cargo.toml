@@ -30,6 +30,10 @@ wit-bindgen = "0.58"
 # wrong, and a template that parses to the wrong thing is worse than one that
 # fails to parse.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# TC.4: `#[derive(ConfigShape)]` — a Rust struct as a config schema and value,
+# plus the arena flattening the WIT config seam takes. WIT-agnostic pure Rust,
+# so it compiles to wasm32-wasip2 like the rest of the component.
+lattice-plugin-sdk = { path = "../lattice/crates/lattice-plugin-sdk" }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 # OR.4: the roam index's on-store encoding. The store holds opaque bytes and the
 # GUEST owns the schema, so the format is this plugin's choice — MessagePack,

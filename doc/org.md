@@ -62,11 +62,11 @@ elsewhere, so a clock survives a restart and can be closed by any editor.
 
 | chord | command | what it does |
 |---|---|---|
-| `<leader>oi` | `:org-clock-in` | start a clock on the entry at the cursor |
-| `<leader>oO` | `:org-clock-out` | close it, writing the end stamp and elapsed time |
-| `<leader>oq` | `:org-clock-cancel` | discard it, leaving no trace |
-| `<leader>oj` | `:org-clock-goto` | jump to the entry the clock is on |
-| `<leader>oR` | `:org-clock-resume` | start a clock on the last entry clocked |
+| `<leader>oxi` | `:org-clock-in` | start a clock on the entry at the cursor |
+| `<leader>oxo` | `:org-clock-out` | close it, writing the end stamp and elapsed time |
+| `<leader>oxq` | `:org-clock-cancel` | discard it, leaving no trace |
+| `<leader>oxj` | `:org-clock-goto` | jump to the entry the clock is on |
+| `<leader>oxr` | `:org-clock-resume` | start a clock on the last entry clocked |
 
 Each is one registration reachable two ways — the chord and the `:` line run the
 same code.
@@ -110,7 +110,7 @@ capture lands.
 Clocking in on an entry that already has a running clock is refused rather than
 stacking a second one. Clocking out re-reads the buffer rather than trusting
 anything remembered, so it works on a clock started before the editor was last
-closed. `<leader>oj` and `<leader>oR` are the two that need this session's memory —
+closed. `<leader>oxj` and `<leader>oxr` are the two that need this session's memory —
 after a restart neither has anywhere to go, and both say so. Clocking OUT does
 not forget: the entry stays the "last clocked" one, which is what makes resume
 work and matches org, where `org-clock-goto` finds the current *or last* clocked

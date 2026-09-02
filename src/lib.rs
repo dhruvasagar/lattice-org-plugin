@@ -371,7 +371,7 @@ const CAPTURE_MENU: u32 = 37;
 const AGENDA_PARSE: u32 = 39;
 const AGENDA_APPLY: u32 = 40;
 
-/// OC.6 — the clock's four chords. `<leader>oi` / `oO` / `oq` / `oj`, org's own
+/// OC.6 — the clock's four chords. `<leader>oxi` / `oxo` / `oxq` / `oxj`, org's own
 /// `C-c C-x C-i` / `C-o` / `C-q` / `C-j` spelled the way nvim-orgmode spells
 /// them.
 ///
@@ -1541,16 +1541,50 @@ impl Guest for Component {
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
                 // nvim-orgmode spells it.
                 bind("<leader>o$", "org-archive-subtree"),
-                // OC.6 — org's `C-c C-x C-i` / `C-o` / `C-q` / `C-j`, in
-                // nvim-orgmode's spelling. `i`, `O`, `q` and `j` were all free
-                // under the `<leader>o` prefix; `J` is taken (move subtree
-                // down) and is a different key from `j`.
-                bind("<leader>oi", "org-clock-in"),
-                bind("<leader>oO", "org-clock-out"),
-                bind("<leader>oq", "org-clock-cancel"),
-                bind("<leader>oj", "org-clock-goto"),
-                // OC.9: org's `C-c C-x C-x`, in nvim-orgmode's spelling.
-                bind("<leader>oR", "org-clock-resume"),
+                // OC.6 / OA.27 — the clock, under `<leader>ox…`.
+                //
+                // **`ox` because emacs is `C-c C-x`.** Clocking is the whole
+                // reason that prefix exists in org, and the letters under it
+                // are org's own: `i` in, `o` out, `q` cancel, `j` goto. A hand
+                // that knows emacs already types the second and third keys
+                // correctly; only the entry into the prefix differs.
+                //
+                // OA.27 moved them off the flat `<leader>oi` / `oO` / `oq` /
+                // `oj` they landed on at OC.6. Those were chosen because the
+                // letters were free, which is a reason to pick a key and not a
+                // reason to keep one: they scattered a five-command group
+                // across the top level, spent the scarce single letters `i`,
+                // `q` and `j` on it, and left `i` — the natural prefix for
+                // inserting things — meaning "clock in".
+                //
+                // `<leader>oi` is now free. Deliberately left free rather than
+                // filled: this slice is a reorganisation, and inventing an
+                // insert group to justify it would be the feature creep the
+                // reorganisation is meant to make room for.
+                bind("<leader>oxi", "org-clock-in"),
+                bind("<leader>oxo", "org-clock-out"),
+                bind("<leader>oxq", "org-clock-cancel"),
+                bind("<leader>oxj", "org-clock-goto"),
+                // OC.9: emacs spells resume `C-c C-x C-x`, which would be
+                // `oxx` — a doubled letter that says nothing. `r` for resume
+                // is the mnemonic the rest of this group already uses, and the
+                // command has no muscle memory to protect: it is org-mode's
+                // own `org-clock-in-last`, which few people bind at all.
+                bind("<leader>oxr", "org-clock-resume"),
+                // The emacs spelling too, letter for letter, on the same
+                // `ActionId`s — the pattern `<leader>on…` / `<C-c>n…` already
+                // set for roam. Safe for `<C-c>`'s reason: it is only ever a
+                // PREFIX here, so `<C-c>` alone stays vim's interrupt.
+                //
+                // No conflict with org's terminal `<C-x>` (timestamp
+                // decrement, OM.9): that is `<C-x>` as the FIRST key, and this
+                // reaches it only after `<C-c>`, which the trie is already
+                // waiting on.
+                bind("<C-c><C-x><C-i>", "org-clock-in"),
+                bind("<C-c><C-x><C-o>", "org-clock-out"),
+                bind("<C-c><C-x><C-q>", "org-clock-cancel"),
+                bind("<C-c><C-x><C-j>", "org-clock-goto"),
+                bind("<C-c><C-x><C-x>", "org-clock-resume"),
                 // OM.11: opens the target picker; `org-refile-to` is the
                 // second hop and is NOT bound — it is invoked by the picker's
                 // accept, never typed.
@@ -2364,7 +2398,7 @@ impl Guest for Component {
         // OC.6 — the clock. Four chords, each doing exactly one buffer edit and
         // then telling org's own async side what happened.
         // OC.7: EX-COMMANDS, not actions — so `:org-clock-in` works as well as
-        // `<leader>oi`. One registration serves both surfaces: a mode keymap
+        // `<leader>oxi`. One registration serves both surfaces: a mode keymap
         // binding resolves a command by NAME and does not care about its kind,
         // while `:` resolves only ex-commands (`excommand.rs` answers `Unknown`
         // for an action, and there is no `action:` kind-prefix). Registering as
@@ -3370,7 +3404,7 @@ thread_local! {
     /// keystroke path. A jump target is neither, so this does not contradict it.
     ///
     /// It does not survive a restart, exactly as the modeline does not (design D4).
-    /// The buffer remains the durable record: after a restart `<leader>oj` says it
+    /// The buffer remains the durable record: after a restart `<leader>oxj` says it
     /// has nowhere to go, and clocking out on the entry still works because that is
     /// re-derived from the file.
     static CLOCK_GOTO_TARGET: std::cell::RefCell<Option<(String, u32)>> =
@@ -3474,7 +3508,7 @@ fn clock_in(
     )]
 }
 
-/// `<leader>oO` (close it) and `<leader>oq` (discard it).
+/// `<leader>oxo` (close it) and `<leader>oxq` (discard it).
 ///
 /// One body for both because they differ in exactly one way — whether the line
 /// is rewritten with an end stamp or removed — and everything around that
@@ -3638,7 +3672,7 @@ fn clock_resume(buffer_id: u32, doc: &Document, tree: Option<&TreeSnapshot>) -> 
     vec![write_at(path, FileAnchor::Line(ins.line), ins.text)]
 }
 
-/// `<leader>oj` — jump to the entry the running clock is on.
+/// `<leader>oxj` — jump to the entry the running clock is on.
 ///
 /// Reads the grammar store's own target (see [`CLOCK_GOTO_TARGET`]), so it
 /// crosses buffers and reopens a file that was closed. Nothing recorded means

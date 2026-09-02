@@ -2,7 +2,7 @@
 //!
 //! `src/clock.rs`'s unit tests cover the drawer arithmetic on the host target.
 //! These are the better test, for the reason the sibling files give: they run
-//! the whole route — `<leader>oi` → org-mode's own keymap layer →
+//! the whole route — `<leader>oxi` → org-mode's own keymap layer →
 //! `Action::Invoke` → the sync grammar trampoline → the guest's `apply-action`
 //! → `Effect::ApplyEdit` → the host's edit path — and nothing in `lattice-host`
 //! knows what a `:LOGBOOK:` drawer is.
@@ -269,7 +269,7 @@ async fn clocking_in_writes_a_logbook_drawer() {
     // From the body line, not the headline — you clock in while reading an
     // entry, and the enclosing headline is what gets the drawer.
     goto_line(&mut editor, 1);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
 
     let got = text(&editor);
     let lines: Vec<&str> = got.lines().collect();
@@ -311,7 +311,7 @@ async fn the_modeline_segment_appears_without_another_keystroke() {
     );
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
 
     let shown = until(&mut editor, Duration::from_secs(5), |e| {
         segment(e).is_some()
@@ -344,7 +344,7 @@ async fn clocking_out_closes_the_line_and_clears_the_segment() {
     let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
     assert!(
         until(&mut editor, Duration::from_secs(5), |e| segment(e)
             .is_some())
@@ -352,7 +352,7 @@ async fn clocking_out_closes_the_line_and_clears_the_segment() {
     );
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oO");
+    press(&mut editor, "<leader>oxo");
 
     let got = text(&editor);
     let clock_line = got.lines().nth(2).unwrap();
@@ -380,9 +380,9 @@ async fn cancelling_removes_the_drawer_it_created() {
     let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oq");
+    press(&mut editor, "<leader>oxq");
 
     assert_eq!(
         text(&editor),
@@ -409,7 +409,7 @@ async fn clocking_out_works_on_a_clock_this_session_never_started() {
     .await;
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oO");
+    press(&mut editor, "<leader>oxo");
 
     let got = text(&editor);
     let clock_line = got.lines().nth(2).unwrap();
@@ -431,7 +431,7 @@ async fn there_is_nothing_to_clock_into_in_the_preamble() {
     let mut editor = org_editor(base.path(), "#+TITLE: Notes\n\n* Task\n").await;
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
 
     assert_eq!(
         text(&editor),
@@ -446,7 +446,7 @@ async fn there_is_nothing_to_clock_into_in_the_preamble() {
 /// failed silently: OC.6 registered them with `register_action`, and
 /// `excommand.rs` answers `Unknown` for an action kind (there is no `action:`
 /// prefix either), so `:org-clock-in` reported "unknown command" while
-/// `<leader>oi` worked perfectly. Nothing in a chord-driven test can see that.
+/// `<leader>oxi` worked perfectly. Nothing in a chord-driven test can see that.
 ///
 /// It is reachable at all only because of OC.10: before it an ex-command was
 /// handed no cursor and no buffer id, so it could locate no entry and name no
@@ -467,7 +467,7 @@ async fn the_clock_is_reachable_from_the_ex_line() {
     let lines: Vec<&str> = got.lines().collect();
     assert_eq!(
         lines[1], ":LOGBOOK:",
-        "`:org-clock-in` must do what `<leader>oi` does; got {got:?}"
+        "`:org-clock-in` must do what `<leader>oxi` does; got {got:?}"
     );
     assert!(lines[2].starts_with("CLOCK: ["));
 
@@ -497,7 +497,7 @@ async fn the_chord_still_works_now_that_it_binds_an_ex_command() {
     let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
 
     goto_line(&mut editor, 0);
-    press(&mut editor, "<leader>oi");
+    press(&mut editor, "<leader>oxi");
 
     assert_eq!(
         text(&editor).lines().nth(1),
@@ -621,5 +621,84 @@ async fn the_last_clocked_entry_outlives_clocking_out() {
         1,
         "resume re-clocked the entry clock-out had finished: {:?}",
         text(&editor)
+    );
+}
+
+/// OA.27 — the clock's two spellings reach the same commands.
+///
+/// `<leader>ox…` is the vim-native one; `<C-c><C-x><C-…>` is emacs' own, letter
+/// for letter. Two spellings of one `ActionId`, so there is no second handler to
+/// keep in step — but a THREE-chord emacs sequence is exactly the shape that
+/// fails silently: a binding that does not parse, or that never expands into a
+/// keymap layer, simply reaches nothing and the key looks unbound.
+///
+/// Resolution rather than dispatch, deliberately. `org_clock.rs`'s other tests
+/// already prove the handlers do the right thing through `<leader>ox…`; what is
+/// unproven is that the second spelling arrives at the same place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_emacs_prefix_reaches_the_same_clock_commands() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor(base.path(), "* Task\n").await;
+
+    let resolve = |keys: &str| -> Option<String> {
+        let expanded = editor.keymap.expand_leader(keys);
+        let seq = parse_chord_sequence(&expanded).expect("parses");
+        let modes: Vec<lattice_mode::ModeId> = editor
+            .mode_registry
+            .load()
+            .iter_meta()
+            .map(|(id, _)| id)
+            .collect();
+        editor
+            .keymap
+            .resolve_trace(lattice_keymap::BindingMode::Normal, &seq, &modes)
+            .hits
+            .last()
+            .map(|h| format!("{:?}", h.command))
+    };
+
+    for (emacs, vim) in [
+        ("<C-c><C-x><C-i>", "<leader>oxi"),
+        ("<C-c><C-x><C-o>", "<leader>oxo"),
+        ("<C-c><C-x><C-q>", "<leader>oxq"),
+        ("<C-c><C-x><C-j>", "<leader>oxj"),
+        ("<C-c><C-x><C-x>", "<leader>oxr"),
+    ] {
+        let a = resolve(emacs);
+        let b = resolve(vim);
+        assert!(
+            a.is_some(),
+            "`{emacs}` must resolve to a command — a declared binding that never \
+             expands into a keymap layer reaches nothing"
+        );
+        assert_eq!(a, b, "`{emacs}` and `{vim}` must reach the same command");
+    }
+}
+
+/// The keys the reorganisation FREED are free.
+///
+/// A move is only done if the old spelling stops working: leaving `<leader>oi`
+/// bound would mean two ways to clock in, one of them undocumented, and the
+/// whole point of the slice was to release `i` for inserting things.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_old_flat_clock_chords_are_gone() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Task\nbody\n").await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>oi");
+    editor.run_tick_pending();
+    assert_eq!(
+        text(&editor),
+        "* Task\nbody\n",
+        "`<leader>oi` no longer clocks in — it is free for an insert group"
     );
 }

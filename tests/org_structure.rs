@@ -1808,7 +1808,7 @@ async fn tk6_the_todo_menu_offers_every_state_and_sets_the_one_you_pick() {
         "sequence: TODO(t) NEXT(n) | DONE(d)\ntype: PROJECT",
     );
 
-    press_chord(&mut editor, "<leader>os").await;
+    press_chord(&mut editor, "<leader>oS").await;
 
     let picker = editor.picker.as_ref().unwrap_or_else(|| {
         panic!(
@@ -1855,7 +1855,7 @@ async fn tk6_the_menu_can_clear_the_state() {
     }
     let base = tempfile::tempdir().unwrap();
     let mut editor = org_editor(base.path(), "* TODO ship it\n").await;
-    press_chord(&mut editor, "<leader>os").await;
+    press_chord(&mut editor, "<leader>oS").await;
     press_menu_key(&mut editor, "<Space>").await;
     assert_eq!(text(&editor), "* ship it\n");
 }
@@ -1878,7 +1878,7 @@ async fn tk6_the_menu_follows_a_set_without_a_reload() {
         "todo-keywords",
         "sequence: PROPOSED | ACCEPTED",
     );
-    press_chord(&mut editor, "<leader>os").await;
+    press_chord(&mut editor, "<leader>oS").await;
     let spec = editor
         .picker
         .as_ref()

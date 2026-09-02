@@ -145,6 +145,10 @@ mod clock_scan;
 mod config_shape;
 mod headline;
 mod links;
+mod org_date;
+// OA.25: the line below a headline, and the rules for writing one field of it
+// without destroying the others.
+mod planning;
 mod refile;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
 mod roam;
@@ -230,6 +234,21 @@ const SET_TAGS: u32 = 14;
 /// The second half of `<leader>o:` — the host dispatches this with the
 /// prompt's text once the user submits.
 const SET_TAGS_SUBMIT: u32 = 15;
+
+/// OA.25 — `<leader>os` / `<leader>od`, and their submit halves.
+///
+/// Four actions rather than two because collecting a date is asynchronous:
+/// the chord returns `OpenPrompt` naming the submit action, the host runs the
+/// minibuffer, and dispatches the submit with what was typed. The same
+/// two-hop shape `org-set-tags` uses.
+///
+/// One pair per FIELD rather than one pair carrying a field argument, because
+/// `on-submit-action` names an action and nothing else — there is nowhere to
+/// carry "which field this prompt was for" across the hop.
+const SCHEDULE: u32 = 74;
+const SCHEDULE_SUBMIT: u32 = 75;
+const DEADLINE: u32 = 76;
+const DEADLINE_SUBMIT: u32 = 77;
 
 /// `<leader>oI` (IM.7).
 const TOGGLE_INLINE_IMAGES: u32 = 16;
@@ -1652,9 +1671,27 @@ impl Guest for Component {
                 // of it — emacs keeps both under
                 // `org-use-fast-todo-selection`, and cycling is the faster
                 // move when the next state is the one you want.
-                bind("<leader>os", "org-todo-select"),
+                // OA.25 took `<leader>os` for scheduling, which is emacs'
+                // `C-c C-s` and the strongest muscle memory org has. Fast
+                // select moves up a shift rather than away: it is our own
+                // invention (emacs reaches it through `C-c C-t`), so it is
+                // the one with no convention to break.
+                bind("<leader>oS", "org-todo-select"),
                 bind("<leader>o,", "org-priority-cycle"),
                 bind("<leader>o:", "org-set-tags"),
+                // OA.25 — planning, in both spellings for the reason the roam
+                // keys carry both: `<leader>o…` is the vim-native one, and
+                // `<C-c><C-s>` / `<C-c><C-d>` is what a hand arriving from
+                // emacs already knows. Two spellings of one `ActionId`, so
+                // there is no second handler to keep in step.
+                //
+                // `<C-c>` stays safe because it is only ever a PREFIX here —
+                // see `org-global-mode`'s note. No collision with capture's
+                // `<C-c><C-c>` / `<C-c><C-k>`: different second key.
+                bind("<leader>os", "org-schedule"),
+                bind("<leader>od", "org-deadline"),
+                bind("<C-c><C-s>", "org-schedule"),
+                bind("<C-c><C-d>", "org-deadline"),
             ],
             target_language: None,
             // MO.1: this mode sets no options for its buffers.
@@ -1873,6 +1910,26 @@ impl Guest for Component {
                 bind("<leader>ot", "org-todo-cycle"),
                 bind("<leader>oT", "org-todo-cycle-back"),
                 bind("<leader>o,", "org-priority-cycle"),
+                // OA.25 — scheduling from the agenda, the same four bindings
+                // and the same four actions `org-todo-mode` declares.
+                //
+                // **Repeated here because the seam cannot express it once.**
+                // `ActivationPolicy` is `Majors(["org-mode"])` OR `Manual`,
+                // never both, and the agenda's major is `multibuffer-mode` —
+                // shared with project search and magit diffs, where a
+                // scheduling key means nothing. So one mode cannot cover both
+                // surfaces, and the repetition is of the BIND lines only: the
+                // handler bodies live once, behind these `ActionId`s. That is
+                // the same trade `<leader>ot` already makes two lines up.
+                //
+                // Not bare `s` / `d`, unlike OA.20's `f` / `b`. Emacs' agenda
+                // spells scheduling `C-c C-s` there too, so the prefixed form
+                // IS the convention — and a bare `d` next to a read-only view
+                // reads like a delete.
+                bind("<leader>os", "org-schedule"),
+                bind("<leader>od", "org-deadline"),
+                bind("<C-c><C-s>", "org-schedule"),
+                bind("<C-c><C-d>", "org-deadline"),
                 // OA.20: emacs' span-walking keys. Bare letters, which is safe
                 // here and nowhere else — the agenda is read-only, so `f` and
                 // `b` are not shadowing an edit, and this mode activates on
@@ -2515,6 +2572,34 @@ impl Guest for Component {
             "Apply tags submitted from the org tag prompt (internal)",
             &spec(),
             SET_TAGS_SUBMIT,
+        );
+        // OA.25 — planning. Registered beside the rest of `org-todo-mode`'s
+        // actions because they are the same workflow: a headline you schedule
+        // is a headline you track, and `:org-todo-mode` off should take
+        // scheduling with it.
+        register_action(
+            "org-schedule",
+            "Schedule this headline, or clear it with an empty answer",
+            &spec(),
+            SCHEDULE,
+        );
+        register_action(
+            "org-schedule-submit",
+            "Apply a date submitted from the org schedule prompt (internal)",
+            &spec(),
+            SCHEDULE_SUBMIT,
+        );
+        register_action(
+            "org-deadline",
+            "Set this headline's deadline, or clear it with an empty answer",
+            &spec(),
+            DEADLINE,
+        );
+        register_action(
+            "org-deadline-submit",
+            "Apply a date submitted from the org deadline prompt (internal)",
+            &spec(),
+            DEADLINE_SUBMIT,
         );
     }
 
@@ -4392,6 +4477,218 @@ fn set_tags_prompt(
     )]
 }
 
+/// OA.23: where the row under the cursor came from, or `None`.
+///
+/// `Some` only in a MULTIBUFFER — the agenda. In an ordinary org file the
+/// cursor is already in the source, so a caller wanting a path there has
+/// `doc.path()`; this answering `none` is what tells the two apart, and the two
+/// need telling apart because an edit in a file is a plain `ApplyEdit` on
+/// `ctx.buffer_id` while an edit behind the agenda has to name a document the
+/// view does not compose.
+///
+/// OA.23b: `buffer` is the id to EDIT — not the path. See
+/// `source-location.buffer`: the path may also name the user's own open buffer,
+/// which is a different document, and writing to the wrong one loses work.
+fn row_source(ctx: &ActionContext) -> Option<host_services::SourceLocation> {
+    host_services::excerpt_source(u64::from(ctx.buffer_id), ctx.cursor.line)
+}
+
+/// OA.25 — where `s` / `d` are about to write, whichever surface they fired on.
+///
+/// Both surfaces from one struct, which is the point: the two differ only in
+/// which document holds the headline and how the line below it is read, and
+/// resolving that difference ONCE here is what keeps the handlers from growing
+/// an agenda branch each.
+struct PlanTarget {
+    /// The buffer the edit names.
+    buffer: u32,
+    /// The headline's line, in that buffer's coordinates.
+    headline: u32,
+    /// The line below it, or `None` at end of document.
+    next: Option<String>,
+    /// Whether `buffer` is a multibuffer SOURCE rather than the active buffer.
+    /// Decides which document lines are read through — the two coordinate
+    /// spaces are unrelated, so guessing from the id would be a coin flip.
+    from_source: bool,
+}
+
+impl PlanTarget {
+    /// `None` when there is no headline to plan against — the cursor is in a
+    /// file's preamble, or on an agenda header row rather than an entry.
+    fn resolve(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Option<Self> {
+        // The agenda first: `row_source` answering `Some` is what says this is
+        // a composed view, and there the headline is the row, already located.
+        if let Some(loc) = row_source(ctx) {
+            return Some(PlanTarget {
+                buffer: loc.buffer,
+                headline: loc.line,
+                // Read through the SOURCE document, not the file: an `s`
+                // pressed twice must see the first one's line. See
+                // `host-services.source-line`.
+                next: host_services::source_line(loc.buffer, loc.line + 1),
+                from_source: true,
+            });
+        }
+        let line = |n: u32| doc.line(n);
+        let hl = headline::Headlines::new(tree, &line, doc.line_count());
+        let (start, _) = hl.enclosing(ctx.cursor.line)?;
+        Some(PlanTarget {
+            buffer: ctx.buffer_id,
+            headline: start,
+            next: doc.line(start + 1),
+            from_source: false,
+        })
+    }
+
+    /// What is already on the planning line for `field`, for the prompt to
+    /// open pre-filled — emacs opens `org-schedule` showing the current date,
+    /// and retyping one you can see is the difference between changing a date
+    /// and re-entering one.
+    fn existing(&self, field: planning::Field) -> String {
+        self.next
+            .as_deref()
+            .and_then(planning::parse)
+            .and_then(|p| p.get(field).cloned())
+            // The stamp without its brackets: `<2026-09-03 Thu>` is what org
+            // writes, and what the prompt takes is a date expression.
+            .map(|s| {
+                s.trim_matches(|c| c == '<' || c == '>' || c == '[' || c == ']')
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Today, in LOCAL time, as `org_date` wants it.
+///
+/// Local rather than UTC for `roam_file_stamp`'s reason: `+1d` resolved against
+/// the UTC day schedules a task for the wrong date for anyone far enough east
+/// or west, and a scheduling key that is off by one after 6pm is worse than no
+/// key.
+fn today_local() -> org_date::Date {
+    let utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let local = utc + i64::from(host_services::local_utc_offset_seconds());
+    let (year, month, day) = agenda::civil_from_epoch_day(local.div_euclid(86_400));
+    org_date::Date { year, month, day }
+}
+
+/// `<leader>os` / `<leader>od` — ask for a date. The first of two hops; the
+/// answer arrives at [`plan_submit`].
+///
+/// An EMPTY answer removes the line, which is emacs' behaviour and the only
+/// spelling of "unschedule" that does not need a second key. That is why the
+/// prompt opens pre-filled: emptying a field you can see is a deliberate act,
+/// where submitting an empty box you were never shown is an accident.
+fn plan_prompt(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    field: planning::Field,
+    on_submit: &str,
+) -> Vec<Effect> {
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: match field {
+                planning::Field::Scheduled => "Schedule: ".to_string(),
+                planning::Field::Deadline => "Deadline: ".to_string(),
+            },
+            initial: target.existing(field),
+            on_submit_action: on_submit.to_string(),
+            buffer_name: None,
+        },
+    )]
+}
+
+/// The second hop: the typed date, turned into the one edit that rewrites the
+/// whole planning line.
+///
+/// Re-resolves the target rather than carrying it across the prompt, because
+/// there is nowhere to carry it — the host dispatches the submit with a fresh
+/// context. That is also the honest thing: the buffer is what it is now.
+fn plan_submit(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    field: planning::Field,
+    args: &Args,
+) -> Vec<Effect> {
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    let Some(typed) = submitted_text(args) else {
+        return vec![Effect::None];
+    };
+    let value = if typed.trim().is_empty() {
+        None
+    } else {
+        match org_date::parse(&typed, today_local()) {
+            Ok(plan) => Some(plan.render()),
+            // Echo rather than swallow: a date the parser did not understand
+            // is a typo the user can fix, and a key that silently does nothing
+            // teaches them the feature is broken.
+            Err(message) => {
+                return vec![Effect::Echo(lattice::plugin_host::types::EchoPayload {
+                    level: lattice::plugin_host::types::EchoLevel::Error,
+                    text: message,
+                })];
+            }
+        }
+    };
+
+    match planning::plan_edit(target.headline, target.next.as_deref(), field, value) {
+        planning::PlanEdit::Nothing => vec![Effect::None],
+        planning::PlanEdit::Replace { line, len, text } => {
+            replace_lines_at(target.buffer, line, line, len, text, ctx.cursor)
+        }
+        // Insert as a REPLACE of the headline line by itself plus the new
+        // line. Anchoring on the headline rather than on `line` start-of-line
+        // keeps it correct at end of document, where `line` does not exist yet
+        // and a range naming it would be out of bounds.
+        planning::PlanEdit::Insert { line: _, text } => {
+            let Some(head) = read_line_of(&target, doc) else {
+                return vec![Effect::None];
+            };
+            replace_lines_at(
+                target.buffer,
+                target.headline,
+                target.headline,
+                head.len() as u32,
+                format!("{head}\n{text}"),
+                ctx.cursor,
+            )
+        }
+        // Delete the planning line by replacing the headline-plus-planning
+        // span with the headline alone — one edit, and it cannot leave a blank
+        // line behind the way deleting a line's content would.
+        planning::PlanEdit::Delete { line, len } => {
+            let Some(head) = read_line_of(&target, doc) else {
+                return vec![Effect::None];
+            };
+            replace_lines_at(target.buffer, target.headline, line, len, head, ctx.cursor)
+        }
+    }
+}
+
+/// The headline's own text, from whichever document holds it.
+///
+/// `doc` is a handle on the ACTIVE buffer, which in the agenda is the view
+/// rather than the source — so reading `doc.line(target.headline)` there would
+/// read a composed row that happens to share a number with a source line. The
+/// two coordinate spaces are unrelated; only `from_source` tells them apart.
+fn read_line_of(target: &PlanTarget, doc: &Document) -> Option<String> {
+    if target.from_source {
+        host_services::source_line(target.buffer, target.headline)
+    } else {
+        doc.line(target.headline)
+    }
+}
+
 /// The submitted text, whichever `args` shape the host used to carry it.
 fn submitted_text(args: &Args) -> Option<String> {
     match args {
@@ -4691,6 +4988,37 @@ impl GrammarCallbacks for Component {
                     todo::set_tags(line, kw, &tags)
                 }))
             }
+            // OA.25. All four go through the same two functions; only the
+            // field differs, which is the point of resolving the surface in
+            // `PlanTarget` rather than in each arm.
+            SCHEDULE => Ok(plan_prompt(
+                &ctx,
+                doc,
+                tree,
+                planning::Field::Scheduled,
+                "org-schedule-submit",
+            )),
+            DEADLINE => Ok(plan_prompt(
+                &ctx,
+                doc,
+                tree,
+                planning::Field::Deadline,
+                "org-deadline-submit",
+            )),
+            SCHEDULE_SUBMIT => Ok(plan_submit(
+                &ctx,
+                doc,
+                tree,
+                planning::Field::Scheduled,
+                &ctx.args,
+            )),
+            DEADLINE_SUBMIT => Ok(plan_submit(
+                &ctx,
+                doc,
+                tree,
+                planning::Field::Deadline,
+                &ctx.args,
+            )),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }

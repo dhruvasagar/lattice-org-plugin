@@ -50,6 +50,7 @@ pub fn annotation_for(
     today: Date,
     done_keywords: &[String],
     nerd_fonts: bool,
+    stats: bool,
 ) -> Option<Annotation> {
     let read = |n: u32| lines.get(n as usize).map(|s| s.to_string());
     let end = headline::subtree_end(read, line, lines.len() as u32);
@@ -68,7 +69,12 @@ pub fn annotation_for(
         },
         today,
     );
-    Some(render(&days, nerd_fonts))
+    let suffix = if stats {
+        crate::habit_stats::render(&crate::habit_stats::stats(&completions, repeater, today))
+    } else {
+        String::new()
+    };
+    Some(render(&days, nerd_fonts, &suffix))
 }
 
 /// `:STYLE: habit` in the subtree's `:PROPERTIES:` drawer, org's own test.
@@ -134,7 +140,7 @@ fn scheduled_repeat(subtree: &[String]) -> Option<(Date, repeat::Repeater)> {
 ///
 /// Byte offsets, not character offsets: the seam's contract, and the glyphs are
 /// multi-byte in both palettes.
-fn render(days: &[habit_graph::Day], nerd_fonts: bool) -> Annotation {
+fn render(days: &[habit_graph::Day], nerd_fonts: bool, suffix: &str) -> Annotation {
     let mut text = String::with_capacity(days.len() * 3);
     let mut spans: Vec<(u32, u32, String)> = Vec::new();
     for day in days {
@@ -147,6 +153,11 @@ fn render(days: &[habit_graph::Day], nerd_fonts: bool) -> Annotation {
             _ => spans.push((start, end, element)),
         }
     }
+    // HB.6: the suffix carries NO span. It is prose rather than a graph cell,
+    // and leaving it unstyled paints it in the row's own foreground — which is
+    // what a caption should look like beside a bar, and what stops it reading
+    // as another day.
+    text.push_str(suffix);
     Annotation { text, spans }
 }
 
@@ -182,7 +193,8 @@ mod tests {
     #[test]
     fn a_habit_gets_a_graph() {
         let l = lines(HABIT);
-        let a = annotation_for(&l, 0, today(), &done(), false).expect("a habit draws a graph");
+        let a =
+            annotation_for(&l, 0, today(), &done(), false, false).expect("a habit draws a graph");
         assert_eq!(
             a.text.chars().count() as i64,
             habit_graph::PRECEDING_DAYS + habit_graph::FOLLOWING_DAYS + 1,
@@ -200,7 +212,7 @@ mod tests {
     #[test]
     fn a_repeating_task_without_the_style_gets_nothing() {
         let text = "* NEXT Pay rent\n  SCHEDULED: <2026-09-05 Sat .+1m>\n";
-        assert!(annotation_for(&lines(text), 0, today(), &done(), false).is_none());
+        assert!(annotation_for(&lines(text), 0, today(), &done(), false, false).is_none());
     }
 
     /// And a habit with no repeater has no cadence to draw against.
@@ -209,14 +221,22 @@ mod tests {
         let text = "* NEXT Odd one\n  \
             SCHEDULED: <2026-09-05 Sat>\n  \
             :PROPERTIES:\n  :STYLE: habit\n  :END:\n";
-        assert!(annotation_for(&lines(text), 0, today(), &done(), false).is_none());
+        assert!(annotation_for(&lines(text), 0, today(), &done(), false, false).is_none());
     }
 
     /// A plain headline is the overwhelmingly common row, and it must cost the
     /// scan nothing beyond the drawer check.
     #[test]
     fn a_plain_headline_gets_nothing() {
-        assert!(annotation_for(&lines("* TODO Ship it\n"), 0, today(), &done(), false).is_none());
+        assert!(annotation_for(
+            &lines("* TODO Ship it\n"),
+            0,
+            today(),
+            &done(),
+            false,
+            false
+        )
+        .is_none());
     }
 
     /// `:STYLE:` is matched case-insensitively — a hand-edited file is not a
@@ -226,7 +246,7 @@ mod tests {
         let text = "* NEXT X\n  \
             SCHEDULED: <2026-09-05 Sat .+2d/4d>\n  \
             :PROPERTIES:\n  :Style: Habit\n  :END:\n";
-        assert!(annotation_for(&lines(text), 0, today(), &done(), false).is_some());
+        assert!(annotation_for(&lines(text), 0, today(), &done(), false, false).is_some());
     }
 
     /// The spans coalesce. A window of 29 cells that emitted one span each
@@ -235,7 +255,7 @@ mod tests {
     #[test]
     fn equal_neighbours_become_one_span() {
         let l = lines(HABIT);
-        let a = annotation_for(&l, 0, today(), &done(), false).expect("a graph");
+        let a = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
         assert!(
             a.spans.len() < a.text.chars().count(),
             "runs must coalesce, got {} spans for {} cells",
@@ -257,7 +277,7 @@ mod tests {
     #[test]
     fn spans_name_registered_habit_elements() {
         let l = lines(HABIT);
-        let a = annotation_for(&l, 0, today(), &done(), false).expect("a graph");
+        let a = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
         for (_, _, slot) in &a.spans {
             assert!(slot.starts_with("habit."), "unexpected element name {slot}");
         }
@@ -268,8 +288,8 @@ mod tests {
     #[test]
     fn both_palettes_render_the_same_width() {
         let l = lines(HABIT);
-        let plain = annotation_for(&l, 0, today(), &done(), false).expect("a graph");
-        let nerd = annotation_for(&l, 0, today(), &done(), true).expect("a graph");
+        let plain = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
+        let nerd = annotation_for(&l, 0, today(), &done(), true, false).expect("a graph");
         assert_eq!(
             plain.text.chars().count(),
             nerd.text.chars().count(),
@@ -283,7 +303,7 @@ mod tests {
     #[test]
     fn span_offsets_are_bytes_not_characters() {
         let l = lines(HABIT);
-        let a = annotation_for(&l, 0, today(), &done(), false).expect("a graph");
+        let a = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
         assert!(
             a.text.len() > a.text.chars().count(),
             "the premise: the glyphs are multi-byte"
@@ -292,6 +312,46 @@ mod tests {
             a.spans.last().map(|s| s.1),
             Some(a.text.len() as u32),
             "the last run ends at the text's BYTE length"
+        );
+    }
+
+    /// HB.6: the stats suffix, and the property that makes it safe to append —
+    /// it carries no span, so the graph's runs still tile the graph exactly and
+    /// the caption paints in the row's own foreground.
+    #[test]
+    fn the_stats_suffix_is_appended_unspanned() {
+        let l = lines(HABIT);
+        let bare = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
+        let with = annotation_for(&l, 0, today(), &done(), false, true).expect("a graph");
+
+        assert!(
+            with.text.starts_with(&bare.text),
+            "the graph is unchanged and the suffix follows it"
+        );
+        assert!(
+            with.text.len() > bare.text.len(),
+            "a habit with a completion has something to say"
+        );
+        assert_eq!(
+            with.spans, bare.spans,
+            "the suffix adds no span — it is a caption, not another day"
+        );
+        assert_eq!(
+            with.spans.last().map(|s| s.1),
+            Some(bare.text.len() as u32),
+            "the graph's runs still end exactly where the graph does"
+        );
+    }
+
+    /// And the option genuinely gates it: off is byte-for-byte the HB.5 row.
+    #[test]
+    fn the_suffix_is_absent_when_the_option_is_off() {
+        let l = lines(HABIT);
+        let off = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
+        assert_eq!(
+            off.text.chars().count() as i64,
+            habit_graph::PRECEDING_DAYS + habit_graph::FOLLOWING_DAYS + 1,
+            "exactly the graph, nothing appended"
         );
     }
 
@@ -307,7 +367,7 @@ mod tests {
             :LOGBOOK:\n  \
             - State \"DONE\" from \"NEXT\" [2026-09-03 Thu 09:14]\n  \
             :END:\n";
-        let a = annotation_for(&lines(text), 0, today(), &done(), false).expect("a graph");
+        let a = annotation_for(&lines(text), 0, today(), &done(), false, false).expect("a graph");
         assert!(
             !a.text.contains('✓'),
             "the child's completion must not mark the parent's graph: {}",

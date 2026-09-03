@@ -145,6 +145,7 @@ mod clock_scan;
 mod config_shape;
 mod habit_graph;
 mod habit_row;
+mod habit_stats;
 mod headline;
 mod history;
 mod links;
@@ -1357,6 +1358,21 @@ impl Guest for Component {
         // loose log lines under a habit are what people migrate away from once
         // a file has a few months of history in it. Org reads both spellings,
         // so the cost of the deviation is placement, not compatibility.
+        // HB.6: the derived analytics beside the graph.
+        //
+        // Defaults ON because deriving them is the whole reason the design
+        // refuses to store them (§1) — a number nobody sees is a number nobody
+        // checks. Off is a real setting rather than a courtesy: the graph is
+        // 29 cells and the suffix is a dozen more, which is a real cost on a
+        // narrow terminal, and someone who wants org's picture exactly should
+        // be able to have it.
+        let _ = register_option(
+            "habit-stats",
+            OptionType::Boolean,
+            "true",
+            "Append the streak, completion rate and weakest weekday to a \
+             habit's consistency graph in the agenda.",
+        );
         let _ = register_option(
             "log-into-drawer",
             OptionType::Boolean,
@@ -2986,6 +3002,7 @@ impl Guest for Component {
                 get_option("ui.nerd_fonts").as_deref(),
                 Some("true") | Some("on")
             ),
+            stats: option_or("habit-stats", "true").eq_ignore_ascii_case("true"),
         }));
         generation
     }
@@ -3109,6 +3126,7 @@ impl Guest for Component {
                         repeat::from_days(state.today),
                         &state.keywords.done,
                         state.nerd_fonts,
+                        state.stats,
                     );
                     agenda::entries_for_row(&row, &state.sections, &state.keywords, state.today)
                         .into_iter()
@@ -3153,6 +3171,9 @@ struct ScanState {
     /// change mid-scan, and a scan of a large corpus would otherwise make one
     /// per habit for an answer that is the same every time.
     nerd_fonts: bool,
+    /// HB.6: whether the graph carries its derived stats. Read once per scan
+    /// for `nerd_fonts`' reason.
+    stats: bool,
     /// AS.1: the blocks this scan files rows into, resolved once so every
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.

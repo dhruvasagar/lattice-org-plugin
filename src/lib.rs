@@ -144,6 +144,7 @@ mod clock;
 mod clock_scan;
 mod config_shape;
 mod habit_graph;
+mod habit_row;
 mod headline;
 mod history;
 mod links;
@@ -2981,6 +2982,10 @@ impl Guest for Component {
             today,
             keywords,
             sections,
+            nerd_fonts: matches!(
+                get_option("ui.nerd_fonts").as_deref(),
+                Some("true") | Some("on")
+            ),
         }));
         generation
     }
@@ -3089,6 +3094,22 @@ impl Guest for Component {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // HB.5c: and the consistency graph, computed ONCE per row
+                    // for `spans`' reason — a row fanned across three sections
+                    // renders the same graph in each, and rebuilding it would
+                    // re-read the same subtree three times.
+                    //
+                    // `None` for every row that is not a `:STYLE: habit`
+                    // headline, which is nearly all of them: the check is a
+                    // properties-drawer scan over a subtree the walk has
+                    // already reached.
+                    let annotation = habit_row::annotation_for(
+                        &lines,
+                        row.line,
+                        repeat::from_days(state.today),
+                        &state.keywords.done,
+                        state.nerd_fonts,
+                    );
                     agenda::entries_for_row(&row, &state.sections, &state.keywords, state.today)
                         .into_iter()
                         .map(move |(group, label, sort_key)| Entry {
@@ -3098,6 +3119,22 @@ impl Guest for Component {
                             label,
                             sort_key,
                             spans: spans.clone(),
+                            annotation: annotation.clone().map(|a| {
+                                lattice::plugin_host::scanned_excerpt_source::Annotation {
+                                    text: a.text,
+                                    spans: a
+                                        .spans
+                                        .into_iter()
+                                        .map(|(start, end, slot)| {
+                                            crate::lattice::plugin_host::types::DisplaySpan {
+                                                start,
+                                                end,
+                                                slot,
+                                            }
+                                        })
+                                        .collect(),
+                                }
+                            }),
                         })
                 })
                 .collect())
@@ -3110,6 +3147,12 @@ impl Guest for Component {
 struct ScanState {
     today: i64,
     keywords: agenda::Keywords,
+    /// HB.5c: which glyph palette the consistency graph draws in.
+    ///
+    /// Read ONCE per scan rather than per row: it is a host call, it cannot
+    /// change mid-scan, and a scan of a large corpus would otherwise make one
+    /// per habit for an answer that is the same every time.
+    nerd_fonts: bool,
     /// AS.1: the blocks this scan files rows into, resolved once so every
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.

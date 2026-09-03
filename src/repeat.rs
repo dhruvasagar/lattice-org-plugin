@@ -120,11 +120,6 @@ impl Repeater {
         let max = self.max.map(|(n, u)| days_of(n, u)).unwrap_or(min);
         (min, min.max(max))
     }
-
-    /// True when this repeater carries a habit range.
-    pub fn is_habit_range(&self) -> bool {
-        self.max.is_some()
-    }
 }
 
 fn days_of(count: u32, unit: Unit) -> u32 {
@@ -306,7 +301,6 @@ mod tests {
         assert_eq!(r.base, Base::Completion);
         assert_eq!((r.count, r.unit), (1, Unit::Day));
         assert_eq!(r.max, Some((3, Unit::Day)));
-        assert!(r.is_habit_range());
         assert_eq!(r.window_days(), (1, 3));
     }
 
@@ -316,7 +310,7 @@ mod tests {
     #[test]
     fn a_repeater_without_a_max_has_no_slack() {
         let r = parse(".+2d").unwrap();
-        assert!(!r.is_habit_range());
+        assert_eq!(r.max, None, "no `/MAX` was written");
         assert_eq!(r.window_days(), (2, 2));
     }
 

@@ -114,6 +114,30 @@ pub fn subtree_end(line: impl Fn(u32) -> Option<String>, start: u32, line_count:
         .unwrap_or(line_count.saturating_sub(1))
 }
 
+/// [`subtree_end`] for a document whose length is not known up front.
+///
+/// The multibuffer source seam reads one line at a time and signals end of
+/// document by answering `none`; there is no line count to pass, and passing
+/// `u32::MAX` would turn "no headline follows" into a four-billion-line walk
+/// on a keystroke path. So the end of the document is discovered rather than
+/// given: the walk stops at the first line that does not exist, which bounds
+/// it by the subtree exactly as the counted version is.
+pub fn subtree_end_unbounded(line: impl Fn(u32) -> Option<String>, start: u32) -> u32 {
+    let Some(level) = line(start).as_deref().and_then(headline_level) else {
+        return start;
+    };
+    let mut end = start;
+    let mut i = start + 1;
+    while let Some(text) = line(i) {
+        if headline_level(&text).is_some_and(|lvl| lvl <= level) {
+            break;
+        }
+        end = i;
+        i += 1;
+    }
+    end
+}
+
 /// Re-star a headline by `delta` levels, or `None` if `line` is not a headline
 /// or the shift is refused.
 ///
@@ -355,6 +379,50 @@ mod tests {
             "the child ends where its parent does"
         );
         assert_eq!(subtree_end(&l, 4, n), 5, "the last subtree runs to the end");
+    }
+
+    /// HB.2b: the same three answers, from a document that will not say how
+    /// long it is. The counted and uncounted walks must agree, or an agenda
+    /// completion would rewrite a different span than the same key does in the
+    /// file.
+    #[test]
+    fn the_unbounded_walk_agrees_with_the_counted_one() {
+        let (l, n) = buf("* One\nbody\n** Child\nkid body\n* Two\ntail\n");
+        for start in [0, 2, 4] {
+            assert_eq!(
+                subtree_end_unbounded(&l, start),
+                subtree_end(&l, start, n),
+                "the two walks disagree at line {start}"
+            );
+        }
+    }
+
+    /// The case that has no counted equivalent: the last subtree, where there
+    /// is no following headline and the walk has to stop because the document
+    /// ran out. A version that trusted a line count it was not given would
+    /// walk to `u32::MAX` here — on a keystroke path.
+    #[test]
+    fn the_unbounded_walk_stops_at_the_end_of_the_document() {
+        let reads = std::cell::Cell::new(0u32);
+        let text = "* One\nbody\n* Last\nplanning\nnote\n";
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        let l = |i: u32| {
+            reads.set(reads.get() + 1);
+            lines.get(i as usize).cloned()
+        };
+        assert_eq!(subtree_end_unbounded(l, 2), 4, "runs to the last line");
+        assert!(
+            reads.get() <= 6,
+            "the walk must stop at the first missing line, not scan on; read {} lines",
+            reads.get()
+        );
+    }
+
+    /// Not a headline: no subtree, and no walk at all.
+    #[test]
+    fn the_unbounded_walk_declines_a_line_that_is_not_a_headline() {
+        let (l, _) = buf("* One\nbody\n* Two\n");
+        assert_eq!(subtree_end_unbounded(&l, 1), 1);
     }
 
     #[test]

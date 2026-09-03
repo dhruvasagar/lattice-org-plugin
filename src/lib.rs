@@ -4615,26 +4615,41 @@ fn set_keyword_repeating(
     tree: Option<&TreeSnapshot>,
     want: &str,
 ) -> Vec<Effect> {
-    let line = |n: u32| doc.line(n);
-    let hl = headline::Headlines::new(tree, &line, doc.line_count());
-    let Some((start, _)) = hl.enclosing(ctx.cursor.line) else {
-        return vec![Effect::None];
-    };
     let keywords = todo_keywords();
     let (_, done) = todo::parse_todo_keywords(&todo_keyword_lines().join("\n")).split();
     // Only a DONE state repeats. Cycling TODO → NEXT must not shift a
     // timestamp, which is the bug an over-eager gate here would be.
+    //
+    // Gated BEFORE resolving the target, so the common cycle costs no host
+    // call: `row_source` crosses the WASM boundary, and TODO → NEXT has no
+    // use for the answer.
     if !done.iter().any(|d| d == want) {
         return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
     }
-    let Some(head) = doc.line(start) else {
+    // HB.2b: through the target, not through `doc`.
+    //
+    // An agenda excerpt is ONE line — the headline — so reading the subtree
+    // from the active buffer there yields a single line with no planning line
+    // under it, `complete_repeating` correctly finds nothing to repeat, and
+    // the fallback below writes a plain `DONE`. That is not a failure to
+    // repeat: it *destroys the habit*, because the headline stops being
+    // scheduled and the completion is never recorded. The whole subtree has
+    // to be read from, and written back to, the document that actually holds
+    // it — which for an agenda row is a multibuffer source the view owns and
+    // no buffer store holds.
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    let Some(head) = target.line(target.headline, doc) else {
         return vec![Effect::None];
     };
     let from_keyword = todo::parse(&head, &keywords)
         .and_then(|h| h.keyword.map(|k| k.to_string()))
         .unwrap_or_default();
-    let end = headline::subtree_end(&line, start, doc.line_count());
-    let lines: Vec<String> = (start..=end).filter_map(&line).collect();
+    let end = target.subtree_end(doc, tree);
+    let lines: Vec<String> = (target.headline..=end)
+        .filter_map(|n| target.line(n, doc))
+        .collect();
 
     let now = clock_now();
     let cx = complete::Context {
@@ -4649,17 +4664,26 @@ fn set_keyword_repeating(
         return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
     };
 
-    let last_len = doc.line(end).map(|l| l.len()).unwrap_or(0) as u32;
-    let cursor = Position {
-        line: start,
-        byte: ctx
-            .cursor
-            .byte
-            .min(done_with.lines.first().map(|l| l.len()).unwrap_or(0) as u32),
+    let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
+    let cursor = if target.from_source {
+        // The edit lands in the source; the caret is in the VIEW and stays
+        // where it is. Naming a source line here would move the caret to a
+        // composed row that happens to share the number — the two coordinate
+        // spaces are unrelated, which is the whole reason `from_source`
+        // exists. (`plan_submit` passes `ctx.cursor` for the same reason.)
+        ctx.cursor
+    } else {
+        Position {
+            line: target.headline,
+            byte: ctx
+                .cursor
+                .byte
+                .min(done_with.lines.first().map(|l| l.len()).unwrap_or(0) as u32),
+        }
     };
-    let mut effects = replace_lines(
-        ctx,
-        start,
+    let mut effects = replace_lines_at(
+        target.buffer,
+        target.headline,
         end,
         last_len,
         done_with.lines.join("\n"),
@@ -4809,6 +4833,36 @@ impl PlanTarget {
         })
     }
 
+    /// One line of whichever document holds the headline.
+    ///
+    /// `doc` is a handle on the ACTIVE buffer, which in the agenda is the view
+    /// rather than the source — so `doc.line(n)` there reads a composed row
+    /// that happens to share a number with a source line. The two coordinate
+    /// spaces are unrelated; only `from_source` tells them apart.
+    fn line(&self, n: u32, doc: &Document) -> Option<String> {
+        if self.from_source {
+            host_services::source_line(self.buffer, n)
+        } else {
+            doc.line(n)
+        }
+    }
+
+    /// The last line of the headline's subtree, in the target's coordinates.
+    ///
+    /// The two branches are not the same walk. In a file the tree-sitter
+    /// structure is available and authoritative; behind the agenda there is no
+    /// parse of the source and no line count either, so the end is found by
+    /// reading until the document runs out. Both stop at the next same-or-
+    /// shallower headline.
+    fn subtree_end(&self, doc: &Document, tree: Option<&TreeSnapshot>) -> u32 {
+        if self.from_source {
+            headline::subtree_end_unbounded(|n| self.line(n, doc), self.headline)
+        } else {
+            let line = |n: u32| doc.line(n);
+            headline::Headlines::new(tree, &line, doc.line_count()).subtree_end(self.headline)
+        }
+    }
+
     /// What is already on the planning line for `field`, for the prompt to
     /// open pre-filled — emacs opens `org-schedule` showing the current date,
     /// and retyping one you can see is the difference between changing a date
@@ -4920,7 +4974,7 @@ fn plan_submit(
         // keeps it correct at end of document, where `line` does not exist yet
         // and a range naming it would be out of bounds.
         planning::PlanEdit::Insert { line: _, text } => {
-            let Some(head) = read_line_of(&target, doc) else {
+            let Some(head) = target.line(target.headline, doc) else {
                 return vec![Effect::None];
             };
             replace_lines_at(
@@ -4936,25 +4990,11 @@ fn plan_submit(
         // span with the headline alone — one edit, and it cannot leave a blank
         // line behind the way deleting a line's content would.
         planning::PlanEdit::Delete { line, len } => {
-            let Some(head) = read_line_of(&target, doc) else {
+            let Some(head) = target.line(target.headline, doc) else {
                 return vec![Effect::None];
             };
             replace_lines_at(target.buffer, target.headline, line, len, head, ctx.cursor)
         }
-    }
-}
-
-/// The headline's own text, from whichever document holds it.
-///
-/// `doc` is a handle on the ACTIVE buffer, which in the agenda is the view
-/// rather than the source — so reading `doc.line(target.headline)` there would
-/// read a composed row that happens to share a number with a source line. The
-/// two coordinate spaces are unrelated; only `from_source` tells them apart.
-fn read_line_of(target: &PlanTarget, doc: &Document) -> Option<String> {
-    if target.from_source {
-        host_services::source_line(target.buffer, target.headline)
-    } else {
-        doc.line(target.headline)
     }
 }
 

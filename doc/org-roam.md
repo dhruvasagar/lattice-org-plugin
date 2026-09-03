@@ -275,10 +275,9 @@ body = """
 :ID:       ${id}
 :END:
 #+Title: ${title}
-#+Category: %^{Category}
+#+date: %U
 
 * Summary
-%?
 """
 '''
 ```
@@ -299,11 +298,27 @@ being made. So there is no `target`, and an optional `file` names the note's
 **filename** instead — `${…}` expands there too. Absent, the timestamped
 default is used.
 
-Every `%` placeholder capture defines keeps working exactly as it does there:
-`%?` where the cursor lands, `%^{Question}` for a value to ask for, `%U` / `%T`
-/ `%t` for dates, `%a` for a link back, `%%` for a literal percent. The two
-syntaxes answer different questions — `%` interpolates the *capture context*,
-`${}` interpolates the *node* — which is why they coexist rather than compete.
+The two syntaxes answer different questions — `%` interpolates the *capture
+context*, `${}` interpolates the *node* — which is why they coexist rather than
+compete.
+
+**Not every `%` placeholder works here yet.** A roam note is written straight
+out; it does not open the capture buffer `<leader>oc` opens, and the three
+placeholders that need one are **silently dropped**:
+
+| | |
+|---|---|
+| `%U` `%T` `%t` | ✅ dates, exactly as in a capture template |
+| `%%` | ✅ a literal `%` |
+| `%^{Question}` | ⚠️ never asked — expands to nothing |
+| `%?` | ⚠️ nothing to place a cursor for — expands to nothing |
+| `%a` | ⚠️ no capture origin to link back to — expands to nothing |
+
+That is a gap rather than a design, and it is the half of this feature still
+being built: roam should get the same editable buffer capture has, with
+`C-c C-c` to file it and `C-c C-k` to throw it away. Until it does, keep roam
+templates to text, `${…}` and the date placeholders — a template written
+around `%^{…}` will quietly produce a note with the field missing.
 
 An unknown `${x}` is left alone, for the same reason an unknown `%x` is: a
 template is your text, and a placeholder that vanished cannot be found and

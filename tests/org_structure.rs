@@ -4594,3 +4594,62 @@ async fn an_ex_line_action_receives_its_argument() {
         editor.last_message.as_ref().map(|m| m.text.clone())
     );
 }
+
+/// HB.2 — completing a repeating task in an org FILE repeats it.
+///
+/// Before this slice the chord just wrote `DONE`, which does not merely fail
+/// to repeat: the headline stops being scheduled and the completion is never
+/// recorded, so the habit is destroyed. The keyword going BACK is the correct
+/// outcome — a repeating task's completion lives in the log, not the keyword.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completing_a_repeating_task_repeats_it() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* TODO Meditate\nSCHEDULED: <2026-09-02 Wed .+1d/3d>\n:PROPERTIES:\n:STYLE: habit\n:END:\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+    let out = text(&editor);
+
+    assert!(
+        out.starts_with("* TODO Meditate"),
+        "the keyword RESET rather than staying DONE — a repeating task records \
+         its completion in the log: {out:?}"
+    );
+    assert!(
+        out.contains(r#"- State "DONE" from "TODO""#),
+        "the completion is logged, and that log is what the graph reads: {out:?}"
+    );
+    assert!(out.contains(":LOGBOOK:"), "into the drawer: {out:?}");
+    assert!(out.contains(":LAST_REPEAT:"), "and stamped: {out:?}");
+    assert!(
+        !out.contains("<2026-09-02"),
+        "the schedule moved forward, so it is not due in the past forever: {out:?}"
+    );
+    assert!(
+        out.contains(".+1d/3d"),
+        "the repeater survives the shift: {out:?}"
+    );
+}
+
+/// …and a task with NO repeater is untouched by any of it. The gate must be
+/// narrow: this slice is about habits, and a change to every completion in
+/// every org file must not ride in on one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completing_a_plain_task_is_unchanged() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Ship it\n").await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+    assert_eq!(text(&editor), "* DONE Ship it\n");
+}

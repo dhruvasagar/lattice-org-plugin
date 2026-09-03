@@ -1822,3 +1822,13 @@ async fn an_unknown_command_key_falls_back_and_names_the_ones_that_exist() {
         "…and the keys that do exist, got {titles:?}"
     );
 }
+
+// HB.2b — completing a habit FROM THE AGENDA is not wired yet, and there is
+// deliberately no test here asserting the current behaviour.
+//
+// An agenda excerpt is ONE line, the headline, so the multi-line rewrite finds
+// no planning line in the composed view and falls back to the plain DONE. The
+// fix is to read and write the SOURCE through the OA.23b seam rather than the
+// view — a real slice, not a tweak. A test pinning today's answer would
+// enshrine the destructive behaviour as intended; the org-file case is covered
+// in `org_structure.rs`.

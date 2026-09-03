@@ -1289,6 +1289,21 @@ impl Guest for Component {
             "Where `:org-roam-dailies-*` files live. Relative to \
              `org.roam-directory` unless it starts with `/`.",
         );
+        // HB.2: where a repeating task's state-change line goes.
+        //
+        // Defaults ON, which is NOT emacs' default (`org-log-into-drawer` is
+        // nil there). The UX-follows-convention rule decides it: essentially
+        // every real org configuration sets this — Dhruva's does — because
+        // loose log lines under a habit are what people migrate away from once
+        // a file has a few months of history in it. Org reads both spellings,
+        // so the cost of the deviation is placement, not compatibility.
+        let _ = register_option(
+            "log-into-drawer",
+            OptionType::Boolean,
+            "true",
+            "Write state-change log lines into a `:LOGBOOK:` drawer rather \
+             than loose under the headline (emacs' `org-log-into-drawer`).",
+        );
         let _ = register_option(
             "inline-images",
             OptionType::Boolean,
@@ -4551,6 +4566,120 @@ fn toggle_heading(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapsho
 /// ENCLOSING headline, not the cursor's line: `<leader>ot` from inside a
 /// subtree's body marks that subtree's headline, which is what org does and
 /// what makes the key usable without navigating first.
+/// HB.2 — cycle the keyword, routing a landing on a done state through the
+/// repeat path.
+///
+/// `cycle_keyword` answers a LINE, not a keyword, so the target is read back
+/// out of the line it produced. That is deliberate rather than lazy: the
+/// cycling rules (sequence order, wrap, the `|` split) live in one place, and
+/// re-deriving "what does NEXT cycle to" here would be a second copy to drift.
+fn cycle_keyword_repeating(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    forward: bool,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, _)) = hl.enclosing(ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let keywords = todo_keywords();
+    let Some(head) = doc.line(start) else {
+        return vec![Effect::None];
+    };
+    let Some(cycled) = todo::cycle_keyword(&head, &keywords, forward) else {
+        return vec![Effect::None];
+    };
+    let want = todo::parse(&cycled, &keywords)
+        .and_then(|h| h.keyword.map(|k| k.to_string()))
+        .unwrap_or_default();
+    set_keyword_repeating(ctx, doc, tree, &want)
+}
+
+/// HB.2 — set the headline's keyword, repeating the task when the keyword is
+/// a done state and the task carries a repeater.
+///
+/// The gate is deliberately narrow: `complete_repeating` answers `None` for
+/// anything that does not repeat, and then this is exactly the old
+/// single-line rewrite. So a plain TODO is untouched by this slice, which is
+/// what keeps a change to *every* completion from riding in on a habit fix.
+///
+/// **One edit over the whole subtree**, not three. A completion that shifted
+/// the stamp but did not log, or logged but did not reset, is a worse state
+/// than either end — and `u` has to take the completion back as one action,
+/// not unpick it a line at a time.
+fn set_keyword_repeating(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    want: &str,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, _)) = hl.enclosing(ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    let keywords = todo_keywords();
+    let (_, done) = todo::parse_todo_keywords(&todo_keyword_lines().join("\n")).split();
+    // Only a DONE state repeats. Cycling TODO → NEXT must not shift a
+    // timestamp, which is the bug an over-eager gate here would be.
+    if !done.iter().any(|d| d == want) {
+        return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
+    }
+    let Some(head) = doc.line(start) else {
+        return vec![Effect::None];
+    };
+    let from_keyword = todo::parse(&head, &keywords)
+        .and_then(|h| h.keyword.map(|k| k.to_string()))
+        .unwrap_or_default();
+    let end = headline::subtree_end(&line, start, doc.line_count());
+    let lines: Vec<String> = (start..=end).filter_map(&line).collect();
+
+    let now = clock_now();
+    let cx = complete::Context {
+        today: today_local(),
+        now_stamp: &now.stamp(),
+        keywords: &keywords,
+        done_keywords: &done,
+        log_into_drawer: option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
+    };
+    let Some(done_with) = complete::complete_repeating(&lines, &from_keyword, &cx) else {
+        // Not a repeating task: the ordinary completion, unchanged.
+        return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
+    };
+
+    let last_len = doc.line(end).map(|l| l.len()).unwrap_or(0) as u32;
+    let cursor = Position {
+        line: start,
+        byte: ctx
+            .cursor
+            .byte
+            .min(done_with.lines.first().map(|l| l.len()).unwrap_or(0) as u32),
+    };
+    let mut effects = replace_lines(
+        ctx,
+        start,
+        end,
+        last_len,
+        done_with.lines.join("\n"),
+        cursor,
+    );
+    // Say what happened. A keyword that goes back to NEXT after you pressed
+    // DONE looks like the key failed; without this line the correct behaviour
+    // is indistinguishable from a bug, which is how org's own newcomers meet
+    // repeaters.
+    let d = done_with.next;
+    effects.push(Effect::Echo(EchoPayload {
+        level: EchoLevel::Info,
+        text: format!(
+            "org: repeated — {} again, next {:04}-{:02}-{:02}",
+            done_with.reset_to, d.year, d.month, d.day
+        ),
+    }));
+    effects
+}
+
 fn rewrite_headline(
     ctx: &ActionContext,
     doc: &Document,
@@ -5143,16 +5272,15 @@ impl GrammarCallbacks for Component {
                     Args::String(s) => s.clone(),
                     _ => String::new(),
                 };
-                Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
-                    todo::set_keyword(line, kw, &want)
-                }))
+                Ok(set_keyword_repeating(&ctx, doc, tree, &want))
             }
-            TODO_CYCLE => Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
-                todo::cycle_keyword(line, kw, true)
-            })),
-            TODO_CYCLE_BACK => Ok(rewrite_headline(&ctx, doc, tree, |line, kw| {
-                todo::cycle_keyword(line, kw, false)
-            })),
+            // HB.2: cycling INTO a done state repeats a repeating task, the
+            // same as selecting it. Routing only `TODO_SET` would have left
+            // `<leader>ot` — the key people actually use on a habit —
+            // destroying it, which is the half-migration this whole slice is
+            // about closing.
+            TODO_CYCLE => Ok(cycle_keyword_repeating(&ctx, doc, tree, true)),
+            TODO_CYCLE_BACK => Ok(cycle_keyword_repeating(&ctx, doc, tree, false)),
             PRIORITY_CYCLE => {
                 let highest = highest_priority();
                 Ok(rewrite_headline(&ctx, doc, tree, move |line, kw| {

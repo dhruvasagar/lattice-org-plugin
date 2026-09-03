@@ -556,7 +556,7 @@ mod filter_tests {
 pub fn describe(view: &ViewArgs, default_span: u32, anchor: i64) -> String {
     let mut parts: Vec<String> = Vec::new();
     let span = view.span.unwrap_or(default_span);
-    parts.push(window(anchor, span));
+    parts.push(format!("{} {}", span_name(span), window(anchor, span)));
     if !view.command.is_empty() {
         parts.push(view.command.clone());
     }
@@ -572,6 +572,28 @@ pub fn describe(view: &ViewArgs, default_span: u32, anchor: i64) -> String {
         parts.push(format!("\u{26a0} {p}"));
     }
     parts.join(" \u{b7} ")
+}
+
+/// What the span is CALLED — `Day`, `Week`, `Month`, `Year`, or a plain count.
+///
+/// The dates alone were the whole header, and a reader had to subtract them to
+/// learn which span they were looking at. Emacs names it (`Week-agenda`), and
+/// `gD` switches between four of them, so the name is what tells you the key
+/// worked.
+///
+/// The four the span keys set (0/1, 7, 30, 365) get names; anything else — a
+/// user's `:set org.agenda-span=10` — reports its own count rather than being
+/// rounded into the nearest word it is not.
+fn span_name(span: u32) -> String {
+    match span {
+        0 | 1 => "Day".to_string(),
+        7 => "Week".to_string(),
+        // 28–31 so a month-length span set by hand still reads as a month;
+        // `gDm` sends 30.
+        28..=31 => "Month".to_string(),
+        365 | 366 => "Year".to_string(),
+        n => format!("{n}-day"),
+    }
 }
 
 /// The dates the view covers: one day, or a range.
@@ -606,6 +628,42 @@ mod describe_tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    /// The span is NAMED, not left to be inferred from the dates. `gD` switches
+    /// between four of them and the name is what tells you the key worked —
+    /// subtracting two dates to learn you are in a month is not a reading.
+    #[test]
+    fn the_span_is_named() {
+        let named = |span: u32| {
+            let v = ViewArgs::parse(&args(&["", &format!("span={span}")]));
+            describe(&v, 7, ANCHOR)
+        };
+        assert!(named(1).starts_with("Day "));
+        assert!(named(7).starts_with("Week "));
+        assert!(named(30).starts_with("Month "));
+        assert!(named(365).starts_with("Year "));
+    }
+
+    /// A hand-set span reports its own count rather than being rounded into a
+    /// word it is not. `:set org.agenda-span=10` is not a week.
+    #[test]
+    fn an_unusual_span_names_its_own_length() {
+        let v = ViewArgs::parse(&args(&["", "span=10"]));
+        assert!(describe(&v, 7, ANCHOR).starts_with("10-day "));
+    }
+
+    /// A month set by hand at 28 or 31 still reads as a month — `gDm` sends 30,
+    /// but a user writing the real length of February should not get "28-day".
+    #[test]
+    fn a_month_length_span_still_reads_as_a_month() {
+        for n in [28, 29, 30, 31] {
+            let v = ViewArgs::parse(&args(&["", &format!("span={n}")]));
+            assert!(
+                describe(&v, 7, ANCHOR).starts_with("Month "),
+                "span={n} should read as a month"
+            );
+        }
+    }
+
     #[test]
     fn the_anchor_is_the_day_it_says() {
         assert_eq!(window(ANCHOR, 1), "2026-09-02");
@@ -617,7 +675,7 @@ mod describe_tests {
     fn the_ordinary_agenda_still_says_when_it_is_looking() {
         assert_eq!(
             describe(&ViewArgs::parse(&args(&[])), 7, ANCHOR),
-            "2026-09-02 \u{2013} 2026-09-08"
+            "Week 2026-09-02 \u{2013} 2026-09-08"
         );
     }
 
@@ -625,7 +683,7 @@ mod describe_tests {
     #[test]
     fn a_daily_agenda_shows_one_date() {
         let v = ViewArgs::parse(&args(&["", "span=1"]));
-        assert_eq!(describe(&v, 7, ANCHOR), "2026-09-02");
+        assert_eq!(describe(&v, 7, ANCHOR), "Day 2026-09-02");
     }
 
     /// The case the slice exists for: a filter must be visible, because
@@ -651,7 +709,7 @@ mod describe_tests {
         let v = ViewArgs::parse(&args(&["waiting"]));
         assert_eq!(
             describe(&v, 7, ANCHOR),
-            "2026-09-02 \u{2013} 2026-09-08 \u{b7} waiting"
+            "Week 2026-09-02 \u{2013} 2026-09-08 \u{b7} waiting"
         );
     }
 
@@ -662,7 +720,7 @@ mod describe_tests {
         let v = ViewArgs::parse(&args(&["", "offset=1"]));
         assert_eq!(
             describe(&v, 7, ANCHOR + 7),
-            "2026-09-09 \u{2013} 2026-09-15",
+            "Week 2026-09-09 \u{2013} 2026-09-15",
             "the caller anchors; this renders what it was given"
         );
     }
@@ -687,7 +745,7 @@ mod describe_tests {
         let v = ViewArgs::parse(&args(&["waiting", "span=1", "tag:work", "nope=1"]));
         assert_eq!(
             describe(&v, 7, ANCHOR),
-            "2026-09-02 \u{b7} waiting \u{b7} +work \u{b7} \u{26a0} unknown view argument `nope`"
+            "Day 2026-09-02 \u{b7} waiting \u{b7} +work \u{b7} \u{26a0} unknown view argument `nope`"
         );
     }
 }

@@ -1013,3 +1013,138 @@ async fn a_tag_filter_narrows_and_the_pipe_clears_it() {
         "`|` restores every row — a filter you cannot undo is worse than none"
     );
 }
+
+/// Run an action ONCE by name and apply what it produced.
+///
+/// `press` cannot be used for a chord that mutates: its own doc says it
+/// re-dispatches an `Invoke` to recover the effects `dispatch_chord` discards,
+/// and that it is "safe here because both chords are pure prompt-openers".
+/// `org-todo-cycle` is not one — pressing it through `press` cycles the keyword
+/// TWICE, which is how this test first read and why it saw a transition it did
+/// not make.
+/// Returns the document's text as it stood the instant the action returned —
+/// BEFORE any prompt was opened. `open_prompt_line` makes the prompt buffer the
+/// active document, so `text(editor)` after it reads the empty prompt, not the
+/// file. That is what "the state lands first" has to be measured against.
+fn invoke_once(editor: &mut Editor, name: &str) -> String {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name(name)
+        .unwrap_or_else(|| panic!("`{name}` is registered"));
+    let out = editor.dispatch(lattice_host::action::Action::Invoke(
+        lattice_grammar::CommandInvocation::of(id),
+    ));
+    // Edits FIRST, then read, then the prompt — in that order and for two
+    // separate reasons. The edits have to land before the read or there is
+    // nothing to see; the prompt has to open after it, because
+    // `open_prompt_line` makes the prompt buffer the active document and
+    // `text(editor)` would then read the empty prompt rather than the file.
+    let mut prompt = None;
+    for effect in out.effects {
+        match effect {
+            lattice_grammar::Effect::ApplyEdit {
+                target,
+                edit,
+                cursor,
+            } => {
+                let _ = editor.dispatch(lattice_host::action::Action::ApplyEdit {
+                    target,
+                    edit,
+                    cursor,
+                });
+            }
+            lattice_grammar::Effect::OpenPrompt {
+                prompt: p,
+                initial,
+                on_submit_action,
+                buffer_name,
+            } => prompt = Some((p, initial, on_submit_action, buffer_name)),
+            _ => {}
+        }
+    }
+    let landed = text(editor);
+    if let Some((p, initial, action, name)) = prompt {
+        editor.open_prompt_line(p, initial, action, name);
+    }
+    landed
+}
+
+// ── TK.9: the note a `(@)` state asks for ──────────────────────────────────
+
+/// The state changes FIRST and the note follows — org's order, and the reason
+/// it matters: dismissing the prompt leaves the state changed and unnoted
+/// rather than making the keyword appear not to respond.
+///
+/// Lives here rather than beside TK.8's tests because `press` discards the
+/// outcome, and `Effect::OpenPrompt` lives in what it discards — a test that
+/// pressed and asserted would report "no prompt" whether or not the feature
+/// worked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk9_a_note_state_changes_first_then_records_the_note() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Task\n").await;
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=TODO | CANCELLED(c@/!)")
+        .expect("the option accepts the sequence");
+
+    goto_line(&mut editor, 0);
+    let landed = invoke_once(&mut editor, "org-todo-cycle");
+
+    assert!(
+        landed.starts_with("* CANCELLED Task"),
+        "the state lands before the note is answered: {landed:?}"
+    );
+    assert!(
+        editor.pending_prompt_submit_action.is_some(),
+        "and a prompt is waiting for the note"
+    );
+
+    submit_prompt(&mut editor, "client went quiet");
+
+    let got = text(&editor);
+    assert!(
+        got.contains("- State \"CANCELLED\" from \"TODO\" ["),
+        "the transition is recorded: {got:?}"
+    );
+    assert!(
+        got.contains("client went quiet"),
+        "…carrying the note: {got:?}"
+    );
+    assert!(
+        got.contains("\\\\"),
+        "…with org's continuation marker, so emacs reads it back: {got:?}"
+    );
+}
+
+/// Dismissing the prompt leaves the state changed and records nothing. That is
+/// the half the chosen ordering trades away, so it is asserted rather than
+/// assumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk9_a_dismissed_note_leaves_the_state_changed_and_unlogged() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Task\n").await;
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=TODO | CANCELLED(c@/!)")
+        .expect("the option accepts the sequence");
+
+    goto_line(&mut editor, 0);
+    let got = invoke_once(&mut editor, "org-todo-cycle");
+    // No submit — the user pressed Escape.
+
+    assert!(got.starts_with("* CANCELLED Task"), "{got:?}");
+    assert!(
+        !got.contains("- State"),
+        "an unanswered note records nothing at all: {got:?}"
+    );
+}

@@ -887,6 +887,28 @@ have their own block regardless, so a short span never hides a missed deadline.
 agenda-span = "0"   # just today
 ```
 
+**Changing the span while you are looking at it**, without touching the option:
+
+| | |
+|---|---|
+| `gDd` | one day |
+| `gDw` | one week |
+| `gDm` | one month |
+| `gDy` | one year |
+| `f` / `b` | move one span forward / back |
+| `.` | back to today |
+
+These are per view: they do not rewrite `org.agenda-span`, so glancing at next
+month does not change what every future agenda means, and two open agendas can
+sit on different windows.
+
+The headerline names the span and the dates it covers — `Week 2026-09-03 –
+2026-09-09` — so the view always says what it is showing.
+
+Emacs puts these on `v d` / `v w`; **lattice puts them on `gD`**, which is where
+`evil-org-agenda` puts them and for the same reason: `v` is Visual mode and an
+editor with vim keys cannot spend it as a prefix.
+
 #### Writing your own
 
 `org.agenda-sections` replaces the built-in set with yours. One `[[section]]`

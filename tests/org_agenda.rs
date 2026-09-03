@@ -1841,3 +1841,85 @@ async fn an_unknown_command_key_falls_back_and_names_the_ones_that_exist() {
 // view — a real slice, not a tweak. A test pinning today's answer would
 // enshrine the destructive behaviour as intended; the org-file case is covered
 // in `org_structure.rs`.
+
+/// OA.20 fix: the span chords resolve, and the headerline names the span.
+///
+/// **The bug this replaces could not have been found by reading the bindings.**
+/// They shipped as `vd` / `vw` / `vm` / `vy` and were unreachable: `v` is bound
+/// at `KeymapLayer::Builtin` to enter Visual mode, layers merge into ONE trie,
+/// and a node carrying both a terminal binding and children resolves to the
+/// terminal. So `v` entered Visual and the second key was never read — the
+/// binding existed, was listed by `:describe-key`, and did nothing.
+///
+/// Which is why this presses the chord through `dispatch_chord` and asserts the
+/// VIEW changed, rather than asserting a binding is registered. There was no
+/// test of these chords at all before, and that is how they shipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_span_chords_change_the_span_and_the_header_says_so() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("a.org"), "* TODO Ship it\n").unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1,
+        "the org component loads"
+    );
+
+    let view = match open_org_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        other => panic!("the agenda declined: {other:?}"),
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+
+    let label_of = |status: &HeaderlineStatus| -> String {
+        match status {
+            HeaderlineStatus::Complete { summary, .. } => summary.clone(),
+            other => panic!("the scan did not complete: {other:?}"),
+        }
+    };
+
+    // The default span, named rather than left to be inferred from two dates.
+    let first = label_of(&settle_agenda(&mb, view).await);
+    assert!(
+        first.contains("Week ") || first.contains("Day "),
+        "the header names the span it is showing: {first:?}"
+    );
+
+    // The chord under test. `gD` is where evil-org-agenda puts these
+    // (`org-agenda-view-mode-dispatch`), for the same reason: evil never
+    // shadows `v`.
+    editor.activate_buffer(view);
+    press(&mut editor, "gDm");
+    let after = label_of(&settle_agenda(&mb, view).await);
+    assert!(
+        after.contains("Month "),
+        "`gDm` switched the view to a month: {after:?} (was {first:?})"
+    );
+
+    // And back, so the test proves a CHANGE rather than a constant.
+    press(&mut editor, "gDd");
+    let back = label_of(&settle_agenda(&mb, view).await);
+    assert!(
+        back.contains("Day "),
+        "`gDd` switched it to a day: {back:?}"
+    );
+}

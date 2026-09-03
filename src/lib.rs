@@ -523,11 +523,25 @@ const AGENDA_MENU: u32 = 60;
 const AGENDA_COMMAND: u32 = 61;
 
 /// OA.20 — span walking. `f` / `b` move the view one span forward or back,
-/// `.` returns it to today, and `v d w m y` set the span itself.
+/// `.` returns it to today, and `gD d w m y` set the span itself.
 ///
 /// Emacs' keys (`org-agenda-later` / `org-agenda-earlier` / `org-agenda-goto-today`
 /// / `org-agenda-day-view` and friends), because this is muscle memory and the
 /// UX-follows-convention rule applies to a surface people arrive at with habits.
+///
+/// **The span keys are `gD`-prefixed, not `v`-prefixed**, and the first attempt
+/// shipped `vd` / `vw` / `vm` / `vy` — which could never fire. `v` is bound at
+/// `KeymapLayer::Builtin` to enter Visual mode, and layers merge into ONE trie:
+/// a node carrying both a terminal binding and children resolves to the
+/// terminal, so `v` entered Visual and the second key was never read. Verified
+/// against `KeymapTrie::lookup` directly, not inferred.
+///
+/// `gD` is where evil-org-agenda puts the same commands
+/// (`org-agenda-view-mode-dispatch`), for exactly this reason — evil never
+/// shadows `v` — so following it costs no muscle memory and gains the one that
+/// org users already have. It is also where this repo's own plan put them
+/// (OA.18). `g` is a Builtin PREFIX rather than a terminal, and `gD` is
+/// terminal only in `lsp-mode`, which never activates on an agenda.
 const AGENDA_LATER: u32 = 62;
 const AGENDA_EARLIER: u32 = 63;
 const AGENDA_TODAY: u32 = 64;
@@ -2140,10 +2154,10 @@ impl Guest for Component {
                 bind("f", "org-agenda-later"),
                 bind("b", "org-agenda-earlier"),
                 bind(".", "org-agenda-today"),
-                bind("vd", "org-agenda-day-view"),
-                bind("vw", "org-agenda-week-view"),
-                bind("vm", "org-agenda-month-view"),
-                bind("vy", "org-agenda-year-view"),
+                bind("gDd", "org-agenda-day-view"),
+                bind("gDw", "org-agenda-week-view"),
+                bind("gDm", "org-agenda-month-view"),
+                bind("gDy", "org-agenda-year-view"),
                 // OA.21: emacs' filter keys. `/` replaces the tag filter,
                 // `\` narrows it further, `|` clears everything.
                 bind("/", "org-agenda-filter-by-tag"),

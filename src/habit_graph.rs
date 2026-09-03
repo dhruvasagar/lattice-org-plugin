@@ -125,7 +125,7 @@ pub fn build(habit: &Habit, today: Date) -> Vec<Day> {
             // The completion most recently BEFORE this column — org consumes
             // a day's completions only after colouring it, so a day is never
             // coloured by its own completion.
-            let last_done = dones.iter().copied().filter(|c| *c < d).next_back();
+            let last_done = dones.iter().copied().rfind(|c| *c < d);
             let remaining = dones.iter().filter(|c| **c >= d).count();
 
             let state = if past && last_done.is_none() && sched >= now {

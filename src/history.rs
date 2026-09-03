@@ -91,10 +91,7 @@ fn state_change_into_done(line: &str, done_keywords: &[String]) -> Option<Date> 
     // finished, and org omits the clause entirely for a task that had no
     // previous keyword.
     let new_state = first_quoted(rest)?;
-    done_keywords
-        .iter()
-        .any(|d| *d == new_state)
-        .then_some(())?;
+    done_keywords.contains(&new_state).then_some(())?;
     stamp_date(line)
 }
 

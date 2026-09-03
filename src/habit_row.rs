@@ -52,7 +52,7 @@ pub fn annotation_for(
     nerd_fonts: bool,
 ) -> Option<Annotation> {
     let read = |n: u32| lines.get(n as usize).map(|s| s.to_string());
-    let end = headline::subtree_end(&read, line, lines.len() as u32);
+    let end = headline::subtree_end(read, line, lines.len() as u32);
     let subtree: Vec<String> = (line..=end).filter_map(&read).collect();
 
     if !is_habit(&subtree) {

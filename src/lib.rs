@@ -2818,8 +2818,17 @@ impl Guest for Component {
     /// load — the `help` seam's premise: the docs travel with the thing they
     /// document, and unloading the plugin removes them.
     ///
-    /// An empty name lands at the bare plugin id, so this is `:help org`
-    /// rather than `:help org.org`.
+    /// An empty name lands at the bare plugin id, so the first is `:help org`
+    /// rather than `:help org.org`; a named one is auto-namespaced, so `roam`
+    /// lands at `:help org.roam`.
+    ///
+    /// **Roam is its own page rather than a section of `org.md`** (OR.12).
+    /// The manual is already the longest thing in this repository and roam is
+    /// a self-contained layer with its own model — nodes, an index, a
+    /// watcher — that an org user who keeps no zettelkasten never touches.
+    /// Splitting it means `:help org` stays about editing org files and
+    /// `:help org.roam` is reachable by name from the picker, rather than
+    /// being a heading two thirds of the way down someone else's page.
     fn register_help_topics() {
         let _ = register_topic(
             "",
@@ -2828,6 +2837,14 @@ impl Guest for Component {
             // `:describe-command` cross-links from any command whose name
             // contains these.
             &["fold".to_string()],
+        );
+        let _ = register_topic(
+            "roam",
+            "Org-roam: id-addressed notes, backlinks, dailies and templates.",
+            include_str!("../doc/org-roam.md"),
+            // Every roam command is `org-roam-…`, so one pattern reaches all
+            // of them and nothing else.
+            &["roam".to_string()],
         );
     }
 

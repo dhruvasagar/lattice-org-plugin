@@ -33,7 +33,7 @@ reached the network.
 | `completion-source` | org-roam nodes, offered inside an `[[…]]` link |
 | `transient-source` | the capture menu, one key per template |
 | `events` | the clock's session, its minute wake and its modeline segment |
-| `help` | `doc/org.md`, shipped inside the component; `:help org` |
+| `help` | `doc/org.md` and `doc/org-roam.md`, shipped inside the component; `:help org`, `:help org.roam` |
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.

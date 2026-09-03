@@ -707,15 +707,13 @@ Four destinations, decided by what the link says:
 | `[[file:notes.org]]`, `[[notes/a.org]]` | opens as a buffer |
 | `[[https://example.com]]` | goes to the system handler |
 | `[[*Some Heading]]` | jumps to that headline in this file |
-| `[[id:6F398E54-…]]` | **recognised, not yet resolvable** |
+| `[[id:6F398E54-…]]` | jumps to that note — file and line |
 
 An `id:` link points at a note by its `:ID:` rather than by where it lives,
 which is what makes the link survive renames — and what means resolving it
-needs an index of every note you have. That index is org-roam's, and it is
-not built yet, so following one tells you the index is missing rather than
-guessing. It is listed here because org now *knows* the kind: before, an
-`id:` link was mistaken for a filename and opening it complained about a
-file that was never meant to exist.
+needs an index of every note you have. That index is org-roam's, so following
+one needs `org.roam-directory` set; with it unset the link says so rather than
+guessing at a filename. See [`org.roam`](help:org.roam).
 
 Unlike an image, a link does **not** have to be alone on its line — opening
 one mid-sentence is the whole point of the key.
@@ -1106,11 +1104,18 @@ headerline says it is partial.
 Lattice itself contributes the walk, the ordering and the view — see
 `:help agenda-view-mode`. What a *dated row* is comes entirely from here.
 
+## Org-roam
+
+Id-addressed notes, backlinks, a journal and note templates — a zettelkasten
+layer over the same org files everything above works on. It is inert until you
+set `org.roam-directory`, and it has its own page:
+[`org.roam`](help:org.roam).
+
 ## What this plugin is not
 
 Code highlighting *inside* a source block is not here; it needs injection.
-Export backends, babel, table formulas, column view and org-roam are out of
-scope rather than pending.
+Export backends, babel, table formulas and column view are out of scope rather
+than pending.
 
 Everything above rides seams that already exist (`language`, `modes`,
 `grammar`, `config`, `media`, `agenda-source`, `help`) — nothing in lattice

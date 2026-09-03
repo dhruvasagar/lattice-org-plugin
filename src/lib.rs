@@ -148,6 +148,7 @@ mod links;
 mod org_date;
 // OA.25: the line below a headline, and the rules for writing one field of it
 // without destroying the others.
+mod complete;
 mod planning;
 mod refile;
 mod repeat;

@@ -739,11 +739,19 @@ async fn a_filtered_agendas_headerline_names_the_filter() {
     };
     settle_agenda(&mb, view).await;
     let plain = headerline_of(&mb, view);
+    // `Week` before the date, not just the date: the span is NAMED as of
+    // "the agenda headerline names its span", because `gD` switches between
+    // four of them and the name is what tells you the key worked. This
+    // asserted `"[agenda: 20"` until that landed — the window still starts
+    // with its year, but no longer *first*, so the old form said the header
+    // had lost the window when what it had gained was a label.
+    //
+    // `org.agenda-span` is unset here, so the default 7 makes it a week.
     assert!(
-        plain.contains("[agenda: 20"),
-        "an unfiltered agenda still says WHEN it is looking — the window is \
-         what `f`/`b` change and the only thing that says where you are: \
-         {plain:?}"
+        plain.contains("[agenda: Week 20"),
+        "an unfiltered agenda still says WHAT it is looking at and WHEN — the \
+         span and the window are what `gD` and `f`/`b` change, and the only \
+         thing that says where you are: {plain:?}"
     );
     assert!(
         !plain.contains('+'),

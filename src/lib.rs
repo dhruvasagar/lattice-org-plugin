@@ -270,6 +270,8 @@ const AGENDA_FILTER_FILE: u32 = 79;
 /// carry "which field this prompt was for" across the hop.
 const SCHEDULE: u32 = 74;
 const SCHEDULE_SUBMIT: u32 = 75;
+/// TK.9: the note a `(@)` state change asks for, submitted.
+const TODO_NOTE_SUBMIT: u32 = 81;
 const DEADLINE: u32 = 76;
 const DEADLINE_SUBMIT: u32 = 77;
 
@@ -2773,6 +2775,12 @@ impl Guest for Component {
             SCHEDULE,
         );
         register_action(
+            "org-todo-note-submit",
+            "Record the note a state change asked for (internal)",
+            &spec(),
+            TODO_NOTE_SUBMIT,
+        );
+        register_action(
             "org-schedule-submit",
             "Apply a date submitted from the org schedule prompt (internal)",
             &spec(),
@@ -4752,12 +4760,8 @@ fn set_keyword_repeating(
     let (_, done) = todo::parse_todo_keywords(&todo_keyword_lines().join("\n")).split();
     // Only a DONE state repeats. Cycling TODO → NEXT must not shift a
     // timestamp, which is the bug an over-eager gate here would be.
-    //
-    // Gated BEFORE resolving the target, so the common cycle costs no host
-    // call: `row_source` crosses the WASM boundary, and TODO → NEXT has no
-    // use for the answer.
     if !done.iter().any(|d| d == want) {
-        return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
+        return set_keyword_logged(ctx, doc, tree, want);
     }
     // HB.2b: through the target, not through `doc`.
     //
@@ -4793,8 +4797,9 @@ fn set_keyword_repeating(
         log_into_drawer: option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
     };
     let Some(done_with) = complete::complete_repeating(&lines, &from_keyword, &cx) else {
-        // Not a repeating task: the ordinary completion, unchanged.
-        return rewrite_headline(ctx, doc, tree, |l, kw| todo::set_keyword(l, kw, want));
+        // Not a repeating task: the ordinary completion, which still logs what
+        // the keyword's flags ask for (TK.8).
+        return set_keyword_logged(ctx, doc, tree, want);
     };
 
     let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
@@ -4835,6 +4840,189 @@ fn set_keyword_repeating(
         ),
     }));
     effects
+}
+
+thread_local! {
+    /// TK.9: the transition a note is being collected for.
+    ///
+    /// The submit arrives as a fresh context with only the typed text, and by
+    /// then the headline already says the NEW state — so "which state did this
+    /// come from" is no longer readable from the buffer. It has to be carried,
+    /// and a `thread_local` is the whole of the synchronisation story here: one
+    /// guest, one actor, calls serialised by the host's per-plugin channel.
+    ///
+    /// Cleared on submit and overwritten on each new prompt, so a dismissed
+    /// prompt cannot make the NEXT note claim the wrong transition.
+    static PENDING_NOTE: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// TK.9 — ask for the note a `(@)` state declared, having already changed it.
+///
+/// Org's order, and the reason for it: `org-todo` writes the new keyword and
+/// then calls `org-add-log-setup`, so dismissing the note leaves the state
+/// changed and unnoted. Holding the change until the note arrived would make a
+/// keyword appear not to respond, which is the more surprising of the two.
+fn note_prompt_for(from: &str, to: &str) -> Vec<Effect> {
+    PENDING_NOTE.replace(Some((from.to_string(), to.to_string())));
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: format!("Note ({to}): "),
+            initial: String::new(),
+            on_submit_action: "org-todo-note-submit".to_string(),
+            buffer_name: None,
+        },
+    )]
+}
+
+/// The second hop: the note, written as the log line the transition owed.
+///
+/// An empty answer records the line with no note — a timestamp is still a
+/// record, and org does the same when you store an empty note.
+fn todo_note_submit(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    let Some((from, to)) = PENDING_NOTE.take() else {
+        // No prompt is outstanding. Nothing to attribute the note to, and
+        // guessing a transition would file it under the wrong one.
+        return vec![Effect::None];
+    };
+    let Some(text) = submitted_text(&ctx.args) else {
+        return vec![Effect::None];
+    };
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    let end = target.subtree_end(doc, tree);
+    let mut lines: Vec<String> = (target.headline..=end)
+        .filter_map(|n| target.line(n, doc))
+        .collect();
+    if lines.is_empty() {
+        return vec![Effect::None];
+    }
+    let stamp = clock_now().stamp();
+    let mut log = complete::state_log_line(&to, &from, &stamp);
+    let note = text.trim();
+    if !note.is_empty() {
+        // Org's continuation shape: the state line ends with ` \\` and the note
+        // follows on the next line, indented under it.
+        log.push_str(" \\\\\n  ");
+        log.push_str(note);
+    }
+    complete::insert_log(
+        &mut lines,
+        &log,
+        option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
+    );
+    let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
+    replace_lines_at(
+        target.buffer,
+        target.headline,
+        end,
+        last_len,
+        lines.join("\n"),
+        ctx.cursor,
+    )
+}
+
+/// TK.8 — set the headline's keyword, recording what the keyword flags ask for.
+///
+/// `org-todo-keywords` lets a state declare `(@)`, `(!)` or `(@/!)`, and until
+/// this those were parsed and inert — the design said so in as many words, and
+/// deferred acting on them to "its own slice with its own tests". This is that
+/// slice's not-a-note half.
+///
+/// **One edit**, headline and log line together, so `u` takes the transition
+/// back in one step. The note case cannot do that — it needs an answer from the
+/// user first — and takes two; see [`note_prompt_for`].
+fn set_keyword_logged(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    want: &str,
+) -> Vec<Effect> {
+    let keywords = todo_keywords();
+    let kws = todo::parse_todo_keywords(&todo_keyword_lines().join("\n"));
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    let Some(head) = target.line(target.headline, doc) else {
+        return vec![Effect::None];
+    };
+    let from = todo::parse(&head, &keywords)
+        .and_then(|h| h.keyword.map(|k| k.to_string()))
+        .unwrap_or_default();
+    let to = (!want.is_empty()).then_some(want);
+    let action = todo::log_on_change(&kws, (!from.is_empty()).then_some(from.as_str()), to);
+
+    let Some(new_head) = todo::set_keyword(&head, &keywords, want) else {
+        return vec![Effect::None];
+    };
+    if new_head == head {
+        return vec![Effect::None];
+    }
+    match action {
+        // The overwhelmingly common case, and it must stay a single-line edit:
+        // most keywords declare no flags at all, and rewriting a whole subtree
+        // to change one word would make every `<leader>ot` a bigger undo step
+        // than it is.
+        todo::LogOnChange::Nothing => {
+            let cursor = Position {
+                line: target.headline,
+                byte: ctx.cursor.byte.min(new_head.len() as u32),
+            };
+            replace_lines_at(
+                target.buffer,
+                target.headline,
+                target.headline,
+                head.len() as u32,
+                new_head,
+                cursor,
+            )
+        }
+        todo::LogOnChange::Timestamp => {
+            let end = target.subtree_end(doc, tree);
+            let mut lines: Vec<String> = (target.headline..=end)
+                .filter_map(|n| target.line(n, doc))
+                .collect();
+            lines[0] = new_head;
+            let stamp = clock_now().stamp();
+            complete::insert_log(
+                &mut lines,
+                &complete::state_log_line(want, &from, &stamp),
+                option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
+            );
+            let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
+            replace_lines_at(
+                target.buffer,
+                target.headline,
+                end,
+                last_len,
+                lines.join("\n"),
+                ctx.cursor,
+            )
+        }
+        // TK.9: the state change lands NOW and the note follows, which is org's
+        // order — escaping the prompt leaves the state changed and unnoted.
+        todo::LogOnChange::Note => {
+            let cursor = Position {
+                line: target.headline,
+                byte: ctx.cursor.byte.min(new_head.len() as u32),
+            };
+            let mut effects = replace_lines_at(
+                target.buffer,
+                target.headline,
+                target.headline,
+                head.len() as u32,
+                new_head,
+                cursor,
+            );
+            effects.extend(note_prompt_for(&from, want));
+            effects
+        }
+    }
 }
 
 fn rewrite_headline(
@@ -5476,6 +5664,7 @@ impl GrammarCallbacks for Component {
                     })],
                 })
             }
+            TODO_NOTE_SUBMIT => Ok(todo_note_submit(&ctx, doc, tree)),
             SET_TAGS_SUBMIT => {
                 let Some(tags) = submitted_text(&ctx.args) else {
                     return Ok(vec![Effect::None]);

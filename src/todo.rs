@@ -71,6 +71,72 @@ impl Logging {
     fn is_empty(self) -> bool {
         self == Logging::default()
     }
+
+    /// What entering this state records, on its own.
+    fn on_entry(self) -> LogOnChange {
+        // A note supersedes a timestamp: an org note line CARRIES a timestamp,
+        // so `(@!)` is a note, not both.
+        if self.note_on_entry {
+            LogOnChange::Note
+        } else if self.stamp_on_entry {
+            LogOnChange::Timestamp
+        } else {
+            LogOnChange::Nothing
+        }
+    }
+
+    /// What leaving this state records, on its own.
+    fn on_exit(self) -> LogOnChange {
+        if self.note_on_exit {
+            LogOnChange::Note
+        } else if self.stamp_on_exit {
+            LogOnChange::Timestamp
+        } else {
+            LogOnChange::Nothing
+        }
+    }
+}
+
+/// What a state change writes into the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOnChange {
+    Nothing,
+    /// `!` — a `- State "X" from "Y" [ts]` line.
+    Timestamp,
+    /// `@` — the same line, with a note the user is prompted for.
+    Note,
+}
+
+/// What a transition from `from` to `to` records.
+///
+/// **Org's rule is a precedence, not a union** (`org-todo`, org.el):
+///
+/// ```elisp
+/// (setq dolog (or (nth 1 (assoc org-state org-todo-log-states))   ; NEW entry
+///                 (nth 2 (assoc this      org-todo-log-states)))) ; OLD exit
+/// ```
+///
+/// The state being entered decides first; only if it asks for nothing does the
+/// state being left get a say. So moving from `CANCELLED(c@/!)` into a plain
+/// `NEXT` records the timestamp `CANCELLED`'s `/!` asked for — but moving into
+/// `WAITING(w@/!)` records WAITING's note instead, and not both.
+///
+/// `to` is `None` when the keyword is being cleared; org treats that as a state
+/// too, so the old state's exit spec still applies.
+pub fn log_on_change(kws: &Keywords, from: Option<&str>, to: Option<&str>) -> LogOnChange {
+    let spec = |name: Option<&str>| {
+        name.and_then(|n| kws.all.iter().find(|k| k.name == n))
+            .map(|k| k.logging)
+    };
+    let entry = spec(to)
+        .map(Logging::on_entry)
+        .unwrap_or(LogOnChange::Nothing);
+    if entry != LogOnChange::Nothing {
+        return entry;
+    }
+    spec(from)
+        .map(Logging::on_exit)
+        .unwrap_or(LogOnChange::Nothing)
 }
 
 /// One TODO state.
@@ -582,6 +648,95 @@ pub fn tags_string(h: &Headline) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // ── TK.8: what a transition records ─────────────────────────────────
+
+    fn kws() -> Keywords {
+        parse_todo_keywords("sequence: TODO NEXT(n) WAITING(w@/!) | DONE(d!) CANCELLED(c@/!)")
+    }
+
+    /// The entry spec of the state being ENTERED decides first.
+    #[test]
+    fn tk8_entering_a_note_state_asks_for_a_note() {
+        assert_eq!(
+            log_on_change(&kws(), Some("NEXT"), Some("CANCELLED")),
+            LogOnChange::Note
+        );
+    }
+
+    #[test]
+    fn tk8_entering_a_timestamp_state_records_a_timestamp() {
+        assert_eq!(
+            log_on_change(&kws(), Some("NEXT"), Some("DONE")),
+            LogOnChange::Timestamp
+        );
+    }
+
+    /// Only when the new state asks for nothing does the OLD state's exit spec
+    /// get a say. `CANCELLED(c@/!)` → plain `TODO` records the `/!` timestamp.
+    #[test]
+    fn tk8_leaving_a_state_with_an_exit_spec_records_it() {
+        assert_eq!(
+            log_on_change(&kws(), Some("CANCELLED"), Some("TODO")),
+            LogOnChange::Timestamp
+        );
+    }
+
+    /// **A precedence, not a union.** Org writes
+    /// `(or new-entry old-exit)`, so leaving `CANCELLED(c@/!)` — whose exit is
+    /// a timestamp — into `WAITING(w@/!)` — whose entry is a note — records the
+    /// note and NOT both. A union would write two log lines for one keypress.
+    #[test]
+    fn tk8_the_new_states_entry_beats_the_old_states_exit() {
+        assert_eq!(
+            log_on_change(&kws(), Some("CANCELLED"), Some("WAITING")),
+            LogOnChange::Note
+        );
+    }
+
+    /// Two states with no flags between them record nothing, which is the
+    /// overwhelmingly common transition and must stay free.
+    #[test]
+    fn tk8_an_unflagged_transition_records_nothing() {
+        assert_eq!(
+            log_on_change(&kws(), Some("TODO"), Some("NEXT")),
+            LogOnChange::Nothing
+        );
+    }
+
+    /// Clearing the keyword is still leaving a state, so the exit spec applies.
+    #[test]
+    fn tk8_clearing_a_keyword_still_honours_the_exit_spec() {
+        assert_eq!(
+            log_on_change(&kws(), Some("CANCELLED"), None),
+            LogOnChange::Timestamp
+        );
+        assert_eq!(
+            log_on_change(&kws(), Some("TODO"), None),
+            LogOnChange::Nothing
+        );
+    }
+
+    /// A name no sequence declares contributes nothing rather than erroring —
+    /// a headline can carry a word the current config no longer knows.
+    #[test]
+    fn tk8_an_unknown_state_contributes_nothing() {
+        assert_eq!(
+            log_on_change(&kws(), Some("ANCIENT"), Some("ALSO-GONE")),
+            LogOnChange::Nothing
+        );
+    }
+
+    /// A note SUPERSEDES a timestamp rather than adding to it: an org note line
+    /// carries a timestamp already, so `(@!)` is one record, not two.
+    #[test]
+    fn tk8_a_note_supersedes_a_timestamp_on_the_same_side() {
+        let k = parse_todo_keywords("sequence: TODO BOTH(b@!) | DONE");
+        assert_eq!(
+            log_on_change(&k, Some("TODO"), Some("BOTH")),
+            LogOnChange::Note
+        );
+    }
     use super::*;
 
     fn kw() -> Vec<String> {

@@ -4653,3 +4653,104 @@ async fn completing_a_plain_task_is_unchanged() {
     press(&mut editor, "<leader>ot");
     assert_eq!(text(&editor), "* DONE Ship it\n");
 }
+
+// ── TK.8 / TK.9: `org-todo-keywords` logging flags ─────────────────────────
+
+/// TK.8: `(!)` on the state being ENTERED records a state-change line.
+///
+/// The flags were parsed and inert until this slice — the design said so and
+/// deferred acting on them. Driven through a real keypress rather than the
+/// parser, because the parser answered correctly the whole time; what was
+/// missing was anything reading its answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk8_entering_a_timestamp_state_writes_a_log_line() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Task\n").await;
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=TODO | DONE(d!)")
+        .expect("the option accepts the sequence");
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+
+    let got = text(&editor);
+    assert!(
+        got.starts_with("* DONE Task"),
+        "the keyword changed: {got:?}"
+    );
+    assert!(
+        got.contains("- State \"DONE\" from \"TODO\" ["),
+        "…and `(d!)` recorded the transition: {got:?}"
+    );
+    assert!(
+        got.contains(":LOGBOOK:"),
+        "into the drawer, which `org.log-into-drawer` defaults on: {got:?}"
+    );
+}
+
+/// And the transition that asks for nothing stays a one-line edit. Most
+/// keywords declare no flags, and rewriting a subtree to change one word would
+/// make every `<leader>ot` a bigger undo step than it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk8_an_unflagged_transition_writes_no_log() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Task\n").await;
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=TODO | DONE")
+        .expect("the option accepts the sequence");
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+
+    assert_eq!(
+        text(&editor),
+        "* DONE Task\n",
+        "no flags, no log, and no other line touched"
+    );
+}
+
+/// TK.8: the OLD state's exit spec applies when the new state asks for nothing.
+///
+/// Cycling off `CANCELLED(c@/!)` CLEARS the keyword — it is last in the
+/// sequence — and the `/!` still records, because clearing is leaving. Org
+/// renders the empty target as `State ""`: `%s` substitutes
+/// `(format "\"%s\"" org-log-note-state)` and an empty string is truthy in
+/// elisp, so it does not take the `""` branch. This assertion first expected
+/// `TODO` and was wrong about the cycle, not about the logging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tk8_leaving_a_state_records_its_exit_spec() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* CANCELLED Task\n").await;
+    editor
+        .config
+        .parse_and_set_command("org.todo-keywords=TODO | CANCELLED(c@/!)")
+        .expect("the option accepts the sequence");
+
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<leader>ot");
+
+    let got = text(&editor);
+    assert!(
+        got.starts_with("* Task"),
+        "the keyword is cleared — CANCELLED is last in the sequence: {got:?}"
+    );
+    assert!(
+        got.contains("- State \"\" from \"CANCELLED\" ["),
+        "…and leaving it still records the timestamp its `/!` asked for, with \
+         org's own rendering of an empty target state: {got:?}"
+    );
+}

@@ -84,12 +84,7 @@ pub fn complete_repeating(
     let reset_to = reset_keyword(lines, ctx)?;
     let new_headline = crate::todo::set_keyword(headline, ctx.keywords, &reset_to)?;
 
-    let log = format!(
-        "- State \"{}\" from \"{}\" {}",
-        done_label(ctx),
-        from_keyword,
-        ctx.now_stamp
-    );
+    let log = state_log_line(&done_label(ctx), from_keyword, ctx.now_stamp);
 
     let mut out: Vec<String> = lines.to_vec();
     out[0] = new_headline;
@@ -104,6 +99,17 @@ pub fn complete_repeating(
         reset_to,
         next,
     })
+}
+
+/// One `- State "TO" from "FROM" [ts]` line, org's `org-log-note-headings`
+/// shape for a state change.
+///
+/// Shared with TK.8 so a repeat's log line and an ordinary transition's are the
+/// same string built the same way. Two spellings of one record is how a reader
+/// stops round-tripping — `history` parses both back, but only because it is
+/// written to tolerate what emacs emits.
+pub(crate) fn state_log_line(to: &str, from: &str, stamp: &str) -> String {
+    format!("- State \"{to}\" from \"{from}\" {stamp}")
 }
 
 /// The done keyword to name in the log line — the one the user actually
@@ -194,7 +200,7 @@ fn set_property(lines: &mut Vec<String>, key: &str, value: &str) {
 ///
 /// New entries go at the TOP of the drawer, which is org's order: most recent
 /// first, so the newest completion is the one you see without scrolling.
-fn insert_log(lines: &mut Vec<String>, log: &str, into_drawer: bool) {
+pub(crate) fn insert_log(lines: &mut Vec<String>, log: &str, into_drawer: bool) {
     let after_plan = lines
         .iter()
         .position(|l| crate::planning::parse(l).is_some())

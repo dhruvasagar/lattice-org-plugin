@@ -143,7 +143,9 @@ mod checkbox;
 mod clock;
 mod clock_scan;
 mod config_shape;
+mod habit_graph;
 mod headline;
+mod history;
 mod links;
 mod org_date;
 // OA.25: the line below a headline, and the rules for writing one field of it
@@ -928,6 +930,63 @@ mod todo_theme {
             // stops instantiating against the grammar seam's sync linker
             // (see the world declaration).
             let _ = register_element(&format!("todo.{}", k.name), "A TODO state.", &s);
+        }
+
+        habit_elements();
+    }
+
+    /// HB.4 — the consistency graph's eight elements.
+    ///
+    /// Eight, not four: each of org's states has a solid and a muted variant,
+    /// and the muted axis is what stops three weeks of ordinary kept days
+    /// shouting as loudly as a miss. See `habit_graph`'s module doc.
+    ///
+    /// Colours follow org's faces — blue, green, yellow, red — resolved from
+    /// the theme's palette rather than written as hex, so `:colorscheme` moves
+    /// them. That is OA.16's lesson, which shipped hardcoded hex and had to be
+    /// undone.
+    ///
+    /// Org fills the whole cell with a BACKGROUND colour. A terminal cell here
+    /// carries a glyph the user reads, and a filled background behind it is a
+    /// solid block, so the colour goes on the foreground instead. The muted
+    /// variant dims rather than naming a second palette slot, which keeps the
+    /// pair recognisably one colour under every theme.
+    fn habit_elements() {
+        use crate::habit_graph::DayState;
+        for (state, slot, doc) in [
+            (
+                DayState::Clear,
+                "blue",
+                "A graph day before the habit is due again.",
+            ),
+            (
+                DayState::Ready,
+                "green",
+                "A graph day the habit may be done on.",
+            ),
+            (DayState::Alert, "yellow", "The habit's deadline day."),
+            (
+                DayState::Overdue,
+                "red",
+                "A graph day the habit was missed on.",
+            ),
+        ] {
+            for muted in [false, true] {
+                let _ = register_element(
+                    state.element(muted),
+                    doc,
+                    &ThemeStyleSpec {
+                        inherit: None,
+                        fg: Some(ColorRef::Palette(slot.to_string())),
+                        bg: None,
+                        modifiers: ModifierSet {
+                            dim: Some(muted),
+                            ..unset()
+                        },
+                        scale: None,
+                    },
+                );
+            }
         }
     }
 

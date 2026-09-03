@@ -285,11 +285,20 @@ async fn agenda_collects_headlines_from_every_org_file_in_the_project() {
     let source = &snapshot.sources()[0];
     assert_eq!(
         source.extensions(),
-        ["org".to_string(), "org_archive".to_string()],
+        ["org".to_string()],
         "declared by the guest, normalised by the loader"
     );
     assert!(source.claims(std::path::Path::new("/p/notes.org")));
     assert!(!source.claims(std::path::Path::new("/p/main.rs")));
+    // The agenda must NOT scan archives. This list looks like it should match
+    // the one `register_languages` declares — an `.org_archive` IS org-mode
+    // and should highlight like one — and it used to, which put every task
+    // ever archived back into the view it was archived to escape. The two
+    // answer different questions; re-syncing them is the regression.
+    assert!(
+        !source.claims(std::path::Path::new("/p/notes.org_archive")),
+        "archiving exists to remove an entry from the agenda"
+    );
     drop(snapshot);
 
     // --- `:agenda <dir>` through the ordinary ex-command path.

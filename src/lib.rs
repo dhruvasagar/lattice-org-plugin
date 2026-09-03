@@ -2815,12 +2815,22 @@ impl Guest for Component {
     // agenda lives in `agenda.rs`. See its module docs for what counts as a
     // row and why.
 
-    /// The host offers this plugin `.org` and `.org_archive` files and no
-    /// others. It is the same pair `register_languages` claims, and the
-    /// duplication is real: an agenda source is not required to have a
-    /// language, so it cannot read the answer off one.
+    /// The host offers this plugin `.org` files and no others.
+    ///
+    /// **Deliberately NOT the pair `register_languages` claims**, and this
+    /// used to be that pair on the reasoning that the two lists were the same.
+    /// They are not the same question. `register_languages` answers "which
+    /// files are org-mode", and an `.org_archive` is org-mode — it should
+    /// highlight and fold like any other. This answers "which files does the
+    /// AGENDA scan", and archiving exists precisely to take an entry out of
+    /// the agenda. Scanning archives puts every task you ever finished back
+    /// into the view you archived it to escape.
+    ///
+    /// Emacs draws the same line: `org-agenda-files` never includes archives,
+    /// and `org-agenda-archives-mode` (`v a`) is an explicit, default-off
+    /// toggle for the times you want them.
     fn extensions() -> Vec<String> {
-        vec!["org".to_string(), "org_archive".to_string()]
+        vec!["org".to_string()]
     }
 
     /// AF.3: `org.agenda-files`, one path per line.

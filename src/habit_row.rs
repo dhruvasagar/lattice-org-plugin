@@ -147,7 +147,7 @@ fn render(days: &[habit_graph::Day], nerd_fonts: bool, suffix: &str) -> Annotati
         let start = text.len() as u32;
         text.push(habit_graph::glyph(day, nerd_fonts));
         let end = text.len() as u32;
-        let element = day.state.element(day.muted).to_string();
+        let element = day.state.theme_slot(day.muted);
         match spans.last_mut() {
             Some(last) if last.2 == element && last.1 == start => last.1 = end,
             _ => spans.push((start, end, element)),
@@ -272,14 +272,23 @@ mod tests {
         }
     }
 
-    /// Every span names an element the mode registers, in the `habit.*`
-    /// namespace the host auto-prefixes with `org.`.
+    /// Every span names an element the mode registers, **namespaced**.
+    ///
+    /// The host prefixes a registration by manifest id and does not prefix a
+    /// lookup, so a span naming the bare `habit.ready` resolves to nothing and
+    /// paints the renderer's default — a monochrome graph, with no error
+    /// anywhere to explain it. This assertion checked the BARE prefix when it
+    /// was first written, which is how that shipped.
     #[test]
     fn spans_name_registered_habit_elements() {
         let l = lines(HABIT);
         let a = annotation_for(&l, 0, today(), &done(), false, false).expect("a graph");
+        assert!(!a.spans.is_empty(), "a graph has runs to check");
         for (_, _, slot) in &a.spans {
-            assert!(slot.starts_with("habit."), "unexpected element name {slot}");
+            assert!(
+                slot.starts_with("org.habit."),
+                "a span must name the namespaced element, got {slot}"
+            );
         }
     }
 

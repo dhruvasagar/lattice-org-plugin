@@ -63,11 +63,16 @@ pub enum DayState {
 }
 
 impl DayState {
-    /// The theme element this day resolves its colour through.
+    /// The theme element this day resolves its colour through, as the plugin
+    /// REGISTERS it.
     ///
-    /// Names are auto-namespaced by the host (`habit.clear` → `org.habit.clear`),
-    /// so `:colorscheme` recolours the graph — the lesson OA.16's hardcoded hex
-    /// left behind.
+    /// The host auto-namespaces a registration by manifest id, so this becomes
+    /// `org.habit.clear` in the registry. Anything that *references* the
+    /// element — a span slot crossing the seam — must therefore name the
+    /// namespaced form: see [`theme_slot`](Self::theme_slot). Registering with
+    /// one spelling and referencing with the other resolves to nothing, and
+    /// the symptom is a graph drawn entirely in the default foreground, which
+    /// is exactly the colour the design says is the whole point.
     pub fn element(self, muted: bool) -> &'static str {
         match (self, muted) {
             (DayState::Clear, false) => "habit.clear",
@@ -79,6 +84,18 @@ impl DayState {
             (DayState::Overdue, false) => "habit.overdue",
             (DayState::Overdue, true) => "habit.overdue.muted",
         }
+    }
+
+    /// The element as a CONSUMER must name it: the registered name with the
+    /// plugin's namespace, which the host adds at registration and does not add
+    /// at lookup.
+    ///
+    /// Derived from [`element`](Self::element) rather than written out again,
+    /// so the two cannot drift — the failure mode is silent (an unresolvable
+    /// slot renders in the default foreground rather than erroring), and it is
+    /// the failure this feature shipped with until it was caught.
+    pub fn theme_slot(self, muted: bool) -> String {
+        format!("org.{}", self.element(muted))
     }
 }
 
@@ -462,6 +479,36 @@ mod tests {
             glyph(&day(true, true), false),
             glyph(&day(true, false), false)
         );
+    }
+
+    /// The registration name and the reference name differ by the namespace the
+    /// host adds at registration and does NOT add at lookup.
+    ///
+    /// Asserted as a relationship rather than as two literals: a span naming
+    /// `habit.ready` while the registry holds `org.habit.ready` resolves to
+    /// nothing and paints the default foreground — a monochrome graph, with no
+    /// error anywhere. That is what shipped before this test existed.
+    #[test]
+    fn the_slot_a_consumer_names_is_the_registered_name_namespaced() {
+        for s in [
+            DayState::Clear,
+            DayState::Ready,
+            DayState::Alert,
+            DayState::Overdue,
+        ] {
+            for muted in [false, true] {
+                assert_eq!(
+                    s.theme_slot(muted),
+                    format!("org.{}", s.element(muted)),
+                    "the two must stay derived from one another"
+                );
+                assert!(
+                    s.theme_slot(muted).starts_with("org.habit."),
+                    "a consumer names the namespaced element: {}",
+                    s.theme_slot(muted)
+                );
+            }
+        }
     }
 
     /// Every state has a distinct element in both variants — a copy-paste slip

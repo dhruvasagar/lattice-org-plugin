@@ -256,6 +256,11 @@ const AGENDA_GOTO: u32 = 78;
 /// OR.11b — the second hop of creating a note from a template: the menu row
 /// dispatches this with the title and the chosen key.
 const ROAM_CREATE_FROM_TEMPLATE: u32 = 80;
+
+/// OR.11b — the THIRD hop, for a template that asks `%^{…}` questions: the
+/// fields menu's fire row, carrying the title, key and minted id ahead of the
+/// answers.
+const ROAM_CAPTURE_FIELDS_SUBMIT: u32 = 82;
 const AGENDA_FILTER_FILE: u32 = 79;
 
 /// OA.25 — `<leader>os` / `<leader>od`, and their submit halves.
@@ -333,6 +338,12 @@ const ORG_TRANSIENT_TODO: &str = "todo";
 /// the node's TITLE beside the discriminator, because the menu is opened FOR a
 /// node and each row has to hand that title on to the create action.
 const ORG_TRANSIENT_ROAM: &str = "roam";
+
+/// OR.11b — the roam FIELDS menu, opened for a node whose template asks
+/// `%^{…}` questions. Distinct from [`ORG_TRANSIENT_ROAM`] because the two
+/// carry different things: the chooser knows a title, the fields menu knows a
+/// title, a chosen key and the id already minted for the note.
+const ORG_TRANSIENT_ROAM_FIELDS: &str = "roam-fields";
 
 /// OA.12 — the agenda dispatcher's discriminator, alongside `todo`. Same
 /// mechanism: one `transient-source::id()` per guest, so org's menus branch on
@@ -2710,6 +2721,12 @@ impl Guest for Component {
             CAPTURE_FIELDS_SUBMIT,
         );
         register_action(
+            "org-roam-capture-fields-submit",
+            "Open the roam note the template menu collected (fired by its own row)",
+            &spec(),
+            ROAM_CAPTURE_FIELDS_SUBMIT,
+        );
+        register_action(
             "org-capture-finalize",
             "File the capture buffer's contents (C-c C-c)",
             &spec(),
@@ -3273,15 +3290,51 @@ thread_local! {
     /// emacs's default is likewise one (`org-capture` in progress refuses a
     /// second). Cleared on finalize and on abort, so an abandoned capture
     /// cannot mis-file the next one.
-    static PENDING_CAPTURE: std::cell::RefCell<Option<PendingCapture>> =
+    static PENDING_CAPTURE: std::cell::RefCell<Option<CaptureDestination>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// OC.7b: what `C-c C-c` needs that the buffer cannot tell it.
+/// OC.7b / OR.11b: what `C-c C-c` needs that the buffer cannot tell it.
+///
+/// **The destination, not the template that produced it.** This held a whole
+/// `capture_templates::Template` until OR.11b, and `capture_finalize` used it
+/// for exactly one call — `capture_effects`, which reads `target` and
+/// `clock_in` and nothing else. Narrowing the state to what the consumer
+/// actually reads is what lets org-capture and org-roam share one buffer
+/// surface: a roam create has no capture template, no key and no `:clock-in`.
+/// What it has is a file to append to, which is precisely a `Target::File`.
+///
+/// The alternative — roam synthesising a `Template` with dead `key`,
+/// `description` and `clock_in` fields to satisfy this — is a struct built to
+/// fit a consumer rather than to describe anything, and it would leave the
+/// shared state coupled to a type roam has no business constructing.
 #[derive(Clone)]
-struct PendingCapture {
-    /// The resolved template — its target file and headline.
-    template: capture_templates::Template,
+struct CaptureDestination {
+    /// Where the finalized text lands: a file to append to, or a file and the
+    /// headline whose subtree it goes after.
+    target: capture_templates::Target,
+    /// OC.11 — org's `:clock-in`. Always false for roam, which has no
+    /// equivalent: a new note is not an entry you are working on.
+    clock_in: bool,
+}
+
+impl CaptureDestination {
+    /// Where an org-capture template files.
+    fn of(template: &capture_templates::Template) -> Self {
+        Self {
+            target: template.target.clone(),
+            clock_in: template.clock_in,
+        }
+    }
+
+    /// Append to one file — roam's whole destination, and the shape of every
+    /// capture target that names no headline.
+    fn appending_to(path: String) -> Self {
+        Self {
+            target: capture_templates::Target::File { file: path },
+            clock_in: false,
+        }
+    }
 }
 
 thread_local! {
@@ -4208,7 +4261,14 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     // OC.7b: the BUFFER, not a one-line prompt. Before this the template was
     // never shown — it was expanded only at submit — so the user typed into an
     // empty minibuffer and found out what the template did afterwards.
-    open_capture_buffer(&template, &[], "")
+    open_capture_buffer(
+        capture_buffer_name(&template.key),
+        CaptureDestination::of(&template),
+        &template.body,
+        &[],
+        "",
+        &capture_origin(),
+    )
 }
 
 /// OC.7b: open the capture BUFFER — the surface emacs has and the prompt was
@@ -4224,31 +4284,35 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// wants org's grammar, motions and folding. Only the finalize/abort pair is
 /// capture-specific, so it rides `org-capture-mode` as a MINOR; putting those
 /// chords on the major would make `C-c C-c` file every org file you touched.
+///
+/// OR.11b widened this from two entry paths to four — org-capture's direct and
+/// fields routes, and org-roam's two peers. It takes a `body` and a `name`
+/// rather than a template because roam has neither a `capture_templates::
+/// Template` nor a key to derive a name from, and because the body it hands
+/// over has already had `${…}` expanded over the node being created.
+///
+/// `annotation` is `%a`'s expansion, passed in rather than read from
+/// [`CAPTURE_ORIGIN`] here. That is not tidiness: the origin is written by
+/// `capture_open` and cleared by `taken_origin`, so reading it here would let
+/// a roam note inherit the `%a` of whatever org-capture ran before it — a link
+/// back to a file the user was not in when they made the note. Roam passes
+/// `""`, which is what `%a` correctly means for a create that has no origin
+/// buffer.
 fn open_capture_buffer(
-    template: &capture_templates::Template,
+    name: String,
+    dest: CaptureDestination,
+    body: &str,
     answers: &[String],
     entered: &str,
+    annotation: &str,
 ) -> Vec<Effect> {
-    let annotation = CAPTURE_ORIGIN
-        .with(|c| c.borrow().clone())
-        .unwrap_or_default();
-    let (text, point) = capture::expand_for_buffer(
-        &template.body,
-        entered,
-        answers,
-        today_epoch_day(),
-        &annotation,
-    );
-    let name = capture_buffer_name(&template.key);
+    let (text, point) =
+        capture::expand_for_buffer(body, entered, answers, today_epoch_day(), annotation);
     // Remembered BEFORE the effect is returned: the action context carries a
     // buffer id and a cursor but no buffer NAME, and a synthetic buffer's
     // `document.path()` is `none`, so `C-c C-c` could not otherwise work out
     // where to file what it is looking at.
-    PENDING_CAPTURE.with(|c| {
-        *c.borrow_mut() = Some(PendingCapture {
-            template: template.clone(),
-        })
-    });
+    PENDING_CAPTURE.with(|c| *c.borrow_mut() = Some(dest));
     vec![Effect::OpenSyntheticBuffer(
         lattice::plugin_host::types::OpenSyntheticBufferPayload {
             name,
@@ -4312,6 +4376,21 @@ fn taken_origin() -> String {
         .unwrap_or_default()
 }
 
+/// The origin without consuming it — what the BUFFER path expands `%a` to.
+///
+/// Peeking rather than taking, unlike [`taken_origin`], because the buffer path
+/// expands `%a` when the buffer OPENS and the capture is not over until
+/// `C-c C-c`: a fields menu that opens the buffer after collecting answers
+/// would otherwise have consumed the origin on the way through, and the same
+/// capture would lose its own `%a`. The origin is overwritten unconditionally
+/// by the next `capture_open`, so nothing leaks forward to a capture that has
+/// one of its own — and org-roam does not read this at all, passing `""`.
+fn capture_origin() -> String {
+    CAPTURE_ORIGIN
+        .with(|c| c.borrow().clone())
+        .unwrap_or_default()
+}
+
 /// OC.5a — turn a template's target into the effect that files the note.
 ///
 /// A `file` target appends. A `file+headline` target reads the file and inserts
@@ -4370,9 +4449,9 @@ fn captured_title(text: &str) -> String {
     clock_title(text.lines().next().unwrap_or_default())
 }
 
-fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<Effect> {
-    let path = template.target.file().to_string();
-    let headline = match &template.target {
+fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
+    let path = dest.target.file().to_string();
+    let headline = match &dest.target {
         capture_templates::Target::File { .. } => None,
         capture_templates::Target::FileHeadline { headline, .. } => Some(headline.clone()),
     };
@@ -4380,7 +4459,7 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
         // Appended at the end, so the entry starts at the file's current line
         // count. Read only when a clock is actually wanted — an ordinary capture
         // must not pay for it.
-        let text = if template.clock_in {
+        let text = if dest.clock_in {
             let at = lattice::plugin_host::host_services::read_file(&path)
                 .map(|s| s.lines().count() as u32)
                 .unwrap_or(0);
@@ -4430,7 +4509,7 @@ fn capture_effects(template: &capture_templates::Template, text: String) -> Vec<
     // The file is already read above for the target search, so the line the
     // entry lands on is known without a second read on either arm.
     let clocked = |text: String, at: u32| {
-        if template.clock_in {
+        if dest.clock_in {
             let title = captured_title(&text);
             clock_captured_entry(text, &path, at, &title)
         } else {
@@ -4508,7 +4587,14 @@ fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
     // buffer rather than a write. The body row it collected seeds the `%?`
     // point and the caret lands after it, so the answer is a draft the user
     // can keep editing rather than the final word.
-    open_capture_buffer(&template, &answers, &entered)
+    open_capture_buffer(
+        capture_buffer_name(&template.key),
+        CaptureDestination::of(&template),
+        &template.body,
+        &answers,
+        &entered,
+        &capture_origin(),
+    )
 }
 
 /// OC.7b — `C-c C-c`: file what the capture buffer holds.
@@ -4538,7 +4624,7 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
             }),
         ];
     }
-    let mut effects = capture_effects(&pending.template, text);
+    let mut effects = capture_effects(&pending, text);
     // AFTER the write, so a failed write leaves the buffer on screen with the
     // text still in it rather than closing over the top of it.
     effects.push(Effect::BufferDelete(true));
@@ -4608,7 +4694,7 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
         Err(effect) => return vec![effect],
     };
     let text = capture::expand(&template.body, &entered, today_epoch_day(), &taken_origin());
-    capture_effects(&template, text)
+    capture_effects(&CaptureDestination::of(&template), text)
 }
 
 /// The second hop of `<leader>or`: file the subtree at the cursor into the
@@ -5426,6 +5512,7 @@ impl GrammarCallbacks for Component {
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
+            ROAM_CAPTURE_FIELDS_SUBMIT => Ok(roam_capture_fields_submit(&ctx)),
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
@@ -6941,42 +7028,77 @@ fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
 /// through the menu rather than stashing it guest-side is what makes two
 /// concurrent creates impossible to confuse — the same reason TR.3a gave a
 /// transient open its own arguments.
-/// OR.11a + OR.11b — write the note the chosen template describes.
+/// The note's FILENAME for one template and node.
 ///
-/// The second hop of `:org-roam-create-node`. Both placeholder syntaxes run,
-/// `${…}` first: `roam_capture::expand_fields` interpolates the node being
-/// made, then `capture::expand_with` interpolates the capture context. That
-/// order is the safe one — a title containing a literal `%U` is inserted as
-/// TEXT rather than being re-read as a placeholder, so user data never becomes
-/// template syntax.
+/// Takes `${…}` and nothing else: `%U` in a FILENAME would put a timestamp with
+/// spaces and brackets into a path, which is a different kind of mistake from
+/// putting one in a note.
+fn roam_note_filename(
+    template: &roam_templates::RoamTemplate,
+    node: &roam_capture::Node<'_>,
+) -> String {
+    match template.file.as_deref() {
+        Some(pattern) => roam_capture::expand_fields(pattern, node),
+        None => {
+            let stamp = roam_file_stamp();
+            if node.slug.is_empty() {
+                format!("{stamp}.org")
+            } else {
+                format!("{stamp}-{}.org", node.slug)
+            }
+        }
+    }
+}
+
+/// The capture buffer a roam note is drafted in.
+///
+/// Namespaced apart from `*org-capture:…*` so a roam template and a capture
+/// template that share a key cannot land in the same buffer — they are two
+/// different drafts filing to two different places, and one buffer holding both
+/// would file whichever was typed last into whichever target was remembered.
+fn roam_capture_buffer_name(key: &str) -> String {
+    if key.is_empty() {
+        "*org-roam-capture*".to_string()
+    } else {
+        format!("*org-roam-capture:{key}*")
+    }
+}
+
+/// OR.11a + OR.11b — open the note the chosen template describes, as a draft.
+///
+/// The second hop of `:org-roam-create-node`, and a THIRD hop when the template
+/// asks questions.
+///
+/// ## The buffer, not a write
+///
+/// This wrote the file directly until OR.11b, which is why `%?`, `%^{…}` and
+/// `%a` all expanded to nothing: each of them needs a surface, and there was
+/// none. It now opens the same capture buffer `<leader>oc` opens — `org-mode`
+/// major, `org-capture-mode` minor, `C-c C-c` to file and `C-c C-k` to throw
+/// away — with the destination remembered rather than a template.
+///
+/// **`C-c C-k` leaves nothing behind, and that falls out rather than being
+/// cleaned up.** The file is written on finalize, so an abort has nothing to
+/// undo — including the minted id, which is simply discarded. That is emacs's
+/// behaviour for an aborted roam capture and the property the direct write
+/// could not have.
+///
+/// ## Both placeholder syntaxes, in one order
+///
+/// `${…}` first — `roam_capture::expand_fields` interpolates the node being
+/// made — then `capture::expand_for_buffer` interpolates the capture context
+/// and reports where `%?` was. That order is the safe one: a title containing a
+/// literal `%U` is inserted as TEXT rather than being re-read as a placeholder,
+/// so user data never becomes template syntax.
 fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
-    let warn = |text: String| {
-        vec![Effect::Echo(EchoPayload {
-            level: EchoLevel::Warn,
-            text,
-        })]
-    };
     let (title, key) = match &ctx.args {
         Args::List(items) => match items.as_slice() {
             [lattice::plugin_host::types::ArgValue::String(t), lattice::plugin_host::types::ArgValue::String(k)] => {
                 (t.trim().to_string(), k.clone())
             }
-            _ => return warn("org-roam: a template needs a title and a key".to_string()),
+            _ => return roam_warn("org-roam: a template needs a title and a key"),
         },
-        _ => return warn("org-roam: a template needs a title and a key".to_string()),
-    };
-    if title.is_empty() {
-        return warn("org-roam: a new note needs a title".to_string());
-    }
-    let Some(dir) = roam_scan::roam_directory() else {
-        return warn("org-roam: set `org.roam-directory` first".to_string());
-    };
-    let set = roam_templates::read();
-    let Some(template) = set.get(&key) else {
-        // The menu built its rows from this same set, so a key that is not in
-        // it means the option changed between the open and the pick. Saying so
-        // beats writing a note from a template the user is no longer looking at.
-        return warn(format!("org-roam: no template `{key}`"));
+        _ => return roam_warn("org-roam: a template needs a title and a key"),
     };
     let id = match host_services::new_uuid() {
         Ok(id) => id,
@@ -6989,43 +7111,141 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
             })];
         }
     };
-    let slug = roam_find::slug(&title);
-    let node = roam_capture::Node {
-        title: &title,
-        slug: &slug,
-        id: &id,
-    };
-    let body = capture::expand_with(
-        &roam_capture::expand_fields(&template.body, &node),
-        "",
-        &[],
-        today_epoch_day(),
-        "",
-    );
-    // The filename takes `${…}` and nothing else: `%U` in a FILENAME would put
-    // a timestamp with spaces and brackets into a path, which is a different
-    // kind of mistake from putting one in a note.
-    let name = match template.file.as_deref() {
-        Some(pattern) => roam_capture::expand_fields(pattern, &node),
-        None => {
-            let stamp = roam_file_stamp();
-            if slug.is_empty() {
-                format!("{stamp}.org")
-            } else {
-                format!("{stamp}-{slug}.org")
-            }
+    // OC.4's order, which is emacs's: questions first, then the buffer. The
+    // fields menu is opened only when there is something to ask — a template
+    // with no `%^{…}` goes straight to the draft, because routing it through a
+    // menu would cost three keystrokes to collect nothing.
+    match roam_draft(&title, &key, &id, &[], "") {
+        Err(effect) => effect,
+        Ok(draft) if draft.asks_questions => {
+            vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    args: Args::List(vec![
+                        lattice::plugin_host::types::ArgValue::String(
+                            ORG_TRANSIENT_ROAM_FIELDS.to_string(),
+                        ),
+                        lattice::plugin_host::types::ArgValue::String(title),
+                        lattice::plugin_host::types::ArgValue::String(key),
+                        lattice::plugin_host::types::ArgValue::String(id),
+                    ]),
+                },
+            )]
         }
+        Ok(draft) => draft.open(),
+    }
+}
+
+/// OR.11b — the fire row of the roam fields menu.
+///
+/// `ctx.args` is `[title, key, id, answer…]`: the row's own three arguments
+/// first, then the menu's `Argument` rows in declaration order (TR.3b). The
+/// LAST answer is the body, exactly as in `capture_fields_submit` — the fields
+/// menu appends a body row after the questions so `%?` is collected the same
+/// way everything else is.
+fn roam_capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
+    let Args::List(values) = &ctx.args else {
+        return roam_warn("org-roam: the template menu collected nothing");
     };
-    // ONE effect and no trailing echo, for `:org-roam-create-node`'s reason:
-    // `WriteToFile` reports a refusal by setting the message, and an `Echo`
-    // after it would overwrite exactly that — so a refused write would look
-    // like a successful one. The new buffer IS the feedback when it works.
-    vec![Effect::WriteToFile(WriteToFilePayload {
-        path: format!("{}/{name}", dir.trim_end_matches('/')),
-        anchor: lattice::plugin_host::types::FileAnchor::End,
-        text: body,
-        cut: None,
-        create_parents: false,
+    let mut collected = values.iter().map(|v| match v {
+        lattice::plugin_host::types::ArgValue::String(s) => s.clone(),
+        lattice::plugin_host::types::ArgValue::Raw(s) => s.clone(),
+        lattice::plugin_host::types::ArgValue::Char(c) => c.to_string(),
+        other => format!("{other:?}"),
+    });
+    let (Some(title), Some(key), Some(id)) = (collected.next(), collected.next(), collected.next())
+    else {
+        return roam_warn("org-roam: the template menu lost the note it was making");
+    };
+    let mut answers: Vec<String> = collected.collect();
+    // The body is the last row. A menu that somehow collected nothing still
+    // opens the draft — losing it would be worse than opening it bare.
+    let entered = answers.pop().unwrap_or_default();
+    match roam_draft(&title, &key, &id, &answers, &entered) {
+        Err(effect) => effect,
+        Ok(draft) => draft.open(),
+    }
+}
+
+/// A roam note resolved far enough to know where it goes and what it says.
+struct RoamDraft {
+    name: String,
+    dest: CaptureDestination,
+    body: String,
+    answers: Vec<String>,
+    entered: String,
+    /// Whether the body still holds `%^{…}` the user has not been asked.
+    asks_questions: bool,
+}
+
+impl RoamDraft {
+    fn open(self) -> Vec<Effect> {
+        open_capture_buffer(
+            self.name,
+            self.dest,
+            &self.body,
+            &self.answers,
+            &self.entered,
+            // No origin: a roam create is fired from the picker or the command
+            // line, not from a buffer you want a link back to. Empty is what
+            // `%a` means when there is nothing to point at — the same answer
+            // capture gives for a capture fired from a pathless buffer.
+            "",
+        )
+    }
+}
+
+/// Resolve a roam note: its directory, template, filename and expanded body.
+///
+/// Shared by both hops so the menu and the submit cannot disagree about any of
+/// them. The template is re-READ here rather than carried, so a `:set` between
+/// the hops takes effect; only the id is pinned by the caller, because only the
+/// id cannot be re-derived from the title.
+fn roam_draft(
+    title: &str,
+    key: &str,
+    id: &str,
+    answers: &[String],
+    entered: &str,
+) -> Result<RoamDraft, Vec<Effect>> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(roam_warn("org-roam: a new note needs a title"));
+    }
+    let Some(dir) = roam_scan::roam_directory() else {
+        return Err(roam_warn("org-roam: set `org.roam-directory` first"));
+    };
+    let set = roam_templates::read();
+    let Some(template) = set.get(key) else {
+        // The menu built its rows from this same set, so a key that is not in
+        // it means the option changed between the open and the pick. Saying so
+        // beats writing a note from a template the user is no longer looking at.
+        return Err(roam_warn(&format!("org-roam: no template `{key}`")));
+    };
+    let slug = roam_find::slug(title);
+    let node = roam_capture::Node {
+        title,
+        slug: &slug,
+        id,
+    };
+    let body = roam_capture::expand_fields(&template.body, &node);
+    let name = roam_note_filename(template, &node);
+    Ok(RoamDraft {
+        asks_questions: answers.is_empty()
+            && entered.is_empty()
+            && !capture_flow::questions(&body).is_empty(),
+        name: roam_capture_buffer_name(key),
+        dest: CaptureDestination::appending_to(format!("{}/{name}", dir.trim_end_matches('/'))),
+        body,
+        answers: answers.to_vec(),
+        entered: entered.to_string(),
+    })
+}
+
+fn roam_warn(text: &str) -> Vec<Effect> {
+    vec![Effect::Echo(EchoPayload {
+        level: EchoLevel::Warn,
+        text: text.to_string(),
     })]
 }
 
@@ -7255,6 +7475,17 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
                     return roam_template_menu(title);
                 }
             }
+            // OR.11b: and the roam FIELDS menu, which needs the id already
+            // minted for this note as well as the title and key — carried
+            // rather than re-minted, so the `${id}` the user sees in the draft
+            // is the one written into the file's `:ID:`.
+            if let [lattice::plugin_host::types::ArgValue::String(kind), lattice::plugin_host::types::ArgValue::String(title), lattice::plugin_host::types::ArgValue::String(key), lattice::plugin_host::types::ArgValue::String(id)] =
+                items.as_slice()
+            {
+                if kind == ORG_TRANSIENT_ROAM_FIELDS {
+                    return roam_fields_menu(title, key, id);
+                }
+            }
         }
 
         // An `err` echoes with the plugin named and the menu does not open —
@@ -7328,17 +7559,90 @@ fn fields_menu(
     set: &capture_templates::ParsedSet,
     key: &str,
 ) -> Result<lattice::plugin_host::types::TransientSpec, String> {
-    use lattice::plugin_host::types::{
-        Args as WitArgs, TransientAction, TransientArgument, TransientGroup, TransientItem,
-        TransientItemKind, TransientSpec,
-    };
+    use lattice::plugin_host::types::Args as WitArgs;
 
     let template = set
         .by_key(key)
         .ok_or_else(|| format!("no capture template keyed `{key}`"))?;
 
+    Ok(fields_menu_spec(
+        format!("Capture: {}", template.description),
+        &template.body,
+        format!("→ {}", template.target.file()),
+        "org-capture-fields-submit",
+        // The template this menu is collecting for. It arrives at the action
+        // ahead of the answers (TR.3b).
+        WitArgs::String(template.key.clone()),
+    ))
+}
+
+/// OR.11b: the same form, for a roam note being created.
+///
+/// **The minted id is carried, not re-minted.** `title` and `key` alone would
+/// be enough to rebuild the template — and the id would differ between the menu
+/// opening and the answers arriving, so the `${id}` the user is about to see in
+/// the buffer would not be the one written into the file's `:ID:`. Carrying it
+/// is the same reasoning that puts the title on the roam template menu's rows
+/// rather than in a guest-side slot (TR.3a): what the second hop needs travels
+/// with the row that fires it.
+///
+/// The roam template is re-READ from the option, like capture's is, so a `:set`
+/// between the two hops takes effect. Only the id is pinned, because only the
+/// id cannot be re-derived.
+fn roam_fields_menu(
+    title: &str,
+    key: &str,
+    id: &str,
+) -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{ArgValue, Args as WitArgs};
+
+    let set = roam_templates::read();
+    let template = set
+        .get(key)
+        .ok_or_else(|| format!("no roam template keyed `{key}`"))?;
+    let slug = roam_find::slug(title);
+    let node = roam_capture::Node {
+        title,
+        slug: &slug,
+        id,
+    };
+    // `${…}` FIRST, so the questions this menu offers are the ones left in the
+    // body after the node has been interpolated — and so a title that contains
+    // a literal `%^{…}` cannot conjure a question out of user data.
+    let body = roam_capture::expand_fields(&template.body, &node);
+    Ok(fields_menu_spec(
+        format!("Roam: {title}"),
+        &body,
+        format!("→ {}", roam_note_filename(template, &node)),
+        "org-roam-capture-fields-submit",
+        WitArgs::List(vec![
+            ArgValue::String(title.to_string()),
+            ArgValue::String(key.to_string()),
+            ArgValue::String(id.to_string()),
+        ]),
+    ))
+}
+
+/// The rows both fields menus are: one per `%^{Question}`, one for the body,
+/// one that fires and one that quits.
+///
+/// `carried` is prepended to the collected answers by the host (TR.3b), so the
+/// submit action reads `[carried…, q0, q1, …, body]`. Capture carries one
+/// string; roam carries three.
+fn fields_menu_spec(
+    title: String,
+    body: &str,
+    fire_description: String,
+    command: &str,
+    carried: lattice::plugin_host::types::Args,
+) -> lattice::plugin_host::types::TransientSpec {
+    use lattice::plugin_host::types::{
+        TransientAction, TransientArgument, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
     let mut items: Vec<TransientItem> = Vec::new();
-    for (i, question) in capture_flow::questions(&template.body).iter().enumerate() {
+    for (i, question) in capture_flow::questions(body).iter().enumerate() {
         items.push(TransientItem {
             // `1`..`9` then letters would run out; the index IS the key for
             // the first nine, which covers every real template.
@@ -7353,7 +7657,7 @@ fn fields_menu(
         });
     }
     // The body last, so `%?` is collected the same way every other field is.
-    // Its answer is the final one `capture-fields-submit` pops off.
+    // Its answer is the final one the submit action pops off.
     items.push(TransientItem {
         key: vec!["b".to_string()],
         label: "body".to_string(),
@@ -7367,12 +7671,10 @@ fn fields_menu(
     items.push(TransientItem {
         key: vec!["c".to_string()],
         label: "capture".to_string(),
-        description: format!("→ {}", template.target.file()),
+        description: fire_description,
         kind: TransientItemKind::Action(TransientAction {
-            command: "org-capture-fields-submit".to_string(),
-            // The template this menu is collecting for. It arrives at the
-            // action ahead of the answers (TR.3b).
-            args: WitArgs::String(template.key.clone()),
+            command: command.to_string(),
+            args: carried,
         }),
     });
     items.push(TransientItem {
@@ -7382,14 +7684,14 @@ fn fields_menu(
         kind: TransientItemKind::Dismiss,
     });
 
-    Ok(TransientSpec {
-        title: format!("Capture: {}", template.description),
+    TransientSpec {
+        title,
         groups: vec![TransientGroup {
             label: "Fields".to_string(),
             items,
         }],
         footer: Some("c to capture, q to abandon".to_string()),
-    })
+    }
 }
 
 #[cfg(test)]

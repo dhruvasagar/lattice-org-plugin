@@ -1097,6 +1097,38 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);
             }
+            // OR.11b: the roam draft. RENDERER-applied, like `OpenTransient`
+            // below — so dropping it here would make a working capture buffer
+            // look like a create that did nothing, which is the failure mode
+            // this helper exists to prevent.
+            lattice_grammar::Effect::OpenSyntheticBuffer {
+                name,
+                mode_id,
+                content,
+                cursor,
+                activate_minor,
+            } => {
+                editor.open_synthetic_buffer_seeded(
+                    &name,
+                    &mode_id,
+                    content.as_deref(),
+                    cursor,
+                    activate_minor.as_deref(),
+                );
+            }
+            // Closing the draft is part of both `C-c C-c` and `C-c C-k`.
+            // Applied rather than ignored so "the draft is gone afterwards" is
+            // a thing these tests can assert.
+            lattice_grammar::Effect::BufferDelete { force } => {
+                let _ = editor.do_buffer_delete(force);
+            }
+            // OR.11b: the roam FIELDS menu. Reached as a direct effect of the
+            // chooser's row rather than through `next_actions`, so it needs its
+            // own arm — the caller polls `run_tick_pending` afterwards, which
+            // is what seats a plugin menu's off-thread `build`.
+            lattice_grammar::Effect::OpenTransient { source, args } => {
+                editor.open_named_transient(source, args);
+            }
             other => {
                 eprintln!("unapplied accept effect: {other:?}");
             }
@@ -2088,30 +2120,13 @@ async fn a_templated_note_expands_its_fields() {
     editor.do_transient_trigger("d".to_string(), &mut out);
     apply_accept_effects(&mut editor, out);
 
-    let draft_text = |editor: &Editor| -> Option<String> {
-        let mut ids = Vec::new();
-        editor.buffers.for_each(|entry| ids.push(entry.id));
-        ids.into_iter().find_map(|id| {
-            let handle = editor.buffers.document_handle(id)?;
-            let path = handle.snapshot().path.clone()?;
-            if !path.to_string_lossy().contains("zettelkasten") {
-                return None;
-            }
-            Some(lattice_runtime::Document::text(handle.as_ref()))
-        })
-    };
-    let mut text = None;
-    for _ in 0..240 {
-        editor.run_tick_pending();
-        text = draft_text(&editor);
-        if text.is_some() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let text = text.unwrap_or_else(|| {
+    // OR.11b: the draft is now the CAPTURE BUFFER, not a file. Asserting on
+    // the synthetic buffer rather than on a path is the flow change — before
+    // it, picking a template wrote the note straight to disk and there was
+    // nothing to edit and nothing to abort.
+    let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
         panic!(
-            "the template wrote a draft (last message: {:?})",
+            "the template opened a draft (last message: {:?})",
             editor.last_message.as_ref().map(|m| &m.text)
         )
     });
@@ -2134,6 +2149,359 @@ async fn a_templated_note_expands_its_fields() {
         .expect("`${id}` became an :ID: line");
     let id = id_line.split_whitespace().nth(1).unwrap_or_default();
     assert_eq!(id.split('-').count(), 5, "a real v4 id: {id:?}");
+
+    // …and the note does not exist yet. The draft is a draft: `capture_effects`
+    // does not run until `C-c C-c`, so there is no buffer at the note's path
+    // and nothing on disk either.
+    assert!(
+        note_buffer(&editor, &corpus).is_none(),
+        "an unfiled draft has produced no note"
+    );
+
+    finalize_roam_capture(&mut editor).await;
+    let (path, filed) = note_buffer(&editor, &corpus).unwrap_or_else(|| {
+        panic!(
+            "`C-c C-c` filed the note (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+    assert!(
+        path.to_string_lossy().ends_with("-zettelkasten.org"),
+        "…into the timestamped, slug-named file: {}",
+        path.display()
+    );
+    assert!(
+        filed.contains("#+title: Zettelkasten") && filed.contains(id),
+        "…and it is the draft that was on screen, id and all: {filed:?}"
+    );
+}
+
+/// The buffer a roam create filed into, if there is one.
+///
+/// A note is filed through `Effect::WriteToFile`, which resolves the path to a
+/// BUFFER rather than writing bytes — the note is unsaved until `:w`, which is
+/// org-roam-capture's own model. So this looks for the buffer, not the file;
+/// asserting on the filesystem here would fail on a working capture.
+fn note_buffer(editor: &Editor, corpus: &Path) -> Option<(std::path::PathBuf, String)> {
+    let mut ids = Vec::new();
+    editor.buffers.for_each(|entry| ids.push(entry.id));
+    ids.into_iter().find_map(|id| {
+        let handle = editor.buffers.document_handle(id)?;
+        let path = handle.snapshot().path.clone()?;
+        if path.parent() != Some(corpus) {
+            return None;
+        }
+        // The fixture's own files are written by `write_corpus`; only a created
+        // note carries this slug.
+        if !path.to_string_lossy().contains("zettelkasten") {
+            return None;
+        }
+        Some((
+            path.as_ref().clone(),
+            lattice_runtime::Document::text(handle.as_ref()),
+        ))
+    })
+}
+
+/// Drain until the roam capture buffer exists, and return its text.
+///
+/// Found by NAME rather than by path: a capture buffer is synthetic, so
+/// `document.path()` is `none` — which is the whole reason the destination is
+/// remembered guest-side rather than recovered from the buffer.
+async fn settle_roam_draft(editor: &mut Editor) -> Option<String> {
+    for _ in 0..240 {
+        editor.run_tick_pending();
+        let mut found = None;
+        let mut ids = Vec::new();
+        editor
+            .buffers
+            .for_each(|entry| ids.push((entry.id, entry.name.clone())));
+        for (id, name) in ids {
+            if !name.unwrap_or_default().starts_with("*org-roam-capture") {
+                continue;
+            }
+            if let Some(handle) = editor.buffers.document_handle(id) {
+                found = Some(lattice_runtime::Document::text(handle.as_ref()));
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// `C-c C-c` in the roam draft: file it.
+async fn finalize_roam_capture(editor: &mut Editor) {
+    dispatch_capture_action(editor, "org-capture-finalize").await;
+}
+
+/// `C-c C-k` in the roam draft: throw it away.
+async fn abort_roam_capture(editor: &mut Editor) {
+    dispatch_capture_action(editor, "org-capture-abort").await;
+}
+
+/// The shared minor's chords are ONE pair for both capture and roam — which is
+/// why these dispatch `org-capture-*` on a roam draft rather than a roam-
+/// specific peer. A second pair would be the duplication the minor exists to
+/// prevent.
+async fn dispatch_capture_action(editor: &mut Editor, name: &str) {
+    let id = editor
+        .registry
+        .load()
+        .id_by_name(name)
+        .unwrap_or_else(|| panic!("`{name}` is registered"));
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
+    apply_accept_effects(editor, out);
+    for _ in 0..40 {
+        editor.run_tick_pending();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Configure `templates`, then drive the create flow for `title` as far as the
+/// template chooser, and pick `key`.
+///
+/// The shared prefix of every OR.11b test below. What each of them asserts is
+/// what happens AFTER the pick, which is the whole of what OR.11b changed.
+async fn pick_roam_template(
+    editor: &mut Editor,
+    index: &Index,
+    templates: &str,
+    title: &str,
+    key: &str,
+) {
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!("org.roam-capture-templates={templates}"),
+    });
+    let _ = open_find_node(editor).await;
+    let rows = query_picker(editor, title);
+    assert_eq!(rows, vec![format!("Create note: {title}")], "{rows:?}");
+
+    let out = editor.do_picker_accept();
+    apply_accept_effects(editor, out);
+    for _ in 0..80 {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger(key.to_string(), &mut out);
+    apply_accept_effects(editor, out);
+    for _ in 0..40 {
+        editor.run_tick_pending();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Press a field row's key and answer the prompt it parks for.
+async fn answer_roam_field(editor: &mut Editor, key: &str, value: &str) {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger(key.to_string(), &mut out);
+    apply_accept_effects(editor, out);
+    // The prompt a field opens registers no submit action: the host routes a
+    // parked transient itself (`do_prompt_line_submit` checks for one first).
+    editor.open_prompt_line(
+        String::new(),
+        value.to_string(),
+        String::new(),
+        editor.pending_prompt_buffer_name.clone(),
+    );
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_prompt_line_submit(&mut out);
+    apply_accept_effects(editor, out);
+    editor.run_tick_pending();
+}
+
+/// OR.11b — `C-c C-k` on a roam draft leaves NOTHING: no note, no buffer, and
+/// no `:ID:` minted into anything.
+///
+/// This is the property the direct write could not have and the reason the
+/// buffer surface is worth its wiring. Before OR.11b, choosing a template WAS
+/// the write — there was no draft to abandon, so "I picked the wrong template"
+/// cost you a file with a real id in it that the indexer would then pick up.
+///
+/// Asserted three ways because they fail independently: the note buffer must
+/// not exist, the DRAFT buffer must be gone, and the corpus directory must hold
+/// no new file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_roam_capture_leaves_nothing_behind() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    let before: Vec<_> = std::fs::read_dir(&corpus)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+
+    pick_roam_template(
+        &mut editor,
+        &index,
+        concat!(
+            "[[template]]\n",
+            "key = \"d\"\n",
+            "description = \"Default note\"\n",
+            "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n#+title: ${title}\\n\"\n",
+        ),
+        "Zettelkasten",
+        "d",
+    )
+    .await;
+    assert!(
+        settle_roam_draft(&mut editor).await.is_some(),
+        "the draft opened, so there is something to abort"
+    );
+
+    abort_roam_capture(&mut editor).await;
+
+    assert!(
+        note_buffer(&editor, &corpus).is_none(),
+        "an aborted capture files no note"
+    );
+    assert!(
+        editor.buffers.by_name("*org-roam-capture:d*").is_none(),
+        "…and the draft buffer is gone with it"
+    );
+    let after: Vec<_> = std::fs::read_dir(&corpus)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "…and nothing new is on disk: {after:?}"
+    );
+}
+
+/// OR.11b — a roam template's `%^{Question}` is ASKED, and `%?` places the
+/// caret.
+///
+/// Both were silently dropped before this slice: the roam path called
+/// `capture::expand_with` with no answers and no typed text, so each expanded
+/// to the empty string and vanished from the note. A template written around
+/// `%^{Category}` produced a note with the field simply missing — a failure
+/// with no error and no trace.
+///
+/// The minted id is asserted to SURVIVE the menu hop. That is the one thing the
+/// fields flow can get wrong in a way nothing else would notice: the template
+/// is deliberately re-read from the option between hops (so a `:set` takes
+/// effect), and re-deriving the id the same way would mean the `${id}` in the
+/// draft is not the `:ID:` the note is filed with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_roam_template_asks_its_questions() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    pick_roam_template(
+        &mut editor,
+        &index,
+        concat!(
+            "[[template]]\n",
+            "key = \"c\"\n",
+            "description = \"Concept\"\n",
+            "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n",
+            "#+title: ${title}\\n#+category: %^{Category}\\n\\n* Summary\\n%?\\n\"\n",
+        ),
+        "Zettelkasten",
+        "c",
+    )
+    .await;
+
+    // Choosing the template opens the FIELDS menu, not the draft — emacs's
+    // order, and capture's: questions first, then the buffer.
+    let spec = editor
+        .picker
+        .as_ref()
+        .and_then(|p| p.transient.as_ref())
+        .expect("the roam fields menu opened")
+        .clone();
+    assert!(
+        spec.title.contains("Zettelkasten"),
+        "the menu names the note it is making: {:?}",
+        spec.title
+    );
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["Category", "body", "capture", "quit"],
+        "a row per question, then the body, then the fire row"
+    );
+
+    // The id the menu is carrying, so the draft can be checked against it.
+    let carried = spec.groups[0]
+        .items
+        .iter()
+        .find_map(|i| match &i.kind {
+            lattice_picker::TransientItemKind::Action { args, .. } => Some(args.clone()),
+            _ => None,
+        })
+        .expect("the fire row carries the note's identity");
+    let lattice_grammar::Args::List(carried) = carried else {
+        panic!("the fire row carries [title, key, id]: {carried:?}");
+    };
+    let menu_id = match carried.get(2) {
+        Some(lattice_grammar::ArgValue::String(s)) => s.clone(),
+        other => panic!("the third carried argument is the minted id: {other:?}"),
+    };
+    assert_eq!(menu_id.split('-').count(), 5, "a real v4 id: {menu_id:?}");
+
+    answer_roam_field(&mut editor, "1", "concept").await;
+    answer_roam_field(&mut editor, "b", "the linking method").await;
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("c".to_string(), &mut out);
+    apply_accept_effects(&mut editor, out);
+
+    let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
+        panic!(
+            "the answers opened a draft (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+    assert!(
+        text.contains("#+category: concept"),
+        "`%^{{Category}}` became the answer rather than vanishing: {text:?}"
+    );
+    assert!(
+        text.contains("the linking method"),
+        "`%?` became the body row's answer: {text:?}"
+    );
+    assert!(
+        text.contains(&menu_id),
+        "the id the menu carried is the one in the draft, not a re-minted one: \
+         {menu_id:?} not in {text:?}"
+    );
+
+    finalize_roam_capture(&mut editor).await;
+    let (_, filed) = note_buffer(&editor, &corpus).expect("`C-c C-c` filed the note");
+    assert!(
+        filed.contains("#+category: concept") && filed.contains(&menu_id),
+        "…and what was filed is what was on screen: {filed:?}"
+    );
 }
 
 /// With NO templates configured, creating a note still writes the built-in

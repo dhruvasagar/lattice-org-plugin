@@ -137,6 +137,10 @@ and transliterating is a guess.
 model, where a new note is a draft you finalize. The watcher indexes it when it
 lands on disk, so a draft you abandon never enters the index.
 
+That is the zero-configuration path. With `org.roam-capture-templates` set you
+get a template menu and then an editable draft instead — see
+[Templates](#templates).
+
 ## Linking
 
 ### Inserting a link
@@ -275,9 +279,11 @@ body = """
 :ID:       ${id}
 :END:
 #+Title: ${title}
+#+category: %^{Category}
 #+date: %U
 
 * Summary
+%?
 """
 '''
 ```
@@ -302,27 +308,52 @@ The two syntaxes answer different questions — `%` interpolates the *capture
 context*, `${}` interpolates the *node* — which is why they coexist rather than
 compete.
 
-**Not every `%` placeholder works here yet.** A roam note is written straight
-out; it does not open the capture buffer `<leader>oc` opens, and the three
-placeholders that need one are **silently dropped**:
+Every `%` placeholder capture defines works here too:
 
 | | |
 |---|---|
-| `%U` `%T` `%t` | ✅ dates, exactly as in a capture template |
-| `%%` | ✅ a literal `%` |
-| `%^{Question}` | ⚠️ never asked — expands to nothing |
-| `%?` | ⚠️ nothing to place a cursor for — expands to nothing |
-| `%a` | ⚠️ no capture origin to link back to — expands to nothing |
-
-That is a gap rather than a design, and it is the half of this feature still
-being built: roam should get the same editable buffer capture has, with
-`C-c C-c` to file it and `C-c C-k` to throw it away. Until it does, keep roam
-templates to text, `${…}` and the date placeholders — a template written
-around `%^{…}` will quietly produce a note with the field missing.
+| `%?` | where the cursor lands in the draft |
+| `%^{Question}` | asked before the draft opens. Several become a fields menu |
+| `%U` `%T` `%t` | dates, exactly as in a capture template |
+| `%%` | a literal `%` |
+| `%a` | empty — a new note has no buffer you fired it from to link back to |
 
 An unknown `${x}` is left alone, for the same reason an unknown `%x` is: a
 template is your text, and a placeholder that vanished cannot be found and
 fixed.
+
+### The draft
+
+Choosing a template does not write the note. It opens a **draft** — a real org
+buffer holding the template expanded, with the cursor where `%?` was:
+
+| | |
+|---|---|
+| `C-c C-c` | file it — the note is created and opened |
+| `C-c C-k` | throw it away — **nothing is created, not even the id** |
+
+The same two chords capture uses, because it is the same buffer and the same
+minor mode. Edit it freely first: what gets filed is what is on screen when you
+press `C-c C-c`, not the template you started from.
+
+A template that asks `%^{…}` questions collects those first — emacs's order,
+and capture's — and the draft opens with the answers already in it.
+
+**An abandoned draft leaves nothing behind**, which is the reason this is a
+buffer rather than a write. The file is created on `C-c C-c`, so `C-c C-k` has
+nothing to undo, and the id minted for the note is simply discarded. Before
+this, picking the wrong template cost you a file with a real `:ID:` in it that
+the indexer would then pick up.
+
+A filed note is an **unsaved buffer** until you `:w` it — org-roam-capture's
+own model, where a new note is a draft you finalize. The watcher indexes it when
+it lands on disk.
+
+**The zero-template path stays one step.** With `org.roam-capture-templates`
+unset there is no menu and no draft: creating a note opens the built-in stub
+directly, at its real path, with the cursor at the end. A stub has no `%?` and
+no questions, so a draft surface would add a `C-c C-c` to the one flow that
+should cost nothing.
 
 A template missing a `key`, or reusing one another template took, is skipped
 and the menu names it in the footer. TOML that does not parse at all refuses

@@ -150,6 +150,7 @@ mod org_date;
 // without destroying the others.
 mod planning;
 mod refile;
+mod repeat;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
 mod roam;
 // OR.4: the thin tree half — where the headlines and drawers are.

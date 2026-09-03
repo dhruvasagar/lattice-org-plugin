@@ -524,6 +524,35 @@ row rewrites the source, not the row.
 A repeating task carrying `:STYLE: habit` gets a bar under its agenda row: one
 cell per day, three weeks back and one forward.
 
+**The repeater has to be on `SCHEDULED:`.** A habit whose repeater is on
+`DEADLINE:` gets no graph — and that is org's rule, not a gap here: org checks
+`:STYLE:` only in `org-agenda-get-scheduled`, `org-agenda-get-deadlines` has no
+habit path at all, and `org-habit-parse-todo` errors outright on a habit with no
+scheduled date. Emacs draws nothing for those either; they render as ordinary
+deadline rows.
+
+This is the single most likely reason a habit of yours shows no graph, so it is
+worth checking first:
+
+```org
+* NEXT Pay the bill
+DEADLINE: <2025-06-27 Fri +1m>     ← no graph, in lattice or in emacs
+:PROPERTIES:
+:STYLE:    habit
+:END:
+
+* NEXT Pay the bill
+SCHEDULED: <2025-06-27 Fri +1m>    ← graph
+:PROPERTIES:
+:STYLE:    habit
+:END:
+```
+
+The other thing to check is the property drawer's **position**. It must follow
+the headline and its planning line immediately; a second `:PROPERTIES:` drawer
+further down the entry is body text as far as org is concerned, so a `:STYLE:`
+inside it is not read — by org or by lattice.
+
 ```
   ···○○!●●✓··○!●✓··○!✓··○✓··○  5× · 80% · Mon↓
 ```

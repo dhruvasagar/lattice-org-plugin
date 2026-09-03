@@ -3633,12 +3633,18 @@ async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
 
 // ── OT.7: a table is a node, and one drawn in a block is not ──────────
 
-/// `<leader>o|` on a table written inside `#+BEGIN_SRC` must not realign it.
+/// Aligning a table written inside `#+BEGIN_SRC` must not realign it.
 ///
 /// `is_table_line` is `trim_start().starts_with('|')`, which is true of example
 /// content in a code block, so the line test finds a table there and aligns
-/// someone's sample. The grammar parses the block as `block contents:` with no
-/// `table` node in it at all.
+/// someone's sample. OT.7 answered that with the org grammar — the block parses
+/// as `block contents:` with no `table` node in it.
+///
+/// TB.2 moved the whole surface to the host's `table-mode`, which has no tree
+/// to ask, so it counts `#+BEGIN_`/`#+END_` and fence delimiters from the top
+/// of the file instead. This test is what says the ANSWER survived the move,
+/// whatever now computes it — which is why it stays here rather than being
+/// left to the host's own suite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_table_inside_a_block_is_not_aligned() {
     if org_plugin_wasm().is_none() {
@@ -3651,7 +3657,11 @@ async fn a_table_inside_a_block_is_not_aligned() {
     let mut editor = org_editor(base.path(), original).await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<leader>o|");
+    // TB.2: align is `<leader>t|` now, not `<leader>o|`. The chord joined the
+    // rest of the table family under `<leader>t` when the surface left org —
+    // `<leader>o…` is org's namespace, and a generic table mode has no
+    // business squatting in it.
+    press(&mut editor, "<leader>t|");
     assert_eq!(
         text(&editor),
         original,
@@ -3661,10 +3671,10 @@ async fn a_table_inside_a_block_is_not_aligned() {
 
 /// The ordinary table still aligns, and the bounds still stop at a blank line.
 ///
-/// The bounds come from the `table` node's extent now rather than from walking
-/// outward while lines start with `|`. Two tables separated by a blank line are
-/// two `table` nodes, which is the same answer the walk gave — asserted so the
-/// switch is known not to have merged them.
+/// The bounds came from the `table` node's extent under OT.7; under TB.2 they
+/// come from the host walking outward while lines start with `|`. Two tables
+/// separated by a blank line must still be two tables either way — this is the
+/// assertion that says the move did not merge them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alignment_stops_at_the_table_the_caret_is_in() {
     if org_plugin_wasm().is_none() {
@@ -3675,7 +3685,7 @@ async fn alignment_stops_at_the_table_the_caret_is_in() {
     let mut editor = org_editor(base.path(), "* T\n|a|bb|\n|ccc|d|\n\n|x|y|\n").await;
 
     goto_line(&mut editor, 1);
-    press(&mut editor, "<leader>o|");
+    press(&mut editor, "<leader>t|");
     assert_eq!(
         text(&editor),
         "* T\n| a   | bb |\n| ccc | d  |\n\n|x|y|\n",

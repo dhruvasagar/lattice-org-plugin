@@ -483,6 +483,107 @@ are both registered once, when the plugin loads. Emacs works the same way —
 `org.highest-priority` is the last priority letter, default `C` (so A, B, C),
 and is read on each keypress.
 
+## Repeating tasks and habits
+
+A task with a **repeater** on its `SCHEDULED:` stamp does not stay done. Mark it
+done and the stamp moves forward, the keyword goes back to a live state, and the
+completion is written into the log:
+
+```org
+* NEXT Water the plants
+  SCHEDULED: <2026-09-05 Sat .+2d/4d>
+  :PROPERTIES:
+  :STYLE: habit
+  :END:
+  :LOGBOOK:
+  - State "DONE" from "NEXT" [2026-09-03 Thu 09:14]
+  :END:
+```
+
+That the headline never stays `DONE` reads as a bug until you know it. **The
+log line is the only record that the thing was done**, which is why marking one
+done writes both halves as a single edit — `u` takes the whole completion back
+in one step, and neither half can land without the other.
+
+| repeater | means | counts from |
+|---|---|---|
+| `+1d` | every day | the old timestamp — may land in the past |
+| `++1d` | every day, catching up to the future | the old timestamp |
+| `.+1d` | a day after you *did* it | today |
+| `.+1d/3d` | ready after a day, overdue after three | today |
+
+Only `.+` counts from when you did it. That distinction is the difference
+between "water the plants every 3 days" and "water them on the 1st, 4th and 7th
+regardless", and it is why both spellings exist.
+
+It works from the agenda as well as from the file — `<leader>ot` on an agenda
+row rewrites the source, not the row.
+
+### The consistency graph
+
+A repeating task carrying `:STYLE: habit` gets a bar under its agenda row: one
+cell per day, three weeks back and one forward.
+
+```
+  ···○○!●●✓··○!●✓··○!✓··○✓··○  5× · 80% · Mon↓
+```
+
+| colour | when |
+|---|---|
+| blue | before it is due again |
+| green | due, and not yet late |
+| yellow | **the deadline day itself** |
+| red | past the deadline day |
+
+Yellow is a single day, not a mood and not a band — it is the day `MAX` falls
+on, in every column of the window. Red only ever comes after it, and completing
+*on* the deadline day is completing in time, so that cell is green.
+
+Two things that look like bugs and are not. **The last few columns of even a
+perfectly kept habit run green → yellow → red**: a future day assumes you have
+not done it yet, so that run is the graph prompting you rather than a record of
+failure. And **past days you simply kept are drawn pale**, while days you missed
+and days you completed are solid — otherwise three weeks of ordinary days shout
+as loudly as a miss.
+
+A repeater with no `/MAX` never shows green: `MAX` defaults to `MIN`, so the
+habit goes blue → yellow → red.
+
+### The numbers beside it
+
+| | |
+|---|---|
+| `5×` | five kept repetitions in a row — **not** five days |
+| `80%` | completions over the repetitions the window had room for |
+| `Mon↓` | the weekday you complete on least often |
+
+The streak counts repetitions because "five days" is only true for a daily
+habit; five in a row on a `.+3d` habit is fifteen days. A repetition counts as
+kept if the next one lands within `MAX`. **A habit you are currently overdue on
+shows `0×`** — a streak you have already broken is not a streak.
+
+The weekday only appears for daily habits with at least three completions on
+every weekday. A habit on any other cadence lands on a rotating subset of
+weekdays however well you keep it, so naming one would be a confident wrong
+answer.
+
+### Options
+
+| | |
+|---|---|
+| `org.log-into-drawer` | write log lines into `:LOGBOOK:` rather than loose under the headline. Default **on** |
+| `org.habit-stats` | show `5× · 80% · Mon↓` beside the graph. Default **on** |
+
+`org.log-into-drawer` defaults on where emacs' `org-log-into-drawer` defaults
+off, because essentially every real org configuration turns it on — loose log
+lines are what people migrate away from once a file has a few months of history.
+Org reads both, so the cost is placement, not compatibility.
+
+Everything here is byte-compatible with `org-habit`: the same repeaters, the
+same `:LOGBOOK:` entries, the same `:LAST_REPEAT:`. Nothing new is written to
+your files, which is also why the graph shows real history the first time you
+open it — emacs has been writing those log lines for years.
+
 ## Checkboxes
 
 | | |

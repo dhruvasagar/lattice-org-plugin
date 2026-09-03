@@ -802,6 +802,13 @@ network traffic you did not ask for.
 
 ## Agenda
 
+Archives are **not** scanned. `.org_archive` files highlight and fold like any
+other org file, but the agenda skips them — archiving an entry is how you take
+it out of the agenda, so scanning archives would put everything you ever
+finished back into the view you archived it to escape. Emacs behaves the same
+way; its `org-agenda-archives-mode` (`v a`) toggle for temporarily including
+them is not implemented here yet.
+
 `:org-agenda` collects your headlines across every org file into one view,
 grouped into **sections**.
 

@@ -40,6 +40,16 @@ pub struct Stamp {
     pub day: u32,
     /// `None` for a date-only stamp.
     pub time: Option<(u32, u32)>,
+    /// The repeater / warning cookies trailing the time, in the order they
+    /// were written — `+3m`, `++3m`, `.+1d/3d`, `-2d`.
+    ///
+    /// Carried VERBATIM rather than parsed. `repeat.rs` is what understands
+    /// what a repeater means, and it reads the line itself; the only thing
+    /// this module needs is to not destroy one while renumbering a date.
+    /// Re-deriving them here would be a second implementation of `repeat.rs`
+    /// that could disagree with it, and an unrecognised-but-valid cookie
+    /// would round-trip to nothing — which is the bug this field fixes.
+    pub cookies: Vec<String>,
 }
 
 pub fn is_leap(year: i32) -> bool {
@@ -163,8 +173,10 @@ fn parse_inner(inner: &str) -> Option<Stamp> {
     if d.next().is_some() || !(1..=12).contains(&month) || day == 0 || day > 31 {
         return None;
     }
-    // Anything after the date is an optional day name then an optional time.
+    // Anything after the date is an optional day name, an optional time, and
+    // any number of repeater / warning cookies.
     let mut time = None;
+    let mut cookies = Vec::new();
     for p in parts {
         if let Some((h, m)) = p.split_once(':') {
             let h: u32 = h.parse().ok()?;
@@ -173,6 +185,12 @@ fn parse_inner(inner: &str) -> Option<Stamp> {
                 return None;
             }
             time = Some((h, m));
+        } else if p.starts_with(['+', '-', '.']) {
+            // A cookie, by its first character — `+1w`, `++3m`, `.+1d/3d`,
+            // `-2d`. The day name is alphabetic and falls through here, which
+            // is right: `render` recomputes it from the date rather than
+            // trusting a name that a date step just invalidated.
+            cookies.push(p.to_string());
         }
     }
     Some(Stamp {
@@ -183,6 +201,7 @@ fn parse_inner(inner: &str) -> Option<Stamp> {
         month,
         day,
         time,
+        cookies,
     })
 }
 
@@ -307,16 +326,23 @@ pub fn step(line: &str, stamp: &Stamp, part: Part, delta: i64) -> String {
 pub fn render(s: &Stamp) -> String {
     let (open, close) = if s.active { ('<', '>') } else { ('[', ']') };
     let dow = DAY_NAMES[weekday(s.year, s.month, s.day)];
-    match s.time {
+    // Cookies ride after the time, space-separated, in input order. Written
+    // back verbatim: dropping them turned `<C-a>` on a repeating deadline
+    // into "move the date and stop repeating", which the line does not look
+    // wrong after.
+    let mut out = match s.time {
         Some((h, m)) => format!(
-            "{open}{:04}-{:02}-{:02} {dow} {:02}:{:02}{close}",
+            "{open}{:04}-{:02}-{:02} {dow} {:02}:{:02}",
             s.year, s.month, s.day, h, m
         ),
-        None => format!(
-            "{open}{:04}-{:02}-{:02} {dow}{close}",
-            s.year, s.month, s.day
-        ),
+        None => format!("{open}{:04}-{:02}-{:02} {dow}", s.year, s.month, s.day),
+    };
+    for cookie in &s.cookies {
+        out.push(' ');
+        out.push_str(cookie);
     }
+    out.push(close);
+    out
 }
 
 #[cfg(test)]
@@ -443,5 +469,76 @@ mod tests {
         assert_eq!(DAY_NAMES[weekday(2026, 8, 25)], "Tue");
         assert_eq!(DAY_NAMES[weekday(1970, 1, 1)], "Thu");
         assert_eq!(DAY_NAMES[weekday(2024, 2, 29)], "Thu");
+    }
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    /// The reported bug: `<C-a>` / `<C-x>` on a repeating timestamp dropped
+    /// the repeater.
+    ///
+    /// `render` wrote `<DATE Dow[ TIME]>` and `step` replaced the WHOLE stamp
+    /// span with it, so every token org allows after the time — the repeater
+    /// and the warning period — was silently deleted by a keypress whose job
+    /// was to move the date by one. Losing `+3m` off a rent reminder does not
+    /// look like a bug afterwards: the line is still a valid timestamp, it
+    /// has just stopped repeating.
+    #[test]
+    fn stepping_a_repeating_stamp_keeps_its_repeater() {
+        let line = "SCHEDULED: <2026-09-30 Wed +3m>";
+        let s = stamp_at(line, 20).expect("a stamp");
+        let out = step(line, &s, Part::Day, 1);
+        assert!(
+            out.contains("+3m"),
+            "the repeater must survive a step, got {out}"
+        );
+        assert_eq!(out, "SCHEDULED: <2026-10-01 Thu +3m>");
+    }
+
+    /// All three repeater forms, because they are different tasks and
+    /// `repeat.rs` already distinguishes them: `+` is a fixed schedule, `++`
+    /// catches up, `.+` counts from when you did it.
+    #[test]
+    fn every_repeater_form_survives() {
+        for cookie in ["+3m", "++3m", ".+1d", ".+1d/3d", "+1w"] {
+            let line = format!("SCHEDULED: <2026-09-30 Wed {cookie}>");
+            let s = stamp_at(&line, 20).expect("a stamp");
+            let out = step(&line, &s, Part::Day, 1);
+            assert!(
+                out.contains(cookie),
+                "{cookie} must survive a step, got {out}"
+            );
+        }
+    }
+
+    /// A warning period rides in the same slot and was lost the same way.
+    /// Org writes the repeater first, then the warning; the order is
+    /// preserved verbatim rather than re-derived.
+    #[test]
+    fn a_warning_period_survives_beside_a_repeater() {
+        let line = "DEADLINE: <2026-09-30 Wed +3m -2d>";
+        let s = stamp_at(line, 19).expect("a stamp");
+        let out = step(line, &s, Part::Day, 1);
+        assert_eq!(out, "DEADLINE: <2026-10-01 Thu +3m -2d>");
+    }
+
+    /// A timed stamp keeps its cookies after the time, not before it.
+    #[test]
+    fn cookies_follow_the_time() {
+        let line = "<2026-09-30 Wed 10:30 +1d>";
+        let s = stamp_at(line, 2).expect("a stamp");
+        let out = step(line, &s, Part::Hour, 1);
+        assert_eq!(out, "<2026-09-30 Wed 11:30 +1d>");
+    }
+
+    /// The plain case keeps working — no trailing space when there is
+    /// nothing to append.
+    #[test]
+    fn a_plain_stamp_gains_nothing() {
+        let line = "<2026-09-30 Wed>";
+        let s = stamp_at(line, 2).expect("a stamp");
+        assert_eq!(step(line, &s, Part::Day, 1), "<2026-10-01 Thu>");
     }
 }

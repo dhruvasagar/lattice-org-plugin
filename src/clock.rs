@@ -107,6 +107,9 @@ impl Now {
             month: self.month,
             day: self.day,
             time: Some((self.hour, self.minute)),
+            // A clock stamp never repeats: it records when something
+            // happened, and an instant does not recur.
+            cookies: Vec::new(),
         })
     }
 

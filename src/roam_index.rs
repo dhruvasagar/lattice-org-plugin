@@ -290,24 +290,6 @@ pub fn forget_file(path: &str) -> bool {
     true
 }
 
-/// OE.0 — the line an entry's `:PROPERTIES:` drawer starts on, whether or not
-/// one is there yet.
-///
-/// One past the headline, unless that line is the entry's planning line, in
-/// which case one past THAT. See [`id_drawer_insert`] for why the order is
-/// load-bearing rather than cosmetic.
-///
-/// Public because the property writer OE.1 adds needs the same answer, and two
-/// derivations of "where does the drawer go" would drift — silently, since both
-/// produce a file that looks right.
-pub fn drawer_line_for(line: &dyn Fn(u32) -> Option<String>, headline_line: u32) -> u32 {
-    let first = headline_line + 1;
-    match line(first) {
-        Some(text) if crate::planning::parse(&text).is_some() => first + 1,
-        _ => first,
-    }
-}
-
 /// OR.8 — where an `:ID:` drawer goes for the headline on `headline_line`, and
 /// whether one is needed at all.
 ///
@@ -352,12 +334,18 @@ pub fn id_drawer_insert(
     headline_line: u32,
     id: &str,
 ) -> Option<(u32, String)> {
-    let first = drawer_line_for(line, headline_line);
+    let first = crate::properties::drawer_line_for(line, headline_line);
     let opens_drawer = line(first).is_some_and(|l| l.trim().eq_ignore_ascii_case(":properties:"));
 
     if !opens_drawer {
         // No drawer at all: write a whole one.
-        return Some((first, format!(":PROPERTIES:\n:ID:       {id}\n:END:\n")));
+        return Some((
+            first,
+            format!(
+                ":PROPERTIES:\n{}\n:END:\n",
+                crate::properties::format_property("", "ID", id)
+            ),
+        ));
     }
 
     // A drawer exists. Walk to its `:END:`, and stop at a new headline in case
@@ -383,7 +371,10 @@ pub fn id_drawer_insert(
         i += 1;
     }
     // Extend the existing drawer rather than opening a second one.
-    Some((first + 1, format!(":ID:       {id}\n")))
+    Some((
+        first + 1,
+        format!("{}\n", crate::properties::format_property("", "ID", id)),
+    ))
 }
 
 #[cfg(test)]

@@ -1156,3 +1156,139 @@ async fn tk9_a_dismissed_note_leaves_the_state_changed_and_unlogged() {
         "an unanswered note records nothing at all: {got:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+//  OE.2 — `org-set-property`, two prompts and a drawer
+// ─────────────────────────────────────────────────────────────
+
+/// The whole chain: chord → name prompt → value prompt → drawer.
+///
+/// **The key survives the hop through `buffer-name` and only an end-to-end
+/// test can say so.** `open-prompt-payload` has no argument slot, so hop two
+/// smuggles the name the way capture smuggles its template key; a unit test of
+/// the writer proves the edit and proves nothing about whether the name
+/// arrives. If it did not, this would write `::` or nothing at all.
+///
+/// The corpus carries a `SCHEDULED:` line because OE.0's rule is the thing
+/// most likely to regress here: a drawer written above it takes the plan out
+/// of the tree and the agenda stops seeing the date.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_property_writes_a_drawer_below_the_planning_line() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        &format!("* TODO Ship it\n  SCHEDULED: {}\nbody\n", today_stamp()),
+    )
+    .await;
+
+    goto_line(&mut editor, 0);
+    let out = press_raw(&mut editor, "<C-c><C-x>p");
+    apply_effects(&mut editor, out);
+    submit_prompt(&mut editor, "CATEGORY");
+    submit_prompt(&mut editor, "work");
+
+    assert_eq!(
+        text(&editor),
+        format!(
+            "* TODO Ship it\n  SCHEDULED: {}\n:PROPERTIES:\n:CATEGORY: work\n:END:\nbody\n",
+            today_stamp()
+        ),
+        "the drawer goes below the plan, and the value is the one typed"
+    );
+}
+
+/// Setting the same key twice replaces it. The `:ID:` writer refuses this
+/// case; a user who typed the command means the value they typed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setting_a_property_twice_replaces_rather_than_duplicates() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Ship it\n").await;
+
+    for value in ["first", "second"] {
+        goto_line(&mut editor, 0);
+        let out = press_raw(&mut editor, "<C-c><C-x>p");
+        apply_effects(&mut editor, out);
+        submit_prompt(&mut editor, "CATEGORY");
+        submit_prompt(&mut editor, value);
+    }
+
+    assert_eq!(
+        text(&editor),
+        "* TODO Ship it\n:PROPERTIES:\n:CATEGORY: second\n:END:\n",
+        "one drawer, one CATEGORY, the second value"
+    );
+}
+
+/// An empty name backs out. `<CR>` on an empty prompt is how a person
+/// abandons this, and a second question would make the escape hatch look like
+/// part of the flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_property_name_backs_out() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Ship it\n").await;
+
+    goto_line(&mut editor, 0);
+    let out = press_raw(&mut editor, "<C-c><C-x>p");
+    apply_effects(&mut editor, out);
+    submit_prompt(&mut editor, "");
+
+    assert!(
+        editor.pending_prompt_submit_action.is_none(),
+        "no second prompt after an empty name"
+    );
+    assert_eq!(
+        text(&editor),
+        "* TODO Ship it\n",
+        "and nothing written — asserted on the TEXT, since 'no edit recorded' \
+         passes on a build that wrote to the wrong line"
+    );
+}
+
+/// From the agenda, the drawer lands in the SOURCE file.
+///
+/// The case with no cheaper coverage, and OA.25's reason: an agenda row is one
+/// line, so the drawer goes outside every excerpt. It cannot be a composed
+/// edit and cannot be addressed by path — only through the row's source
+/// buffer, which is what `PlanTarget` resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_property_from_the_agenda_writes_the_source_file() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, mb) = agenda_over_two_files(base.path()).await;
+    let handle = mb.handle(view).unwrap();
+
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+    editor.cursor.byte = 0;
+    let out = press_raw(&mut editor, "<C-c><C-x>p");
+    apply_effects(&mut editor, out);
+    submit_prompt(&mut editor, "CATEGORY");
+    submit_prompt(&mut editor, "work");
+    editor.run_tick_pending();
+
+    let source = handle.excerpts()[0].source;
+    let written = handle.source_text(source).expect("the source is attached");
+    assert!(
+        written.contains(":PROPERTIES:\n:CATEGORY: work\n:END:"),
+        "the drawer landed in the row's own file: {written:?}"
+    );
+    assert!(
+        written.contains("SCHEDULED:"),
+        "…without displacing the planning line: {written:?}"
+    );
+}

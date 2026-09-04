@@ -155,6 +155,9 @@ mod org_date;
 // without destroying the others.
 mod complete;
 mod planning;
+// OE.1: an entry's `:PROPERTIES:` drawer — where it starts, and the edit that
+// writes one key of it without disturbing the others.
+mod properties;
 mod refile;
 mod repeat;
 // OR.4: what makes a file's contents into roam nodes — the pure half.
@@ -620,6 +623,24 @@ const AGENDA_FILTER_CLEAR: u32 = 73;
 /// the agenda is read-only, so `l` is not shadowing a motion anybody can use
 /// on it, and this mode activates on agenda views alone.
 const AGENDA_LOG_MODE: u32 = 83;
+
+/// OE.2 — `org-set-property`, emacs' `C-c C-x p`.
+///
+/// Three callbacks for one command, because collecting two values takes two
+/// prompts and the host dispatches each submit as its own action.
+///
+/// **The key rides `buffer-name` between the hops, not a guest-side stash.**
+/// `open-prompt-payload` has no argument slot, but the host hands a plugin's
+/// submit action `[typed-text, buffer-name]` (OC.3a) — which is exactly what
+/// capture already smuggles its template key through. A `thread_local` would
+/// be the obvious alternative and is the wrong one for capture's stated
+/// reason: `<Esc>` on a prompt dispatches NOTHING, so nothing would ever clear
+/// it and the next `org-set-property` would inherit the abandoned key.
+const SET_PROPERTY: u32 = 85;
+/// The first submit: the name was typed, now ask for the value.
+const SET_PROPERTY_KEY: u32 = 86;
+/// The second submit: both halves in hand, write the drawer.
+const SET_PROPERTY_VALUE: u32 = 87;
 
 /// OA.18 — `gD`, emacs' `org-agenda-view-mode-dispatch`. The view toggles in
 /// one menu instead of four chords and two loose letters.
@@ -2098,6 +2119,12 @@ impl Guest for Component {
                 // one you want, which is most of the time.
                 bind("<C-c><C-t>", "org-todo-select"),
                 bind("<C-c><C-q>", "org-set-tags"),
+                // OE.2 — emacs' own `C-c C-x p`, which sits beside the clock
+                // family already under `<C-c><C-x>`. `<leader>op` is the
+                // vim-native spelling of the same `ActionId`; two spellings,
+                // one handler.
+                bind("<C-c><C-x>p", "org-set-property"),
+                bind("<leader>op", "org-set-property"),
                 bind("<C-c>,", "org-priority-cycle"),
             ],
             target_language: None,
@@ -2345,6 +2372,14 @@ impl Guest for Component {
                 bind("<C-c><C-t>", "org-todo-select"),
                 bind("<leader>oS", "org-todo-select"),
                 bind("<C-c>,", "org-priority-cycle"),
+                // OE.2 — emacs binds `C-c C-x p` in the agenda too
+                // (`org-agenda-set-property`), and it works here for OA.25's
+                // reason: `PlanTarget` resolves a row to the headline in its
+                // SOURCE file, so the drawer is written where the entry lives.
+                // Repeated bind line, one handler — the constraint OA.25
+                // recorded.
+                bind("<C-c><C-x>p", "org-set-property"),
+                bind("<leader>op", "org-set-property"),
                 // OA.20: emacs' span-walking keys. Bare letters, which is safe
                 // here and nowhere else — the agenda is read-only, so `f` and
                 // `b` are not shadowing an edit, and this mode activates on
@@ -2688,6 +2723,27 @@ impl Guest for Component {
             "Choose an agenda from a menu, keyed the way org.agenda-custom-commands says",
             &spec(),
             AGENDA_MENU,
+        );
+        // OE.2 — three actions for one command: the chord fires the first, the
+        // host dispatches the other two as each prompt is submitted. All three
+        // are registered because the host resolves a submit action BY NAME.
+        register_action(
+            "org-set-property",
+            "Set a property on the entry at the cursor",
+            &spec(),
+            SET_PROPERTY,
+        );
+        register_action(
+            "org-set-property-key",
+            "Take the property name typed at the prompt and ask for its value",
+            &spec(),
+            SET_PROPERTY_KEY,
+        );
+        register_action(
+            "org-set-property-value",
+            "Write the property typed at the prompt into the entry's drawer",
+            &spec(),
+            SET_PROPERTY_VALUE,
         );
         register_action(
             "org-agenda-view-menu",
@@ -5801,6 +5857,117 @@ fn plan_submit(
     }
 }
 
+/// OE.2, hop 1 — `org-set-property`: ask for the name.
+///
+/// The entry is resolved BEFORE the prompt opens, so a cursor that is nowhere
+/// near a headline says so at the keystroke rather than after the user has
+/// typed two answers. `PlanTarget` is what resolves it, which is also what
+/// gives the command the agenda for free: a row there is a headline in its
+/// source file, and setting a property on it writes to that file.
+fn set_property_prompt(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    if PlanTarget::resolve(ctx, doc, tree).is_none() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: not inside a headline — a property goes on an entry".to_string(),
+        })];
+    }
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: "Property: ".to_string(),
+            initial: String::new(),
+            on_submit_action: "org-set-property-key".to_string(),
+            buffer_name: None,
+        },
+    )]
+}
+
+/// OE.2, hop 2 — the name was typed; ask for the value, carrying the name.
+///
+/// An empty name backs out silently: `<CR>` on an empty prompt is how a person
+/// abandons this, and asking for the value of a property with no name would
+/// make the escape hatch look like a second question.
+fn set_property_value_prompt(args: &Args) -> Vec<Effect> {
+    let key = submitted_text(args).unwrap_or_default().trim().to_string();
+    if key.is_empty() {
+        return vec![Effect::None];
+    }
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt: format!("{key}: "),
+            initial: String::new(),
+            on_submit_action: "org-set-property-value".to_string(),
+            // The smuggle slot (OC.3a). The value hop reads it as the SECOND
+            // argument, beside the text the user typed.
+            buffer_name: Some(key),
+        },
+    )]
+}
+
+/// OE.2, hop 3 — write it.
+///
+/// `args` is `[value, key]`: the typed text first, the name the previous hop
+/// smuggled through `buffer-name` second. Re-resolves the entry rather than
+/// carrying it, for `plan_submit`'s reason — there is nowhere to carry it, and
+/// re-reading is the honest answer because the buffer is what it is now.
+fn set_property_write(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    args: &Args,
+) -> Vec<Effect> {
+    let Some(key) = smuggled_name(args).filter(|k| !k.trim().is_empty()) else {
+        // No key means the hop that carries it did not run — a bug rather than
+        // a user action, and writing `::` into their drawer would be the worst
+        // possible answer to it.
+        return vec![Effect::None];
+    };
+    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
+        return vec![Effect::None];
+    };
+    let value = submitted_text(args).unwrap_or_default().trim().to_string();
+    let line = |n: u32| target.line(n, doc);
+    match properties::set_entry_property(&line, target.headline, key.trim(), &value) {
+        properties::PropertyEdit::Replace { at, text } => {
+            let len = line(at).map(|l| l.len() as u32).unwrap_or(0);
+            replace_lines_at(target.buffer, at, at, len, text, ctx.cursor)
+        }
+        // Anchored on the line ABOVE, exactly as `plan_submit` anchors its
+        // insert: at end of document the line being inserted before does not
+        // exist, and a range naming it is out of bounds.
+        properties::PropertyEdit::Insert { at, text } => {
+            let above = at.saturating_sub(1);
+            let Some(prev) = line(above) else {
+                return vec![Effect::None];
+            };
+            replace_lines_at(
+                target.buffer,
+                above,
+                above,
+                prev.len() as u32,
+                format!("{prev}\n{text}"),
+                ctx.cursor,
+            )
+        }
+    }
+}
+
+/// The name the previous hop smuggled through `buffer-name` (OC.3a) — the
+/// SECOND argument, where [`submitted_text`] reads the first.
+fn smuggled_name(args: &Args) -> Option<String> {
+    match args {
+        Args::List(items) => items.get(1).and_then(|v| match v {
+            lattice::plugin_host::types::ArgValue::String(s) => Some(s.clone()),
+            lattice::plugin_host::types::ArgValue::Raw(s) => Some(s.clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// The submitted text, whichever `args` shape the host used to carry it.
 fn submitted_text(args: &Args) -> Option<String> {
     match args {
@@ -6177,6 +6344,10 @@ impl GrammarCallbacks for Component {
                 })
             }
             TODO_NOTE_SUBMIT => Ok(todo_note_submit(&ctx, doc, tree)),
+            // OE.2: three hops, one command. See `set_property_prompt`.
+            SET_PROPERTY => Ok(set_property_prompt(&ctx, doc, tree)),
+            SET_PROPERTY_KEY => Ok(set_property_value_prompt(&ctx.args)),
+            SET_PROPERTY_VALUE => Ok(set_property_write(&ctx, doc, tree, &ctx.args)),
             SET_TAGS_SUBMIT => {
                 let Some(tags) = submitted_text(&ctx.args) else {
                     return Ok(vec![Effect::None]);

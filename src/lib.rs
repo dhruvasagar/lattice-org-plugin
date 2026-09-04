@@ -351,6 +351,11 @@ const ORG_TRANSIENT_ROAM_FIELDS: &str = "roam-fields";
 /// what the open was FOR rather than registering a source each.
 const ORG_TRANSIENT_AGENDA: &str = "agenda";
 
+/// OA.18 — the VIEW dispatch, which is a different menu from the one above and
+/// so needs its own discriminator. `agenda` chooses WHICH agenda to open;
+/// `agenda-view` changes how the agenda already open is being shown.
+const ORG_TRANSIENT_AGENDA_VIEW: &str = "agenda-view";
+
 // TB.2: 21..=31 were `org-table-mode`'s eleven generic table callbacks.
 // They are the host's now — `table-mode` in `lattice-mode` owns pipe-table
 // editing for markdown and org alike (see that mode's docs for why the host
@@ -615,6 +620,26 @@ const AGENDA_FILTER_CLEAR: u32 = 73;
 /// the agenda is read-only, so `l` is not shadowing a motion anybody can use
 /// on it, and this mode activates on agenda views alone.
 const AGENDA_LOG_MODE: u32 = 83;
+
+/// OA.18 — `gD`, emacs' `org-agenda-view-mode-dispatch`. The view toggles in
+/// one menu instead of four chords and two loose letters.
+///
+/// **`gD` could not be a chord while `gDd` was one, and that is why the four
+/// span binds go.** `KeymapTrie::lookup` answers `Bound` the moment the walk
+/// reaches a node carrying a binding and never looks at its children, so a
+/// `gD` binding would make `gDd` / `gDw` / `gDm` / `gDy` unreachable — and
+/// unreachable *silently*, since the trailing `d` would then fall through to
+/// the grammar in a read-only view and do nothing anybody could see. Which is
+/// exactly the failure this menu exists to stop shipping.
+///
+/// **The keystrokes do not change.** `gD` then `d` was day view before and is
+/// day view now; what is new is that the letters are on screen while you
+/// choose, which is what emacs' dispatch does too.
+///
+/// No time-grid row: that mode is not built, and OA.17 records why. A row for
+/// it would be a menu entry that does nothing — the class this codebase keeps
+/// paying for.
+const AGENDA_VIEW_MENU: u32 = 84;
 
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
@@ -2327,10 +2352,23 @@ impl Guest for Component {
                 bind("f", "org-agenda-later"),
                 bind("b", "org-agenda-earlier"),
                 bind(".", "org-agenda-today"),
-                bind("gDd", "org-agenda-day-view"),
-                bind("gDw", "org-agenda-week-view"),
-                bind("gDm", "org-agenda-month-view"),
-                bind("gDy", "org-agenda-year-view"),
+                // OA.18: `gD` is emacs' view-mode dispatch (`v` there,
+                // `gD` in evil-org-agenda), and it is a MENU rather than a
+                // prefix now.
+                //
+                // OA.20 bound `gDd` / `gDw` / `gDm` / `gDy` directly, and
+                // those four lines are gone rather than kept beside this one:
+                // `KeymapTrie::lookup` answers `Bound` as soon as the walk
+                // reaches a node with a binding and never consults its
+                // children, so `gD` and `gDd` cannot both fire. Keeping both
+                // would have left the four span chords dead — and dead
+                // *quietly*, since the trailing letter falls through to the
+                // grammar in a read-only view.
+                //
+                // The keystrokes are unchanged: `gD` then `d` is still the day
+                // view. What the menu adds is the two rows a chord had nowhere
+                // to advertise, `l` and `r`.
+                bind("gD", "org-agenda-view-menu"),
                 // OA.15: emacs' `l`. Bare, for `f` / `b`'s reason — the agenda
                 // is read-only, so a letter here shadows nothing that could be
                 // typed, and this mode activates on agenda views alone.
@@ -2650,6 +2688,12 @@ impl Guest for Component {
             "Choose an agenda from a menu, keyed the way org.agenda-custom-commands says",
             &spec(),
             AGENDA_MENU,
+        );
+        register_action(
+            "org-agenda-view-menu",
+            "Change how the agenda is shown \u{2014} span, log mode, clock report",
+            &spec(),
+            AGENDA_VIEW_MENU,
         );
         register_action(
             "org-agenda-command",
@@ -5880,6 +5924,16 @@ impl GrammarCallbacks for Component {
                     args: Args::String(ORG_TRANSIENT_AGENDA.to_string()),
                 },
             )]),
+            // OA.18: the same seam, a different discriminator. The menu's rows
+            // name actions that already exist — this handler opens a chooser
+            // and owns no behaviour of its own, which is what keeps `gDd` and
+            // the menu's `d` one code path rather than two.
+            AGENDA_VIEW_MENU => Ok(vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    args: Args::String(ORG_TRANSIENT_AGENDA_VIEW.to_string()),
+                },
+            )]),
             // OA.12: the chosen agenda rides the row's own args, and lands in
             // the SCAN-ARG slot rather than the argument one. The argument is
             // the root the host interprets; a command key sent there would
@@ -7361,6 +7415,107 @@ fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
     })
 }
 
+/// OA.18 — the view dispatch: how the open agenda is being SHOWN.
+///
+/// Emacs' `org-agenda-view-mode-dispatch`, whose letters this reuses exactly —
+/// `d`ay, `w`eek, `m`onth, `y`ear, `l`og, `r`eport. A hand that has typed
+/// `v d` in emacs types `gD d` here and gets the same view.
+///
+/// **Fixed rows, and the only menu of org's that reads no option.** Every row
+/// names an action that is already registered, so the menu adds no behaviour
+/// and cannot drift from the chords: the `d` here and `f` / `b` / `.` next to
+/// it are one code path. That is also why it cannot fail — there is no
+/// `Err` arm, unlike the capture and TODO menus, which err when what they
+/// enumerate is unconfigured.
+///
+/// **Two groups, because the rows answer different questions.** How much time
+/// am I looking at, versus what extra content is on. Emacs runs them together
+/// in one prompt line; a menu has room to say which is which.
+///
+/// **No row shows its own on/off state**, and that is deliberate rather than
+/// unfinished. Log mode's state is derivable here (`VIEW_ARGS.log`), the clock
+/// report's is not — it is a NATIVE mode and the guest has no query for mode
+/// state at all. One row reporting state beside one that cannot is worse than
+/// neither reporting it: the silent row reads as "off". Emacs shows no state
+/// either.
+///
+/// **The clock-report row names a HOST action**, `scan-view-clockreport-mode`'s
+/// own toggle. Not org's to re-declare: the report is generic over any scan
+/// view that reports clock spans (OA.16), and a second org-side toggle would be
+/// a second writer of one switch.
+fn agenda_view_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let row = |key: &str, label: &str, description: &str, command: &str| TransientItem {
+        key: vec![key.to_string()],
+        label: label.to_string(),
+        description: description.to_string(),
+        kind: TransientItemKind::Action(TransientAction {
+            command: command.to_string(),
+            // The rows carry no arguments: each names a distinct action, so
+            // there is nothing for a parameter to choose between. The capture
+            // menu's per-row args exist because its rows differ only by
+            // template key.
+            args: WitArgs::None,
+        }),
+    };
+
+    Ok(TransientSpec {
+        title: "Agenda view".to_string(),
+        groups: vec![
+            TransientGroup {
+                label: "Span".to_string(),
+                items: vec![
+                    row("d", "day", "one day", "org-agenda-day-view"),
+                    row("w", "week", "seven days", "org-agenda-week-view"),
+                    row("m", "month", "thirty days", "org-agenda-month-view"),
+                    row("y", "year", "a year", "org-agenda-year-view"),
+                ],
+            },
+            TransientGroup {
+                label: "Display".to_string(),
+                items: vec![
+                    row(
+                        "l",
+                        "log mode",
+                        "what you did, not what you planned",
+                        "org-agenda-log-mode",
+                    ),
+                    row(
+                        "r",
+                        "clock report",
+                        "clocked time, totalled up the outline",
+                        lattice_clock_report_toggle(),
+                    ),
+                    TransientItem {
+                        // A menu with no way out is a trap. `q` is the
+                        // transient's own convention.
+                        key: vec!["q".to_string()],
+                        label: "quit".to_string(),
+                        description: String::new(),
+                        kind: TransientItemKind::Dismiss,
+                    },
+                ],
+            },
+        ],
+        footer: None,
+    })
+}
+
+/// The host's clock-report toggle, named in one place.
+///
+/// A string literal that has to agree with
+/// `lattice_multibuffer::providers::clock_report::TOGGLE_ACTION` — the guest
+/// compiles to wasm and cannot depend on the host crate, so this is a wire
+/// value like every callback id above it. Isolated in a function so the one
+/// place it is written is the one place a test can pin it.
+const fn lattice_clock_report_toggle() -> &'static str {
+    "action:scan-view-clockreport-toggle"
+}
+
 /// OR.11b — the roam template chooser, opened for one node.
 ///
 /// Each row carries the TITLE as well as its key, because the menu is the only
@@ -7799,6 +7954,13 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             // agenda chord and has never configured a capture.
             if key == ORG_TRANSIENT_AGENDA {
                 return agenda_menu();
+            }
+            // OA.18: and the VIEW dispatch, before the same parse and for the
+            // same reason. It is the one menu in this list that reads no
+            // option at all — its rows are fixed, because every one of them
+            // names an action this plugin (or the host) already registered.
+            if key == ORG_TRANSIENT_AGENDA_VIEW {
+                return agenda_view_menu();
             }
         }
 

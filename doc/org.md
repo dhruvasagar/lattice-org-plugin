@@ -889,23 +889,39 @@ agenda-span = "0"   # just today
 
 | | |
 |---|---|
-| `gDd` | one day |
-| `gDw` | one week |
-| `gDm` | one month |
-| `gDy` | one year |
 | `f` / `b` | move one span forward / back |
 | `.` | back to today |
+| `gD` | the **view menu**, below |
 
-These are per view: they do not rewrite `org.agenda-span`, so glancing at next
-month does not change what every future agenda means, and two open agendas can
-sit on different windows.
+The `f` / `b` / `.` keys are per view: they do not rewrite `org.agenda-span`, so
+glancing at next month does not change what every future agenda means, and two
+open agendas can sit on different windows.
 
 The headerline names the span and the dates it covers — `Week 2026-09-03 –
 2026-09-09` — so the view always says what it is showing.
 
-Emacs puts these on `v d` / `v w`; **lattice puts them on `gD`**, which is where
-`evil-org-agenda` puts them and for the same reason: `v` is Visual mode and an
-editor with vim keys cannot spend it as a prefix.
+#### `gD` — the view menu
+
+`gD` opens a menu of everything that changes **how the agenda is shown**, and
+you pick from it with one more key:
+
+| | |
+|---|---|
+| `d` | one day |
+| `w` | one week |
+| `m` | one month |
+| `y` | one year |
+| `l` | log mode on / off (below) |
+| `r` | the clock report on / off |
+| `q` | close the menu |
+
+So `gD d` is the day view and `gD r` puts a clocked-time summary at the top of
+the agenda. Both are per view, like `f` and `b`.
+
+Emacs opens the same menu on `v` and calls it `org-agenda-view-mode-dispatch`;
+**lattice puts it on `gD`**, which is where `evil-org-agenda` puts it and for
+the same reason: `v` is Visual mode and an editor with vim keys cannot spend it
+as a prefix. Emacs' letters are unchanged, so `v d` there is `gD d` here.
 
 #### `l` — what you did, beside what you plan to do
 

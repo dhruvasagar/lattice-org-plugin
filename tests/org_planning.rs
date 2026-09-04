@@ -1292,3 +1292,37 @@ async fn set_property_from_the_agenda_writes_the_source_file() {
         "…without displacing the planning line: {written:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+//  OE.3 / OE.4 — `C-c C-c` acts on the thing at the cursor
+// ─────────────────────────────────────────────────────────────
+
+/// On a checkbox, `C-c C-c` toggles it and updates the ancestor cookie —
+
+/// On a headline, `C-c C-c` prompts for tags — emacs' behaviour, and the
+/// same prompt `<C-c><C-q>` opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ctrl_c_on_a_headline_prompts_for_tags() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* TODO Ship it\nbody\n").await;
+
+    goto_line(&mut editor, 0);
+    let out = press_raw(&mut editor, "<C-c><C-c>");
+    apply_effects(&mut editor, out);
+    assert_eq!(
+        editor.pending_prompt_submit_action.as_deref(),
+        Some("org-set-tags-submit"),
+        "the headline arm opens the tags prompt"
+    );
+
+    submit_prompt(&mut editor, "work");
+    assert_eq!(
+        text(&editor),
+        "* TODO Ship it :work:\nbody\n",
+        "…and submitting it writes the tags"
+    );
+}

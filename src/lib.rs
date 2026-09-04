@@ -662,6 +662,9 @@ const SET_PROPERTY_VALUE: u32 = 87;
 /// paying for.
 const AGENDA_VIEW_MENU: u32 = 84;
 
+/// OE.3 — `C-c C-c`, emacs' `org-ctrl-c-ctrl-c`. See [`ctrl_c_ctrl_c`].
+const CTRL_C_CTRL_C: u32 = 88;
+
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
 /// scatter notes across the filesystem; being told to set it once is better
@@ -1959,6 +1962,26 @@ impl Guest for Component {
                 bind("<C-c><C-x><C-a>", "org-archive-subtree"),
                 bind("<C-c><C-x><C-v>", "org-toggle-inline-images"),
                 bind("<C-c>*", "org-toggle-heading"),
+                // OE.3 — emacs' `C-c C-c`, on the MAJOR and deliberately not
+                // on a minor.
+                //
+                // `org-capture-mode` binds the same chord to finalize, and a
+                // MINOR's layer beats its major's — which is what guarantees
+                // a capture buffer files instead of dispatching. Bound on
+                // `org-todo-mode` (a minor) first, this competed with capture
+                // minor-to-minor, the order is not either mode's to control,
+                // and capture lost: `C-c C-c` opened a TAGS prompt on the
+                // template's headline and the note was never written. The
+                // test that presses the chord rather than dispatching the
+                // action by name is what caught it.
+                //
+                // It is also org's first TERMINAL binding under `<C-c>`, and
+                // must stay the only one: every other org chord here is a
+                // PREFIX (`<C-c>a`, `<C-c>n…`, `<C-c><C-x>…`), and a terminal
+                // node kills any longer chord grown beneath it —
+                // `KeymapTrie::lookup` answers `Bound` at the first binding
+                // and never consults children.
+                bind("<C-c><C-c>", "org-ctrl-c-ctrl-c"),
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
@@ -2828,6 +2851,12 @@ impl Guest for Component {
             "Step the timestamp component under the cursor back",
             &spec(),
             TIMESTAMP_DOWN,
+        );
+        register_action(
+            "org-ctrl-c-ctrl-c",
+            "Act on the thing at the cursor \u{2014} toggle a checkbox, set a headline's tags",
+            &spec(),
+            CTRL_C_CTRL_C,
         );
         register_action(
             "org-toggle-checkbox",
@@ -6048,6 +6077,9 @@ impl GrammarCallbacks for Component {
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
+            // OE.3: the context dispatcher. Its arms call the two bodies
+            // above rather than repeating them.
+            CTRL_C_CTRL_C => Ok(ctrl_c_ctrl_c(&ctx, doc, tree)),
             OPEN_LINK => Ok(open_link(&ctx, doc, Effect::None)),
             FOLLOW_LINK => Ok(open_link(&ctx, doc, Effect::Declined)),
             TIMESTAMP_UP => Ok(step_timestamp(&ctx, doc, 1)),
@@ -7063,6 +7095,61 @@ fn toggle_checkbox(
         body.join("\n"),
         ctx.cursor,
     )
+}
+
+/// OE.3 — `C-c C-c`, emacs' `org-ctrl-c-ctrl-c`: act on the thing at point.
+///
+/// The most-pressed key in org, and the one surface where a key's meaning is
+/// the CONTEXT rather than the chord. Two arms here; the rest live on the
+/// modes that own what they act on (`focused-surface.md`'s sibling argument:
+/// a guest cannot invoke a registered command, so `table-mode` binds this
+/// chord itself and declines outside a table — OE.4).
+///
+/// | Context | Does |
+/// |---|---|
+/// | Checkbox item | toggle it, updating every ancestor cookie |
+/// | Headline | set tags |
+/// | Anything else | say so |
+///
+/// **The arms CALL the bodies the chords call.** `toggle_checkbox` and
+/// `set_tags_prompt` are the same functions `<C-Space>` and `<C-c><C-q>`
+/// reach, not copies — two spellings of one verb that could drift is the
+/// thing this file already avoids everywhere else.
+///
+/// **No statistics-cookie arm**, and the slice plan said there would be one.
+/// Emacs spells that `C-c #` (`org-update-statistics-cookies`), and a cookie
+/// lives on a headline or on a parent list item — both of which already have
+/// an arm here, and the toggle already rewrites every ancestor's cookie as a
+/// side effect. A third arm would have been inventing a binding org does not
+/// have.
+///
+/// **The fallback is a message, not silence.** Emacs answers `C-c C-c can do
+/// nothing useful at this location`; a key that does nothing is
+/// indistinguishable from one that is unbound, which is the failure class
+/// this codebase keeps paying for.
+fn ctrl_c_ctrl_c(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let at = ctx.cursor.line;
+
+    // A checkbox first: `item_at` already requires a real `[ ]` box, so a
+    // plain bullet falls through rather than toggling nothing.
+    let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
+    if cb.item_at(at).is_some() {
+        return toggle_checkbox(ctx, doc, tree);
+    }
+
+    // Then the headline — the line ITSELF, not the subtree it encloses.
+    // `enclosing` answers for every line under a headline, and `C-c C-c` in
+    // the body of an entry is not "set the entry's tags" in emacs either.
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    if hl.enclosing(at).is_some_and(|(start, _)| start == at) {
+        return set_tags_prompt(ctx, doc, tree);
+    }
+
+    vec![Effect::Echo(EchoPayload {
+        level: EchoLevel::Warn,
+        text: "org: C-c C-c has nothing to do here".to_string(),
+    })]
 }
 
 /// OM.9 — step the timestamp component under the cursor.

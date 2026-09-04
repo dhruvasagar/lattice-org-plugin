@@ -2439,14 +2439,14 @@ async fn finalize_capture(editor: &mut Editor, text: &str) {
         );
         editor.run_tick_pending();
     }
-    let id = editor
-        .registry
-        .load()
-        .id_by_name("org-capture-finalize")
-        .expect("the finalize action is registered");
-    let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
-    apply_renderer_effects(editor, out).await;
+    // OE.3/OE.4: through the CHORD, not by dispatching the action by name.
+    //
+    // `<C-c><C-c>` is bound three times over a capture buffer now — capture's
+    // own minor, org's major (the context dispatcher), and `table-mode`
+    // (which realigns and declines elsewhere). Only pressing it proves the
+    // one the user gets is capture's; a by-name dispatch would pass however
+    // the layers resolved.
+    press_chord(editor, "<C-c><C-c>").await;
     editor.run_tick_pending();
 }
 
@@ -4119,14 +4119,19 @@ async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
         "the capture buffer resolves org's grammar from its major, not from a path"
     );
 
+    // Every layer that binds the chord, not just the winning one. OE.4 gave
+    // `table-mode` a `<C-c><C-c>` too — it declines outside a table, so
+    // capture still files — and a helper that looked only at `.last()` then
+    // reported the wrong layer for a binding that was present all along.
     let resolves = |chord: &str, modes: &[ModeId]| {
         let seq = lattice_protocol::parse_chord_sequence(chord).expect("parses");
-        editor
+        let hits = editor
             .keymap
             .resolve_trace(lattice_keymap::BindingMode::Normal, &seq, modes)
-            .hits
-            .last()
-            .map(|h| format!("{:?}", h.command))
+            .hits;
+        hits.is_empty()
+            .then(|| None)
+            .unwrap_or_else(|| Some(format!("{hits:?}")))
     };
     assert!(
         resolves("<C-c><C-c>", &modes).is_some(),
@@ -4157,7 +4162,9 @@ async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
         assert!(
             hit.contains("MinorMode(ModeId(\"org-capture-mode\"))"),
             "{chord} must be bound on the capture MINOR's layer, not on org's \
-             major or on Builtin: {hit}"
+             major or on Builtin. OE.4's `table-mode` binding may also appear \
+             here — it declines outside a table, so capture still files — but \
+             capture's own must be present: {hit}"
         );
     }
 }
@@ -4752,5 +4759,91 @@ async fn tk8_leaving_a_state_records_its_exit_spec() {
         got.contains("- State \"\" from \"CANCELLED\" ["),
         "…and leaving it still records the timestamp its `/!` asked for, with \
          org's own rendering of an empty target state: {got:?}"
+    );
+}
+
+// ── OE.3 / OE.4: `C-c C-c` acts on the thing at the cursor ──
+
+/// On a checkbox, `C-c C-c` toggles it and updates the ancestor cookie — the
+/// same body `<C-Space>` runs, reached through the dispatcher.
+///
+/// **Here rather than in `org_planning.rs`** because that file's `press_raw`
+/// re-dispatches the resolved action after `dispatch_chord` already ran it.
+/// For a prompt-opener (its subject) running twice is harmless; for a TOGGLE
+/// it flips the box back, so the buffer looks untouched. This file's `press`
+/// dispatches the chord and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ctrl_c_toggles_the_checkbox_at_the_cursor() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Shopping [1/3]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-c><C-c>");
+    assert_eq!(
+        text(&editor),
+        "* Shopping [2/3]\n  - [X] bread\n  - [X] milk\n  - [ ] eggs\n",
+        "the box flipped AND the cookie followed — the arm calls \
+         `toggle_checkbox`, it does not reimplement it"
+    );
+}
+
+/// Anywhere else it says so, and changes nothing.
+///
+/// Asserted on the BUFFER TEXT as well as the message: "no edit recorded"
+/// passes on a build that edited the wrong line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_ctrl_c_on_ordinary_prose_says_it_has_nothing_to_do() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let before = "* TODO Ship it\njust some prose\n";
+    let mut editor = org_editor(base.path(), before).await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+
+    assert_eq!(text(&editor), before, "nothing was edited");
+    let msg = editor.last_message.as_ref().map(|m| m.text.clone());
+    assert!(
+        msg.as_deref()
+            .is_some_and(|m| m.contains("nothing to do here")),
+        "a key that does nothing is indistinguishable from one that is \
+         unbound — it has to say so. Got: {msg:?}"
+    );
+}
+
+/// …and OUTSIDE a table the same chord falls through to org's dispatcher.
+///
+/// **This is the composition, and the whole risk of OE.4.** `table-mode` is
+/// active on the entire org buffer, not only inside tables, so without
+/// `Effect::Declined` it would swallow `C-c C-c` everywhere and org's arms
+/// would be dead. A test that only checked the in-table case passes on
+/// exactly that build — which is why the fixture has a table in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outside_a_table_the_chord_reaches_orgs_dispatcher() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Tasks [0/1]\n  - [ ] one\n\n| a | b |\n").await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+
+    assert_eq!(
+        text(&editor),
+        "* Tasks [1/1]\n  - [X] one\n\n| a | b |\n",
+        "the chord declined out of `table-mode` and org's checkbox arm ran"
     );
 }

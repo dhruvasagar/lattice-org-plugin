@@ -907,6 +907,48 @@ Emacs puts these on `v d` / `v w`; **lattice puts them on `gD`**, which is where
 `evil-org-agenda` puts them and for the same reason: `v` is Visual mode and an
 editor with vim keys cannot spend it as a prefix.
 
+#### `l` — what you did, beside what you plan to do
+
+The agenda shows work you have **not** finished; that is what makes it a plan
+rather than a list. `l` turns on **log mode**, which adds what your files record
+about the window's past: headlines you closed, time you clocked, and — if you
+ask for it — TODO states you changed. `l` again turns it off, and
+`:org-agenda-log-mode` is the same switch.
+
+Log rows are ordinary agenda rows, not a read-only strip. `<CR>` jumps to the
+headline, `<leader>ot` cycles its state, and the line under each one says what
+happened and when:
+
+```
+* DONE Ship the thing
+  Closed 14:32
+* TODO Write the docs
+  Clocked 2:15
+```
+
+Which entries it admits:
+
+```toml
+[org]
+agenda-log-mode-items = "closed clock"   # the default, as in emacs
+# agenda-log-mode-items = "all"          # ...plus state changes
+```
+
+`closed`, `clock` and `state`, separated by commas or spaces. State changes are
+off by default because they are the noisiest of the three — a task walked
+through four keywords logs four lines, and most of them say nothing the closure
+did not.
+
+**The log looks backward over the same span the plan looks forward.** A daily
+agenda logs today; a week view logs the last seven days. Nothing is ever logged
+in the future, so a forward window would only ever have shown you today. `f` and
+`b` walk it exactly as they walk the plan.
+
+One difference from emacs worth knowing if you are coming from it: emacs mixes
+log items into each day's block alongside that day's plan. Here they get a block
+of their own, after the rest. Your blocks are yours to configure, and a set with
+no day-grouped block in it would have had nowhere to put them.
+
 #### Writing your own
 
 `org.agenda-sections` replaces the built-in set with yours. One `[[section]]`

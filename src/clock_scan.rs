@@ -61,12 +61,33 @@ fn headline_text(line: &str, level: usize) -> String {
     line[level..].trim().to_string()
 }
 
-/// Parse one `CLOCK:` line into `(epoch_day, minutes)`.
+/// One closed `CLOCK:` line, read whole.
+///
+/// `started` is what OA.15 needed and the clock report never did: a report
+/// sums a day and does not ask when the day's work began, but a log row is a
+/// record of an event and orders by the time it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockLine {
+    /// Epoch day the span is filed under — the day it BEGAN; see the module
+    /// header on midnight.
+    pub day: i64,
+    pub minutes: u32,
+    /// `(hour, minute)` the clock started, or `None` for a date-only stamp.
+    pub started: Option<(u32, u32)>,
+}
+
+/// Parse one `CLOCK:` line.
 ///
 /// `None` for a running clock, a malformed line, or a negative duration — an
 /// end before its start is a file that was edited by hand into a state no
 /// clock-out produces, and guessing at it would put invented time in a total.
-fn closed_span(line: &str) -> Option<(i64, u32)> {
+///
+/// `pub(crate)` for [`agenda_log`](crate::agenda_log), which files the same
+/// lines as log rows. Those three refusals are the interesting part of this
+/// function, and a second reader of the construct would have to rediscover
+/// every one of them — in a module where nobody would think to test a
+/// backwards span.
+pub(crate) fn closed_span(line: &str) -> Option<ClockLine> {
     let t = line.trim_start();
     if !t.starts_with(CLOCK.trim_end()) {
         return None;
@@ -92,10 +113,11 @@ fn closed_span(line: &str) -> Option<(i64, u32)> {
     if minutes < 0 {
         return None;
     }
-    Some((
-        timestamp::epoch_day(start.year, start.month, start.day),
-        minutes as u32,
-    ))
+    Some(ClockLine {
+        day: timestamp::epoch_day(start.year, start.month, start.day),
+        minutes: minutes as u32,
+        started: start.time,
+    })
 }
 
 /// Every clocked span in `text`, aggregated per (headline, day).
@@ -136,7 +158,7 @@ pub fn scan(text: &str) -> Vec<Span> {
             // under an invented root.
             continue;
         };
-        let Some((day, minutes)) = closed_span(raw) else {
+        let Some(ClockLine { day, minutes, .. }) = closed_span(raw) else {
             continue;
         };
         if minutes == 0 {

@@ -132,6 +132,7 @@ wit_bindgen::generate!({
 mod agenda;
 mod agenda_args;
 mod agenda_custom_commands;
+mod agenda_log;
 mod agenda_match;
 mod agenda_sections;
 mod archive;
@@ -454,6 +455,27 @@ const ON_ROAM_FILES_CHANGED: u32 = 2;
 /// the find-node picker, which is indistinguishable from a corpus with no notes
 /// in it.
 const ON_ROAM_OPTION_CHANGED: u32 = 3;
+/// OA.15b: `org-agenda-log-mode` went on or off on some buffer.
+///
+/// **This handler is the mode's body.** A native minor supplies one itself —
+/// `scan-view-clockreport-mode` registers its provider in `on_activate` and
+/// drops it on deactivation, which is what makes the mode the switch rather
+/// than a label beside one. A plugin mode is DATA: the host builds it into a
+/// `PluginMode` whose `on_activate` is a no-op, so without this the mode could
+/// be toggled and change nothing.
+///
+/// The mode is therefore the single source of truth for whether log rows are
+/// on, and the `log=` scan argument is DERIVED from it here — never written by
+/// the chord. Two writers is exactly the disagreement the mode-as-switch shape
+/// exists to prevent.
+const ON_AGENDA_LOG_MODE: u32 = 4;
+
+/// The mode `l` toggles, named once. Spelled in four places — the declaration,
+/// the toggle effect, the lifecycle filter and the tests — and three of them
+/// fail SILENTLY on a typo: a `ToggleMode` naming nothing echoes an error the
+/// user sees but no test does, and a lifecycle filter matching nothing simply
+/// never fires.
+const AGENDA_LOG_MODE_ID: &str = "org-agenda-log-mode";
 
 /// OR.6: `YYYYMMDDHHMMSS` in LOCAL time, for a new note's filename.
 ///
@@ -577,6 +599,23 @@ const AGENDA_FILTER_TAG_ADD: u32 = 70;
 const AGENDA_FILTER_TAG_SUBMIT: u32 = 71;
 const AGENDA_FILTER_CLEAR: u32 = 73;
 
+/// OA.15 — `l`, emacs' `org-agenda-log-mode`. What you DID, beside what you
+/// plan to do.
+///
+/// **An argument, not a mode**, which is the slice's whole shape and worth
+/// having in front of whoever reads this next. A log row is an ordinary
+/// excerpt over the headline the event happened to — so `<CR>` jumps to it and
+/// `<leader>ot` acts on it — which means turning log mode on is "re-open this
+/// view asking for more rows", exactly what `f` / `gDw` / `/` already are. The
+/// design fragment originally filed log entries as host-side virtual rows
+/// beside the clock report; that would have made them display-only, and the
+/// use of seeing "you closed Ship it at 14:32" is being able to go there.
+///
+/// Bare `l`, as emacs binds it. Safe here for OA.20's reason and nowhere else:
+/// the agenda is read-only, so `l` is not shadowing a motion anybody can use
+/// on it, and this mode activates on agenda views alone.
+const AGENDA_LOG_MODE: u32 = 83;
+
 /// `org-default-notes-file`, with no default. A key that silently creates
 /// `capture.org` in whichever directory the editor happened to start in would
 /// scatter notes across the filesystem; being told to set it once is better
@@ -609,6 +648,14 @@ const DEFAULT_CAPTURE_TEMPLATES: [capture_templates::RawTemplate; 0] = [];
 /// value: the unbounded view is exactly what AS.1 replaced, and it is the one
 /// that buries today under a year of someone's recurring reminders.
 const DEFAULT_AGENDA_SPAN: &str = "7";
+/// OA.15: which log items `l` admits, emacs' `org-agenda-log-mode-items`.
+///
+/// Emacs' own default, and for its reason: what you finished and what you
+/// spent time on are the two questions a log answers, where a state change is
+/// the noisiest of the three — a task walked through four keywords logs four
+/// lines, and most of them say nothing you did not already know from the
+/// closure. `state` is one word away for anyone who wants it.
+const DEFAULT_LOG_MODE_ITEMS: &str = "closed,clock";
 /// AS.2 / OA.11: `org.agenda-sections` and `org.agenda-custom-commands` are
 /// STRUCTURED options (TC.6), so their defaults are empty LISTS rather than
 /// empty strings — and an empty list is a legal value of `list<record>`, which
@@ -933,6 +980,47 @@ mod todo_theme {
                 scale: None,
             },
         );
+
+        // OA.15: the three words a log row's annotation leads with. Elements
+        // rather than baked colours for the clock report's reason — a
+        // hardcoded green survives `:colorscheme` and then sits in the
+        // previous theme's palette — and separate from each other because
+        // "finished", "spent time on" and "moved" are three different facts
+        // and a reader scans the log for one of them.
+        //
+        // A state change's KEYWORDS are not styled here: they resolve through
+        // `org.todo.<KEYWORD>`, registered above, so `WAITING` in a log row is
+        // the yellow it is in every other view and a user's
+        // `todo-keyword-styles` override reaches it with nothing added.
+        for (name, doc, colour) in [
+            (
+                "log.closed",
+                "The `Closed` label on an agenda log row.",
+                "green",
+            ),
+            (
+                "log.clocked",
+                "The `Clocked` label on an agenda log row.",
+                "blue",
+            ),
+            (
+                "log.state",
+                "The `State` label on an agenda log row.",
+                "overlay",
+            ),
+        ] {
+            let _ = register_element(
+                name,
+                doc,
+                &ThemeStyleSpec {
+                    inherit: None,
+                    fg: Some(ColorRef::Palette(colour.to_string())),
+                    bg: None,
+                    modifiers: unset(),
+                    scale: None,
+                },
+            );
+        }
 
         for k in &kws.all {
             let parent = if k.done {
@@ -1328,6 +1416,20 @@ impl Guest for Component {
              agenda. Overdue items are shown by their own section regardless, \
              so a short span does not hide a missed deadline.",
         );
+        // OA.15: what `l` shows. A String beside `agenda-span` for the reason
+        // given there — one accessor per subsystem — and a comma/space list
+        // rather than three booleans because it is emacs' own spelling and
+        // because "which items" is one decision, not three.
+        let _ = register_option(
+            "agenda-log-mode-items",
+            OptionType::String,
+            DEFAULT_LOG_MODE_ITEMS,
+            "Which log entries `l` admits into the agenda: any of `closed`, \
+             `clock` and `state`, separated by commas or spaces, or `all`. \
+             The default matches emacs \u{2014} what you finished and what you \
+             spent time on. Log rows cover the span ENDING today, where the \
+             plan covers the span starting today.",
+        );
         // AS.2 / TC.6: the section set, a STRUCTURED option. It was TOML in a
         // string for `capture-templates`' reason and is a declared shape for
         // the same one — see `agenda_sections`. `when` is an `enum-of`, so a
@@ -1540,6 +1642,21 @@ impl Guest for Component {
             },
             ON_ROAM_OPTION_CHANGED,
         );
+        // OA.15b: the log mode's BODY.
+        //
+        // A native minor supplies one itself; a plugin mode is data with a
+        // no-op `on_activate`, so this subscription is what makes
+        // `org-agenda-log-mode` a switch rather than a label. Both directions
+        // are needed — without the deactivation half, `l` would turn log rows
+        // on and never off, with the mode reporting itself inactive.
+        events::subscribe(
+            &EventFilter {
+                kinds: Some(vec![EventKind::MinorActivated, EventKind::MinorDeactivated]),
+                path_globs: None,
+                major_modes: None,
+            },
+            ON_AGENDA_LOG_MODE,
+        );
         // Boot does a full walk, because lattice was not running while the
         // corpus changed and a watcher cannot report what it did not see.
         // Unchanged files cost a read and a hash; only moved ones parse. A
@@ -1590,6 +1707,51 @@ impl Guest for Component {
                 // with no explanation.
                 arm_roam_scan();
             }
+            return;
+        }
+        // OA.15b: log mode went on or off. Derive the `log=` argument from the
+        // mode's new state and re-open the view — the mode is the truth, the
+        // argument is its shadow.
+        if handler == ON_AGENDA_LOG_MODE {
+            let (mode, on) = match &ev {
+                Event::MinorActivated(m) => (m.mode.as_str(), true),
+                Event::MinorDeactivated(m) => (m.mode.as_str(), false),
+                _ => return,
+            };
+            // Filtered by NAME here rather than by the subscription, because
+            // the event filter has no mode field — every minor's lifecycle is
+            // delivered and this arm decides. Same shape as
+            // `ON_ROAM_OPTION_CHANGED` two arms up.
+            if mode != AGENDA_LOG_MODE_ID {
+                return;
+            }
+            let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+            view.log = on.then(|| {
+                // Read from the option every time the mode goes ON rather than
+                // remembered from last time: `:set org.agenda-log-mode-items`
+                // has to take effect on the next `l`, and a remembered set
+                // would make the option appear not to work until the view was
+                // closed.
+                let (items, _problems) = agenda_log::LogItems::parse(&option_or(
+                    "agenda-log-mode-items",
+                    DEFAULT_LOG_MODE_ITEMS,
+                ));
+                // A set that parsed to nothing would make "on" produce a view
+                // identical to "off" — indistinguishable from a dead key.
+                // Emacs' default is what a misconfigured option falls back to.
+                if items.any() {
+                    items
+                } else {
+                    agenda_log::LogItems::DEFAULT
+                }
+            });
+            // OA.15a's seam. An `Effect` return is not available here —
+            // `on-event` answers `()` by construction — which is precisely the
+            // gap that slice closed.
+            lattice::plugin_host::multibuffer_view_registry::refresh_view(
+                "agenda",
+                &view.to_args(),
+            );
             return;
         }
         if handler != ON_CLOCK_EVENT {
@@ -2169,6 +2331,10 @@ impl Guest for Component {
                 bind("gDw", "org-agenda-week-view"),
                 bind("gDm", "org-agenda-month-view"),
                 bind("gDy", "org-agenda-year-view"),
+                // OA.15: emacs' `l`. Bare, for `f` / `b`'s reason — the agenda
+                // is read-only, so a letter here shadows nothing that could be
+                // typed, and this mode activates on agenda views alone.
+                bind("l", "org-agenda-log-mode"),
                 // OA.21: emacs' filter keys. `/` replaces the tag filter,
                 // `\` narrows it further, `|` clears everything.
                 bind("/", "org-agenda-filter-by-tag"),
@@ -2217,6 +2383,43 @@ impl Guest for Component {
                 value: "99".to_string(),
                 priority: OverridePriority::Normal,
             }],
+        });
+
+        // OA.15b — `org-agenda-log-mode`, layered on the agenda view.
+        //
+        // Emacs' `l`: what you DID, beside what you plan to do — closed,
+        // clocked and state-changed headlines, filed under the day each
+        // happened.
+        //
+        // **An empty keymap, and that is not an oversight.** `l` binds on
+        // `org-agenda-mode` above, not here — the one place "modes own their
+        // full surface" cannot be read literally, since a keymap layer is
+        // gated to buffers where its mode is ACTIVE, so an `l` declared here
+        // could only ever turn the mode off. The switch belongs to the surface
+        // that offers it; everything the mode does stays with the mode. Same
+        // split as `cr` on `scan-view-mode` (OA.16), one layer over.
+        //
+        // What the mode owns instead is its BODY, in the `minor-activated` /
+        // `minor-deactivated` handler (`ON_AGENDA_LOG_MODE`) — which is the
+        // whole reason this is a mode rather than a bare view argument. It
+        // gives `:describe-mode` something to answer, the `gD` transient
+        // (OA.18) something to name, `:org-agenda-log-mode` a live toggle, and
+        // a later log-specific chord a home.
+        //
+        // Manual, for `org-agenda-mode`'s reason: no policy can say "the view
+        // the agenda provider just built", and one keyed on `multibuffer-mode`
+        // would put log rows in project search and magit diffs.
+        //
+        // No option overrides: log mode changes which ROWS the scan produces,
+        // not how the buffer behaves.
+        register_mode(&ModeDeclaration {
+            id: "org-agenda-log-mode".to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Manual,
+            capabilities: ModeCapabilities::empty(),
+            keymap: Vec::new(),
+            target_language: None,
+            options: Vec::new(),
         });
 
         // OM.12 / TB.2 — `org-table-mode`, the third mode.
@@ -2500,6 +2703,12 @@ impl Guest for Component {
                 "org-agenda-filter-by-file",
                 "Restrict the agenda to the file the row under the cursor is in",
                 AGENDA_FILTER_FILE,
+            ),
+            // OA.15: emacs' `l`.
+            (
+                "org-agenda-log-mode",
+                "Show what was closed, clocked and changed \u{2014} the span's log, not its plan",
+                AGENDA_LOG_MODE,
             ),
             ("org-agenda-day-view", "Show one day", AGENDA_SPAN_DAY),
             ("org-agenda-week-view", "Show one week", AGENDA_SPAN_WEEK),
@@ -3056,6 +3265,12 @@ impl Guest for Component {
             args.hash(&mut h);
             h.finish()
         };
+        // OA.15: log mode's window, resolved here beside `today` because it is
+        // derived from it — a scan crossing midnight must file every file's
+        // log against ONE window, which is the whole reason `begin` exists.
+        let log = view
+            .log
+            .map(|items| (items, agenda_args::ViewArgs::log_days(span, today)));
         // OA.20: what the next span/filter chord modifies. The agenda is
         // `reuse: true`, so there is one view and one slot is the accurate
         // model; a chord reads this, changes one argument and re-opens.
@@ -3064,6 +3279,7 @@ impl Guest for Component {
             today,
             keywords,
             sections,
+            log,
             nerd_fonts: matches!(
                 get_option("ui.nerd_fonts").as_deref(),
                 Some("true") | Some("on")
@@ -3129,12 +3345,28 @@ impl Guest for Component {
             // is, both walks produce exactly the rows they always produced —
             // the extra ones would be unreachable, and a corpus of them is not
             // free to build or to carry back across the seam.
-            let admit_tag_only = state.sections.iter().any(|s| s.filter.r#match.is_some());
+            // OA.15 widens the same switch: a tag filter has to reach LOG rows
+            // too, and a log row's headline is usually DONE — which is not a
+            // row at all unless this walk is admitting tag-only ones. A filter
+            // that silently stopped applying to half the view would be the
+            // worse failure by some distance.
+            let filtering_log = state.log.is_some() && view.is_filtered();
+            let admit_tag_only =
+                filtering_log || state.sections.iter().any(|s| s.filter.r#match.is_some());
             let mut rows = match tree {
                 Some(snapshot) => {
                     agenda::scan_tree(&snapshot.root(), &text, &state.keywords, admit_tag_only)
                 }
                 None => agenda::scan_file(&text, &state.keywords, admit_tag_only),
+            };
+            // …captured BEFORE the retain below, because the map has to answer
+            // for every headline in the file rather than for the ones that
+            // survived. Tags here are the walk's own, inheritance included, so
+            // a log row obeys `-CANCELLED` for the reason every other row does.
+            let tags_by_line: Vec<(u32, Vec<String>)> = if filtering_log {
+                rows.iter().map(|r| (r.line, r.tags.clone())).collect()
+            } else {
+                Vec::new()
             };
             // OA.21: a `tag:` filter narrows every block at once, which is
             // what makes it a FILTER rather than another section. Applied to
@@ -3154,7 +3386,7 @@ impl Guest for Component {
             // TODO is emitted three times and a headline nothing wants is
             // emitted none. `flat_map` rather than `map` is the entire shape
             // change at this seam — the ABI did not move.
-            Ok(rows
+            let mut entries: Vec<Entry> = rows
                 .into_iter()
                 .flat_map(|row| {
                     // OA.6: computed ONCE per row. `entries_for_row` fans a
@@ -3221,7 +3453,87 @@ impl Guest for Component {
                             }),
                         })
                 })
-                .collect())
+                .collect();
+
+            // OA.15: and the log's own rows, when the view asked for them.
+            //
+            // Appended rather than fanned through `entries_for_row`, because a
+            // log row is not a candidate any SECTION could want: the sections
+            // are a user's configuration of what their plan looks like, and a
+            // record of the past has no business landing in "Overdue" because
+            // that block happens to match. It gets one block of its own,
+            // ranked after every section — the plan comes first and the record
+            // reads as the answer to a different question.
+            if let Some((items, days)) = &state.log {
+                let rank = state.sections.len() as i64;
+                for event in agenda_log::scan(&text, *items, days) {
+                    // The tag filter reaches log rows too. An untagged
+                    // headline is absent from the map and is therefore
+                    // refused, which is correct: it can satisfy no `tag:`
+                    // term.
+                    if filtering_log
+                        && !tags_by_line
+                            .iter()
+                            .find(|(line, _)| *line == event.line)
+                            .is_some_and(|(_, tags)| view.admits_tags(tags))
+                    {
+                        continue;
+                    }
+                    let (text, spans) = event.annotation();
+                    entries.push(Entry {
+                        // The HEADLINE, not the `CLOCK:` or LOGBOOK line the
+                        // event was read from: the row is the thing you want
+                        // to read and `<CR>` is the thing you want it to do,
+                        // and neither wants the interior of a drawer.
+                        line: event.line,
+                        end_line: event.line,
+                        group: format!("{rank}:{}", agenda::group_key(event.day)),
+                        label: format!(
+                            "Log \u{2014} {}",
+                            agenda::group_label(event.day, state.today)
+                        ),
+                        sort_key: agenda::log_sort_key(rank, event.day, event.within_day()),
+                        // The headline's own colouring, exactly as a plan row
+                        // gets it — a log row IS a headline, and painting it
+                        // differently would make one task look like two.
+                        spans: lines
+                            .get(event.line as usize)
+                            .map(|line| {
+                                agenda::headline_spans(line, &state.keywords.all)
+                                    .into_iter()
+                                    .map(|(start, end, slot)| {
+                                        crate::lattice::plugin_host::types::DisplaySpan {
+                                            start,
+                                            end,
+                                            slot,
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        // What happened, under the row. An excerpt is verbatim
+                        // source and there is no line in the file that says
+                        // "Closed 14:32" — HB.5's annotation is the one place
+                        // a scan source may draw content of its own.
+                        annotation: Some(
+                            lattice::plugin_host::scanned_excerpt_source::Annotation {
+                                text,
+                                spans: spans
+                                    .into_iter()
+                                    .map(|(start, end, slot)| {
+                                        crate::lattice::plugin_host::types::DisplaySpan {
+                                            start,
+                                            end,
+                                            slot,
+                                        }
+                                    })
+                                    .collect(),
+                            },
+                        ),
+                    });
+                }
+            }
+            Ok(entries)
         })?;
         Ok(lattice::plugin_host::scanned_excerpt_source::ScanResult { entries, clock })
     }
@@ -3244,6 +3556,15 @@ struct ScanState {
     /// file of one scan agrees on both the set and each section's RANK — the
     /// rank is packed into the sort key the host orders on.
     sections: Vec<agenda::Section>,
+    /// OA.15: log mode's item set and the days it covers, or `None` when the
+    /// mode is off — which costs the walk nothing, because `agenda_log::scan`
+    /// returns immediately on an empty item set.
+    ///
+    /// The RANGE is resolved in `begin` beside `today` and for the same
+    /// reason: a scan crossing midnight must file every file's log against one
+    /// window, or two files scanned a second apart would disagree about what
+    /// "today" was.
+    log: Option<(agenda_log::LogItems, std::ops::RangeInclusive<i64>)>,
 }
 
 thread_local! {
@@ -5706,6 +6027,25 @@ impl GrammarCallbacks for Component {
                     },
                 ))])
             }
+            // OA.15: the same move every phase-6 chord makes — take the view's
+            // own arguments, change one, re-open. The mode IS the argument, so
+            // there is no second piece of state that could disagree with it,
+            // and `gr` carries it forward for free.
+            // OA.15b: `l` flips the MODE and nothing else.
+            //
+            // It does not touch `VIEW_ARGS`, and that is the slice's whole
+            // shape. The mode is the single source of truth for whether log
+            // rows are on; the `log=` scan argument is derived from it in the
+            // lifecycle handler (`ON_AGENDA_LOG_MODE`). A chord that wrote the
+            // argument *and* flipped the mode would be two writers of one
+            // fact, which is the disagreement OA.16 chose the
+            // mode-as-the-switch shape to prevent — and the drift would be
+            // invisible, because both states look right in isolation.
+            //
+            // The same `Effect::ToggleMode` the auto-generated
+            // `:org-agenda-log-mode` ex-command returns, so the chord and the
+            // command are one switch rather than two paths that can differ.
+            AGENDA_LOG_MODE => Ok(vec![Effect::ToggleMode(AGENDA_LOG_MODE_ID.to_string())]),
             AGENDA_FILTER_CLEAR => {
                 let mut view = VIEW_ARGS.with_borrow(Clone::clone);
                 view.filters.clear();

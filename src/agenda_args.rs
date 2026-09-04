@@ -60,6 +60,17 @@ pub struct ViewArgs {
     pub offset: i32,
     /// The filters the user has narrowed by, in the order they added them.
     pub filters: Vec<FilterTerm>,
+    /// OA.15: which log items this view admits, or `None` for log mode off —
+    /// which is every agenda nobody has pressed `l` in.
+    ///
+    /// A view ARGUMENT rather than a minor mode, and that is the slice's whole
+    /// shape. A log row is an ordinary excerpt over the headline the event
+    /// happened to, so turning log mode on is "re-open this view asking for
+    /// more rows" — which is exactly what `span` and `filters` already are.
+    /// Modelling it as a mode would have made it the one display toggle that
+    /// could not survive `gr`, could not differ between two open agendas, and
+    /// could not be written down.
+    pub log: Option<crate::agenda_log::LogItems>,
     /// Arguments that were not understood, named for the headerline. Never
     /// fatal — see the module header.
     pub problems: Vec<String>,
@@ -74,6 +85,7 @@ impl ViewArgs {
             span: None,
             offset: 0,
             filters: Vec::new(),
+            log: None,
             problems: Vec::new(),
         }
     }
@@ -115,6 +127,16 @@ impl ViewArgs {
                             .problems
                             .push(format!("offset `{value}` is not a number")),
                     },
+                    // OA.15. `log=` with nothing after it is log mode OFF
+                    // rather than a problem: it is what an empty item set
+                    // renders to, and a round trip that turned "no items" into
+                    // a warning would put a ⚠ in the headerline for a state
+                    // the user reached by pressing `l` twice.
+                    "log" => {
+                        let (items, problems) = crate::agenda_log::LogItems::parse(value);
+                        out.problems.extend(problems);
+                        out.log = items.any().then_some(items);
+                    }
                     _ => out.problems.push(format!("unknown view argument `{key}`")),
                 }
                 continue;
@@ -149,6 +171,12 @@ impl ViewArgs {
         }
         if self.offset != 0 {
             out.push(format!("offset={}", self.offset));
+        }
+        // OA.15: emitted only when log mode is ON. An `log=` on every agenda
+        // would make the default view's arguments say something about a mode
+        // it is not in, and `parse` reads its absence as off anyway.
+        if let Some(items) = self.log {
+            out.push(format!("log={}", items.to_spec()));
         }
         for f in &self.filters {
             out.push(match f {
@@ -192,6 +220,23 @@ impl ViewArgs {
             FilterTerm::Tag(t) => tags.iter().any(|x| x == t),
             FilterTerm::File(_) => true,
         })
+    }
+
+    /// OA.15: the inclusive epoch-day range log mode reports over, given the
+    /// view's resolved `span` and the day it is anchored to.
+    ///
+    /// **Backward, where the plan is forward.** A section's window is
+    /// `anchor ..= anchor + span`; a log has nothing to say about the future,
+    /// so filing log rows into that window would only ever surface today's.
+    /// The daily agenda logs today, the week view logs the last seven days,
+    /// and `b` walks back through earlier weeks exactly as it walks the plan.
+    ///
+    /// Length matches what the headerline CALLS the span (`window` renders
+    /// `anchor ..= anchor + span - 1`), so a header reading `Week` covers
+    /// seven days in both directions rather than seven forward and eight back.
+    pub fn log_days(span: u32, anchor: i64) -> std::ops::RangeInclusive<i64> {
+        let back = i64::from(span.max(1)) - 1;
+        (anchor - back)..=anchor
     }
 
     /// Whether any filter is active at all — what OA.22's headerline asks, and
@@ -297,11 +342,76 @@ mod tests {
             "r",
             "span=30",
             "offset=2",
+            "log=closed,clock",
             "tag:work",
             "file:a.org",
         ]));
         let round = ViewArgs::parse(&original.to_args());
         assert_eq!(round, original);
+    }
+
+    // ── OA.15: log mode is an argument, so it round-trips like one ──────
+
+    #[test]
+    fn log_mode_parses_its_item_set() {
+        let a = ViewArgs::parse(&args(&["", "log=closed,state"]));
+        let items = a.log.expect("log mode is on");
+        assert!(items.closed && items.state);
+        assert!(!items.clock, "…and only what was asked for");
+        assert!(a.problems.is_empty());
+    }
+
+    /// Absent means OFF, which is what every agenda that has never been shown
+    /// a log row carries.
+    #[test]
+    fn no_log_argument_is_log_mode_off() {
+        assert_eq!(ViewArgs::parse(&args(&["r", "span=7"])).log, None);
+    }
+
+    /// `l` pressed twice renders an empty item set. That has to read back as
+    /// OFF rather than as a malformed argument, or turning the mode off would
+    /// put a ⚠ in the headerline.
+    #[test]
+    fn an_empty_item_set_is_off_rather_than_a_problem() {
+        let a = ViewArgs::parse(&args(&["", "log="]));
+        assert_eq!(a.log, None);
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert!(
+            !a.to_args().iter().any(|s| s.starts_with("log")),
+            "and it is not re-emitted: {:?}",
+            a.to_args()
+        );
+    }
+
+    #[test]
+    fn an_unknown_log_item_is_named_and_the_rest_survives() {
+        let a = ViewArgs::parse(&args(&["", "log=closed,sideways"]));
+        assert!(a.log.expect("the rest still applies").closed);
+        assert_eq!(a.problems.len(), 1, "{:?}", a.problems);
+        assert!(a.problems[0].contains("sideways"), "{:?}", a.problems);
+    }
+
+    /// The log window looks BACKWARD. A forward window would only ever contain
+    /// today, because nothing is logged in the future.
+    #[test]
+    fn the_log_window_covers_the_span_ending_today() {
+        assert_eq!(ViewArgs::log_days(0, 100), 100..=100, "the daily agenda");
+        assert_eq!(ViewArgs::log_days(1, 100), 100..=100);
+        assert_eq!(ViewArgs::log_days(7, 100), 94..=100, "the last seven days");
+    }
+
+    /// The headerline has to say it: a view listing yesterday's closures with
+    /// nothing to explain them reads as an agenda that has started showing
+    /// finished work.
+    #[test]
+    fn the_header_says_log_mode_is_on() {
+        let a = ViewArgs::parse(&args(&["", "log=closed,clock"]));
+        let header = describe(&a, 7, 0);
+        assert!(header.contains("log closed,clock"), "{header}");
+        assert!(
+            !describe(&ViewArgs::parse(&[]), 7, 0).contains("log"),
+            "…and stays quiet when it is off"
+        );
     }
 
     #[test]
@@ -313,6 +423,7 @@ mod tests {
             span: None,
             offset: 0,
             filters: vec![FilterTerm::Tag("work".into())],
+            log: None,
             problems: Vec::new(),
         };
         assert_eq!(a.to_args(), vec!["".to_string(), "tag:work".to_string()]);
@@ -567,6 +678,12 @@ pub fn describe(view: &ViewArgs, default_span: u32, anchor: i64) -> String {
             FilterTerm::Tag(t) => format!("+{t}"),
             FilterTerm::File(f) => format!("file:{f}"),
         });
+    }
+    // OA.15: log mode changes which rows exist, so the header has to say it —
+    // a view showing yesterday's closures with nothing to explain them reads
+    // as an agenda that has started listing finished work.
+    if let Some(items) = view.log {
+        parts.push(format!("log {}", items.to_spec()));
     }
     for p in &view.problems {
         parts.push(format!("\u{26a0} {p}"));

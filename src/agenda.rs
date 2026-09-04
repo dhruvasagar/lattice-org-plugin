@@ -792,6 +792,18 @@ pub fn group_label(day: i64, today: i64) -> String {
 /// section. It covers ±1000 years, well past any date org's parser accepts.
 const DAY_BIAS: i64 = 400_000;
 
+/// OA.15: the same packing for a LOG row, which has no [`Row`] behind it.
+///
+/// A log row's within-day order is the time the event happened rather than
+/// (kind, priority) — a record reads in the order the day went. `within_day`
+/// comes from `agenda_log::LogEvent::within_day`, which is bounded to fit this
+/// slot; it is clamped here as well, because a term that carried into the DAY
+/// digits would file an evening event on the following morning and nothing
+/// downstream could tell.
+pub fn log_sort_key(section_rank: i64, day: i64, within_day: i64) -> i64 {
+    section_rank * 10_000_000_000_000 + (day + DAY_BIAS) * 10_000 + within_day.clamp(0, 9_999)
+}
+
 pub fn sort_key_in_section(row: &Row, section_rank: i64, today: i64) -> i64 {
     let priority = match row.priority {
         Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as i64) - ('A' as i64),

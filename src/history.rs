@@ -81,17 +81,57 @@ fn own_lines(lines: &[String]) -> usize {
         .unwrap_or(lines.len())
 }
 
+/// One `- State "NEW" from "OLD" [stamp]` line, read whole.
+///
+/// OA.15 needs the parts this module always threw away — which state the task
+/// moved to, which it came from, and the stamp's TIME — because log mode
+/// renders the change itself rather than only counting it as a completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateChange {
+    /// The state the task moved TO. Always present; it is the first quoted
+    /// field, which org writes for every state change.
+    pub to: String,
+    /// The state it came FROM, or `None` — org omits the clause entirely for a
+    /// task that had no previous keyword.
+    pub from: Option<String>,
+    /// The log stamp, inactive by construction (see [`stamp_date`]).
+    pub stamp: timestamp::Stamp,
+}
+
+/// `- State "DONE" from "NEXT" [2026-09-03 Wed 09:14]`, parsed generally.
+///
+/// **One parser, two consumers.** [`completions`] reads these to build a
+/// habit's graph and cares only whether the new state is done; `agenda_log`
+/// renders the change as a log row and needs every field. A second copy of
+/// this parse in the log module would be two readers of one construct, and the
+/// permissiveness this one has earned — org's `%-12s` padding, the `\\`
+/// note continuation, the drawer being optional — would have to be earned
+/// again there, in a place where nobody would think to test emacs' spacing.
+pub fn state_change(line: &str) -> Option<StateChange> {
+    let rest = line.trim_start().strip_prefix("- ")?.trim_start();
+    let rest = rest.strip_prefix("State")?;
+    let to = first_quoted(rest)?;
+    // `from "OLD"` follows the new state, so the search for it starts AFTER
+    // the first quoted field — otherwise a `from` clause would read back the
+    // state the task moved to.
+    let after = rest.find(&to).map(|i| i + to.len()).unwrap_or(0);
+    let from = rest
+        .get(after..)
+        .and_then(|tail| tail.split_once("from"))
+        .and_then(|(_, tail)| first_quoted(tail));
+    let stamp = timestamp::first_stamp(line)?;
+    // Inactive, for [`stamp_date`]'s reason: an active stamp in a note is
+    // something the user scheduled, not something they recorded doing.
+    (!stamp.active).then_some(())?;
+    Some(StateChange { to, from, stamp })
+}
+
 /// `- State "DONE" from "NEXT" [2026-09-03 Wed 09:14]` → the date, when the
 /// new state is a done keyword.
 fn state_change_into_done(line: &str, done_keywords: &[String]) -> Option<Date> {
-    let rest = line.trim_start().strip_prefix("- ")?.trim_start();
-    let rest = rest.strip_prefix("State")?;
-    // The new state is the first quoted field; `from "OLD"` follows and is not
-    // read. Which state it came FROM does not change that the task was
-    // finished, and org omits the clause entirely for a task that had no
-    // previous keyword.
-    let new_state = first_quoted(rest)?;
-    done_keywords.contains(&new_state).then_some(())?;
+    let change = state_change(line)?;
+    // Which state it came FROM does not change that the task was finished.
+    done_keywords.contains(&change.to).then_some(())?;
     stamp_date(line)
 }
 

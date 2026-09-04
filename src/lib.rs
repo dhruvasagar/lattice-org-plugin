@@ -493,12 +493,8 @@ const AGENDA_LOG_MODE_ID: &str = "org-agenda-log-mode";
 /// comes from `local-utc-offset-seconds` (OC.4) — `wasi:clocks` is UTC and the
 /// guest has no `TZ`.
 fn roam_file_stamp() -> String {
-    let utc = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let local = utc + host_services::local_utc_offset_seconds() as i64;
-    let days = local.div_euclid(86_400);
+    let local = local_now_secs();
+    let days = epoch_day_from_local_secs(local);
     let secs = local.rem_euclid(86_400);
     let (y, m, d) = agenda::civil_from_epoch_day(days);
     format!(
@@ -3840,11 +3836,41 @@ fn origin_annotation(doc: &Document, line: u32) -> Option<String> {
 /// time is the realistic case) yields day 0 — 1970 — so every real row reads
 /// as overdue. That is deliberately conspicuous: an agenda quietly anchored
 /// to the wrong day looks correct and is not.
+/// LOCAL, not UTC — see [`local_now_secs`]. This divided the raw UTC seconds
+/// until 2026-09-05, which anchored the agenda to the UTC day.
 fn today_epoch_day() -> i64 {
-    std::time::SystemTime::now()
+    epoch_day_from_local_secs(local_now_secs())
+}
+
+/// The epoch DAY a local wall-clock instant falls in.
+///
+/// `div_euclid`, not `/`: the local instant is UTC plus a SIGNED offset, and
+/// truncating division rounds toward zero, which is the wrong direction below
+/// the epoch. Pure, so the midnight boundary is testable without a clock.
+fn epoch_day_from_local_secs(local_secs: i64) -> i64 {
+    local_secs.div_euclid(86_400)
+}
+
+/// Now, in LOCAL wall-clock seconds since the epoch.
+///
+/// **The single place this plugin asks what time it is.** `wasi:clocks` is UTC
+/// and a component carries no `TZ`, so the offset comes from the host
+/// (`local-utc-offset-seconds`, host slice OC.4).
+///
+/// This exists because the correction was open-coded four times and the fourth
+/// copy did not have it: `today_epoch_day` divided raw UTC seconds, so the
+/// agenda anchored to the UTC day. East of Greenwich that is YESTERDAY until
+/// local morning catches up with UTC — reported at GMT+5:30 as the agenda
+/// opening on the 4th on the 5th — and west of it, tomorrow after the evening.
+/// The three correct siblings each carried a comment warning about exactly
+/// this bug while the fourth quietly had it, which is the argument for one
+/// function over four careful ones.
+fn local_now_secs() -> i64 {
+    let utc = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_secs() / 86_400) as i64)
-        .unwrap_or(0)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    utc + i64::from(host_services::local_utc_offset_seconds())
 }
 
 /// The shared body of all four promote/demote actions.
@@ -4149,12 +4175,7 @@ thread_local! {
 /// OC.4). Without it every clock line would be wrong by the user's offset and,
 /// near midnight, wrong by a day.
 fn clock_now() -> clock::Now {
-    let utc = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let offset = i64::from(host_services::local_utc_offset_seconds());
-    clock::Now::from_local_secs(utc + offset)
+    clock::Now::from_local_secs(local_now_secs())
 }
 
 /// The headline text, trimmed of its stars and TODO keyword, for the modeline.
@@ -5777,12 +5798,8 @@ impl PlanTarget {
 /// or west, and a scheduling key that is off by one after 6pm is worse than no
 /// key.
 fn today_local() -> org_date::Date {
-    let utc = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let local = utc + i64::from(host_services::local_utc_offset_seconds());
-    let (year, month, day) = agenda::civil_from_epoch_day(local.div_euclid(86_400));
+    let (year, month, day) =
+        agenda::civil_from_epoch_day(epoch_day_from_local_secs(local_now_secs()));
     org_date::Date { year, month, day }
 }
 
@@ -8695,5 +8712,57 @@ mod agenda_files_tests {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod local_clock_tests {
+    use super::epoch_day_from_local_secs;
+
+    /// The reported bug, as arithmetic.
+    ///
+    /// 2026-09-05 00:30 at GMT+5:30 is 2026-09-04 19:00 UTC. Dividing the UTC
+    /// seconds — which `today_epoch_day` did — anchors the agenda to the 4th
+    /// while the user's wall clock says the 5th. Feeding the LOCAL instant is
+    /// the whole fix, so this pins the boundary rather than the offset
+    /// plumbing (which is a host call the guest cannot stub).
+    #[test]
+    fn the_local_day_wins_east_of_greenwich() {
+        let utc_evening = 1_788_548_400_i64; // 2026-09-04 19:00:00 UTC
+        let offset = 5 * 3600 + 30 * 60; // +05:30
+        let utc_day = utc_evening.div_euclid(86_400);
+        let local_day = epoch_day_from_local_secs(utc_evening + offset);
+        assert_eq!(
+            local_day,
+            utc_day + 1,
+            "past local midnight the agenda must have rolled to the next day; \
+             equal days here is the bug — the agenda opening on yesterday"
+        );
+    }
+
+    /// And the mirror case, which the same fix has to not break: west of
+    /// Greenwich the local day is BEHIND UTC in the evening.
+    #[test]
+    fn the_local_day_also_wins_west_of_greenwich() {
+        let utc_early = 1_788_570_600_i64; // 2026-09-05 01:10:00 UTC
+        let offset = -(8 * 3600); // -08:00
+        let utc_day = utc_early.div_euclid(86_400);
+        let local_day = epoch_day_from_local_secs(utc_early + offset);
+        assert_eq!(
+            local_day,
+            utc_day - 1,
+            "it is still the previous evening in California"
+        );
+    }
+
+    /// `div_euclid`, not `/`. A negative local instant is only reachable
+    /// pre-1970, but truncating division rounds toward zero there and would
+    /// put 1969-12-31 in 1970.
+    #[test]
+    fn days_below_the_epoch_round_downward() {
+        assert_eq!(epoch_day_from_local_secs(-1), -1);
+        assert_eq!(epoch_day_from_local_secs(-86_400), -1);
+        assert_eq!(epoch_day_from_local_secs(-86_401), -2);
+        assert_eq!((-1_i64) / 86_400, 0, "the truncating division this avoids");
     }
 }

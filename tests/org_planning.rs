@@ -457,12 +457,16 @@ async fn settle_agenda(registry: &MultibufferRegistryHandle, view: lattice_core:
 
 /// Today's stamp, as the guest computes it — the row has to be dated to appear.
 fn today_stamp() -> String {
-    let z = (std::time::SystemTime::now()
+    // LOCAL, like the guest — see the note on `today()` in `org_agenda.rs`.
+    // Raw UTC seconds here agreed with the guest only while the two happened
+    // to share a day, so this passed all afternoon and failed after local
+    // midnight.
+    let utc = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs()
-        / 86_400) as i64
-        + 719_468;
+        .as_secs() as i64;
+    let offset = i64::from(chrono::Local::now().offset().local_minus_utc());
+    let z = (utc + offset).div_euclid(86_400) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;

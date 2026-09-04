@@ -100,11 +100,19 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
 }
 
 fn today() -> i64 {
-    (std::time::SystemTime::now()
+    // LOCAL, like the guest: the plugin resolves today through
+    // `local-utc-offset-seconds`, which the host implements as
+    // `chrono::Local::now().offset()`. Dividing raw UTC seconds here was a
+    // second, WRONG implementation of the thing under test — it agreed with
+    // the guest only while the two happened to share a day, so these tests
+    // passed all afternoon and failed after local midnight (GMT+5:30), which
+    // is the same bug `today_epoch_day` had.
+    let utc = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs()
-        / 86_400) as i64
+        .as_secs() as i64;
+    let offset = i64::from(chrono::Local::now().offset().local_minus_utc());
+    (utc + offset).div_euclid(86_400)
 }
 
 fn stamp(offset: i64) -> String {

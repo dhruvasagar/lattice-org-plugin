@@ -290,6 +290,24 @@ pub fn forget_file(path: &str) -> bool {
     true
 }
 
+/// OE.0 — the line an entry's `:PROPERTIES:` drawer starts on, whether or not
+/// one is there yet.
+///
+/// One past the headline, unless that line is the entry's planning line, in
+/// which case one past THAT. See [`id_drawer_insert`] for why the order is
+/// load-bearing rather than cosmetic.
+///
+/// Public because the property writer OE.1 adds needs the same answer, and two
+/// derivations of "where does the drawer go" would drift — silently, since both
+/// produce a file that looks right.
+pub fn drawer_line_for(line: &dyn Fn(u32) -> Option<String>, headline_line: u32) -> u32 {
+    let first = headline_line + 1;
+    match line(first) {
+        Some(text) if crate::planning::parse(&text).is_some() => first + 1,
+        _ => first,
+    }
+}
+
 /// OR.8 — where an `:ID:` drawer goes for the headline on `headline_line`, and
 /// whether one is needed at all.
 ///
@@ -298,11 +316,32 @@ pub fn forget_file(path: &str) -> bool {
 /// `:org-roam-id-create` twice is something a user does, and answering it with
 /// a second drawer would produce a file org itself cannot read.
 ///
-/// `Some((line, text))` is the line to insert `text` before — always
-/// `headline_line + 1`, because org requires the drawer to be the first thing
-/// under its headline. An existing drawer WITHOUT an `:ID:` is extended in
-/// place instead, by inserting the `:ID:` line just inside its opener; that is
-/// why the answer is a line rather than a fixed offset.
+/// `Some((line, text))` is the line to insert `text` before. An existing drawer
+/// WITHOUT an `:ID:` is extended in place instead, by inserting the `:ID:` line
+/// just inside its opener; that is why the answer is a line rather than a fixed
+/// offset.
+///
+/// ## The drawer goes after the PLANNING line, not directly under the headline
+///
+/// OE.0. This function used to answer `headline_line + 1` unconditionally, on
+/// the stated grounds that "org requires the drawer to be the first thing under
+/// its headline". It does not, and the difference is a live defect rather than
+/// a style question: tree-sitter-org's `section` rule is
+/// `headline, [plan], [property_drawer], [body], subsection*` — a SEQ, so the
+/// plan comes FIRST.
+///
+/// Parsed, a drawer written above the planning line does not merely look odd.
+/// The `plan` field disappears; `SCHEDULED: <…>` becomes a `paragraph` in
+/// `body`, its timestamp not even tokenised as a timestamp. And `agenda.rs`
+/// reads the date from `section.child_by_field("plan")` — so an `:ID:` minted
+/// on a scheduled TODO silently moved it out of the dated agenda and into the
+/// undated block, leaving a file that still reads correctly to a human.
+///
+/// A plan is ONE line here: `SCHEDULED:` on one line and `DEADLINE:` on the
+/// next parses only the first as a plan (the second is body prose — a grammar
+/// limitation worth knowing, and not this function's to fix). So the answer is
+/// "one line past the headline, plus one more if that line is planning", with
+/// no loop.
 ///
 /// `line` is the file read through an accessor rather than a materialised
 /// `Vec`, matching `headline.rs`'s shape: a drawer is a handful of lines under
@@ -313,7 +352,7 @@ pub fn id_drawer_insert(
     headline_line: u32,
     id: &str,
 ) -> Option<(u32, String)> {
-    let first = headline_line + 1;
+    let first = drawer_line_for(line, headline_line);
     let opens_drawer = line(first).is_some_and(|l| l.trim().eq_ignore_ascii_case(":properties:"));
 
     if !opens_drawer {
@@ -363,6 +402,55 @@ mod id_create_tests {
         let (at, text) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
         assert_eq!(at, 1);
         assert_eq!(text, ":PROPERTIES:\n:ID:       ABC\n:END:\n");
+    }
+
+    /// OE.0 — the regression. A drawer written above the planning line takes
+    /// the plan out of the tree: tree-sitter-org's `section` is
+    /// `headline, [plan], [property_drawer], …`, so with the drawer first the
+    /// `plan` field is absent and `SCHEDULED:` becomes body prose. `agenda.rs`
+    /// reads the date from that field, so `:org-roam-id-create` on a scheduled
+    /// TODO used to move it out of the dated agenda — leaving a file that still
+    /// reads correctly to a human, which is why nothing caught it.
+    #[test]
+    fn a_drawer_goes_below_the_planning_line_not_above_it() {
+        let l = lines("* TODO Task\nSCHEDULED: <2026-09-04 Fri>\nbody\n");
+        let (at, text) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 2, "below the plan, not between it and the headline");
+        assert_eq!(text, ":PROPERTIES:\n:ID:       ABC\n:END:\n");
+    }
+
+    /// The same, with the drawer already there — the walk has to START in the
+    /// right place too, or it reads the plan line, finds no `:PROPERTIES:` and
+    /// opens a second drawer beside the first.
+    #[test]
+    fn an_existing_drawer_below_a_plan_is_found_and_extended() {
+        let l = lines(
+            "* TODO Task\nDEADLINE: <2026-09-09 Wed>\n:PROPERTIES:\n:CATEGORY: work\n:END:\n",
+        );
+        let (at, text) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 3, "just inside the opener of the drawer that exists");
+        assert_eq!(text, ":ID:       ABC\n");
+    }
+
+    /// …and it must still be a no-op when that drawer already has the id.
+    /// Before OE.0 this answered `Some`, because the walk began on the plan
+    /// line and never saw the `:ID:` — a second drawer on a scheduled node.
+    #[test]
+    fn an_id_below_a_plan_is_still_recognised() {
+        let l = lines(
+            "* TODO Task\nSCHEDULED: <2026-09-04 Fri>\n:PROPERTIES:\n:ID:       OLD\n:END:\n",
+        );
+        assert_eq!(id_drawer_insert(&l, 0, "NEW"), None);
+    }
+
+    /// A body line that merely mentions a keyword is not a plan.
+    /// `planning::parse` is strict in this direction on purpose — being too
+    /// loose here would push the drawer past a line of the user's prose.
+    #[test]
+    fn prose_mentioning_scheduled_does_not_move_the_drawer() {
+        let l = lines("* Topic\nSCHEDULED: is how org spells it\n");
+        let (at, _) = id_drawer_insert(&l, 0, "ABC").expect("needs an id");
+        assert_eq!(at, 1);
     }
 
     #[test]

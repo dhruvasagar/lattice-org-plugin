@@ -373,6 +373,20 @@ impl<'a> Lists<'a> {
         (node.byte_range().start.line == n).then_some(node)
     }
 
+    /// The `listitem` node OPENING line `n`, for callers that must walk the
+    /// tree from it rather than read the item's fields.
+    ///
+    /// This is [`item_at`](Self::item_at)'s own question, handed back as a node
+    /// instead of an `Item`: same bullet-column probe, same "does an item start
+    /// here" veto. It exists so `Checkboxes` can reach the ancestor walk without
+    /// asking that question a second way — before OS.3's fix-round it asked at a
+    /// different column with a different predicate, and the two could disagree.
+    pub(crate) fn listitem_node_at(&self, snapshot: &TreeSnapshot, n: u32) -> Option<Node> {
+        let text = self.text(n)?;
+        let item = parse_bullet(&text, indent_of(&text))?;
+        self.listitem_at(snapshot, n, item.indent)
+    }
+
     // Dead only because its public caller is; see `Lists::siblings`.
     #[allow(dead_code)]
     fn tree_siblings(&self, snapshot: &TreeSnapshot, item: &Item) -> Option<Vec<u32>> {

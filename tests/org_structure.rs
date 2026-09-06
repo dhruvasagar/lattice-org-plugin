@@ -4865,3 +4865,79 @@ async fn outside_a_table_the_chord_reaches_orgs_dispatcher() {
         "the chord declined out of `table-mode` and org's checkbox arm ran"
     );
 }
+
+/// OS.3 fix-round: a box and the cookie above it must describe the same buffer.
+///
+/// `Checkboxes` asks "does this line carry a box" in three tree paths — the
+/// toggle's veto, the ancestor walk, and the tally's child filter. Until this
+/// round two of them read the grammar's `checkbox` FIELD while the third, newly
+/// rebuilt onto `Lists`, read the text. Two answers to one question inside one
+/// struct is the drift OS.3 exists to remove, and the rebuild had reproduced it
+/// one level down.
+///
+/// **This pins the invariant, not a reproduction.** No input was found where the
+/// two predicates actually disagree: every shape below was probed against the
+/// pre-fix code and box and cookie already moved together, so the fix is
+/// behaviour-preserving and closes a hazard rather than a live bug. The test
+/// earns its place anyway — it is the only coverage `Lists::item_at`'s TREE
+/// branch has across bullet forms, since `list.rs`'s unit tests all run
+/// tree-less, and it is what would fail if a later slice re-split the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_bullet_shape_moves_its_box_and_its_cookie_together() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    }
+    // (name, before, after). The last case is the negative: `[  ]` is not a
+    // checkbox to either path, so nothing moves.
+    let cases: Vec<(&str, &str, &str)> = vec![
+        (
+            "contentless",
+            "* S [0/1]\n  - [ ]\n",
+            "* S [1/1]\n  - [X]\n",
+        ),
+        (
+            "extra space before the box",
+            "* S [0/1]\n  -   [ ] a\n",
+            "* S [1/1]\n  -   [X] a\n",
+        ),
+        (
+            "tab indent",
+            "* S [0/1]\n\t- [ ] a\n",
+            "* S [1/1]\n\t- [X] a\n",
+        ),
+        (
+            "ordered",
+            "* S [0/1]\n  1. [ ] a\n",
+            "* S [1/1]\n  1. [X] a\n",
+        ),
+        ("plus", "* S [0/1]\n  + [ ] a\n", "* S [1/1]\n  + [X] a\n"),
+        (
+            "star, which is a bullet only because it is indented",
+            "* S [0/1]\n  * [ ] a\n",
+            "* S [1/1]\n  * [X] a\n",
+        ),
+        (
+            "at column zero",
+            "* S [0/1]\n- [ ] a\n",
+            "* S [1/1]\n- [X] a\n",
+        ),
+        (
+            "with a nested child below it",
+            "* S [0/1]\n  - [ ] a\n    - [ ] b\n",
+            "* S [1/1]\n  - [X] a\n    - [ ] b\n",
+        ),
+        (
+            "a two-space box is not a checkbox",
+            "* S [0/1]\n  - [  ] a\n",
+            "* S [0/1]\n  - [  ] a\n",
+        ),
+    ];
+    for (name, before, after) in cases {
+        let base = tempfile::tempdir().unwrap();
+        let mut editor = org_editor(base.path(), before).await;
+        goto_line(&mut editor, 1);
+        press(&mut editor, "<C-Space>");
+        assert_eq!(text(&editor), after, "{name}");
+    }
+}

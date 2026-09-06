@@ -278,7 +278,14 @@ impl<'a> Checkboxes<'a> {
         };
         let mut node = item;
         while let Some(ancestor) = tree::ancestor(&node, LISTITEM) {
-            if let Some(line) = checkbox_start_line(&ancestor) {
+            // Cookie-bearing ancestors only — and asked of the MODEL, the same
+            // "does this line carry a box" the toggle path asks. Reading the
+            // grammar's `checkbox` FIELD here instead would reintroduce one
+            // level up the divergence `listitem_on` just removed: an ancestor
+            // whose text carries a box but whose node has no such field would
+            // be skipped, and its cookie would never update.
+            let line = ancestor.byte_range().start.line;
+            if self.carries_box(line) {
                 out.push(Parent::Item {
                     line,
                     indent: self.indent_of(line),
@@ -322,7 +329,8 @@ impl<'a> Checkboxes<'a> {
         let mut out = Vec::new();
         for list in tree::children_of_kind(&node, LIST) {
             for item in tree::children_of_kind(&list, LISTITEM) {
-                if let Some(line) = checkbox_start_line(&item) {
+                let line = item.byte_range().start.line;
+                if self.carries_box(line) {
                     out.push(line);
                 }
             }
@@ -330,19 +338,41 @@ impl<'a> Checkboxes<'a> {
         out
     }
 
+    /// Does line `n` carry a checkbox, per the model?
+    ///
+    /// The single answer three tree paths used to give three ways — the toggle
+    /// veto, the ancestor filter and the tally's child filter. Two of those read
+    /// the grammar's `checkbox` FIELD and one read the text; an item the grammar
+    /// emits without that field, whose text does parse a box, was toggleable but
+    /// invisible to both the ancestors above it and the tally around it. Asking
+    /// once, here, is what keeps the box and its cookie describing the same
+    /// buffer.
+    fn carries_box(&self, n: u32) -> bool {
+        self.lists().item_at(n).and_then(|i| i.checkbox).is_some()
+    }
+
     // ── the fallback ──
 
     /// The `listitem` whose checkbox is on line `n`.
     ///
-    /// Probes at the box's own column, NOT at byte 0. An indented item's
-    /// `listitem` node starts at its bullet, so a point at column 0 is in the
-    /// enclosing `list` (or `body`) and the ancestor walk from there never
-    /// finds a `listitem` at all — which showed up as `<C-Space>` silently
-    /// doing nothing on every indented list in the suite.
+    /// Delegates the structural half to [`Lists::listitem_node_at`] — the same
+    /// question, at the same column, with the same veto [`Self::item_at`]
+    /// already asked. Only the box filter is this struct's own, because only
+    /// this struct cares whether an item is part of a tally.
+    ///
+    /// It did not always. Until OS.3's fix-round this probed at the BOX's
+    /// column and vetoed on "the grammar gave this `listitem` a `checkbox`
+    /// FIELD", while `item_at` had been rebuilt to veto on "a `listitem` starts
+    /// on line `n`". An item the grammar emits without that field, on a line
+    /// whose text does parse a box, then toggled here and yielded no ancestors
+    /// there — the box flipped while the cookie above it silently stopped
+    /// matching. Two answers to one question inside one struct is precisely the
+    /// drift this slice exists to remove, and the rebuild had reproduced it one
+    /// level down. `a_contentless_item_still_carries_its_cookie` pins it.
     fn listitem_on(&self, snapshot: &TreeSnapshot, n: u32) -> Option<Node> {
-        let col = self.text(n).as_deref().and_then(parse_item)?.box_at as u32;
-        let node = enclosing_listitem(snapshot, n, col)?;
-        (checkbox_start_line(&node) == Some(n)).then_some(node)
+        // A plain bullet is not part of any tally.
+        self.carries_box(n).then_some(())?;
+        self.lists().listitem_node_at(snapshot, n)
     }
 
     fn indent_of(&self, n: u32) -> usize {
@@ -451,17 +481,6 @@ pub fn tally_lines(lines: &[u32], state_of: impl Fn(u32) -> Option<String>) -> (
         }
     }
     (done, total)
-}
-
-/// The innermost `listitem` covering `(line, byte)`.
-fn enclosing_listitem(snapshot: &TreeSnapshot, line: u32, byte: u32) -> Option<Node> {
-    tree::enclosing(snapshot, line, byte, LISTITEM)
-}
-
-/// The line a `listitem`'s checkbox sits on. `None` for an item with no box —
-/// a plain bullet is not part of any tally.
-fn checkbox_start_line(item: &Node) -> Option<u32> {
-    Some(item.child_by_field("checkbox")?.byte_range().start.line)
 }
 
 #[cfg(test)]

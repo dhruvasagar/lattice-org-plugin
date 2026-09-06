@@ -1866,6 +1866,14 @@ impl Guest for Component {
             chord: chord.to_string(),
             command: command.to_string(),
         };
+        // OS.4: the Insert-mode peer. A separate closure rather than a second
+        // parameter on `bind`, so the forty-odd existing Normal binds below are
+        // not all rewritten to say `Normal` out loud.
+        let ibind = |chord: &str, command: &str| ModeKeymapBinding {
+            binding_mode: BindingMode::Insert,
+            chord: chord.to_string(),
+            command: command.to_string(),
+        };
         register_mode(&ModeDeclaration {
             id: "org-mode".to_string(),
             kind: ModeKind::Major,
@@ -1881,6 +1889,13 @@ impl Guest for Component {
                 // `<leader>o` prefix.
                 bind("<leader>oK", "org-move-subtree-up"),
                 bind("<leader>oJ", "org-move-subtree-down"),
+                // OS.4: `<M-CR>` is org's own spelling, in Normal AND Insert —
+                // the gesture is most useful mid-typing, which is where emacs
+                // users reach for it. `<leader><CR>` stays: it is the portable
+                // spelling, and a terminal that cannot send `<M-CR>` (see OS.1)
+                // must still reach the verb.
+                bind("<M-CR>", "org-meta-return"),
+                ibind("<M-CR>", "org-meta-return"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -5304,12 +5319,135 @@ fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -
 /// Declines in a file's preamble: with no enclosing headline there is no level
 /// to inherit, and guessing level 1 would make `<leader><CR>` mean something
 /// different depending on where the cursor happens to be.
-fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
-    let line = |n: u32| doc.line(n);
-    let hl = headline::Headlines::new(tree, &line, doc.line_count());
-    let Some((start, level)) = hl.enclosing(ctx.cursor.line) else {
+/// What the cursor is on, for the gestures that mean different things over
+/// different structure.
+///
+/// OS.5 adds no variants; it adds a second verb over the same three.
+enum AtPoint {
+    CheckboxItem(list::Item),
+    ListItem(list::Item),
+    /// `(start line, level)` of the enclosing headline.
+    Headline(u32, usize),
+}
+
+/// Which of the three the cursor is in, innermost first.
+///
+/// A list item wins over the headline that owns it — `<M-CR>` inside a list
+/// means "another item", not "another heading", and the headline is always also
+/// an answer, so asking it first would make the list arms unreachable.
+///
+/// `enclosing_item`, not `item_at`: acting from a continuation line is acting on
+/// the item it belongs to. That is the whole reason the model distinguishes the
+/// two.
+fn at_point(doc: &Document, tree: Option<&TreeSnapshot>, line: u32) -> Option<AtPoint> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    if let Some(item) = lists.enclosing_item(line) {
+        return Some(if item.checkbox.is_some() {
+            AtPoint::CheckboxItem(item)
+        } else {
+            AtPoint::ListItem(item)
+        });
+    }
+    let hl = headline::Headlines::new(tree, &l, doc.line_count());
+    hl.enclosing(line)
+        .map(|(start, level)| AtPoint::Headline(start, level))
+}
+
+/// Insert a sibling list item after the one at point, renumbering in the SAME
+/// edit.
+///
+/// One edit rather than two because `u` must undo what felt like one keystroke.
+/// The insert lands after `item_end` — the item's continuation lines and its
+/// nested children included — for the reason the headline arm respects content:
+/// dropping a sibling between a parent and its children reparents them, which is
+/// a silent restructure from a key that means "new item".
+///
+/// The new box is always empty. Copying `[X]` from the item above would tick a
+/// task nobody has done.
+fn meta_return_list(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    item: &list::Item,
+) -> Vec<Effect> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    let end = lists.item_end(item.line);
+    // The whole list, because renumbering restarts each level at 1 across the
+    // span it is given: handing it only the tail would renumber that tail from 1.
+    let (ls, le) = lists.list_span(item.line).unwrap_or((item.line, end));
+    let to = le.max(end);
+
+    let bullet = match item.bullet {
+        list::Bullet::Ordered { n, delim } => list::Bullet::Ordered { n: n + 1, delim },
+        other => other,
+    };
+    let box_text = if item.checkbox.is_some() { "[ ] " } else { "" };
+    let new_line = format!("{}{} {box_text}", " ".repeat(item.indent), bullet.render());
+    let insert_at = end + 1;
+
+    // The buffer as it will be. Renumbering must be computed against the text
+    // AFTER the insert or the new item is not counted, and the line numbers
+    // below it have all shifted by one.
+    let after = |n: u32| -> Option<String> {
+        match n.cmp(&insert_at) {
+            std::cmp::Ordering::Less => doc.line(n),
+            std::cmp::Ordering::Equal => Some(new_line.clone()),
+            std::cmp::Ordering::Greater => doc.line(n - 1),
+        }
+    };
+    // `None` for the tree DELIBERATELY: the snapshot describes the buffer before
+    // the insert, so every line number in it is off by one past `insert_at`.
+    // Renumbering needs only indent structure, which the fallback answers.
+    let shifted = list::Lists::new(None, &after, doc.line_count() + 1);
+    let changes = list::renumber(&shifted, (ls, to + 1));
+
+    let mut out: Vec<String> = Vec::new();
+    for n in ls..=(to + 1) {
+        let Some(base) = after(n) else { break };
+        let text = changes
+            .iter()
+            .find(|(i, _)| *i == n)
+            .map(|(_, t)| t.clone())
+            .unwrap_or(base);
+        out.push(text);
+    }
+
+    let Some(last) = doc.line(to) else {
         return vec![Effect::None];
     };
+    let cursor = Position {
+        line: insert_at,
+        byte: new_line.len() as u32,
+    };
+    replace_lines(ctx, ls, to, last.len() as u32, out.join("\n"), cursor)
+}
+
+fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    // The checkbox arm before the plain-item arm: a checkbox item is also a
+    // list item, so order is what decides which one answers.
+    match at_point(doc, tree, ctx.cursor.line) {
+        Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
+            meta_return_list(ctx, doc, tree, &item)
+        }
+        Some(AtPoint::Headline(start, level)) => meta_return_headline(ctx, doc, tree, start, level),
+        None => vec![Effect::None],
+    }
+}
+
+fn meta_return_headline(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    start: u32,
+    level: usize,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    // `start` / `level` come from `at_point`, which already resolved the
+    // enclosing headline to decide this arm. Re-deriving them here would be a
+    // second answer to a question already asked.
     let end = hl.subtree_end(start);
     let Some(last) = doc.line(end) else {
         return vec![Effect::None];

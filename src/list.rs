@@ -81,6 +81,7 @@ impl Bullet {
     // Unused until OS.7 binds bullet cycling. The model is this slice's whole
     // deliverable and its shape is fixed by the plan, so the alternative to an
     // allow is shipping the gate without the thing it gates.
+    // Unused until OS.9 binds bullet cycling.
     #[allow(dead_code)]
     pub fn cycled(self) -> Bullet {
         match self {
@@ -115,7 +116,6 @@ pub struct Item {
     /// Byte offset where the item's own text begins, after the bullet and any
     /// checkbox.
     // Read by OS.4's meta-return, which splits an item at its content.
-    #[allow(dead_code)]
     pub content_byte: u32,
 }
 
@@ -315,6 +315,7 @@ impl<'a> Lists<'a> {
 
     /// Item lines at the same indent, in order, within one list.
     // Unused until OS.6 moves an item among its siblings; see `Bullet::cycled`.
+    // Unused until OS.6/OS.7 bind indent and move.
     #[allow(dead_code)]
     pub fn siblings(&self, n: u32) -> Vec<u32> {
         let Some(item) = self.enclosing_item(n) else {
@@ -333,6 +334,7 @@ impl<'a> Lists<'a> {
     /// Direct only: a grandchild belongs to its own parent, and counting it
     /// here would make every deep list double-counted.
     // Unused until OS.4 indents a subtree; see `Bullet::cycled`.
+    // Unused until OS.6/OS.7 bind indent and move.
     #[allow(dead_code)]
     pub fn children(&self, n: u32) -> Vec<u32> {
         let Some(item) = self.enclosing_item(n) else {
@@ -348,7 +350,6 @@ impl<'a> Lists<'a> {
 
     /// First and last line of the whole list containing `n`.
     // Unused until OS.6 renumbers a list after a move.
-    #[allow(dead_code)]
     pub fn list_span(&self, n: u32) -> Option<(u32, u32)> {
         let item = self.enclosing_item(n)?;
         if let Some(snapshot) = self.tree {
@@ -388,6 +389,7 @@ impl<'a> Lists<'a> {
     }
 
     // Dead only because its public caller is; see `Lists::siblings`.
+    // Dead only because its public caller is; see `Lists::siblings`.
     #[allow(dead_code)]
     fn tree_siblings(&self, snapshot: &TreeSnapshot, item: &Item) -> Option<Vec<u32>> {
         let node = self.listitem_at(snapshot, item.line, item.indent)?;
@@ -400,6 +402,7 @@ impl<'a> Lists<'a> {
         )
     }
 
+    // Dead only because its public caller is; see `Lists::children`.
     // Dead only because its public caller is; see `Lists::children`.
     #[allow(dead_code)]
     fn tree_children(&self, snapshot: &TreeSnapshot, item: &Item) -> Option<Vec<u32>> {
@@ -520,6 +523,7 @@ impl<'a> Lists<'a> {
     }
 
     // Dead only because its public caller is; see `Lists::children`.
+    // Dead only because its public caller is; see `Lists::children`.
     #[allow(dead_code)]
     fn text_children(&self, item: &Item) -> Vec<u32> {
         let mut out = Vec::new();
@@ -578,7 +582,6 @@ impl<'a> Lists<'a> {
 /// them into one edit — which is what lets a single `u` put a whole renumber
 /// back. Unordered items are untouched.
 // Unused until OS.6 renumbers after a move; see `Bullet::cycled`.
-#[allow(dead_code)]
 pub fn renumber(lists: &Lists<'_>, span: (u32, u32)) -> Vec<(u32, String)> {
     let mut out = Vec::new();
     // One counter per open indent level. A Vec and not a map because leaving a

@@ -372,6 +372,17 @@ fn goto_line(editor: &mut Editor, line: u32) {
     editor.cursor.byte = 0;
 }
 
+/// Put the caret at an exact `(line, byte)` WITHOUT dispatching motions, so a
+/// test's setup cannot fail for a motion's reasons.
+fn goto(editor: &mut Editor, line: u32, byte: u32) {
+    editor.cursor.line = line;
+    editor.cursor.byte = byte;
+}
+
+fn cursor(editor: &Editor) -> (u32, u32) {
+    (editor.cursor.line, editor.cursor.byte)
+}
+
 fn text(editor: &Editor) -> String {
     editor.document.snapshot().text().to_string()
 }
@@ -4940,4 +4951,158 @@ async fn every_bullet_shape_moves_its_box_and_its_cookie_together() {
         press(&mut editor, "<C-Space>");
         assert_eq!(text(&editor), after, "{name}");
     }
+}
+
+// ── OS.4: `<M-CR>` dispatches on what is at point ──────────────────────────
+
+/// The whole point of the slice: one gesture, three meanings, chosen by what
+/// the cursor is on rather than by which key was pressed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_on_a_plain_item_inserts_a_plain_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n- eggs\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(text(&editor), "- milk\n- \n- eggs\n");
+    assert_eq!(
+        cursor(&editor),
+        (1, 2),
+        "caret sits after the bullet, ready to type"
+    );
+}
+
+/// A checkbox item is also a list item, so arm ORDER decides this one. The new
+/// box starts empty whatever the source item's state — copying `[X]` would tick
+/// a task the user has not done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_on_a_checkbox_item_inserts_an_empty_checkbox_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- [X] bread\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(
+        text(&editor),
+        "- [X] bread\n- [ ] \n",
+        "a NEW box starts empty -- copying [X] would tick a task nobody did"
+    );
+}
+
+/// The headline arm is the pre-OS.4 behaviour, unchanged: respect-content, so
+/// the new sibling lands after the whole subtree and does not adopt `Child`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_on_a_headline_still_inserts_after_the_subtree() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n* Two\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(
+        text(&editor),
+        "* One\n** Child\n* \n* Two\n",
+        "respect-content: the new sibling must not adopt Child"
+    );
+}
+
+/// OS.0b is what makes this reachable: an ALT-bearing chord in Insert used to
+/// be normalized away before any lookup saw it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_works_in_insert_mode_too() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n").await;
+
+    goto(&mut editor, 0, 6);
+    press(&mut editor, "A"); // Insert, at end of line
+    press(&mut editor, "<M-CR>");
+    assert_eq!(text(&editor), "- milk\n- \n");
+}
+
+/// Insert and renumber must be ONE edit, or `u` takes two presses to undo what
+/// felt like one keystroke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_renumbers_an_ordered_list_in_the_same_edit() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "1. a\n2. b\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(text(&editor), "1. a\n2. \n3. b\n");
+    press(&mut editor, "u");
+    assert_eq!(
+        text(&editor),
+        "1. a\n2. b\n",
+        "one undo restores the insert AND the numbering"
+    );
+}
+
+/// Nothing at point, nothing to do — and no edit, so a stray `<M-CR>` in prose
+/// cannot corrupt a buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_in_the_preamble_does_nothing() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "just prose\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(text(&editor), "just prose\n");
+}
+
+/// OS.4 owes this: the plan's coverage table wrongly assumed `enclosing_item`
+/// already had integration reach via the checkbox tests. It does not — nothing
+/// routed to it until this slice. Acting from a CONTINUATION line is what
+/// exercises it, and the new item must land after the whole item, not inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_from_a_continuation_line_acts_on_its_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n  and more\n- eggs\n").await;
+
+    goto(&mut editor, 1, 2);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(
+        text(&editor),
+        "- milk\n  and more\n- \n- eggs\n",
+        "the new item follows the whole item, continuation line included"
+    );
+}
+
+/// The other half of OS.4's owed coverage: a nested child means `children`
+/// answers non-empty, and the new sibling must land after the child rather than
+/// between the parent and it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_on_a_parent_item_lands_after_its_children() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- one\n  - one-a\n- two\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-CR>");
+    assert_eq!(
+        text(&editor),
+        "- one\n  - one-a\n- \n- two\n",
+        "the sibling follows the subtree, not the bullet line"
+    );
 }

@@ -3180,6 +3180,14 @@ impl Guest for Component {
     /// Splitting it means `:help org` stays about editing org files and
     /// `:help org.roam` is reachable by name from the picker, rather than
     /// being a heading two thirds of the way down someone else's page.
+    ///
+    /// **The files are `doc/org.md` and `doc/roam.md`, named for the topic
+    /// each one lands at — not `doc/org-roam.md`.** The `org` prefix is the
+    /// host's to add, from the manifest id; a file that carries it too claims
+    /// a topic name that does not exist. That is not cosmetic: a reader who
+    /// sees `doc/org-roam.md` types `:help org-roam`, gets `no help topic:
+    /// org-roam`, and concludes the page was never shipped. Reported
+    /// 2026-09-05, and the file name was the whole of the bug.
     fn register_help_topics() {
         let _ = register_topic(
             "",
@@ -3192,7 +3200,7 @@ impl Guest for Component {
         let _ = register_topic(
             "roam",
             "Org-roam: id-addressed notes, backlinks, dailies and templates.",
-            include_str!("../doc/org-roam.md"),
+            include_str!("../doc/roam.md"),
             // Every roam command is `org-roam-…`, so one pattern reaches all
             // of them and nothing else.
             &["roam".to_string()],

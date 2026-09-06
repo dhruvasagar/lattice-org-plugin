@@ -759,6 +759,36 @@ async fn find_node_offers_to_create_and_pins_it_last() {
 /// because `handle_effect` already applies `Effect::WriteToFile` inline. An
 /// assertion that cannot observe a success is indistinguishable from a product
 /// that cannot produce one, and it makes every fix look plausible.
+///
+/// **OR.13 update, `#[ignore]`d again — this time for a REAL reason the four
+/// rounds above had already found and let go of.** The `active_pane_buffer_id`
+/// assertion below is the one this test always lacked; with it in place the
+/// old "dead end" resurfaces as the live bug. `ROAM_CREATE_NODE`'s stub path
+/// (`src/lib.rs`) now returns `[WriteToFile, OpenBufferAt]`, and confirmed via
+/// a temporary `tracing` probe: BOTH effects reach
+/// `drain_pending_picker_accept` (`lattice-host/src/dispatch.rs:~13436`) as
+/// `Discriminant(4)` (`WriteToFile`) and `Discriminant(13)` (`OpenBufferAt`).
+/// `WriteToFile` still lands because `apply_picker_outcome` already ran
+/// `handle_effect` on it upstream (true, as the paragraph above says) — but
+/// `OpenBufferAt` gets NO such upstream handling (`handle_effect`'s own
+/// catch-all is `_ => {}`, `lattice-host/src/dispatch.rs:4346`), so it is
+/// truly lost rather than redundantly re-applied. `drain_pending_picker_accept`'s post-loop
+/// converts exactly one effect to a renderer signal, `Effect::OpenTransient`
+/// (added for OR.11b's template picker); every other effect — now including
+/// `OpenBufferAt` — falls to `other => tracing::debug!(...)` and is dropped.
+/// This IS the same gap the paragraph above tried once: "a patch for it made
+/// this test pass" was this exact class of fix, abandoned because the test's
+/// OLD assertion could not tell a focused draft from an unfocused one.
+///
+/// This is a **host** fix (`lattice-host/src/dispatch.rs`), out of scope for
+/// the plugin-only slice that owns this file — mirror the existing
+/// `Effect::OpenTransient` arm: `do_edit(path, force)` +
+/// `land_cursor_at(position)`, the same two calls the TUI renderer's own
+/// `Effect::OpenBufferAt` arm makes (`lattice-ui-tui/src/app/dispatch.rs:1050`).
+/// Un-ignore once that lands.
+#[ignore = "OR.13: blocked on a host fix — drain_pending_picker_accept drops \
+            Effect::OpenBufferAt (see doc comment above); confirmed via \
+            tracing that Discriminant(13) reaches the unhandled branch"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
     let base = tempfile::tempdir().unwrap();
@@ -795,7 +825,7 @@ async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
     // file buffer including the scratch one the editor booted with. This test
     // spent its whole ignored life asserting through that filter, which is why
     // a draft that was being created looked like a draft that never was.
-    let draft_text = |editor: &Editor| -> Option<String> {
+    let draft = |editor: &Editor| -> Option<(lattice_core::BufferId, String)> {
         let mut ids = Vec::new();
         editor.buffers.for_each(|entry| ids.push(entry.id));
         ids.into_iter().find_map(|id| {
@@ -804,20 +834,20 @@ async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
             if !path.to_string_lossy().contains("zettelkasten") {
                 return None;
             }
-            Some(lattice_runtime::Document::text(handle.as_ref()))
+            Some((id, lattice_runtime::Document::text(handle.as_ref())))
         })
     };
-    let mut text = None;
+    let mut found = None;
     for _ in 0..240 {
         editor.run_tick_pending();
-        text = draft_text(&editor);
-        if text.is_some() {
+        found = draft(&editor);
+        if found.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    let text = text.unwrap_or_else(|| {
+    let (draft_id, text) = found.unwrap_or_else(|| {
         panic!(
             "a draft buffer was opened (last message: {:?})",
             editor.last_message.as_ref().map(|m| &m.text)
@@ -830,6 +860,16 @@ async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
     assert!(
         text.contains(":ID:"),
         "and a freshly minted id — without one it is not a node: {text:?}"
+    );
+    // OR.13: the registry assertions above prove the draft `Document` EXISTS —
+    // they do not prove anything shows it. This is the assertion four rounds
+    // of investigation lacked: the draft must also be what the active pane is
+    // showing, not merely a buffer sitting in the registry unseen while the
+    // user's pane stays on whatever it had open before `<CR>`.
+    assert_eq!(
+        editor.active_pane_buffer_id(),
+        draft_id,
+        "the draft is focused, not just created"
     );
 
     // The id is a real v4, not a placeholder: the mint happened on the grammar
@@ -1096,6 +1136,25 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             }
             lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);
+            }
+            // OR.13: RENDERER-applied, like `OpenTransient` / `OpenSyntheticBuffer`
+            // below — `handle_effect` deliberately does NOT apply it inline
+            // (see `cross-file-writes.md` §2: `WriteToFile` must not steal
+            // focus, so the effect that DOES focus a buffer is a separate,
+            // renderer-side step). Mirrors the real renderer's arm
+            // (`lattice-ui-tui/src/app/dispatch.rs`): `do_edit` switches the
+            // active document, then `land_cursor_at` seats the cursor and
+            // reveals the target. Dropping this arm — as the wildcard below
+            // used to — makes a working focus-the-draft fix indistinguishable
+            // from one that never focuses anything, the same failure mode the
+            // `OpenSyntheticBuffer` comment already warns about.
+            lattice_grammar::Effect::OpenBufferAt {
+                path,
+                position,
+                force,
+            } => {
+                editor.do_edit(path, force);
+                editor.land_cursor_at(position);
             }
             // OR.11b: the roam draft. RENDERER-applied, like `OpenTransient`
             // below — so dropping it here would make a working capture buffer

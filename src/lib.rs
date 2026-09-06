@@ -6769,7 +6769,7 @@ impl GrammarCallbacks for Component {
                     format!("{stamp}-{slug}.org")
                 };
                 let path = format!("{}/{name}", dir.trim_end_matches('/'));
-                // ONE effect, and deliberately no trailing echo.
+                // TWO effects, in order, and deliberately no trailing echo.
                 //
                 // `WriteToFile` can fail — an unresolvable path, a denied
                 // `fs:write` grant — and it reports that by setting the
@@ -6784,15 +6784,36 @@ impl GrammarCallbacks for Component {
                 // draft you finalize — and it is also why an abandoned draft
                 // never enters the index: the watcher sees it when it lands on
                 // disk, which is when the user saves.
-                Ok(vec![Effect::WriteToFile(WriteToFilePayload {
-                    path,
-                    anchor: lattice::plugin_host::types::FileAnchor::End,
-                    text: roam_find::new_node_text(&id, &title),
-                    cut: None,
-                    // The roam directory is a path the user configured; if it does
-                    // not exist that is worth saying, not papering over.
-                    create_parents: false,
-                })])
+                //
+                // OR.13: `WriteToFile` is deliberately non-focusing — archive,
+                // refile and capture-relocation all rely on it NOT stealing
+                // focus when they move text into a file the user isn't
+                // looking at (see `cross-file-writes.md` §2). The stub-create
+                // path is not one of those callers: it exists to open a new
+                // note for the user to start typing into, so it must ALSO
+                // focus what it just wrote. `OpenBufferAt` does that, named
+                // explicitly by the same `path` `WriteToFile` resolves — the
+                // host applies effects in order (`handle_effect`), so the
+                // file exists on disk (and its buffer in the registry) before
+                // `OpenBufferAt` looks it up by path. Nothing here is
+                // inferred from "whatever was just opened", which is the
+                // hazard `cross-file-writes.md` §1 actually warns about.
+                Ok(vec![
+                    Effect::WriteToFile(WriteToFilePayload {
+                        path: path.clone(),
+                        anchor: lattice::plugin_host::types::FileAnchor::End,
+                        text: roam_find::new_node_text(&id, &title),
+                        cut: None,
+                        // The roam directory is a path the user configured; if it
+                        // does not exist that is worth saying, not papering over.
+                        create_parents: false,
+                    }),
+                    Effect::OpenBufferAt(lattice::plugin_host::types::OpenBufferAtPayload {
+                        path: Some(path),
+                        position: Position { line: 0, byte: 0 },
+                        force: false,
+                    }),
+                ])
             }
             // OR.11a + OR.11b — the second hop: the chosen template becomes a
             // note.

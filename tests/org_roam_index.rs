@@ -785,10 +785,8 @@ async fn find_node_offers_to_create_and_pins_it_last() {
 /// `Effect::OpenTransient` arm: `do_edit(path, force)` +
 /// `land_cursor_at(position)`, the same two calls the TUI renderer's own
 /// `Effect::OpenBufferAt` arm makes (`lattice-ui-tui/src/app/dispatch.rs:1050`).
-/// Un-ignore once that lands.
-#[ignore = "OR.13: blocked on a host fix — drain_pending_picker_accept drops \
-            Effect::OpenBufferAt (see doc comment above); confirmed via \
-            tracing that Discriminant(13) reaches the unhandled branch"]
+/// **That host fix landed as OR.16**, so this runs again — the arm calls
+/// `do_edit` then `land_cursor_at`, exactly as predicted here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
     let base = tempfile::tempdir().unwrap();

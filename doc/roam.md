@@ -304,6 +304,32 @@ being made. So there is no `target`, and an optional `file` names the note's
 **filename** instead — `${…}` expands there too. Absent, the timestamped
 default is used.
 
+**`body-file` reads the body from a FILE**, emacs org-roam's
+`(file "…/template.org")`:
+
+```toml
+[[template]]
+key = "c"
+description = "concept"
+body-file = "~/org-files/roam/templates/pkos-concept.org"
+```
+
+`body` and `body-file` are mutually exclusive — setting both skips the
+template and names it in the menu footer, the same way a duplicate key or a
+missing body does. `~` is expanded, and `${…}` expands on the PATH too, not
+just the text it names — the same as `file` above. Useful if you keep your
+templates as org files you edit directly (in emacs or in lattice) and do not
+want to keep a second, inlined copy in `init.rs` that drifts the moment either
+one changes.
+
+A `body-file` that names a path you cannot read — missing, permissions, a typo
+— skips the same way: the create stops with a message naming the template and
+the path, and nothing is written. This needs no capability beyond what
+archiving and capture already ask for: `fs:write:<prefix>` also permits
+reading under `<prefix>`, so a template file inside your `fs:write` grant is
+readable without a separate `fs:read:` entry. A template file OUTSIDE every
+granted prefix gets the same skip a missing file would.
+
 The two syntaxes answer different questions — `%` interpolates the *capture
 context*, `${}` interpolates the *node* — which is why they coexist rather than
 compete.
@@ -355,10 +381,12 @@ directly, at its real path, with the cursor at the end. A stub has no `%?` and
 no questions, so a draft surface would add a `C-c C-c` to the one flow that
 should cost nothing.
 
-A template missing a `key`, or reusing one another template took, is skipped
-and the menu names it in the footer. TOML that does not parse at all refuses
-outright and names the option — a menu built from the half that survived would
-be guessing.
+A template missing a `key`, reusing one another template took, or setting both
+`body` and `body-file`, is skipped and the menu names it in the footer. TOML
+that does not parse at all refuses outright and names the option — a menu
+built from the half that survived would be guessing. A `body-file` that cannot
+be read is caught later, when you actually pick that template, because only
+then is the node known well enough to finish expanding its path — see above.
 
 ## Keys and commands
 

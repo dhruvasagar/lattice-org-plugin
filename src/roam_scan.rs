@@ -59,7 +59,11 @@ pub fn roam_directory() -> Option<String> {
 /// would produce a plausible path to the wrong place, which is worse than one
 /// that still visibly has a `~` in it. Same rule as the host's
 /// `lattice_core::home::expand_tilde`, which this mirrors.
-fn expand_tilde(path: &str) -> String {
+///
+/// `pub(crate)` rather than private: `roam_templates::resolve_body` reuses it
+/// for a `body-file` path, which has the identical shape — `~` naming a
+/// template file rather than a corpus root.
+pub(crate) fn expand_tilde(path: &str) -> String {
     let Some(rest) = path.strip_prefix('~') else {
         return path.to_string();
     };

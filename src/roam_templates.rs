@@ -42,6 +42,12 @@ pub struct RawRoamTemplate {
     pub description: Option<String>,
     /// The note's text, with `${…}` and `%…` placeholders.
     pub body: Option<String>,
+    /// The note's text, read from a FILE instead of inlined — emacs org-roam's
+    /// `(file "…/template.org")`. `${…}` expands on this PATH the same way it
+    /// does on `file` below, so a per-node template path is possible; the file
+    /// CONTENT gets both placeholder passes, exactly as `body` does. Mutually
+    /// exclusive with `body` — setting both is a configuration error.
+    pub body_file: Option<String>,
     /// The note's FILENAME, with `${…}` placeholders — org-roam's
     /// `:target (file+head "${slug}.org" …)` without the head, which is what
     /// `body` already is. Absent uses the timestamped default, which is what
@@ -57,7 +63,12 @@ pub type Declared = Vec<RawRoamTemplate>;
 pub struct RoamTemplate {
     pub key: String,
     pub description: String,
+    /// Inline text. Empty when [`Self::body_file`] is the source instead —
+    /// the two are mutually exclusive, enforced in [`from_declared`].
     pub body: String,
+    /// A path to read at draft time — see [`resolve_body`]. Unexpanded: it may
+    /// still carry `${…}`, resolved once the node making it exists.
+    pub body_file: Option<String>,
     pub file: Option<String>,
 }
 
@@ -117,13 +128,33 @@ pub fn from_declared(raw: Declared) -> RoamTemplateSet {
                 .push(format!("`{key}` is defined twice; the first one wins"));
             continue;
         }
-        let body = t.body.unwrap_or_default();
-        if body.trim().is_empty() {
-            // A template that writes nothing would make an empty note, which
-            // is indistinguishable from a failed create.
-            out.skipped.push(format!("`{key}` has no `body`"));
-            continue;
-        }
+        // Blank is the same as absent for both — `a_blank_file_is_the_same_as_none`
+        // already established that pattern for `file`.
+        let inline_body = t.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        let body_file = t
+            .body_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty());
+        let (body, body_file) = match (inline_body, body_file) {
+            (Some(_), Some(_)) => {
+                // A template cannot say both "here is the text" and "read the
+                // text from here" — resolving the conflict silently in either
+                // direction would use whichever the user did NOT mean half the
+                // time.
+                out.skipped
+                    .push(format!("`{key}` sets both `body` and `body_file`"));
+                continue;
+            }
+            (Some(b), None) => (b.to_string(), None),
+            (None, Some(f)) => (String::new(), Some(f.to_string())),
+            (None, None) => {
+                // A template that writes nothing would make an empty note,
+                // which is indistinguishable from a failed create.
+                out.skipped.push(format!("`{key}` has no `body`"));
+                continue;
+            }
+        };
         let description = match t.description.as_deref().map(str::trim) {
             Some(d) if !d.is_empty() => d.to_string(),
             _ => key.clone(),
@@ -138,10 +169,62 @@ pub fn from_declared(raw: Declared) -> RoamTemplateSet {
             key,
             description,
             body,
+            body_file,
             file,
         });
     }
     out
+}
+
+/// Resolve a template's body text for one node, reading `body_file` off disk
+/// when that is the source instead of `body`.
+///
+/// ## Why the read happens here, not in [`read`]
+///
+/// `body_file`'s PATH may carry `${…}` — the same shape `file` (the note's own
+/// filename) already has, and for the same reason: org-roam interpolates its
+/// target paths, and a per-node template path is nothing more than that
+/// applied to the template instead of the note. The node does not exist until
+/// a create is underway, so there is nothing to expand, and nothing to read,
+/// before then. `roam_draft` calls this once the node — title, slug, minted
+/// id — is known.
+///
+/// ## `read_file` is injected
+///
+/// So this is testable without a host, the same reason [`from_declared`] is
+/// split from [`read`]: production passes a closure around
+/// `host_services::read_file`, tests pass a fixture. `Err(())` rather than a
+/// carried message — the host's error detail is not for the user, only the
+/// PATH is, and this function already has that.
+///
+/// ## A missing or unreadable file is `Err`, never a panic
+///
+/// The caller turns that into a warn — the same channel `roam_draft` already
+/// uses for every other reason a note cannot be made. A template that
+/// silently wrote an empty note would be worse than one that says why it
+/// could not.
+pub fn resolve_body(
+    template: &RoamTemplate,
+    node: &crate::roam_capture::Node<'_>,
+    read_file: impl FnOnce(&str) -> Result<String, ()>,
+) -> Result<String, String> {
+    let raw = match &template.body_file {
+        Some(pattern) => {
+            let path =
+                crate::roam_scan::expand_tilde(&crate::roam_capture::expand_fields(pattern, node));
+            let text = read_file(&path)
+                .map_err(|()| format!("`{}`'s file could not be read: {path}", template.key))?;
+            if text.trim().is_empty() {
+                // Same reasoning as the inline `has no body` skip in
+                // `from_declared` — an empty file is indistinguishable from a
+                // failed create, just discovered a hop later.
+                return Err(format!("`{}`'s file is empty: {path}", template.key));
+            }
+            text
+        }
+        None => template.body.clone(),
+    };
+    Ok(crate::roam_capture::expand_fields(&raw, node))
 }
 
 #[cfg(test)]
@@ -154,8 +237,13 @@ mod tests {
             key: key.to_string(),
             description: None,
             body: Some(body.to_string()),
+            body_file: None,
             file: None,
         }
+    }
+
+    fn node<'a>(title: &'a str, slug: &'a str, id: &'a str) -> crate::roam_capture::Node<'a> {
+        crate::roam_capture::Node { title, slug, id }
     }
 
     #[test]
@@ -209,5 +297,150 @@ mod tests {
             from_declared(vec![raw]).templates[0].file.as_deref(),
             Some("${slug}.org")
         );
+    }
+
+    /// A template naming a `body_file` instead of an inline `body` is valid —
+    /// `body` stays empty and `body_file` carries the pattern, unread until a
+    /// node exists to read it for.
+    #[test]
+    fn a_body_file_template_is_accepted_with_an_empty_inline_body() {
+        let raw = RawRoamTemplate {
+            key: "s".to_string(),
+            description: None,
+            body: None,
+            body_file: Some("~/templates/source.org".to_string()),
+            file: None,
+        };
+        let set = from_declared(vec![raw]);
+        assert_eq!(set.skipped, Vec::<String>::new());
+        assert_eq!(set.templates[0].body, "");
+        assert_eq!(
+            set.templates[0].body_file.as_deref(),
+            Some("~/templates/source.org")
+        );
+    }
+
+    /// `body` and `body_file` naming the same template is a configuration
+    /// error, not a coin flip between them — skip it and say so, the same as
+    /// every other config mistake this module catches.
+    #[test]
+    fn setting_both_body_and_body_file_is_a_configuration_error() {
+        let mut raw = t("d", "inline text");
+        raw.body_file = Some("~/templates/d.org".to_string());
+        let set = from_declared(vec![raw]);
+        assert!(set.is_empty());
+        assert_eq!(set.skipped, vec!["`d` sets both `body` and `body_file`"]);
+    }
+
+    /// Blank is the same as absent for `body_file` too — a template with a
+    /// blank `body` and a blank `body_file` has no source at all, same
+    /// message as the plain bodyless case.
+    #[test]
+    fn a_blank_body_file_with_no_body_is_the_bodyless_skip() {
+        let raw = RawRoamTemplate {
+            key: "d".to_string(),
+            description: None,
+            body: None,
+            body_file: Some("   ".to_string()),
+            file: None,
+        };
+        let set = from_declared(vec![raw]);
+        assert!(set.is_empty());
+        assert_eq!(set.skipped, vec!["`d` has no `body`"]);
+    }
+
+    /// A blank `body` alongside a real `body_file` is not "both set" — the
+    /// blank one does not count, the same rule `file` already has.
+    #[test]
+    fn a_blank_body_alongside_a_body_file_is_not_a_conflict() {
+        let raw = RawRoamTemplate {
+            key: "d".to_string(),
+            description: None,
+            body: Some("   ".to_string()),
+            body_file: Some("~/templates/d.org".to_string()),
+            file: None,
+        };
+        let set = from_declared(vec![raw]);
+        assert_eq!(set.skipped, Vec::<String>::new());
+        assert_eq!(
+            set.templates[0].body_file.as_deref(),
+            Some("~/templates/d.org")
+        );
+    }
+
+    #[test]
+    fn resolve_body_reads_and_expands_a_file_sourced_template() {
+        let raw = RawRoamTemplate {
+            key: "s".to_string(),
+            description: None,
+            body: None,
+            body_file: Some("~/templates/${slug}.org".to_string()),
+            file: None,
+        };
+        let template = &from_declared(vec![raw]).templates[0];
+        let n = node("Rust Async", "rust_async", "ABC-123");
+        let body = resolve_body(template, &n, |path| {
+            assert!(
+                path.contains("rust_async.org") && !path.contains("${"),
+                "the path is expanded before it is read: {path}"
+            );
+            assert!(
+                !path.starts_with('~'),
+                "the path is tilde-expanded before it is read: {path}"
+            );
+            Ok("#+title: ${title}\n".to_string())
+        })
+        .expect("a readable file resolves");
+        assert_eq!(body, "#+title: Rust Async\n");
+    }
+
+    #[test]
+    fn resolve_body_reads_inline_text_without_a_reader_call() {
+        let template = &from_declared(vec![t("d", "#+title: ${title}")]).templates[0];
+        let n = node("Rust", "rust", "I");
+        let body = resolve_body(template, &n, |_| {
+            panic!("body_file is unset — the reader must not be called")
+        })
+        .expect("an inline body resolves without reading anything");
+        assert_eq!(body, "#+title: Rust");
+    }
+
+    /// A missing or unreadable file is `Err`, never a panic — `roam_draft`
+    /// turns this into a skip (a warn), the same channel every other reason a
+    /// note cannot be made already uses.
+    #[test]
+    fn resolve_body_reports_an_unreadable_file_by_name_and_path() {
+        let raw = RawRoamTemplate {
+            key: "s".to_string(),
+            description: None,
+            body: None,
+            body_file: Some("~/templates/source.org".to_string()),
+            file: None,
+        };
+        let template = &from_declared(vec![raw]).templates[0];
+        let n = node("T", "t", "I");
+        let err = resolve_body(template, &n, |_| Err(())).unwrap_err();
+        assert!(err.contains('s'), "names the template: {err:?}");
+        assert!(
+            err.contains("templates/source.org"),
+            "names the path: {err:?}"
+        );
+    }
+
+    /// An empty file would silently produce an empty note — indistinguishable
+    /// from a failed create, same reasoning as the inline bodyless skip.
+    #[test]
+    fn resolve_body_reports_an_empty_file() {
+        let raw = RawRoamTemplate {
+            key: "s".to_string(),
+            description: None,
+            body: None,
+            body_file: Some("~/templates/source.org".to_string()),
+            file: None,
+        };
+        let template = &from_declared(vec![raw]).templates[0];
+        let n = node("T", "t", "I");
+        let err = resolve_body(template, &n, |_| Ok("   \n".to_string())).unwrap_err();
+        assert!(err.contains("empty"), "{err:?}");
     }
 }

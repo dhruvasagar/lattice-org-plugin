@@ -2233,6 +2233,233 @@ async fn a_templated_note_expands_its_fields() {
     );
 }
 
+/// OR.14 — a template's body can be READ FROM A FILE instead of inlined, the
+/// way emacs org-roam's `(file "…/template.org")` does. This is also the
+/// empirical answer to the capability question OR.14's brief asked for: the
+/// harness below grants only `fs:write:{corpus}` — the same shape the real
+/// `plugin.toml` grants over `~/src/dhruvasagar/org-files` — and the template
+/// file lives under that root (`{corpus}/templates/source.org`), exactly as
+/// Dhruva's real templates live under `org-files/roam/templates/`. If a write
+/// grant did not also permit reading, this test would see the missing-file
+/// warn path instead of a draft — it does not, so no separate `fs:read` grant
+/// is needed for this reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_templated_note_reads_its_body_from_a_file() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+
+    let templates_dir = corpus.join("templates");
+    std::fs::create_dir_all(&templates_dir).unwrap();
+    let template_path = templates_dir.join("source.org");
+    std::fs::write(
+        &template_path,
+        ":PROPERTIES:\n:ID:       ${id}\n:END:\n#+title: ${title}\n\nfrom ${slug}\n",
+    )
+    .unwrap();
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!(
+            concat!(
+                "org.roam-capture-templates=[[template]]\n",
+                "key = \"s\"\n",
+                "description = \"Source\"\n",
+                "body-file = \"{}\"\n",
+            ),
+            template_path.display()
+        ),
+    });
+    assert!(
+        editor
+            .last_message
+            .as_ref()
+            .map(|m| !m.text.contains("expected") && !m.text.contains("error"))
+            .unwrap_or(true),
+        "the template set was accepted: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+
+    let _ = open_find_node(&mut editor).await;
+    let rows = query_picker(&mut editor, "Zettelkasten");
+    assert_eq!(rows, vec!["Create note: Zettelkasten"], "{rows:?}");
+
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..80 {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some(),
+        "the template chooser opened (last message: {:?})",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("s".to_string(), &mut out);
+    apply_accept_effects(&mut editor, out);
+
+    let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
+        panic!(
+            "the file-sourced template opened a draft (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+
+    assert!(
+        !text.contains("${"),
+        "no placeholder survives into the user's note: {text:?}"
+    );
+    assert!(
+        text.contains("#+title: Zettelkasten"),
+        "the file's `${{title}}` became the typed title: {text:?}"
+    );
+    assert!(
+        text.contains("from zettelkasten"),
+        "the file's `${{slug}}` became the slug: {text:?}"
+    );
+    assert!(
+        text.contains(":ID:") && !text.contains(":ID:       ${id}"),
+        "the file's `${{id}}` became a minted id: {text:?}"
+    );
+}
+
+/// A `body-file` naming a path that does not exist is a SKIP — a warn naming
+/// the template and the path — never a trap, and never a note with nothing in
+/// it. Same channel `roam_draft` already uses for "no template `{key}`" and
+/// every other reason a note cannot be made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_body_file_is_skipped_not_a_trap() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+
+    // Under the write grant's prefix (so this is a "file is missing", not a
+    // "capability denied" — the failure this test is actually about), but
+    // never written to disk.
+    let missing_path = corpus.join("templates").join("gone.org");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!(
+            concat!(
+                "org.roam-capture-templates=[[template]]\n",
+                "key = \"s\"\n",
+                "description = \"Source\"\n",
+                "body-file = \"{}\"\n",
+            ),
+            missing_path.display()
+        ),
+    });
+
+    let _ = open_find_node(&mut editor).await;
+    let rows = query_picker(&mut editor, "Zettelkasten");
+    assert_eq!(rows, vec!["Create note: Zettelkasten"], "{rows:?}");
+
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..80 {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some(),
+        "the chooser still opens — a bad template does not hide the row"
+    );
+
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("s".to_string(), &mut out);
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..8 {
+        editor.run_tick_pending();
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let message = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("`s`") && message.contains("could not be read"),
+        "names the template and says why: {message:?}"
+    );
+
+    let mut ids = Vec::new();
+    editor
+        .buffers
+        .for_each(|entry| ids.push((entry.id, entry.name.clone())));
+    assert!(
+        !ids.iter().any(|(_, name)| name
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("*org-roam-capture")),
+        "no draft — and so no note — was ever opened from an unreadable template"
+    );
+
+    // Not a trap: the plugin is not quarantined, and a second create still
+    // reaches the chooser (the broken template's row and all) rather than
+    // going silent — the whole point of "skip, don't trap".
+    let _ = open_find_node(&mut editor).await;
+    let rows = query_picker(&mut editor, "Another Note");
+    assert_eq!(rows, vec!["Create note: Another Note"], "{rows:?}");
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..80 {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some(),
+        "the plugin survives a bad template and keeps offering the chooser"
+    );
+}
+
 /// The buffer a roam create filed into, if there is one.
 ///
 /// A note is filed through `Effect::WriteToFile`, which resolves the path to a
@@ -2558,6 +2785,98 @@ async fn a_roam_template_asks_its_questions() {
     assert!(
         filed.contains("#+category: concept") && filed.contains(&menu_id),
         "…and what was filed is what was on screen: {filed:?}"
+    );
+}
+
+/// OR.14 — a `body-file` template's `%^{Question}` is asked too, not just its
+/// `${…}` fields.
+///
+/// The bug this guards against: `roam_fields_menu` (the menu that lists one
+/// row per `%^{…}`) read `template.body` directly, which is the EMPTY string
+/// for a `body_file` template — the text lives on disk, not in that field.
+/// `roam_draft`'s own scan resolves the file and correctly decides the note
+/// asks questions, so the transient opens; but built from the wrong (empty)
+/// body it would show zero question rows for a file whose questions it just
+/// promised to ask — the row for `%^{Category}` would silently not be there,
+/// same failure shape as the original OR.11b bug this test's sibling
+/// (`a_roam_template_asks_its_questions`) already guards, just reached through
+/// a file instead of an inline string. `pkos-source.org`'s
+/// `%^{Aliases (short title, acronym)}` is this exact shape in the reference
+/// corpus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_file_templates_questions_are_asked_too() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let templates_dir = corpus.join("templates");
+    std::fs::create_dir_all(&templates_dir).unwrap();
+    let template_path = templates_dir.join("concept.org");
+    std::fs::write(
+        &template_path,
+        ":PROPERTIES:\n:ID:       ${id}\n:END:\n\
+         #+title: ${title}\n#+category: %^{Category}\n\n* Summary\n%?\n",
+    )
+    .unwrap();
+
+    pick_roam_template(
+        &mut editor,
+        &index,
+        &format!(
+            concat!(
+                "[[template]]\n",
+                "key = \"c\"\n",
+                "description = \"Concept\"\n",
+                "body-file = \"{}\"\n",
+            ),
+            template_path.display()
+        ),
+        "Zettelkasten",
+        "c",
+    )
+    .await;
+
+    let spec = editor
+        .picker
+        .as_ref()
+        .and_then(|p| p.transient.as_ref())
+        .expect("the roam fields menu opened")
+        .clone();
+    let labels: Vec<&str> = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["Category", "body", "capture", "quit"],
+        "the file's `%^{{Category}}` produced a question row, same as an \
+         inline template's would: {labels:?}"
+    );
+
+    answer_roam_field(&mut editor, "1", "concept").await;
+    answer_roam_field(&mut editor, "b", "the linking method").await;
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("c".to_string(), &mut out);
+    apply_accept_effects(&mut editor, out);
+
+    let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
+        panic!(
+            "the answers opened a draft (last message: {:?})",
+            editor.last_message.as_ref().map(|m| &m.text)
+        )
+    });
+    assert!(
+        text.contains("#+category: concept"),
+        "`%^{{Category}}` became the answer rather than vanishing: {text:?}"
+    );
+    assert!(
+        text.contains("the linking method"),
+        "`%?` became the body row's answer: {text:?}"
     );
 }
 

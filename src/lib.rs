@@ -8000,6 +8000,13 @@ impl RoamDraft {
 /// them. The template is re-READ here rather than carried, so a `:set` between
 /// the hops takes effect; only the id is pinned by the caller, because only the
 /// id cannot be re-derived from the title.
+///
+/// OR.14: when the template names a `body_file` instead of an inline `body`,
+/// the read happens HERE — `roam_templates::resolve_body` needs the node
+/// (`${…}` may appear in the file's PATH, same as it does in `file`), and the
+/// node does not exist before this point. A missing or unreadable file is a
+/// skip: `resolve_body`'s `Err` becomes a `roam_warn`, so a bad template
+/// stops the create with a message rather than filing an empty note.
 fn roam_draft(
     title: &str,
     key: &str,
@@ -8027,7 +8034,12 @@ fn roam_draft(
         slug: &slug,
         id,
     };
-    let body = roam_capture::expand_fields(&template.body, &node);
+    let body = match roam_templates::resolve_body(template, &node, |path| {
+        host_services::read_file(path).map_err(|_| ())
+    }) {
+        Ok(body) => body,
+        Err(message) => return Err(roam_warn(&format!("org-roam: {message}"))),
+    };
     let name = roam_note_filename(template, &node);
     Ok(RoamDraft {
         asks_questions: answers.is_empty()
@@ -8415,7 +8427,16 @@ fn roam_fields_menu(
     // `${…}` FIRST, so the questions this menu offers are the ones left in the
     // body after the node has been interpolated — and so a title that contains
     // a literal `%^{…}` cannot conjure a question out of user data.
-    let body = roam_capture::expand_fields(&template.body, &node);
+    //
+    // OR.14: through `resolve_body`, not `template.body` directly — a
+    // `body_file` template's `body` is empty (the text lives on disk), and
+    // reading it straight would show zero question rows for a file whose
+    // `%^{…}` questions `roam_draft`'s own scan (which DOES resolve the file)
+    // already decided this menu should be asking. `pkos-source.org`'s
+    // `%^{Aliases …}` is exactly this case in the reference corpus.
+    let body = roam_templates::resolve_body(template, &node, |path| {
+        host_services::read_file(path).map_err(|_| ())
+    })?;
     Ok(fields_menu_spec(
         format!("Roam: {title}"),
         &body,

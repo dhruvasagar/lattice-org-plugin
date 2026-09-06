@@ -244,8 +244,8 @@ mod tests {
         assert_eq!(expand("%d %% %?", "x", today(), ""), "%d % x\n");
     }
 
-    /// OC.4: the questions are substituted in template order, each at its own
-    /// position — the property the whole fields menu exists to deliver.
+    /// The questions are substituted in template order, each at its own
+    /// position — the property asking them in that order exists to deliver.
     #[test]
     fn questions_substitute_in_order_at_their_own_positions() {
         let answers = vec![
@@ -355,10 +355,12 @@ const POINT_SENTINEL: &str = "\u{0}";
 ///
 /// `None` is therefore reachable only if the sentinel is somehow absent from
 /// the output, which means a template contained a literal NUL.
-/// `entered` is text already collected for `%?` — the fields menu's body row.
-/// It is placed AT the point and the caret lands after it, so a menu answer is
-/// a starting draft rather than the final word. Empty for the common path,
-/// where the buffer IS where you type.
+/// `entered` is text already collected for `%?` before the buffer opened.
+/// It is placed AT the point and the caret lands after it, so it is a
+/// starting draft rather than the final word — no caller passes anything but
+/// `""` since OR.17 dropped the fields menu's body row, but the parameter
+/// stays: the buffer surface has no reason to assume text can only ever
+/// arrive at open through one specific caller.
 pub fn expand_for_buffer(
     template: &str,
     entered: &str,

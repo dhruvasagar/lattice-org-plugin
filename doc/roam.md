@@ -339,7 +339,7 @@ Every `%` placeholder capture defines works here too:
 | | |
 |---|---|
 | `%?` | where the cursor lands in the draft |
-| `%^{Question}` | asked before the draft opens. Several become a fields menu |
+| `%^{Question}` | asked before the draft opens, one prompt per question, in template order |
 | `%U` `%T` `%t` | dates, exactly as in a capture template |
 | `%%` | a literal `%` |
 | `%a` | empty — a new note has no buffer you fired it from to link back to |
@@ -362,8 +362,9 @@ The same two chords capture uses, because it is the same buffer and the same
 minor mode. Edit it freely first: what gets filed is what is on screen when you
 press `C-c C-c`, not the template you started from.
 
-A template that asks `%^{…}` questions collects those first — emacs's order,
-and capture's — and the draft opens with the answers already in it.
+A template that asks `%^{…}` questions asks them first, one at a time —
+emacs's order, and capture's — and the draft opens once the last one lands,
+with the answers already in it.
 
 **An abandoned draft leaves nothing behind**, which is the reason this is a
 buffer rather than a write. The file is created on `C-c C-c`, so `C-c C-k` has

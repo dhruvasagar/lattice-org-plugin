@@ -1179,12 +1179,25 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             lattice_grammar::Effect::BufferDelete { force } => {
                 let _ = editor.do_buffer_delete(force);
             }
-            // OR.11b: the roam FIELDS menu. Reached as a direct effect of the
-            // chooser's row rather than through `next_actions`, so it needs its
-            // own arm — the caller polls `run_tick_pending` afterwards, which
-            // is what seats a plugin menu's off-thread `build`.
+            // OR.11b: the roam template CHOOSER. Reached as a direct effect of
+            // the create action rather than through `next_actions`, so it
+            // needs its own arm — the caller polls `run_tick_pending`
+            // afterwards, which is what seats a plugin menu's off-thread
+            // `build`.
             lattice_grammar::Effect::OpenTransient { source, args } => {
                 editor.open_named_transient(source, args);
+            }
+            // OR.17: a template that asks `%^{…}` questions opens this
+            // directly — one question at a time, chained through
+            // `on-submit-action` — rather than the chooser's row landing on a
+            // second menu the way it did before OR.17.
+            lattice_grammar::Effect::OpenPrompt {
+                prompt,
+                initial,
+                on_submit_action,
+                buffer_name,
+            } => {
+                editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
             }
             other => {
                 eprintln!("unapplied accept effect: {other:?}");
@@ -2588,19 +2601,17 @@ async fn pick_roam_template(
     }
 }
 
-/// Press a field row's key and answer the prompt it parks for.
-async fn answer_roam_field(editor: &mut Editor, key: &str, value: &str) {
-    let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.do_transient_trigger(key.to_string(), &mut out);
-    apply_accept_effects(editor, out);
-    // The prompt a field opens registers no submit action: the host routes a
-    // parked transient itself (`do_prompt_line_submit` checks for one first).
-    editor.open_prompt_line(
-        String::new(),
-        value.to_string(),
-        String::new(),
-        editor.pending_prompt_buffer_name.clone(),
-    );
+/// OR.17: type `text` into the open question prompt and submit it, then apply
+/// what the submit produced — which may be the NEXT question's prompt, or the
+/// draft once the last one lands. The sequential peer of the old field-menu
+/// row press.
+async fn submit_roam_question(editor: &mut Editor, text: &str) {
+    let action = editor
+        .pending_prompt_submit_action
+        .clone()
+        .expect("a question prompt is open");
+    let name = editor.pending_prompt_buffer_name.clone();
+    editor.open_prompt_line(String::new(), text.to_string(), action, name);
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_prompt_line_submit(&mut out);
     apply_accept_effects(editor, out);
@@ -2674,19 +2685,23 @@ async fn an_aborted_roam_capture_leaves_nothing_behind() {
 }
 
 /// OR.11b — a roam template's `%^{Question}` is ASKED, and `%?` places the
-/// caret.
+/// caret. OR.17 changed HOW it is asked (one prompt at a time rather than a
+/// fields menu); this test's assertions moved with it, but the bug it guards
+/// is the same one.
 ///
-/// Both were silently dropped before this slice: the roam path called
+/// Both were silently dropped before OR.11b: the roam path called
 /// `capture::expand_with` with no answers and no typed text, so each expanded
 /// to the empty string and vanished from the note. A template written around
 /// `%^{Category}` produced a note with the field simply missing — a failure
 /// with no error and no trace.
 ///
-/// The minted id is asserted to SURVIVE the menu hop. That is the one thing the
-/// fields flow can get wrong in a way nothing else would notice: the template
-/// is deliberately re-read from the option between hops (so a `:set` takes
-/// effect), and re-deriving the id the same way would mean the `${id}` in the
-/// draft is not the `:ID:` the note is filed with.
+/// **There is no menu hop left to lose the id across.** Before OR.17 the
+/// minted id crossed the boundary twice (once out to the fields menu, once
+/// back with the answers), and the template was deliberately re-read between
+/// those hops — so a re-minted id disagreeing with the menu's was a real way
+/// to fail. OR.17 collapsed both hops into one guest-side flow struct, which
+/// cannot disagree with itself; what is still worth pinning is that the id
+/// reaching the draft looks like a real one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_roam_template_asks_its_questions() {
     let base = tempfile::tempdir().unwrap();
@@ -2712,57 +2727,29 @@ async fn a_roam_template_asks_its_questions() {
     )
     .await;
 
-    // Choosing the template opens the FIELDS menu, not the draft — emacs's
-    // order, and capture's: questions first, then the buffer.
-    let spec = editor
-        .picker
-        .as_ref()
-        .and_then(|p| p.transient.as_ref())
-        .expect("the roam fields menu opened")
-        .clone();
-    assert!(
-        spec.title.contains("Zettelkasten"),
-        "the menu names the note it is making: {:?}",
-        spec.title
-    );
-    let labels: Vec<&str> = spec.groups[0]
-        .items
-        .iter()
-        .map(|i| i.label.as_str())
-        .collect();
+    // OR.17: choosing the template asks its one question DIRECTLY — a prompt,
+    // not a second menu — emacs's order (questions, then the buffer) and now
+    // emacs's mechanism too.
     assert_eq!(
-        labels,
-        vec!["Category", "body", "capture", "quit"],
-        "a row per question, then the body, then the fire row"
+        editor.pending_prompt_submit_action.as_deref(),
+        Some("org-capture-question-submit"),
+        "the template's question opened a prompt: last message {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+    assert!(
+        editor
+            .last_message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("Category")),
+        "the prompt names the question: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
     );
 
-    // The id the menu is carrying, so the draft can be checked against it.
-    let carried = spec.groups[0]
-        .items
-        .iter()
-        .find_map(|i| match &i.kind {
-            lattice_picker::TransientItemKind::Action { args, .. } => Some(args.clone()),
-            _ => None,
-        })
-        .expect("the fire row carries the note's identity");
-    let lattice_grammar::Args::List(carried) = carried else {
-        panic!("the fire row carries [title, key, id]: {carried:?}");
-    };
-    let menu_id = match carried.get(2) {
-        Some(lattice_grammar::ArgValue::String(s)) => s.clone(),
-        other => panic!("the third carried argument is the minted id: {other:?}"),
-    };
-    assert_eq!(menu_id.split('-').count(), 5, "a real v4 id: {menu_id:?}");
-
-    answer_roam_field(&mut editor, "1", "concept").await;
-    answer_roam_field(&mut editor, "b", "the linking method").await;
-    let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.do_transient_trigger("c".to_string(), &mut out);
-    apply_accept_effects(&mut editor, out);
+    submit_roam_question(&mut editor, "concept").await;
 
     let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
         panic!(
-            "the answers opened a draft (last message: {:?})",
+            "the answer opened a draft (last message: {:?})",
             editor.last_message.as_ref().map(|m| &m.text)
         )
     });
@@ -2770,34 +2757,35 @@ async fn a_roam_template_asks_its_questions() {
         text.contains("#+category: concept"),
         "`%^{{Category}}` became the answer rather than vanishing: {text:?}"
     );
-    assert!(
-        text.contains("the linking method"),
-        "`%?` became the body row's answer: {text:?}"
-    );
-    assert!(
-        text.contains(&menu_id),
-        "the id the menu carried is the one in the draft, not a re-minted one: \
-         {menu_id:?} not in {text:?}"
-    );
+    let id_line = text
+        .lines()
+        .find(|l| l.contains(":ID:"))
+        .expect("the ID drawer line is in the draft");
+    let id = id_line
+        .trim()
+        .strip_prefix(":ID:")
+        .expect("starts with :ID:")
+        .trim();
+    assert_eq!(id.split('-').count(), 5, "a real v4 id landed: {id:?}");
 
     finalize_roam_capture(&mut editor).await;
     let (_, filed) = note_buffer(&editor, &corpus).expect("`C-c C-c` filed the note");
     assert!(
-        filed.contains("#+category: concept") && filed.contains(&menu_id),
+        filed.contains("#+category: concept") && filed.contains(id),
         "…and what was filed is what was on screen: {filed:?}"
     );
 }
 
 /// OR.14 — a `body-file` template's `%^{Question}` is asked too, not just its
-/// `${…}` fields.
+/// `${…}` fields. OR.17 moved the mechanism (a prompt chain rather than a
+/// fields menu); this pins the same OR.14 bug against it.
 ///
-/// The bug this guards against: `roam_fields_menu` (the menu that lists one
-/// row per `%^{…}`) read `template.body` directly, which is the EMPTY string
-/// for a `body_file` template — the text lives on disk, not in that field.
-/// `roam_draft`'s own scan resolves the file and correctly decides the note
-/// asks questions, so the transient opens; but built from the wrong (empty)
-/// body it would show zero question rows for a file whose questions it just
-/// promised to ask — the row for `%^{Category}` would silently not be there,
+/// The bug this guards against: the question-listing code once read
+/// `template.body` directly, which is the EMPTY string for a `body_file`
+/// template — the text lives on disk, not in that field. `roam_draft`'s own
+/// scan resolves the file and correctly decides the note asks questions, so
+/// the flow starts; but questions extracted from the wrong (empty) body would
+/// silently ask NONE for a file whose questions it just promised to ask —
 /// same failure shape as the original OR.11b bug this test's sibling
 /// (`a_roam_template_asks_its_questions`) already guards, just reached through
 /// a file instead of an inline string. `pkos-source.org`'s
@@ -2840,43 +2828,34 @@ async fn a_body_file_templates_questions_are_asked_too() {
     )
     .await;
 
-    let spec = editor
-        .picker
-        .as_ref()
-        .and_then(|p| p.transient.as_ref())
-        .expect("the roam fields menu opened")
-        .clone();
-    let labels: Vec<&str> = spec.groups[0]
-        .items
-        .iter()
-        .map(|i| i.label.as_str())
-        .collect();
+    // The file's `%^{Category}` opened a prompt, same as an inline template's
+    // would — the bug this test guards is exactly that it once did not.
     assert_eq!(
-        labels,
-        vec!["Category", "body", "capture", "quit"],
-        "the file's `%^{{Category}}` produced a question row, same as an \
-         inline template's would: {labels:?}"
+        editor.pending_prompt_submit_action.as_deref(),
+        Some("org-capture-question-submit"),
+        "last message: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+    assert!(
+        editor
+            .last_message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("Category")),
+        "the prompt names the question read off disk: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
     );
 
-    answer_roam_field(&mut editor, "1", "concept").await;
-    answer_roam_field(&mut editor, "b", "the linking method").await;
-    let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.do_transient_trigger("c".to_string(), &mut out);
-    apply_accept_effects(&mut editor, out);
+    submit_roam_question(&mut editor, "concept").await;
 
     let text = settle_roam_draft(&mut editor).await.unwrap_or_else(|| {
         panic!(
-            "the answers opened a draft (last message: {:?})",
+            "the answer opened a draft (last message: {:?})",
             editor.last_message.as_ref().map(|m| &m.text)
         )
     });
     assert!(
         text.contains("#+category: concept"),
         "`%^{{Category}}` became the answer rather than vanishing: {text:?}"
-    );
-    assert!(
-        text.contains("the linking method"),
-        "`%?` became the body row's answer: {text:?}"
     );
 }
 

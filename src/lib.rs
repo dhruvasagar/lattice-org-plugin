@@ -261,10 +261,6 @@ const AGENDA_GOTO: u32 = 78;
 /// dispatches this with the title and the chosen key.
 const ROAM_CREATE_FROM_TEMPLATE: u32 = 80;
 
-/// OR.11b — the THIRD hop, for a template that asks `%^{…}` questions: the
-/// fields menu's fire row, carrying the title, key and minted id ahead of the
-/// answers.
-const ROAM_CAPTURE_FIELDS_SUBMIT: u32 = 82;
 const AGENDA_FILTER_FILE: u32 = 79;
 
 /// OA.25 — `<leader>os` / `<leader>od`, and their submit halves.
@@ -334,20 +330,13 @@ const TODO_SET: u32 = 49;
 const ROAM_DAILIES_GOTO_DATE_SUBMIT: u32 = 50;
 
 /// The `transient-source` id. One per guest, so org's menus share it and
-/// branch on what the open was FOR — the shape OC.4 established for
-/// capture's two menus.
+/// branch on what the open was FOR.
 const ORG_TRANSIENT_TODO: &str = "todo";
 
 /// OR.11b — roam's template chooser, alongside `todo` and `agenda`. Carries
 /// the node's TITLE beside the discriminator, because the menu is opened FOR a
 /// node and each row has to hand that title on to the create action.
 const ORG_TRANSIENT_ROAM: &str = "roam";
-
-/// OR.11b — the roam FIELDS menu, opened for a node whose template asks
-/// `%^{…}` questions. Distinct from [`ORG_TRANSIENT_ROAM`] because the two
-/// carry different things: the chooser knows a title, the fields menu knows a
-/// title, a chosen key and the id already minted for the note.
-const ORG_TRANSIENT_ROAM_FIELDS: &str = "roam-fields";
 
 /// OA.12 — the agenda dispatcher's discriminator, alongside `todo`. Same
 /// mechanism: one `transient-source::id()` per guest, so org's menus branch on
@@ -526,14 +515,15 @@ const EV_ROAM_SYNC: &str = "org/roam-sync";
 /// of interleaving with the current one.
 const EV_ROAM_SCAN_STEP: &str = "org/roam-scan-step";
 
-/// OC.4 — the fields menu's own submit, distinct from the prompt's.
+/// OR.17 — one question of a sequential capture/roam-create flow, answered.
 ///
-/// Two actions rather than one that guesses: the prompt hop hands its action
-/// `[text, buffer-name]` and the fields hop hands its action `[key, answers…]`,
-/// and a single action would have to sniff which shape it got. Naming them
-/// separately is what makes each one's arguments a fact rather than an
-/// inference.
-const CAPTURE_FIELDS_SUBMIT: u32 = 38;
+/// Shared by both surfaces rather than named per-flow: since OR.17 the two are
+/// the identical mechanism (an `OpenPrompt` chain over guest-side state), and
+/// giving them separate actions would be two spellings of one thing. What
+/// distinguishes a capture from a roam-create is [`QuestionFlowKind`], read
+/// out of [`PENDING_QUESTIONS`] rather than sniffed from `ctx.args` — the
+/// prompt hop hands every submit the same shape, `[text]`.
+const CAPTURE_QUESTION_SUBMIT: u32 = 89;
 
 /// OC.7b — `C-c C-c` in the capture buffer: file what is written there.
 const CAPTURE_FINALIZE: u32 = 58;
@@ -3049,16 +3039,11 @@ impl Guest for Component {
             CAPTURE,
         );
         register_action(
-            "org-capture-fields-submit",
-            "File the capture the fields menu collected (fired by its own row)",
+            "org-capture-question-submit",
+            "Answer one %^{Question} of a sequential capture/roam-create flow \
+             (fired by the prompt each question opens)",
             &spec(),
-            CAPTURE_FIELDS_SUBMIT,
-        );
-        register_action(
-            "org-roam-capture-fields-submit",
-            "Open the roam note the template menu collected (fired by its own row)",
-            &spec(),
-            ROAM_CAPTURE_FIELDS_SUBMIT,
+            CAPTURE_QUESTION_SUBMIT,
         );
         register_action(
             "org-capture-finalize",
@@ -3791,6 +3776,144 @@ impl CaptureDestination {
     }
 }
 
+/// OR.17 — which draft a finished question flow opens, and what it needs to
+/// open it.
+///
+/// Not `CaptureDestination`, deliberately: a capture and a roam-create resolve
+/// their destination differently (a template lookup by key versus
+/// `roam_draft`'s directory-plus-node computation), and both need to
+/// RE-RESOLVE at the last answer rather than carry a destination computed at
+/// the first question — the same "`:set` between the hops takes effect"
+/// property every other two-hop action in this file already has.
+enum QuestionFlowKind {
+    /// `<leader>oc` chose this template, and it asks questions.
+    Capture { key: String },
+    /// `:org-roam-create-node` is making this note, and its template asks
+    /// questions. The id is carried rather than re-minted for
+    /// [`roam_create_from_template`]'s reason: it must be the same id the
+    /// user sees interpolated into `${id}` and the one written to `:ID:`.
+    Roam {
+        title: String,
+        key: String,
+        id: String,
+    },
+}
+
+/// OR.17 — one `%^{Question}` flow in progress: what it is FOR, the questions
+/// in template order, and the answers collected so far.
+struct QuestionFlow {
+    kind: QuestionFlowKind,
+    /// `capture_flow::questions(&body)`, captured once at the first question
+    /// so a `:set` mid-flow cannot change which questions are still coming.
+    questions: Vec<String>,
+    /// Grows by one per submit, in the same order as `questions`.
+    answers: Vec<String>,
+}
+
+thread_local! {
+    /// OR.17 — the sequential-prompt flow in progress, if any.
+    ///
+    /// **Reset unconditionally on every fresh start**, including to `None` on
+    /// the read that finishes one — never merely cleared on the paths that
+    /// remember to. `Effect::OpenPrompt`'s Esc "dispatches nothing at all"
+    /// (`types.wit`), so an abandoned flow (`<Esc>` at question 2 of 3) never
+    /// tells the guest it was abandoned; the only guest-side defence is that
+    /// STARTING a new flow always overwrites whatever the last one left
+    /// behind. This is [`CAPTURE_ORIGIN`]'s precedent applied to a second
+    /// piece of cross-hop state.
+    static PENDING_QUESTIONS: std::cell::RefCell<Option<QuestionFlow>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// OR.17 — start (or restart) a sequential question flow and ask the first one.
+///
+/// Called only when `questions` is non-empty; the caller has already checked
+/// (both `capture_open` and `roam_create_from_template` skip straight to the
+/// draft otherwise). Overwrites [`PENDING_QUESTIONS`] unconditionally — the
+/// half of the design that makes an abandoned flow harmless: whatever the last
+/// `<Esc>` left behind is replaced the moment a new capture or roam-create
+/// begins asking, rather than relying on the abandoned flow to have cleaned up
+/// after itself.
+fn start_question_flow(kind: QuestionFlowKind, questions: Vec<String>) -> Vec<Effect> {
+    let prompt = format!("{}: ", questions[0]);
+    PENDING_QUESTIONS.with(|c| {
+        *c.borrow_mut() = Some(QuestionFlow {
+            kind,
+            questions,
+            answers: Vec::new(),
+        })
+    });
+    vec![Effect::OpenPrompt(
+        lattice::plugin_host::types::OpenPromptPayload {
+            prompt,
+            initial: String::new(),
+            on_submit_action: "org-capture-question-submit".to_string(),
+            // No smuggling needed — the flow's identity and progress live in
+            // `PENDING_QUESTIONS`, the [`PENDING_CAPTURE`] precedent. Carrying
+            // a growing answer list through `buffer-name` would be exactly the
+            // "bespoke codec" this design rejected keeping.
+            buffer_name: None,
+        },
+    )]
+}
+
+/// OR.17 — one question answered: ask the next one, or open the draft.
+///
+/// `ctx.args` is always `[text]` — every question in a flow shares this one
+/// action, so there is nothing to sniff. What distinguishes a capture from a
+/// roam-create is [`QuestionFlowKind`], read out of the flow this consumes.
+///
+/// No flow pending (a stray dispatch with nothing outstanding) answers
+/// `Effect::None` — there is nothing to attribute the text to.
+fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
+    let Some(text) = submitted_text(&ctx.args) else {
+        return vec![Effect::None];
+    };
+    let Some(mut flow) = PENDING_QUESTIONS.with(|c| c.borrow_mut().take()) else {
+        return vec![Effect::None];
+    };
+    flow.answers.push(text);
+    if flow.answers.len() < flow.questions.len() {
+        let next = flow.questions[flow.answers.len()].clone();
+        let prompt = format!("{next}: ");
+        PENDING_QUESTIONS.with(|c| *c.borrow_mut() = Some(flow));
+        return vec![Effect::OpenPrompt(
+            lattice::plugin_host::types::OpenPromptPayload {
+                prompt,
+                initial: String::new(),
+                on_submit_action: "org-capture-question-submit".to_string(),
+                buffer_name: None,
+            },
+        )];
+    }
+    // The last answer just landed. `entered` is always empty here: OR.17
+    // dropped the fields menu's extra "body" row along with the menu, so
+    // `%?` is typed into the draft buffer itself, the same as a zero-question
+    // template — there is no seed to pass.
+    match flow.kind {
+        QuestionFlowKind::Capture { key } => {
+            let template = match selected_template(Some(&key)) {
+                Ok(t) => t,
+                Err(effect) => return vec![effect],
+            };
+            open_capture_buffer(
+                capture_buffer_name(&template.key),
+                CaptureDestination::of(&template),
+                &template.body,
+                &flow.answers,
+                "",
+                &capture_origin(),
+            )
+        }
+        QuestionFlowKind::Roam { title, key, id } => {
+            match roam_draft(&title, &key, &id, &flow.answers, "") {
+                Err(effect) => effect,
+                Ok(draft) => draft.open(),
+            }
+        }
+    }
+}
+
 thread_local! {
     static SCAN: std::cell::RefCell<Option<ScanState>> =
         const { std::cell::RefCell::new(None) };
@@ -3799,20 +3922,19 @@ thread_local! {
 thread_local! {
     /// OC.5b: where the capture in flight was fired from, for `%a`.
     ///
-    /// **The origin is gone by the time the note is written.** Opening the
-    /// prompt focuses a synthetic prompt buffer, so the `document` handed to
-    /// `capture_submit` is the prompt — not the file the user was reading when
-    /// they pressed the chord. The fields menu has the same shape. So the
-    /// annotation is computed in `capture_open`, while the source buffer is
-    /// still the current one, and read back at submit.
+    /// **The origin is gone by the time the note is written.** Opening a
+    /// question prompt (or the draft directly) focuses a synthetic buffer, so
+    /// the `document` handed to a later hop is that buffer — not the file the
+    /// user was reading when they pressed the chord. So the annotation is
+    /// computed in `capture_open`, while the source buffer is still the
+    /// current one, and read back when the draft opens.
     ///
-    /// Guest-side rather than smuggled across the seam because the alternatives
-    /// are worse: the prompt hop's only spare slot is `buffer-name`, which is
-    /// shown to the user and would grow a file path, and the fields hop's is
-    /// `args`, already carrying the template key. Both would need an encoding
-    /// for something neither the host nor the menu has any use for. This is
-    /// state whose lifetime is exactly one capture flow, and it lives with the
-    /// flow — the `SCAN` precedent directly above.
+    /// Guest-side rather than smuggled across the seam because the
+    /// alternative is worse: a question prompt's only spare slot is
+    /// `buffer-name`, which is shown to the user and would grow a file path
+    /// neither the host nor the prompt has any use for. This is state whose
+    /// lifetime is exactly one capture flow, and it lives with the flow — the
+    /// `SCAN` precedent directly above, and [`PENDING_QUESTIONS`]'s.
     ///
     /// Always written by `capture_open`, including to `None`, so an abandoned
     /// capture cannot leave an annotation for the next one to pick up.
@@ -4685,21 +4807,12 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
     }
 }
 
-/// The first hop of `<leader>oc`: resolve the template, then open the prompt.
+/// The first hop of `<leader>oc`: resolve the template, then ask its questions
+/// (if any) before opening the draft.
 ///
-/// Resolving BEFORE the prompt is what makes an unset or broken configuration
-/// say so at the keystroke rather than after the user has already typed a note
-/// — the one moment capture must not waste.
-///
-/// The chosen template's key arrives in `ctx.args` — put there by the menu row
-/// the user pressed (OC.3) — and rides back out on `buffer_name`, which is what
-/// the WIT documents that field for. The host hands it to the submit action
-/// alongside the typed text (OC.3a), so the second hop knows which template it
-/// is finishing.
-///
-/// State on the payload rather than in guest memory, deliberately: `<Esc>`
-/// dispatches nothing at all, so a guest-side "current template" would never be
-/// told to clear and the next capture would inherit it.
+/// Resolving BEFORE anything else is what makes an unset or broken
+/// configuration say so at the keystroke rather than after the user has
+/// already answered a question — the one moment capture must not waste.
 ///
 /// A bare `org-capture` with no key still works when the set holds exactly one
 /// template — there is nothing to choose — which is what keeps `:org-capture`
@@ -4717,24 +4830,19 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         Err(effect) => return vec![effect],
     };
 
-    // OC.4: a template that asks questions gets the FIELDS MENU — one row per
-    // `%^{Question}` plus the body — because several named answers before one
-    // write is not something a single prompt can express.
+    // OR.17: a template that asks questions is asked them ONE AT A TIME,
+    // through a chain of `Effect::OpenPrompt`s — emacs's own order and
+    // mechanism. Before this a template with questions opened a FIELDS MENU
+    // instead (OC.4); that stopped earning its keep once OC.7 gave capture a
+    // real draft buffer to re-edit in, which was the fields menu's one
+    // advantage over a plain run of prompts. See `org-capture.md` §5.
     //
-    // A template with no questions keeps the direct prompt, and that is a UX
-    // decision rather than an omission: the common template is one `%?`, and
-    // routing it through a menu would cost three keystrokes (open, pick the
-    // body field, fire) to collect the one value the prompt already asks for.
-    if !capture_flow::questions(&template.body).is_empty() {
-        return vec![Effect::OpenTransient(
-            lattice::plugin_host::types::OpenTransientPayload {
-                source: CAPTURE_TRANSIENT.to_string(),
-                // What the menu is opened FOR (TR.3a). The builder reads this
-                // to know which template's questions to offer — the reason the
-                // ONE registered source can serve both shapes.
-                args: Args::String(template.key.clone()),
-            },
-        )];
+    // A template with no questions is unchanged: straight to the draft. That
+    // was always a UX decision rather than an omission — the common template
+    // is one `%?`, typed directly into the buffer.
+    let questions = capture_flow::questions(&template.body);
+    if !questions.is_empty() {
+        return start_question_flow(QuestionFlowKind::Capture { key: template.key }, questions);
     }
 
     // OC.7b: the BUFFER, not a one-line prompt. Before this the template was
@@ -4754,10 +4862,10 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// standing in for.
 ///
 /// Shared by both entry paths on purpose. A template with `%^{…}` questions
-/// still collects them in the transient first (emacs's order: prompts, then
-/// the buffer), and a template without them comes straight here; either way
-/// what appears is the same buffer with the same chords, so there is one
-/// capture surface rather than two that can drift.
+/// still collects them first, one prompt at a time (OR.17, emacs's order:
+/// prompts, then the buffer), and a template without them comes straight
+/// here; either way what appears is the same buffer with the same chords, so
+/// there is one capture surface rather than two that can drift.
 ///
 /// The major is `org-mode`, because a capture buffer IS an org buffer — it
 /// wants org's grammar, motions and folding. Only the finalize/abort pair is
@@ -4765,10 +4873,11 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// chords on the major would make `C-c C-c` file every org file you touched.
 ///
 /// OR.11b widened this from two entry paths to four — org-capture's direct and
-/// fields routes, and org-roam's two peers. It takes a `body` and a `name`
-/// rather than a template because roam has neither a `capture_templates::
-/// Template` nor a key to derive a name from, and because the body it hands
-/// over has already had `${…}` expanded over the node being created.
+/// question-flow routes, and org-roam's two peers. It takes a `body` and a
+/// `name` rather than a template because roam has neither a
+/// `capture_templates::Template` nor a key to derive a name from, and because
+/// the body it hands over has already had `${…}` expanded over the node being
+/// created.
 ///
 /// `annotation` is `%a`'s expansion, passed in rather than read from
 /// [`CAPTURE_ORIGIN`] here. That is not tidiness: the origin is written by
@@ -4836,14 +4945,8 @@ fn prompt_smuggled_state(args: &Args) -> Option<String> {
     }
 }
 
-/// OC.4: the fields menu's submit — expand the template around the answers the
-/// menu collected and write it.
-///
-/// `ctx.args` is `[key, answer…]`: the fire row's own argument first, then the
-/// menu's `Argument` rows in declaration order (TR.3b). The LAST answer is the
-/// body — the fields menu appends a body row after the questions, so `%?` is
-/// collected the same way everything else is rather than being a special case
-/// OC.5b: consume the origin recorded at `capture_open`.
+/// OC.5b: consume the origin recorded at `capture_open` — what the legacy
+/// single-prompt `capture_submit` expands `%a` to.
 ///
 /// Consuming rather than peeking: one origin belongs to one capture, and a note
 /// filed later carrying the previous capture's `%a` would be a link that looks
@@ -4859,11 +4962,12 @@ fn taken_origin() -> String {
 ///
 /// Peeking rather than taking, unlike [`taken_origin`], because the buffer path
 /// expands `%a` when the buffer OPENS and the capture is not over until
-/// `C-c C-c`: a fields menu that opens the buffer after collecting answers
-/// would otherwise have consumed the origin on the way through, and the same
-/// capture would lose its own `%a`. The origin is overwritten unconditionally
-/// by the next `capture_open`, so nothing leaks forward to a capture that has
-/// one of its own — and org-roam does not read this at all, passing `""`.
+/// `C-c C-c`: a sequential question flow that opens the buffer after collecting
+/// its answers would otherwise have consumed the origin on the way through, and
+/// the same capture would lose its own `%a`. The origin is overwritten
+/// unconditionally by the next `capture_open`, so nothing leaks forward to a
+/// capture that has one of its own — and org-roam does not read this at all,
+/// passing `""`.
 fn capture_origin() -> String {
     CAPTURE_ORIGIN
         .with(|c| c.borrow().clone())
@@ -5030,50 +5134,6 @@ fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
         // silently build a tree.
         create_parents: false,
     })
-}
-
-/// the user reaches by another route.
-fn capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
-    let Args::List(values) = &ctx.args else {
-        return vec![Effect::Echo(EchoPayload {
-            level: EchoLevel::Warn,
-            text: "org: the capture menu collected nothing".to_string(),
-        })];
-    };
-    let mut collected = values.iter().map(|v| match v {
-        lattice::plugin_host::types::ArgValue::String(s) => s.clone(),
-        lattice::plugin_host::types::ArgValue::Raw(s) => s.clone(),
-        lattice::plugin_host::types::ArgValue::Char(c) => c.to_string(),
-        other => format!("{other:?}"),
-    });
-    let Some(key) = collected.next() else {
-        return vec![Effect::None];
-    };
-    // Re-resolved rather than carried, like the prompt hop: a `:set` between
-    // opening the menu and firing it takes effect, which is what the option
-    // promises.
-    let template = match selected_template(Some(&key)) {
-        Ok(t) => t,
-        Err(effect) => return vec![effect],
-    };
-    let mut answers: Vec<String> = collected.collect();
-    // The body is the last row. A menu that somehow collected nothing still
-    // writes the template — losing it would be worse than writing it bare.
-    let entered = answers.pop().unwrap_or_default();
-
-    // OC.7b: the menu still collects the `%^{…}` answers first — emacs's
-    // order, prompts then buffer — but what it opens now is the capture
-    // buffer rather than a write. The body row it collected seeds the `%?`
-    // point and the caret lands after it, so the answer is a draft the user
-    // can keep editing rather than the final word.
-    open_capture_buffer(
-        capture_buffer_name(&template.key),
-        CaptureDestination::of(&template),
-        &template.body,
-        &answers,
-        &entered,
-        &capture_origin(),
-    )
 }
 
 /// OC.7b — `C-c C-c`: file what the capture buffer holds.
@@ -6091,14 +6151,14 @@ impl GrammarCallbacks for Component {
                     source: CAPTURE_TRANSIENT.to_string(),
                     // The template menu is opened for nothing in particular —
                     // it IS the choice. TR.3a's args carry a subject when a
-                    // menu drills down, which is the fields menu (OC.4).
+                    // menu drills down, which is the roam chooser opened FOR a
+                    // node (OR.11b).
                     args: Args::None,
                 },
             )]),
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
-            CAPTURE_FIELDS_SUBMIT => Ok(capture_fields_submit(&ctx)),
-            ROAM_CAPTURE_FIELDS_SUBMIT => Ok(roam_capture_fields_submit(&ctx)),
+            CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
@@ -7910,58 +7970,20 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
             })];
         }
     };
-    // OC.4's order, which is emacs's: questions first, then the buffer. The
-    // fields menu is opened only when there is something to ask — a template
-    // with no `%^{…}` goes straight to the draft, because routing it through a
-    // menu would cost three keystrokes to collect nothing.
+    // OR.17's order, which is emacs's: questions first, then the buffer, asked
+    // ONE AT A TIME rather than through a fields menu (see `capture_open` and
+    // `org-capture.md` §5). A template with no `%^{…}` goes straight to the
+    // draft — nothing to ask.
     match roam_draft(&title, &key, &id, &[], "") {
         Err(effect) => effect,
         Ok(draft) if draft.asks_questions => {
-            vec![Effect::OpenTransient(
-                lattice::plugin_host::types::OpenTransientPayload {
-                    source: CAPTURE_TRANSIENT.to_string(),
-                    args: Args::List(vec![
-                        lattice::plugin_host::types::ArgValue::String(
-                            ORG_TRANSIENT_ROAM_FIELDS.to_string(),
-                        ),
-                        lattice::plugin_host::types::ArgValue::String(title),
-                        lattice::plugin_host::types::ArgValue::String(key),
-                        lattice::plugin_host::types::ArgValue::String(id),
-                    ]),
-                },
-            )]
+            // `draft.body` already has `${…}` interpolated (OR.11b's order:
+            // node fields first, so a title containing a literal `%^{…}`
+            // cannot conjure a question out of user data), so the questions
+            // extracted from it are exactly the ones left to ask.
+            let questions = capture_flow::questions(&draft.body);
+            start_question_flow(QuestionFlowKind::Roam { title, key, id }, questions)
         }
-        Ok(draft) => draft.open(),
-    }
-}
-
-/// OR.11b — the fire row of the roam fields menu.
-///
-/// `ctx.args` is `[title, key, id, answer…]`: the row's own three arguments
-/// first, then the menu's `Argument` rows in declaration order (TR.3b). The
-/// LAST answer is the body, exactly as in `capture_fields_submit` — the fields
-/// menu appends a body row after the questions so `%?` is collected the same
-/// way everything else is.
-fn roam_capture_fields_submit(ctx: &ActionContext) -> Vec<Effect> {
-    let Args::List(values) = &ctx.args else {
-        return roam_warn("org-roam: the template menu collected nothing");
-    };
-    let mut collected = values.iter().map(|v| match v {
-        lattice::plugin_host::types::ArgValue::String(s) => s.clone(),
-        lattice::plugin_host::types::ArgValue::Raw(s) => s.clone(),
-        lattice::plugin_host::types::ArgValue::Char(c) => c.to_string(),
-        other => format!("{other:?}"),
-    });
-    let (Some(title), Some(key), Some(id)) = (collected.next(), collected.next(), collected.next())
-    else {
-        return roam_warn("org-roam: the template menu lost the note it was making");
-    };
-    let mut answers: Vec<String> = collected.collect();
-    // The body is the last row. A menu that somehow collected nothing still
-    // opens the draft — losing it would be worse than opening it bare.
-    let entered = answers.pop().unwrap_or_default();
-    match roam_draft(&title, &key, &id, &answers, &entered) {
-        Err(effect) => effect,
         Ok(draft) => draft.open(),
     }
 }
@@ -8249,11 +8271,11 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             TransientSpec,
         };
 
-        // OC.4: ONE registered source, several shapes — which one is decided
-        // by what the open was FOR (TR.3a). Opened for nothing, this is the
-        // template chooser; opened for a template key, it is that template's
-        // fields; opened for `todo`, it is TK.6's state menu. Separate names
-        // would have needed separate `id()`s, and the seam gives a guest one.
+        // ONE registered source, several shapes — which one is decided by
+        // what the open was FOR (TR.3a). Opened for nothing, this is the
+        // template chooser; opened for `todo`, it is TK.6's state menu.
+        // Separate names would have needed separate `id()`s, and the seam
+        // gives a guest one.
         //
         // TK.6's branch comes BEFORE the capture-templates parse below, and
         // that ordering is load-bearing rather than tidy: the TODO menu has
@@ -8293,17 +8315,6 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
                     return roam_template_menu(title);
                 }
             }
-            // OR.11b: and the roam FIELDS menu, which needs the id already
-            // minted for this note as well as the title and key — carried
-            // rather than re-minted, so the `${id}` the user sees in the draft
-            // is the one written into the file's `:ID:`.
-            if let [lattice::plugin_host::types::ArgValue::String(kind), lattice::plugin_host::types::ArgValue::String(title), lattice::plugin_host::types::ArgValue::String(key), lattice::plugin_host::types::ArgValue::String(id)] =
-                items.as_slice()
-            {
-                if kind == ORG_TRANSIENT_ROAM_FIELDS {
-                    return roam_fields_menu(title, key, id);
-                }
-            }
         }
 
         // An `err` echoes with the plugin named and the menu does not open —
@@ -8312,12 +8323,6 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // are all things the user must fix before a menu means anything. A menu
         // that opens empty says none of that.
         let set = capture_templates::read().map_err(|e| e.message())?;
-
-        if let Args::String(key) = &ctx.args {
-            if !key.is_empty() {
-                return fields_menu(&set, key.as_str());
-            }
-        }
 
         let mut items: Vec<TransientItem> = set
             .templates
@@ -8356,168 +8361,6 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             }],
             footer,
         })
-    }
-}
-
-/// OC.4: the fields menu for one template — a row per `%^{Question}`, a row
-/// for the body, and a row that captures.
-///
-/// A form rather than a run of prompts, deliberately. The menu stays the
-/// surface throughout, so an answer can be re-edited before anything is
-/// written — a questionnaire has already moved on by the time you notice the
-/// typo. It is also the mechanism the editor already has
-/// (`PendingTransientArgument` park/resume), rather than a second one org
-/// would have had to invent.
-///
-/// Field names are POSITIONAL (`q0`, `q1`, …) rather than the question text: a
-/// template may legitimately ask the same question twice (`%^{Line}` in a list
-/// template plainly means two different lines), and two rows sharing a state
-/// key would overwrite each other.
-fn fields_menu(
-    set: &capture_templates::ParsedSet,
-    key: &str,
-) -> Result<lattice::plugin_host::types::TransientSpec, String> {
-    use lattice::plugin_host::types::Args as WitArgs;
-
-    let template = set
-        .by_key(key)
-        .ok_or_else(|| format!("no capture template keyed `{key}`"))?;
-
-    Ok(fields_menu_spec(
-        format!("Capture: {}", template.description),
-        &template.body,
-        format!("→ {}", template.target.file()),
-        "org-capture-fields-submit",
-        // The template this menu is collecting for. It arrives at the action
-        // ahead of the answers (TR.3b).
-        WitArgs::String(template.key.clone()),
-    ))
-}
-
-/// OR.11b: the same form, for a roam note being created.
-///
-/// **The minted id is carried, not re-minted.** `title` and `key` alone would
-/// be enough to rebuild the template — and the id would differ between the menu
-/// opening and the answers arriving, so the `${id}` the user is about to see in
-/// the buffer would not be the one written into the file's `:ID:`. Carrying it
-/// is the same reasoning that puts the title on the roam template menu's rows
-/// rather than in a guest-side slot (TR.3a): what the second hop needs travels
-/// with the row that fires it.
-///
-/// The roam template is re-READ from the option, like capture's is, so a `:set`
-/// between the two hops takes effect. Only the id is pinned, because only the
-/// id cannot be re-derived.
-fn roam_fields_menu(
-    title: &str,
-    key: &str,
-    id: &str,
-) -> Result<lattice::plugin_host::types::TransientSpec, String> {
-    use lattice::plugin_host::types::{ArgValue, Args as WitArgs};
-
-    let set = roam_templates::read();
-    let template = set
-        .get(key)
-        .ok_or_else(|| format!("no roam template keyed `{key}`"))?;
-    let slug = roam_find::slug(title);
-    let node = roam_capture::Node {
-        title,
-        slug: &slug,
-        id,
-    };
-    // `${…}` FIRST, so the questions this menu offers are the ones left in the
-    // body after the node has been interpolated — and so a title that contains
-    // a literal `%^{…}` cannot conjure a question out of user data.
-    //
-    // OR.14: through `resolve_body`, not `template.body` directly — a
-    // `body_file` template's `body` is empty (the text lives on disk), and
-    // reading it straight would show zero question rows for a file whose
-    // `%^{…}` questions `roam_draft`'s own scan (which DOES resolve the file)
-    // already decided this menu should be asking. `pkos-source.org`'s
-    // `%^{Aliases …}` is exactly this case in the reference corpus.
-    let body = roam_templates::resolve_body(template, &node, |path| {
-        host_services::read_file(path).map_err(|_| ())
-    })?;
-    Ok(fields_menu_spec(
-        format!("Roam: {title}"),
-        &body,
-        format!("→ {}", roam_note_filename(template, &node)),
-        "org-roam-capture-fields-submit",
-        WitArgs::List(vec![
-            ArgValue::String(title.to_string()),
-            ArgValue::String(key.to_string()),
-            ArgValue::String(id.to_string()),
-        ]),
-    ))
-}
-
-/// The rows both fields menus are: one per `%^{Question}`, one for the body,
-/// one that fires and one that quits.
-///
-/// `carried` is prepended to the collected answers by the host (TR.3b), so the
-/// submit action reads `[carried…, q0, q1, …, body]`. Capture carries one
-/// string; roam carries three.
-fn fields_menu_spec(
-    title: String,
-    body: &str,
-    fire_description: String,
-    command: &str,
-    carried: lattice::plugin_host::types::Args,
-) -> lattice::plugin_host::types::TransientSpec {
-    use lattice::plugin_host::types::{
-        TransientAction, TransientArgument, TransientGroup, TransientItem, TransientItemKind,
-        TransientSpec,
-    };
-
-    let mut items: Vec<TransientItem> = Vec::new();
-    for (i, question) in capture_flow::questions(body).iter().enumerate() {
-        items.push(TransientItem {
-            // `1`..`9` then letters would run out; the index IS the key for
-            // the first nine, which covers every real template.
-            key: vec![(i + 1).to_string()],
-            label: question.clone(),
-            description: String::new(),
-            kind: TransientItemKind::Argument(TransientArgument {
-                name: format!("q{i}"),
-                default: None,
-                prompt: question.clone(),
-            }),
-        });
-    }
-    // The body last, so `%?` is collected the same way every other field is.
-    // Its answer is the final one the submit action pops off.
-    items.push(TransientItem {
-        key: vec!["b".to_string()],
-        label: "body".to_string(),
-        description: "what `%?` becomes".to_string(),
-        kind: TransientItemKind::Argument(TransientArgument {
-            name: "body".to_string(),
-            default: None,
-            prompt: "Capture".to_string(),
-        }),
-    });
-    items.push(TransientItem {
-        key: vec!["c".to_string()],
-        label: "capture".to_string(),
-        description: fire_description,
-        kind: TransientItemKind::Action(TransientAction {
-            command: command.to_string(),
-            args: carried,
-        }),
-    });
-    items.push(TransientItem {
-        key: vec!["q".to_string()],
-        label: "quit".to_string(),
-        description: String::new(),
-        kind: TransientItemKind::Dismiss,
-    });
-
-    TransientSpec {
-        title,
-        groups: vec![TransientGroup {
-            label: "Fields".to_string(),
-            items,
-        }],
-        footer: Some("c to capture, q to abandon".to_string()),
     }
 }
 

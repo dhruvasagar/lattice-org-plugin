@@ -277,8 +277,9 @@ You stay where you are. Refile files something; it does not navigate.
 
 `<leader>oc` (or `C-c c`) opens the **capture menu** — one key per template —
 and the key you press picks the template. A template that asks `%^{…}`
-questions collects those first; then a **capture buffer** opens, holding the
-template expanded, with the cursor where `%?` was.
+questions asks them first, one at a time — the same order emacs asks in; then
+a **capture buffer** opens, holding the template expanded, with the cursor
+where `%?` was.
 
 | | |
 |---|---|
@@ -356,7 +357,7 @@ org.capture-template = "* TODO %?\n  %U"
 | `%U` | today, inactive: `[2026-08-26 Wed]` |
 | `%T` | today, active: `<2026-08-26 Wed>` — the agenda sees this one |
 | `%t` | today, active, date only. Same as `%T` for now — `%T` will grow a time of day, `%t` never will |
-| `%^{Question}` | asks for a named value. Several become a **fields menu**, not a run of prompts |
+| `%^{Question}` | asks for a named value, in a prompt of its own. Several are asked one after another, in template order |
 | `%a` | a link back to where you fired the capture: `[[file:/path/notes.org::42][notes.org]]` |
 | `%%` | a literal `%` |
 

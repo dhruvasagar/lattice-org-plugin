@@ -12,12 +12,12 @@
 //! of this shape can exist at all — a vocabulary entry is not one line of typed
 //! text, it is several named fields.
 //!
-//! This module only *finds* the questions. Collecting the answers is the
-//! transient `Argument` mechanism (`PendingTransientArgument` → the menu is
-//! parked, the value lands in `TransientState`, the menu comes back), which is
-//! what lattice already uses for magit's argument rows. An earlier draft
-//! encoded the answers into the prompt buffer's name instead; that was a second
-//! spelling of a mechanism the editor already has, and it is gone.
+//! This module only *finds* the questions. Collecting the answers (OR.17) is
+//! a chain of `Effect::OpenPrompt`s, one per question in the order this module
+//! returns them — the same order emacs asks in — with the running answers held
+//! guest-side in `PENDING_QUESTIONS` rather than smuggled through the prompt
+//! payload. An earlier design asked them all at once through a transient
+//! FIELDS menu instead; §5 records why that was reversed.
 //!
 //! Design: `docs/dev/architecture/org-capture.md` §5.
 

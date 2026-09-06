@@ -343,25 +343,15 @@ async fn press_menu_key(editor: &mut Editor, key: &str) {
     apply_renderer_effects(editor, out).await;
 }
 
-/// Press a field's key and answer its prompt — the menu parks, the prompt
-/// takes the value, and `resume_parked_transient` puts the menu back.
-async fn answer_field(editor: &mut Editor, key: &str, value: &str) {
-    press_menu_key(editor, key).await;
-    // The prompt the field opened registers no submit action: the host routes
-    // a parked transient itself (`do_prompt_line_submit` checks for one first).
-    editor.open_prompt_line(
-        String::new(),
-        value.to_string(),
-        String::new(),
-        editor.pending_prompt_buffer_name.clone(),
-    );
-    let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.do_prompt_line_submit(&mut out);
-    apply_renderer_effects(editor, out).await;
-}
-
-/// Type `text` into the open prompt and submit it, the way `<CR>` does.
-fn submit_prompt(editor: &mut Editor, text: &str) {
+/// Type `text` into the open prompt and submit it, the way `<CR>` does — then
+/// apply what the submit produced, which is where the edit is.
+///
+/// OR.17: a sequential question flow chains through repeated calls to this,
+/// each one opening the NEXT question's prompt (or the draft, on the last) via
+/// the same `apply_renderer_effects` path `press_chord` and `press_menu_key`
+/// use — a caller that only pressed would prove the chord resolved and
+/// nothing more, `apply_renderer_effects`'s own founding reason.
+async fn submit_prompt(editor: &mut Editor, text: &str) {
     let action = editor
         .pending_prompt_submit_action
         .clone()
@@ -373,6 +363,7 @@ fn submit_prompt(editor: &mut Editor, text: &str) {
     editor.open_prompt_line("".to_string(), text.to_string(), action, name);
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_prompt_line_submit(&mut out);
+    apply_renderer_effects(editor, out).await;
 }
 
 /// Put the caret on `line`, column 0.
@@ -2939,15 +2930,12 @@ async fn a_broken_set_leaves_the_menu_closed_and_echoes() {
     );
 }
 
-/// OC.4 — a template with `%^{Question}`s collects them as menu FIELDS.
-///
-/// Three named answers before one write is what makes a vocabulary template
-/// possible at all — it is not one line of typed text, it is several fields.
-/// Collected through the mechanism the editor already has (the menu parks, a
-/// prompt takes the value, the menu comes back), so the menu stays the surface
-/// and an answer can be re-edited before anything is written.
+/// OR.17 — a template with `%^{Question}`s asks them ONE AT A TIME, in
+/// template order, through a chain of real prompt submits — emacs's own order
+/// and mechanism, replacing the fields menu OC.4 shipped and OC.7 made
+/// redundant (`org-capture.md` §5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_template_with_questions_collects_them_as_fields() {
+async fn a_template_with_questions_is_asked_them_sequentially() {
     if org_plugin_wasm().is_none() {
         return;
     }
@@ -2968,38 +2956,39 @@ async fn a_template_with_questions_collects_them_as_fields() {
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "v").await;
 
-    // The second menu is the FIELDS one, opened for this template — one row
-    // per question, in template order, plus the body and a way to fire.
-    let spec = editor
-        .picker
-        .as_ref()
-        .and_then(|p| p.transient.as_ref())
-        .expect("the fields menu opened")
-        .clone();
-    assert_eq!(spec.title, "Capture: Vocab");
-    let labels: Vec<&str> = spec.groups[0]
-        .items
-        .iter()
-        .map(|i| i.label.as_str())
-        .collect();
+    // Picking the template opens a PROMPT directly — no second menu — naming
+    // the first question in template order.
     assert_eq!(
-        labels,
-        vec!["Word", "Context", "Translation", "body", "capture", "quit"],
-        "a row per question in TEMPLATE order, then the body, then the fire row"
+        editor.pending_prompt_submit_action.as_deref(),
+        Some("org-capture-question-submit"),
+        "last message: {:?}",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+    let prompt_text = |editor: &Editor| editor.last_message.as_ref().map(|m| m.text.clone());
+    assert_eq!(prompt_text(&editor), Some("Word: ".to_string()));
+
+    submit_prompt(&mut editor, "chat").await;
+    assert_eq!(
+        prompt_text(&editor),
+        Some("Context: ".to_string()),
+        "the SECOND question, in template order"
     );
 
-    // Answer them, then fire.
-    answer_field(&mut editor, "1", "chat").await;
-    answer_field(&mut editor, "2", "le chat noir").await;
-    answer_field(&mut editor, "3", "cat").await;
-    press_menu_key(&mut editor, "c").await;
+    submit_prompt(&mut editor, "le chat noir").await;
+    assert_eq!(
+        prompt_text(&editor),
+        Some("Translation: ".to_string()),
+        "the THIRD question, in template order"
+    );
 
-    // OC.7b: the menu still collects the answers first (emacs's order), but
-    // what it opens now is the capture BUFFER — so the file is written by
-    // `C-c C-c`, not by firing the row.
+    submit_prompt(&mut editor, "cat").await;
+
+    // The last answer opens the capture BUFFER, exactly as a zero-question
+    // template does — there is no extra "body" prompt: `%?` is typed into the
+    // draft directly.
     assert!(
         editor.buffers.by_name("*org-capture:v*").is_some(),
-        "the fields menu opens the capture buffer with the answers substituted"
+        "the last answer opened the capture buffer with the answers substituted"
     );
     finalize_capture(&mut editor, "").await;
 
@@ -3046,10 +3035,24 @@ async fn a_template_without_questions_still_captures_in_one_hop() {
     assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
 }
 
-/// Abandoning the fields menu writes nothing and leaves nothing behind — the
-/// next capture starts clean rather than inheriting half of this one.
+/// OR.17 — `<Esc>` mid-flow abandons the WHOLE capture: no note, no draft, and
+/// — the harder half — no stale accumulator for the NEXT capture to inherit.
+///
+/// `Effect::OpenPrompt`'s Esc "dispatches nothing at all" (`types.wit`), so
+/// `do_prompt_line_cancel` (what the host's own modal-escape routing calls) is
+/// how the test reaches the same state a real `<Esc>` does — including
+/// dropping back to Normal, which the second capture below needs in order to
+/// even dispatch `<leader>oc` again.
+///
+/// What makes this worth its own test rather than following from the others:
+/// the guest holds the flow's answers in a `thread_local` that Esc never
+/// tells to clear (nothing is dispatched to the guest at all), so the only
+/// thing standing between an abandoned "chat" and a fresh capture inheriting
+/// it is `capture_open` overwriting that state unconditionally on every new
+/// start. A design that merely cleared it on the paths that remember to would
+/// pass every OTHER test in this file and fail exactly this one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn abandoning_the_fields_menu_writes_nothing() {
+async fn abandoning_a_question_flow_leaves_nothing_behind() {
     if org_plugin_wasm().is_none() {
         return;
     }
@@ -3061,28 +3064,43 @@ async fn abandoning_the_fields_menu_writes_nothing() {
         "capture-templates",
         &format!(
             "[[template]]\nkey = \"v\"\ndescription = \"Vocab\"\n\
-             target = {{ file = \"{}\" }}\nbody = \"* %^{{Word}}\"\n",
+             target = {{ file = \"{}\" }}\n\
+             body = \"\"\"\n* %^{{Word}} :fc:\n- Context: %^{{Context}}\n- T: %^{{Translation}}\n\"\"\"\n",
             vocab.to_str().unwrap()
         ),
     );
 
+    // Question 1 of 3, answered; question 2 of 3 opens — then `<Esc>`.
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "v").await;
-    answer_field(&mut editor, "1", "chat").await;
-    press_menu_key(&mut editor, "q").await;
+    submit_prompt(&mut editor, "chat").await;
+    assert_eq!(
+        editor.last_message.as_ref().map(|m| m.text.clone()),
+        Some("Context: ".to_string()),
+        "question 2 of 3 is open before the escape"
+    );
+    editor.do_prompt_line_cancel();
 
-    assert!(!vocab.exists(), "abandoning wrote nothing");
-    assert!(editor.picker.is_none(), "and closed the menu");
+    assert!(!vocab.exists(), "no note");
+    assert!(
+        editor.buffers.by_name("*org-capture:v*").is_none(),
+        "no draft either — the flow never reached the last question"
+    );
 
-    // A fresh capture does not inherit the abandoned answer.
+    // A FRESH capture of the same template must not inherit "chat" as its
+    // answer to `Word`.
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "v").await;
-    press_menu_key(&mut editor, "c").await;
+    submit_prompt(&mut editor, "dog").await;
+    submit_prompt(&mut editor, "le chien noir").await;
+    submit_prompt(&mut editor, "canine").await;
     finalize_capture(&mut editor, "").await;
+
     assert_eq!(
         text_of(&editor, &vocab),
-        "* \n",
-        "the new menu started empty — the abandoned answer did not survive"
+        "* dog :fc:\n- Context: le chien noir\n- T: canine\n",
+        "the fresh capture started clean — the abandoned flow's answer did \
+         not survive into it"
     );
 }
 

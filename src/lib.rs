@@ -150,6 +150,9 @@ mod habit_stats;
 mod headline;
 mod history;
 mod links;
+// OS.3: what a list item IS — bullet shape, nesting, extent, numbering. The
+// model every list verb reads, and the one `checkbox.rs` now sits on.
+mod list;
 mod org_date;
 // OA.25: the line below a headline, and the rules for writing one field of it
 // without destroying the others.

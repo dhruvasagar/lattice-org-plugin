@@ -46,50 +46,22 @@ pub struct Item {
 /// `[ ]` / `[X]` / `[x]` / `[-]`. Note `*` is NOT accepted as a bullet at
 /// column 0 — that is a headline, and treating `* [ ] x` as a checkbox would
 /// make `<C-Space>` silently rewrite a heading.
+///
+/// The bullet itself is [`crate::list`]'s to recognise (OS.3). This carried its
+/// own `strip_bullet` until then — which is exactly the second walker that ends
+/// up disagreeing with the first on the day the grammar grows a bullet form,
+/// and the way such a disagreement surfaces is a statistics cookie that quietly
+/// stops counting an item.
 pub fn parse_item(line: &str) -> Option<Item> {
     let indent = line.len() - line.trim_start().len();
-    let rest = &line[indent..];
-    let after_bullet = strip_bullet(rest, indent)?;
-    let box_off = rest.len() - after_bullet.len();
-    let b = after_bullet.as_bytes();
-    if b.first() != Some(&b'[') || b.get(2) != Some(&b']') {
-        return None;
-    }
-    let state = match b.get(1)? {
-        b' ' => Check::Off,
-        b'X' | b'x' => Check::On,
-        b'-' => Check::Partial,
-        _ => return None,
-    };
+    let parsed = crate::list::parse_line(line, indent)?;
     Some(Item {
         indent,
-        box_at: indent + box_off,
-        state,
+        // Both `?`s ask the same thing — a list item with no box is not a
+        // checkbox item — of the one parse, rather than re-scanning the line.
+        box_at: parsed.box_byte?,
+        state: parsed.item.checkbox?,
     })
-}
-
-/// Strip a list bullet, returning what follows it (whitespace trimmed).
-fn strip_bullet(rest: &str, indent: usize) -> Option<&str> {
-    // `*` is a bullet ONLY when indented — at column 0 it is a headline.
-    for (marker, needs_indent) in [("- ", false), ("+ ", false), ("* ", true)] {
-        if let Some(r) = rest.strip_prefix(marker) {
-            if needs_indent && indent == 0 {
-                return None;
-            }
-            return Some(r.trim_start());
-        }
-    }
-    // Ordered: digits then `.` or `)` then a space.
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0 {
-        let after = &rest[digits..];
-        for marker in [". ", ") "] {
-            if let Some(r) = after.strip_prefix(marker) {
-                return Some(r.trim_start());
-            }
-        }
-    }
-    None
 }
 
 /// Rewrite `line`'s checkbox to `state`. `None` if it is not an item.
@@ -197,6 +169,7 @@ pub fn update_cookie(line: &str, done: usize, total: usize) -> Option<String> {
 // `update_cookie` have no node to migrate to, exactly as OT.5 found for stamps.
 
 use crate::lattice::plugin_host::tree_sitter::{Node, TreeSnapshot};
+use crate::list::Lists;
 use crate::tree;
 
 const LIST: &str = "list";
@@ -252,24 +225,28 @@ impl<'a> Checkboxes<'a> {
         (self.line)(n)
     }
 
+    /// The list model underneath, over the same buffer and the same tree.
+    ///
+    /// Built per call rather than stored: it is three copied references, and a
+    /// stored one would be a second place the tree could go stale relative to
+    /// the accessor beside it.
+    fn lists(&self) -> Lists<'a> {
+        Lists::new(self.tree, self.line, self.line_count)
+    }
+
     /// The checkbox item whose box sits on line `n`.
     ///
     /// The box, not the item: a `listitem` spans its continuation lines too,
     /// and toggling from the middle of a wrapped item is not what `<C-Space>`
     /// means. `box_at` still comes from the text, because the caller rewrites
     /// the line and needs a byte offset into it.
+    ///
+    /// Since OS.3 this is [`Lists::item_at`] filtered to items carrying a box —
+    /// the model already answers "does a list item start on line `n`", tree
+    /// veto included, and answering it twice is what this slice removed.
     pub fn item_at(&self, n: u32) -> Option<Item> {
-        let text = self.text(n)?;
-        let item = parse_item(&text)?;
-        match self.tree {
-            // The tree is the veto: it says whether this line is a list item at
-            // all. What the box CONTAINS is still read from the text.
-            Some(snapshot) => {
-                let node = enclosing_listitem(snapshot, n, item.box_at as u32)?;
-                (checkbox_start_line(&node) == Some(n)).then_some(item)
-            }
-            None => Some(item),
-        }
+        self.lists().item_at(n)?.checkbox?;
+        parse_item(&self.text(n)?)
     }
 
     /// The cookie-bearing ancestors of the item on line `n`, innermost first,

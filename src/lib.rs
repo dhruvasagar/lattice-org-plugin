@@ -1965,15 +1965,30 @@ impl Guest for Component {
                 bind("<M-Right>", "org-meta-right"),
                 bind("<M-S-Left>", "org-shift-meta-left"),
                 bind("<M-S-Right>", "org-shift-meta-right"),
+                // The hjkl peers. Same ActionIds, so there is one verb with two
+                // spellings rather than two verbs: emacs muscle memory reaches
+                // for the arrows, vim muscle memory does not want to leave the
+                // home row, and org users routinely have both. `h`/`l` are the
+                // horizontal pair (promote/demote, outdent/indent) and `k`/`j`
+                // the vertical one (move up/down), matching the motions they
+                // already mean everywhere else in the editor.
+                bind("<M-h>", "org-meta-left"),
+                bind("<M-l>", "org-meta-right"),
+                bind("<M-S-h>", "org-shift-meta-left"),
+                bind("<M-S-l>", "org-shift-meta-right"),
                 // OS.7. `<leader>oK` / `oJ` stay bound and unchanged.
                 bind("<M-Up>", "org-meta-up"),
                 bind("<M-Down>", "org-meta-down"),
+                bind("<M-k>", "org-meta-up"),
+                bind("<M-j>", "org-meta-down"),
                 // Emacs's subtree-explicit peers, the SAME ActionIds: on a
                 // headline both spellings mean the subtree, which is what
                 // org's own move does. Binding them apart would invent a
                 // distinction org does not make.
                 bind("<M-S-Up>", "org-meta-up"),
                 bind("<M-S-Down>", "org-meta-down"),
+                bind("<M-S-k>", "org-meta-up"),
+                bind("<M-S-j>", "org-meta-down"),
                 // OS.8. Insert ONLY, and the only org chords that DECLINE:
                 // vim's own `<C-t>` / `<C-d>` shiftwidth indent lives
                 // underneath them.
@@ -1993,6 +2008,10 @@ impl Guest for Component {
                 vbind("<M-Right>", "org-meta-right"),
                 vbind("<M-S-Left>", "org-shift-meta-left"),
                 vbind("<M-S-Right>", "org-shift-meta-right"),
+                vbind("<M-h>", "org-meta-left"),
+                vbind("<M-l>", "org-meta-right"),
+                vbind("<M-S-h>", "org-shift-meta-left"),
+                vbind("<M-S-l>", "org-shift-meta-right"),
                 vbind("<C-Space>", "org-toggle-checkbox"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),

@@ -64,12 +64,17 @@ fn org_component() -> Option<Vec<u8>> {
 /// the next person reintroducing parallelism by removing a flag they cannot see
 /// the reason for. Poisoning is ignored — a panicking test has already failed,
 /// and turning its neighbours red too would hide which one broke.
-static LANGUAGE_REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A TOKIO mutex, not a `std` one: the critical section spans `.await` points
+/// (loading the component, driving the seam), which is precisely what a
+/// blocking guard must not be held across — it parks a runtime worker and
+/// clippy's `await_holding_lock` says so. The async mutex yields instead.
+///
+/// No poisoning to handle, either: `tokio::sync::Mutex` has none, so a
+/// panicking test cannot turn its neighbours red and hide which one broke.
+static LANGUAGE_REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn serialise_registry() -> std::sync::MutexGuard<'static, ()> {
-    LANGUAGE_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+async fn serialise_registry() -> tokio::sync::MutexGuard<'static, ()> {
+    LANGUAGE_REGISTRY.lock().await
 }
 
 async fn load_language_seam(base: &std::path::Path, wasm: &[u8]) -> usize {
@@ -148,7 +153,7 @@ async fn load_theme_and_language(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_shipped_component_colours_an_org_buffer() {
-    let _serialised = serialise_registry();
+    let _serialised = serialise_registry().await;
     let Some(wasm) = org_component() else {
         eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
         return;
@@ -206,7 +211,7 @@ async fn the_shipped_component_colours_an_org_buffer() {
 /// injected range.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_src_block_is_highlighted_by_its_own_language() {
-    let _serialised = serialise_registry();
+    let _serialised = serialise_registry().await;
     let Some(wasm) = org_component() else {
         eprintln!("skipping: component not built");
         return;
@@ -249,7 +254,7 @@ async fn a_src_block_is_highlighted_by_its_own_language() {
 /// to the host as language names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_or_absent_language_degrades_to_plain_text() {
-    let _serialised = serialise_registry();
+    let _serialised = serialise_registry().await;
     let Some(wasm) = org_component() else {
         eprintln!("skipping: component not built");
         return;
@@ -290,7 +295,7 @@ async fn an_unknown_or_absent_language_degrades_to_plain_text() {
 /// query missing a keyword.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tk3_todo_states_register_as_theme_elements() {
-    let _serialised = serialise_registry();
+    let _serialised = serialise_registry().await;
     let Some(wasm) = org_component() else {
         eprintln!("skipping: component not built");
         return;
@@ -322,7 +327,7 @@ async fn tk3_todo_states_register_as_theme_elements() {
 /// colour, and DONE must not be the same colour as TODO.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tk3_todo_is_no_longer_painted_as_a_language_keyword() {
-    let _serialised = serialise_registry();
+    let _serialised = serialise_registry().await;
     let Some(wasm) = org_component() else {
         return;
     };

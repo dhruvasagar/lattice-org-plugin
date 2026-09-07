@@ -211,6 +211,7 @@ same thing without leaving the editor.
 | `<M-Left>` `<M-Right>` | promote / demote the headline |
 | `<M-S-Left>` `<M-S-Right>` | promote / demote the whole subtree |
 | `<M-Up>` `<M-Down>` | move the subtree up / down past a sibling |
+| `<M-h>` `<M-l>` `<M-k>` `<M-j>` | the same four, without leaving the home row |
 | `<leader><CR>` `<M-CR>` | new headline at the same level, after this subtree |
 | `<M-S-CR>` | new headline, carrying your first TODO keyword |
 | `<leader>oi` | new heading one level deeper, after this one's children |
@@ -237,6 +238,13 @@ Three refusals are deliberate:
   Inserting directly under a headline would put the new one in front of that
   headline's children and silently adopt them. `<leader>oi` nests one level
   deeper and lands after the children for the same reason.
+
+Every meta-arrow has an **hjkl peer** — `<M-h>` `<M-l>` `<M-k>` `<M-j>`, and
+the `<M-S-…>` forms — bound to the same verb rather than a parallel one. Emacs
+muscle memory reaches for the arrows and vim muscle memory stays on the home
+row; org users routinely have both, so both are here. `h` / `l` are the
+horizontal pair and `k` / `j` the vertical one, matching the motions they
+already mean everywhere else in the editor.
 
 The meta-arrows are the same verbs under org's own spelling, and they mean
 whatever is under the cursor — see **Lists** below, where `<M-Right>` indents
@@ -679,6 +687,7 @@ a task nobody has done.
 | `<M-Right>` `<M-Left>` | indent / outdent the item |
 | `<M-S-Right>` `<M-S-Left>` | indent / outdent the item **and its children** |
 | `<M-Up>` `<M-Down>` | move the item past its sibling, children and all |
+| `<M-l>` `<M-h>` `<M-k>` `<M-j>` | the same four, without leaving the home row |
 | `<C-t>` `<C-d>` | indent / outdent **while typing** (Insert mode) |
 | `<leader>o-` `<C-c>-` | cycle every bullet in the list to the next shape |
 | `<leader>o_` | turn this line into a list item, or back into prose |

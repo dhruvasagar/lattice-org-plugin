@@ -5837,3 +5837,79 @@ fn settle_budget(base: usize) -> usize {
         .unwrap_or(10);
     base.saturating_mul(scale)
 }
+
+// ── The hjkl peers of the meta-arrows ──────────────────────────────────────
+
+/// One verb, two spellings. Emacs muscle memory reaches for the arrows; vim
+/// muscle memory does not want to leave the home row, and org users routinely
+/// have both. `h`/`l` are the horizontal pair and `k`/`j` the vertical one,
+/// matching the motions they already mean everywhere else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hjkl_peers_reach_the_same_verbs_as_the_arrows() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    // Horizontal: demote / promote a headline, indent / outdent an item.
+    for (chord, before, after) in [
+        ("<M-l>", "* One\n", "** One\n"),
+        ("<M-h>", "** One\n", "* One\n"),
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let mut editor = org_editor(base.path(), before).await;
+        goto(&mut editor, 0, 0);
+        press(&mut editor, chord);
+        assert_eq!(text(&editor), after, "{chord}");
+    }
+
+    // Vertical: move past a sibling, exactly as `<M-Up>` / `<M-Down>` do.
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n* Two\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-j>");
+    assert_eq!(text(&editor), "* Two\n* One\n");
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-k>");
+    assert_eq!(text(&editor), "* One\n* Two\n", "and back");
+}
+
+/// The shifted peers take the wider unit, the same split the arrows make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_shifted_hjkl_peers_take_the_subtree_and_the_children() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-l>");
+    assert_eq!(
+        text(&editor),
+        "** One\n*** Child\n",
+        "the subtree moved, not just the headline"
+    );
+
+    let base2 = tempfile::tempdir().unwrap();
+    let mut editor2 = org_editor(base2.path(), "- a\n- b\n  - b-a\n").await;
+    goto(&mut editor2, 1, 0);
+    press(&mut editor2, "<M-S-l>");
+    assert_eq!(
+        text(&editor2),
+        "- a\n  - b\n    - b-a\n",
+        "child came along"
+    );
+}
+
+/// And in Visual, over a region, like their arrow spellings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hjkl_peers_work_over_a_visual_region() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n- c\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "V");
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-l>");
+    assert_eq!(text(&editor), "  - a\n  - b\n- c\n");
+}

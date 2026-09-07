@@ -284,6 +284,9 @@ const META_DOWN: u32 = 97;
 // they DECLINE where those return `Effect::None` — see `insert_indent`.
 const INSERT_INDENT: u32 = 98;
 const INSERT_OUTDENT: u32 = 99;
+// OS.9: bullet cycling, and the line <-> item axis.
+const CYCLE_LIST_BULLET: u32 = 100;
+const TOGGLE_ITEM: u32 = 101;
 
 const AGENDA_FILTER_FILE: u32 = 79;
 
@@ -1968,6 +1971,12 @@ impl Guest for Component {
                 // underneath them.
                 ibind("<C-t>", "org-indent-item-insert"),
                 ibind("<C-d>", "org-outdent-item-insert"),
+                // OS.9. `<C-c>-` is safe because `<C-c>` is only ever a PREFIX
+                // here -- `<C-c>*` already lives beside it. A TERMINAL binding
+                // on `<C-c>` itself would kill every longer chord under it.
+                bind("<leader>o-", "org-cycle-list-bullet"),
+                bind("<C-c>-", "org-cycle-list-bullet"),
+                bind("<leader>o_", "org-toggle-item"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2816,6 +2825,18 @@ impl Guest for Component {
             "Demote the subtree, or indent the item and its children",
             &spec(),
             SHIFT_META_RIGHT,
+        );
+        register_action(
+            "org-cycle-list-bullet",
+            "Cycle every bullet in the list at the cursor to the next shape",
+            &spec(),
+            CYCLE_LIST_BULLET,
+        );
+        register_action(
+            "org-toggle-item",
+            "Turn the line at the cursor into a list item, or back into prose",
+            &spec(),
+            TOGGLE_ITEM,
         );
         register_action(
             "org-indent-item-insert",
@@ -5602,6 +5623,105 @@ fn insert_todo_heading(
     }
 }
 
+/// `<leader>o-` / `<C-c>-` — cycle the bullets of the list at point.
+///
+/// The WHOLE list, not one item: a list with mixed bullets is not something org
+/// produces, and cycling a single item would create one. `list::cycle_bullets`
+/// carries the rule; this is the edit around it.
+fn cycle_list_bullet(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    let Some(item) = lists.enclosing_item(ctx.cursor.line) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "not in a list".to_string(),
+        })];
+    };
+    let Some(changes) = list::cycle_bullets(&lists, item.line) else {
+        return vec![Effect::None];
+    };
+    let lo = changes.iter().map(|(n, _)| *n).min().unwrap_or(item.line);
+    let hi = changes.iter().map(|(n, _)| *n).max().unwrap_or(item.line);
+    let body: Vec<String> = (lo..=hi)
+        .map(|n| {
+            changes
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .or_else(|| doc.line(n))
+                .unwrap_or_default()
+        })
+        .collect();
+    let Some(last) = doc.line(hi) else {
+        return vec![Effect::None];
+    };
+    replace_lines(ctx, lo, hi, last.len() as u32, body.join("\n"), ctx.cursor)
+}
+
+/// `<leader>o_` — turn the line at point into a list item, or back into prose.
+///
+/// Un-itemising a checkbox item DROPS ITS BOX, so every cookie counting it is
+/// wrong the instant the line changes. They are rewritten in the SAME edit --
+/// the rule `<C-Space>` already follows, and the reason one `u` restores both.
+fn toggle_item(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
+    let at = ctx.cursor.line;
+    let line = |n: u32| doc.line(n);
+    let Some(text) = doc.line(at) else {
+        return vec![Effect::None];
+    };
+    let Some(toggled) = list::toggle_item(&text) else {
+        return vec![Effect::None];
+    };
+
+    // Ancestors are read BEFORE the edit -- afterwards the line may no longer be
+    // an item, and the locator would not find the parents whose cookies it just
+    // invalidated.
+    let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
+    let parents = cb.ancestors(at);
+
+    let mut rewritten: Vec<(u32, String)> = vec![(at, toggled)];
+    for parent in parents {
+        let Some(above) = line(parent.line()) else {
+            continue;
+        };
+        // State from the buffer AS IT WILL BE, so the cookie counts the line's
+        // new shape rather than the one it is replacing.
+        let after = |n: u32| -> Option<String> {
+            rewritten
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .or_else(|| line(n))
+        };
+        let (done, total) = checkbox::tally_lines(&cb.child_item_lines(parent), after);
+        if let Some(updated) = checkbox::update_cookie(&above, done, total) {
+            if updated != above {
+                rewritten.push((parent.line(), updated));
+            }
+        }
+    }
+
+    let top = rewritten.iter().map(|(i, _)| *i).min().unwrap_or(at);
+    let body: Vec<String> = (top..=at)
+        .map(|i| {
+            rewritten
+                .iter()
+                .find(|(j, _)| *j == i)
+                .map(|(_, t)| t.clone())
+                .or_else(|| line(i))
+                .unwrap_or_default()
+        })
+        .collect();
+    let Some(last) = doc.line(at) else {
+        return vec![Effect::None];
+    };
+    replace_lines(ctx, top, at, last.len() as u32, body.join("\n"), ctx.cursor)
+}
+
 /// `<C-t>` / `<C-d>` in Insert — restructure what is at point, or get out of the
 /// way.
 ///
@@ -6746,6 +6866,8 @@ impl GrammarCallbacks for Component {
             META_DOWN => Ok(meta_move(&ctx, doc, tree, 1)),
             INSERT_INDENT => Ok(insert_indent(&ctx, doc, tree, 1)),
             INSERT_OUTDENT => Ok(insert_indent(&ctx, doc, tree, -1)),
+            CYCLE_LIST_BULLET => Ok(cycle_list_bullet(&ctx, doc, tree)),
+            TOGGLE_ITEM => Ok(toggle_item(&ctx, doc, tree)),
             INSERT_SUBHEADING => Ok(insert_subheading(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),

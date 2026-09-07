@@ -5561,3 +5561,99 @@ async fn ctrl_t_in_a_headlines_body_indents_rather_than_demoting_the_headline() 
         "and the paragraph got vim's indent"
     );
 }
+
+// ── OS.9: bullet cycling, and line ↔ item ↔ headline ───────────────────────
+
+/// Cycling acts on the WHOLE list, not one item — a list with mixed bullets is
+/// not something org produces, and cycling one item would create one. This is
+/// also emacs's no-region `C-c -`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cycling_rewrites_every_bullet_in_the_list() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<leader>o-");
+    assert_eq!(text(&editor), "+ a\n+ b\n");
+    press(&mut editor, "<leader>o-");
+    assert_eq!(
+        text(&editor),
+        "1. a\n2. b\n",
+        "ordered entry numbers from 1"
+    );
+    press(&mut editor, "<leader>o-");
+    assert_eq!(text(&editor), "1) a\n2) b\n");
+    press(&mut editor, "<leader>o-");
+    assert_eq!(text(&editor), "- a\n- b\n", "and wraps");
+}
+
+/// `<C-c>-` is the emacs spelling of the same action. It is safe because
+/// `<C-c>` is only ever a PREFIX here — a terminal binding on `<C-c>` itself
+/// would kill every longer chord grown under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_emacs_spelling_cycles_too() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<C-c>-");
+    assert_eq!(text(&editor), "+ a\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggle_item_round_trips_a_prose_line_preserving_indent() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n  some prose\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<leader>o_");
+    assert_eq!(line_at(&editor, 1), "  - some prose");
+    press(&mut editor, "<leader>o_");
+    assert_eq!(line_at(&editor, 1), "  some prose");
+}
+
+/// Un-itemising a checkbox item drops its box, so the parent's cookie is wrong
+/// until it is rewritten — in the SAME edit, the rule the toggle already
+/// follows, which is why ONE undo restores both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_itemising_a_checkbox_updates_the_cookie_in_one_edit() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* Shop [1/2]\n- [X] a\n- [ ] b\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<leader>o_");
+    assert_eq!(line_at(&editor, 0), "* Shop [0/1]");
+    press(&mut editor, "u");
+    assert_eq!(
+        line_at(&editor, 0),
+        "* Shop [1/2]",
+        "one undo restores both"
+    );
+}
+
+/// §5.6.6 and the existing rule: the new headline takes the ENCLOSING level,
+/// not level 1 — and its text is the item's TITLE, not its bullet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggle_heading_on_an_item_uses_the_enclosing_level() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Two\n- milk\n").await;
+
+    goto(&mut editor, 2, 0);
+    press(&mut editor, "<leader>o*");
+    assert_eq!(line_at(&editor, 2), "** milk");
+}

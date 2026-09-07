@@ -303,7 +303,15 @@ pub fn toggle_heading(line: &str, level: usize) -> Option<String> {
     if line.trim().is_empty() {
         return None;
     }
-    Some(format!("{} {line}", "*".repeat(level)))
+    // OS.9: a LIST ITEM becomes a headline of its title, not of its bullet.
+    // Without this, `- milk` under `** Two` became `** - milk` -- a heading
+    // whose text still carries the marker of the structure it just left.
+    if let Some(prose) = crate::list::toggle_item(line) {
+        if crate::list::parse_bullet(line, line.len() - line.trim_start().len()).is_some() {
+            return Some(format!("{} {}", "*".repeat(level), prose.trim_start()));
+        }
+    }
+    Some(format!("{} {}", "*".repeat(level), line.trim_start()))
 }
 
 #[cfg(test)]

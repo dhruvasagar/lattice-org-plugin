@@ -81,8 +81,6 @@ impl Bullet {
     // Unused until OS.7 binds bullet cycling. The model is this slice's whole
     // deliverable and its shape is fixed by the plan, so the alternative to an
     // allow is shipping the gate without the thing it gates.
-    // Unused until OS.9 binds bullet cycling.
-    #[allow(dead_code)]
     pub fn cycled(self) -> Bullet {
         match self {
             Bullet::Dash => Bullet::Plus,
@@ -1052,6 +1050,70 @@ mod tests {
 
     /// A nested item's siblings are its own sublist, so a move must not reach
     /// out to the items around its parent.
+    // ── OS.9: bullet cycling, and line <-> item ───────────────────────────
+
+    #[test]
+    fn cycling_walks_the_four_shapes_and_wraps() {
+        for (before, after) in [
+            ("- a\n- b\n", vec![(0, "+ a"), (1, "+ b")]),
+            ("+ a\n+ b\n", vec![(0, "1. a"), (1, "2. b")]),
+            ("1. a\n2. b\n", vec![(0, "1) a"), (1, "2) b")]),
+            ("1) a\n2) b\n", vec![(0, "- a"), (1, "- b")]),
+        ] {
+            over(before, |lists| {
+                let got = cycle_bullets(lists, 0).unwrap();
+                let want: Vec<(u32, String)> =
+                    after.iter().map(|(n, t)| (*n, t.to_string())).collect();
+                assert_eq!(got, want, "cycling {before:?}");
+            });
+        }
+    }
+
+    /// A nested sublist is its own list with its own shape; dragging it along
+    /// would flatten a distinction the document is making.
+    #[test]
+    fn cycling_leaves_a_nested_sublist_alone() {
+        over("- a\n  - a-a\n- b\n", |lists| {
+            let got = cycle_bullets(lists, 0).unwrap();
+            assert_eq!(
+                got,
+                vec![(0, "+ a".to_string()), (2, "+ b".to_string())],
+                "`- a-a` keeps its own bullet"
+            );
+        });
+    }
+
+    /// The marker changes and nothing else does — checkbox and spacing included.
+    #[test]
+    fn cycling_preserves_a_checkbox_and_its_spacing() {
+        over("- [X] a\n", |lists| {
+            assert_eq!(
+                cycle_bullets(lists, 0).unwrap(),
+                vec![(0, "+ [X] a".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn toggle_item_round_trips_prose_preserving_indent() {
+        assert_eq!(toggle_item("  some prose").unwrap(), "  - some prose");
+        assert_eq!(toggle_item("  - some prose").unwrap(), "  some prose");
+    }
+
+    /// A headline is a different axis — `<leader>o*` converts between a line and
+    /// a HEADLINE, and collapsing the two gestures would make one key mean two
+    /// structures.
+    #[test]
+    fn toggle_item_declines_on_a_headline_and_a_blank_line() {
+        assert!(toggle_item("* One").is_none());
+        assert!(toggle_item("   ").is_none());
+    }
+
+    #[test]
+    fn un_itemising_keeps_the_checkbox_text_it_found() {
+        assert_eq!(toggle_item("- [X] a").unwrap(), "[X] a");
+    }
+
     #[test]
     fn a_nested_item_moves_only_among_its_own_siblings() {
         over("- a\n  - a-a\n  - a-b\n- b\n", |lists| {
@@ -1244,4 +1306,79 @@ pub fn move_span(lists: &Lists<'_>, start: u32, delta: isize) -> Option<(u32, u3
         }
         std::cmp::Ordering::Equal => None,
     }
+}
+
+/// Rewrite the item at `n` to carry `bullet`, leaving everything after the
+/// marker — spacing, checkbox, text — exactly as it was.
+fn with_bullet(lists: &Lists<'_>, n: u32, bullet: Bullet) -> Option<(u32, String)> {
+    let text = lists.text(n)?;
+    let indent = indent_of(&text);
+    let parsed = parse_line(&text, indent)?;
+    let rest = text.get(indent + parsed.marker_len..)?;
+    Some((
+        n,
+        format!("{}{}{rest}", " ".repeat(indent), bullet.render()),
+    ))
+}
+
+/// Cycle every bullet in the list at `anchor` to the next shape.
+///
+/// **The whole list, not one item.** A list with mixed bullets is not something
+/// org produces, and cycling a single item would create one. This is also what
+/// emacs's `C-c -` does with no region.
+///
+/// Only items at the ANCHOR's own indent are rewritten. A nested sublist is its
+/// own list with its own shape, and dragging it along would flatten a
+/// distinction the document is making.
+///
+/// Ordered forms are numbered as they are written, so entering `1.` from `+`
+/// counts from 1 rather than inheriting whatever the unordered items implied.
+pub fn cycle_bullets(lists: &Lists<'_>, anchor: u32) -> Option<Vec<(u32, String)>> {
+    let item = lists.item_at(anchor)?;
+    let next = item.bullet.cycled();
+    let (ls, le) = lists.list_span(anchor)?;
+    let mut out = Vec::new();
+    let mut counter = 1u32;
+    for n in ls..=le {
+        let Some(other) = lists.item_at(n) else {
+            continue;
+        };
+        if other.indent != item.indent {
+            continue;
+        }
+        let shape = match next {
+            Bullet::Ordered { delim, .. } => {
+                let b = Bullet::Ordered { n: counter, delim };
+                counter += 1;
+                b
+            }
+            plain => plain,
+        };
+        if let Some(change) = with_bullet(lists, n, shape) {
+            out.push(change);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Turn a prose line into a list item, or a list item back into prose —
+/// preserving the line's indent either way.
+///
+/// `None` on a blank line (nothing to itemise) and on a headline, which is a
+/// different axis: `<leader>o*` converts between a line and a HEADLINE, and
+/// collapsing the two gestures would make one key mean two structures.
+pub fn toggle_item(line: &str) -> Option<String> {
+    if line.trim().is_empty() || crate::headline::headline_level(line).is_some() {
+        return None;
+    }
+    let indent = indent_of(line);
+    if let Some(parsed) = parse_line(line, indent) {
+        // Item -> prose. Everything after the marker, with the single
+        // separating space taken off: the space belongs to the marker, and
+        // keeping it would leave the text one column adrift of where it started.
+        let rest = line.get(indent + parsed.marker_len..)?;
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        return Some(format!("{}{rest}", " ".repeat(indent)));
+    }
+    Some(format!("{}- {}", " ".repeat(indent), line.trim_start()))
 }

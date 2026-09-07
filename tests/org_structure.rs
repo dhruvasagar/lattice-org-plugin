@@ -5339,3 +5339,100 @@ async fn shift_meta_right_carries_children_and_meta_right_does_not() {
         "the child stayed where it was"
     );
 }
+
+// ── OS.7: `<M-Up>` / `<M-Down>` — move an item or a subtree ────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_down_moves_a_subtree_and_an_item_alike() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n* Two\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Down>");
+    assert_eq!(text(&editor), "* Two\n* One\n");
+
+    let base2 = tempfile::tempdir().unwrap();
+    let mut editor2 = org_editor(base2.path(), "- a\n- b\n").await;
+    goto(&mut editor2, 0, 0);
+    press(&mut editor2, "<M-Down>");
+    assert_eq!(text(&editor2), "- b\n- a\n");
+}
+
+/// The numbers belong to the POSITIONS, not the items: swapping `1. a` and
+/// `2. b` gives `1. b` / `2. a`, never `2. b` / `1. a`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_an_ordered_item_renumbers_both_positions() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "1. a\n2. b\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Down>");
+    assert_eq!(text(&editor), "1. b\n2. a\n", "numbers stay positional");
+}
+
+/// A move carries the item's children, and the caret rides along — otherwise a
+/// second `<M-Down>` would move whatever line the cursor was left on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_an_item_carries_its_children_and_the_caret() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n  - a-a\n- b\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Down>");
+    assert_eq!(text(&editor), "- b\n- a\n  - a-a\n");
+    assert_eq!(cursor(&editor).0, 1, "the caret followed `- a` down");
+
+    // And back, which only works if the caret really did follow.
+    press(&mut editor, "<M-Up>");
+    assert_eq!(
+        text(&editor),
+        "- a\n  - a-a\n- b\n",
+        "the move is reversible"
+    );
+}
+
+/// §5.6.6, and the refusal that matters: a move stops at the sibling chain
+/// rather than splicing the item into a neighbouring list. The echo is the
+/// point — "unchanged" alone passes against an unbound key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_past_the_end_of_the_sibling_chain_is_refused() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n  - a-a\n- b\n").await;
+
+    // `- a-a` is the only item in its sublist; `- b` is its PARENT's sibling.
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-Down>");
+    assert_eq!(
+        text(&editor),
+        "- a\n  - a-a\n- b\n",
+        "not spliced into `- b`"
+    );
+    assert!(last_echo(&editor).is_some(), "and it says so");
+}
+
+/// Emacs's subtree-explicit spellings reach the SAME action: on a headline both
+/// mean the subtree, which is what org's own move does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_shift_meta_spellings_move_the_subtree_too() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n* Two\n").await;
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-Down>");
+    assert_eq!(
+        text(&editor),
+        "* Two\n* One\n** Child\n",
+        "the child moved with its parent"
+    );
+}

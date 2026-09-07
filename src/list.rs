@@ -1013,6 +1013,55 @@ mod tests {
             assert_eq!(out, vec![(1, "- a-a".to_string())]);
         });
     }
+
+    // ── OS.7: move_item ───────────────────────────────────────────────────
+
+    #[test]
+    fn moving_an_item_carries_its_children_and_skips_theirs() {
+        over("- a\n  - a-a\n- b\n", |lists| {
+            // `- a` moves DOWN past `- b`; `- a-a` travels with it, and `- b`
+            // is a sibling to step over rather than something to descend into.
+            assert_eq!(move_item(lists, 0, 1).unwrap(), "- b\n- a\n  - a-a");
+            assert_eq!(move_span(lists, 0, 1).unwrap(), (0, 2));
+        });
+    }
+
+    #[test]
+    fn moving_up_swaps_with_the_previous_sibling() {
+        over("- a\n- b\n  - b-a\n", |lists| {
+            assert_eq!(move_item(lists, 1, -1).unwrap(), "- b\n  - b-a\n- a");
+            assert_eq!(move_span(lists, 1, -1).unwrap(), (0, 2));
+        });
+    }
+
+    /// §5.6.6: a move stops at its parent rather than splicing the item into a
+    /// neighbouring list.
+    #[test]
+    fn moving_the_last_sibling_down_is_refused() {
+        over("- a\n- b\n", |lists| {
+            assert!(move_item(lists, 1, 1).is_none());
+        });
+    }
+
+    #[test]
+    fn moving_the_first_sibling_up_is_refused() {
+        over("- a\n- b\n", |lists| {
+            assert!(move_item(lists, 0, -1).is_none());
+        });
+    }
+
+    /// A nested item's siblings are its own sublist, so a move must not reach
+    /// out to the items around its parent.
+    #[test]
+    fn a_nested_item_moves_only_among_its_own_siblings() {
+        over("- a\n  - a-a\n  - a-b\n- b\n", |lists| {
+            assert_eq!(move_item(lists, 1, 1).unwrap(), "  - a-b\n  - a-a");
+            assert!(
+                move_item(lists, 2, 1).is_none(),
+                "`- b` is the PARENT's sibling, not this item's"
+            );
+        });
+    }
 }
 
 /// The last line of the item at `start` NOT counting its nested children —
@@ -1134,4 +1183,65 @@ pub fn shift_item(
         ));
     }
     Some(out)
+}
+
+/// The text of the item at `n` and everything it carries — continuation lines
+/// and nested children — as it currently stands.
+fn block(lists: &Lists<'_>, n: u32) -> Option<String> {
+    let end = lists.item_end(n);
+    let mut out = Vec::new();
+    for i in n..=end {
+        out.push(lists.text(i)?);
+    }
+    Some(out.join("\n"))
+}
+
+/// Swap the item at `start` with its previous (`delta < 0`) or next
+/// (`delta > 0`) SIBLING, carrying continuation lines and children. `None` at
+/// either end of the sibling chain.
+///
+/// Answers the rewritten BLOCK, not the changed lines [`shift_item`] and
+/// [`renumber`] answer. That is not an inconsistency: a move rewrites one
+/// contiguous span in which every line has shifted position, so "which lines
+/// changed" is all of them.
+///
+/// **No trailing newline** — the caller writes this over a LINE RANGE, where a
+/// trailing newline would insert a blank line on every move.
+///
+/// §5.6.6: the move stops at the sibling chain, and refusing at either end is
+/// what keeps it from splicing the item into a neighbouring list. A sibling is
+/// something to step OVER rather than descend into: `- b` sitting below `- a`'s
+/// child is `- a`'s peer, not its next line.
+pub fn move_item(lists: &Lists<'_>, start: u32, delta: isize) -> Option<String> {
+    let siblings = lists.siblings(start);
+    let idx = siblings.iter().position(|&n| n == start)?;
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => {
+            let prev = *siblings.get(idx.checked_sub(1)?)?;
+            Some(format!("{}\n{}", block(lists, start)?, block(lists, prev)?))
+        }
+        std::cmp::Ordering::Greater => {
+            let next = *siblings.get(idx + 1)?;
+            Some(format!("{}\n{}", block(lists, next)?, block(lists, start)?))
+        }
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+/// The line span [`move_item`]'s block must be written over: from the first of
+/// the two swapped siblings through the end of the second.
+pub fn move_span(lists: &Lists<'_>, start: u32, delta: isize) -> Option<(u32, u32)> {
+    let siblings = lists.siblings(start);
+    let idx = siblings.iter().position(|&n| n == start)?;
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => {
+            let prev = *siblings.get(idx.checked_sub(1)?)?;
+            Some((prev, lists.item_end(start)))
+        }
+        std::cmp::Ordering::Greater => {
+            let next = *siblings.get(idx + 1)?;
+            Some((start, lists.item_end(next)))
+        }
+        std::cmp::Ordering::Equal => None,
+    }
 }

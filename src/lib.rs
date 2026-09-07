@@ -277,6 +277,9 @@ const META_LEFT: u32 = 92;
 const META_RIGHT: u32 = 93;
 const SHIFT_META_LEFT: u32 = 94;
 const SHIFT_META_RIGHT: u32 = 95;
+// OS.7: move an item or a subtree.
+const META_UP: u32 = 96;
+const META_DOWN: u32 = 97;
 
 const AGENDA_FILTER_FILE: u32 = 79;
 
@@ -1947,6 +1950,15 @@ impl Guest for Component {
                 bind("<M-Right>", "org-meta-right"),
                 bind("<M-S-Left>", "org-shift-meta-left"),
                 bind("<M-S-Right>", "org-shift-meta-right"),
+                // OS.7. `<leader>oK` / `oJ` stay bound and unchanged.
+                bind("<M-Up>", "org-meta-up"),
+                bind("<M-Down>", "org-meta-down"),
+                // Emacs's subtree-explicit peers, the SAME ActionIds: on a
+                // headline both spellings mean the subtree, which is what
+                // org's own move does. Binding them apart would invent a
+                // distinction org does not make.
+                bind("<M-S-Up>", "org-meta-up"),
+                bind("<M-S-Down>", "org-meta-down"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2795,6 +2807,18 @@ impl Guest for Component {
             "Demote the subtree, or indent the item and its children",
             &spec(),
             SHIFT_META_RIGHT,
+        );
+        register_action(
+            "org-meta-up",
+            "Move the subtree, or the list item, at the cursor up past its sibling",
+            &spec(),
+            META_UP,
+        );
+        register_action(
+            "org-meta-down",
+            "Move the subtree, or the list item, at the cursor down past its sibling",
+            &spec(),
+            META_DOWN,
         );
         register_action(
             "org-insert-subheading",
@@ -5557,6 +5581,109 @@ fn insert_todo_heading(
     }
 }
 
+/// `<M-Up>` / `<M-Down>` — move a subtree or a list item past its sibling.
+///
+/// On a headline this calls the existing [`move_subtree`], the body
+/// `<leader>oK` / `oJ` already call. On a list item it swaps with the adjacent
+/// SIBLING, carrying continuation lines and children.
+///
+/// The refusal that matters: a move stops at the sibling chain rather than
+/// splicing the item into a neighbouring list (§5.6.6). At either end there is
+/// no sibling to swap with, and the item stays put with an echo saying so.
+fn meta_move(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    delta: isize,
+) -> Vec<Effect> {
+    match at_point(doc, tree, ctx.cursor.line) {
+        Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
+            meta_move_item(ctx, doc, tree, &item, delta)
+        }
+        Some(AtPoint::Headline(..)) => move_subtree(ctx, doc, tree, delta < 0),
+        None => vec![Effect::None],
+    }
+}
+
+fn meta_move_item(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    item: &list::Item,
+    delta: isize,
+) -> Vec<Effect> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    let (Some(moved), Some((from, to))) = (
+        list::move_item(&lists, item.line, delta),
+        list::move_span(&lists, item.line, delta),
+    ) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: if delta < 0 {
+                "already the first item in this list".to_string()
+            } else {
+                "already the last item in this list".to_string()
+            },
+        })];
+    };
+
+    // Where the item ended up. Down: past the block that was below it. Up: it
+    // now starts where its previous sibling did. The caret must follow, or a
+    // second `<M-Down>` would move whatever line the cursor was left sitting on.
+    let moved_lines: Vec<&str> = moved.lines().collect();
+    let new_line = if delta < 0 {
+        from
+    } else {
+        let next_height = moved_lines.len() as u32 - (lists.item_end(item.line) - item.line + 1);
+        item.line + next_height
+    };
+
+    // Renumbering is positional: `1. a` / `2. b` swapped is `1. b` / `2. a`,
+    // not `2. b` / `1. a`. The numbers belong to the POSITIONS, not the items,
+    // so the whole list is recounted after the swap.
+    let (ls, le) = lists.list_span(item.line).unwrap_or((from, to));
+    let swapped = |n: u32| -> Option<String> {
+        if n >= from && n <= to {
+            moved_lines.get((n - from) as usize).map(|t| t.to_string())
+        } else {
+            doc.line(n)
+        }
+    };
+    // `tree: None` — the snapshot describes the buffer BEFORE the swap.
+    let after = list::Lists::new(None, &swapped, doc.line_count());
+    let renumbered = list::renumber(&after, (ls, le));
+
+    let span_lo = ls.min(from);
+    let span_hi = le.max(to);
+    let mut out: Vec<String> = Vec::new();
+    for n in span_lo..=span_hi {
+        let Some(base) = swapped(n) else { break };
+        out.push(
+            renumbered
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .unwrap_or(base),
+        );
+    }
+    let Some(last) = doc.line(span_hi) else {
+        return vec![Effect::None];
+    };
+    let cursor = Position {
+        line: new_line,
+        byte: ctx.cursor.byte,
+    };
+    replace_lines(
+        ctx,
+        span_lo,
+        span_hi,
+        last.len() as u32,
+        out.join("\n"),
+        cursor,
+    )
+}
+
 /// The meta-arrows: one gesture carrying two verbs, chosen by what is at point.
 ///
 /// On a headline this IS promote/demote — it calls [`shift`], the same body
@@ -6534,6 +6661,8 @@ impl GrammarCallbacks for Component {
             META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, false)),
             SHIFT_META_LEFT => Ok(meta_shift(&ctx, doc, tree, -1, true)),
             SHIFT_META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, true)),
+            META_UP => Ok(meta_move(&ctx, doc, tree, -1)),
+            META_DOWN => Ok(meta_move(&ctx, doc, tree, 1)),
             INSERT_SUBHEADING => Ok(insert_subheading(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),

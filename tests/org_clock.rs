@@ -684,6 +684,15 @@ async fn the_emacs_prefix_reaches_the_same_clock_commands() {
 /// A move is only done if the old spelling stops working: leaving `<leader>oi`
 /// bound would mean two ways to clock in, one of them undocumented, and the
 /// whole point of the slice was to release `i` for inserting things.
+///
+/// **OS.5 collected on that release** and bound `<leader>oi` to
+/// `org-insert-subheading` — the insert group the sentence above anticipated.
+/// So "the buffer is unchanged" is no longer the right assertion. It was only
+/// ever a PROXY for this test's real subject, which is that the chord does not
+/// CLOCK IN, and that subject still holds. The check therefore got more
+/// specific rather than looser: no `CLOCK:` line, no `:LOGBOOK:` drawer.
+/// Relaxing it to "something happened" would let a genuine clock regression
+/// back in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_old_flat_clock_chords_are_gone() {
     if org_plugin_wasm().is_none() {
@@ -696,10 +705,15 @@ async fn the_old_flat_clock_chords_are_gone() {
     goto_line(&mut editor, 0);
     press(&mut editor, "<leader>oi");
     editor.run_tick_pending();
-    assert_eq!(
-        text(&editor),
-        "* Task\nbody\n",
-        "`<leader>oi` no longer clocks in — it is free for an insert group"
+    let after = text(&editor);
+    assert!(
+        !after.contains("CLOCK:"),
+        "`<leader>oi` must not clock in — it belongs to the insert group now, \
+         but got: {after:?}"
+    );
+    assert!(
+        !after.contains(":LOGBOOK:"),
+        "`<leader>oi` must not open a logbook drawer, but got: {after:?}"
     );
 }
 

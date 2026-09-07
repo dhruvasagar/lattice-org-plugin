@@ -263,6 +263,15 @@ const AGENDA_GOTO: u32 = 78;
 /// OR.11b — the second hop of creating a note from a template: the menu row
 /// dispatches this with the title and the chosen key.
 const ROAM_CREATE_FROM_TEMPLATE: u32 = 80;
+// OS.5: the `<M-S-CR>` variant, and its no-modifier peer.
+//
+// 90/91, not 81/82: action ids are hand-assigned and scattered through this
+// file, and 81 was already `TODO_NOTE_SUBMIT` -- a collision the dispatch match
+// reports only as an `unreachable pattern` warning, which is exactly how a new
+// action silently never fires. Take the next values above the current maximum
+// (`CAPTURE_QUESTION_SUBMIT` = 89) rather than the next visible gap.
+const INSERT_TODO_HEADING: u32 = 90;
+const INSERT_SUBHEADING: u32 = 91;
 
 const AGENDA_FILTER_FILE: u32 = 79;
 
@@ -789,6 +798,29 @@ fn todo_keyword_lines() -> Vec<String> {
     } else {
         lines
     }
+}
+
+/// The first NOT-DONE keyword in the configured sequence — what a heading
+/// inserted by `<M-S-CR>` starts as.
+///
+/// `split().0`, not `names()[0]`: `names()` includes the done states, so a
+/// sequence written `| DONE` would hand a brand-new heading `DONE`.
+fn first_todo_keyword() -> String {
+    let configured = todo::parse_todo_keywords(&todo_keyword_lines().join("\n"))
+        .split()
+        .0
+        .into_iter()
+        .next();
+    configured.unwrap_or_else(|| {
+        // Same fallback shape as `todo_keywords()` beside it: a user who
+        // configures nothing usable gets the default rather than a dead key.
+        todo::parse_todo_keywords(&DEFAULT_TODO_KEYWORDS.join("\n"))
+            .split()
+            .0
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "TODO".to_string())
+    })
 }
 
 fn todo_keywords() -> Vec<String> {
@@ -1896,6 +1928,13 @@ impl Guest for Component {
                 // must still reach the verb.
                 bind("<M-CR>", "org-meta-return"),
                 ibind("<M-CR>", "org-meta-return"),
+                // OS.5. `<M-S-CR>` needs OS.1's keyboard-protocol push to be
+                // typable in a terminal at all; GPUI has always delivered it.
+                bind("<M-S-CR>", "org-insert-todo-heading"),
+                ibind("<M-S-CR>", "org-insert-todo-heading"),
+                // `<leader>oi` -- the letter OA.27 left deliberately free,
+                // noting `i` as "the natural prefix for inserting things".
+                bind("<leader>oi", "org-insert-subheading"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2714,6 +2753,18 @@ impl Guest for Component {
             "Insert a new headline at the same level, after this subtree",
             &spec(),
             META_RETURN,
+        );
+        register_action(
+            "org-insert-todo-heading",
+            "Insert the other kind: a checkbox item, a plain item, or a TODO heading",
+            &spec(),
+            INSERT_TODO_HEADING,
+        );
+        register_action(
+            "org-insert-subheading",
+            "Insert a heading one level deeper, after this subtree's children",
+            &spec(),
+            INSERT_SUBHEADING,
         );
         // TB.2: the eleven `org-table-*` actions are gone. Pipe-table
         // editing is the host's `table-mode` now — `action:table-align`,
@@ -5370,6 +5421,7 @@ fn meta_return_list(
     doc: &Document,
     tree: Option<&TreeSnapshot>,
     item: &list::Item,
+    with_box: bool,
 ) -> Vec<Effect> {
     let l = |n: u32| doc.line(n);
     let lists = list::Lists::new(tree, &l, doc.line_count());
@@ -5383,7 +5435,10 @@ fn meta_return_list(
         list::Bullet::Ordered { n, delim } => list::Bullet::Ordered { n: n + 1, delim },
         other => other,
     };
-    let box_text = if item.checkbox.is_some() { "[ ] " } else { "" };
+    // OS.5: the CALLER decides, because `<M-S-CR>` means "the other kind".
+    // `<M-CR>` passes the item's own shape; the shift variant passes its
+    // inverse. Either way a new box starts empty.
+    let box_text = if with_box { "[ ] " } else { "" };
     let new_line = format!("{}{} {box_text}", " ".repeat(item.indent), bullet.render());
     let insert_at = end + 1;
 
@@ -5429,11 +5484,63 @@ fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>)
     // list item, so order is what decides which one answers.
     match at_point(doc, tree, ctx.cursor.line) {
         Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
-            meta_return_list(ctx, doc, tree, &item)
+            // The item's OWN shape: a checkbox item begets a checkbox item.
+            let with_box = item.checkbox.is_some();
+            meta_return_list(ctx, doc, tree, &item, with_box)
         }
-        Some(AtPoint::Headline(start, level)) => meta_return_headline(ctx, doc, tree, start, level),
+        Some(AtPoint::Headline(start, level)) => {
+            meta_return_headline(ctx, doc, tree, start, level, None)
+        }
         None => vec![Effect::None],
     }
+}
+
+/// `<M-S-CR>` — the variant of [`meta_return`]: the OTHER kind of thing.
+///
+/// Off a plain item you get a checkbox item, off a checkbox item a plain one,
+/// off a headline a TODO heading seeded with the first configured keyword.
+/// Emacs's `org-insert-todo-heading` reads the same way on headlines, which is
+/// why one action serves all three rather than three actions serving one each.
+///
+/// An arm table, not a copy: every body here is [`meta_return`]'s, called with
+/// one argument flipped.
+fn insert_todo_heading(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    match at_point(doc, tree, ctx.cursor.line) {
+        // The INVERSE of what is at point: a checkbox item's variant is the
+        // plain item, and a plain item's is the checkbox one.
+        Some(AtPoint::CheckboxItem(item)) => meta_return_list(ctx, doc, tree, &item, false),
+        Some(AtPoint::ListItem(item)) => meta_return_list(ctx, doc, tree, &item, true),
+        Some(AtPoint::Headline(start, level)) => {
+            meta_return_headline(ctx, doc, tree, start, level, Some(&first_todo_keyword()))
+        }
+        None => vec![Effect::None],
+    }
+}
+
+/// `<leader>oi` — a heading one level DEEPER, after the existing children.
+///
+/// Respect-content for the same reason [`meta_return`] has it: inserting
+/// immediately below the headline line would put the new child in front of its
+/// own siblings. "Deeper" must not mean "in front of the nest".
+///
+/// Declines outside a headline. A subheading of a list item is meaningless, and
+/// guessing a level from one would turn a shopping list into an outline. No
+/// modifier gesture, because emacs gives it none either.
+fn insert_subheading(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let hl = headline::Headlines::new(tree, &line, doc.line_count());
+    let Some((start, level)) = hl.enclosing(ctx.cursor.line) else {
+        return vec![Effect::None];
+    };
+    meta_return_headline(ctx, doc, tree, start, level + 1, None)
 }
 
 fn meta_return_headline(
@@ -5442,6 +5549,7 @@ fn meta_return_headline(
     tree: Option<&TreeSnapshot>,
     start: u32,
     level: usize,
+    keyword: Option<&str>,
 ) -> Vec<Effect> {
     let line = |n: u32| doc.line(n);
     let hl = headline::Headlines::new(tree, &line, doc.line_count());
@@ -5453,18 +5561,25 @@ fn meta_return_headline(
         return vec![Effect::None];
     };
     let stars = "*".repeat(level);
+    // OS.5: `<M-S-CR>` seeds the first configured keyword, `<M-CR>` seeds
+    // nothing. The trailing space belongs to the prefix either way, so the
+    // caret lands where the title starts rather than on top of it.
+    let prefix = match keyword {
+        Some(kw) => format!("{stars} {kw} "),
+        None => format!("{stars} "),
+    };
     // A zero-width range at the end of the subtree's last line: the newline is
     // part of the INSERTED text, so the line above keeps its own.
     let cursor = Position {
         line: end + 1,
-        byte: stars.len() as u32 + 1,
+        byte: prefix.len() as u32,
     };
     replace_lines(
         ctx,
         end,
         end,
         last.len() as u32,
-        format!("{last}\n{stars} "),
+        format!("{last}\n{prefix}"),
         cursor,
     )
 }
@@ -6275,6 +6390,8 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_UP => Ok(move_subtree(&ctx, doc, tree, true)),
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, tree, false)),
             META_RETURN => Ok(meta_return(&ctx, doc, tree)),
+            INSERT_TODO_HEADING => Ok(insert_todo_heading(&ctx, doc, tree)),
+            INSERT_SUBHEADING => Ok(insert_subheading(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),
             REFILE => Ok(vec![Effect::OpenPicker(

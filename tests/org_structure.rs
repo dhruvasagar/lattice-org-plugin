@@ -5106,3 +5106,102 @@ async fn meta_return_on_a_parent_item_lands_after_its_children() {
         "the sibling follows the subtree, not the bullet line"
     );
 }
+
+// ── OS.5: `<M-S-CR>` — the variant, and the headline insert family ─────────
+
+/// The shift variant is the OTHER kind of item, not a second way to make the
+/// same one: off a plain item it gives you a box, off a boxed one it gives you
+/// a plain item. Emacs's `org-insert-todo-heading` reads the same way on
+/// headlines, which is why one action serves all three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_return_upgrades_a_plain_item_to_a_checkbox_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-CR>");
+    assert_eq!(text(&editor), "- milk\n- [ ] \n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_return_downgrades_a_checkbox_item_to_a_plain_one() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- [X] bread\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-CR>");
+    assert_eq!(text(&editor), "- [X] bread\n- \n");
+}
+
+/// The keyword comes from the CONFIGURED sequence, not a hardcoded "TODO" --
+/// `org.todo-keywords` is a list option and a user whose first state is `NEXT`
+/// must get `NEXT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_return_on_a_headline_uses_the_first_configured_keyword() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n").await;
+    set_org_option(&mut editor, "todo-keywords", "NEXT TODO | DONE");
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-CR>");
+    assert_eq!(text(&editor), "* One\n* NEXT \n");
+}
+
+/// The default sequence, so the option-reading path above is not the only one
+/// covered -- a bug that always answered the configured list's first element
+/// would pass that test and fail every real buffer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_return_on_a_headline_defaults_to_todo() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n* Two\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-CR>");
+    assert_eq!(
+        text(&editor),
+        "* One\n** Child\n* TODO \n* Two\n",
+        "respect-content applies to the variant too"
+    );
+}
+
+/// `<leader>oi`: one level DEEPER, and still after the existing children --
+/// nesting must not mean "in front of the nest".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_subheading_nests_without_adopting_existing_children() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n* Two\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<leader>oi");
+    assert_eq!(text(&editor), "* One\n** Child\n** \n* Two\n");
+}
+
+/// A subheading off a list item is meaningless, and guessing a headline level
+/// from one would turn a shopping list into an outline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn insert_subheading_declines_in_the_preamble() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "just prose\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<leader>oi");
+    assert_eq!(text(&editor), "just prose\n");
+}

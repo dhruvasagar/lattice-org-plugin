@@ -208,7 +208,12 @@ same thing without leaving the editor.
 | `<leader>oh` `<leader>ol` | promote / demote the headline |
 | `<leader>oH` `<leader>oL` | promote / demote the whole subtree |
 | `<leader>oK` `<leader>oJ` | move the subtree up / down past a sibling |
-| `<leader><CR>` | new headline at the same level, after this subtree |
+| `<M-Left>` `<M-Right>` | promote / demote the headline |
+| `<M-S-Left>` `<M-S-Right>` | promote / demote the whole subtree |
+| `<M-Up>` `<M-Down>` | move the subtree up / down past a sibling |
+| `<leader><CR>` `<M-CR>` | new headline at the same level, after this subtree |
+| `<M-S-CR>` | new headline, carrying your first TODO keyword |
+| `<leader>oi` | new heading one level deeper, after this one's children |
 | `<leader>o*` | toggle the current line between headline and text |
 | `<leader>o$` | archive the subtree into `<this file>_archive` |
 | `<leader>or` | refile the subtree under a headline you pick |
@@ -230,7 +235,19 @@ Three refusals are deliberate:
   another parent's children.
 - **`<leader><CR>` inserts after the whole subtree**, not on the next line.
   Inserting directly under a headline would put the new one in front of that
-  headline's children and silently adopt them.
+  headline's children and silently adopt them. `<leader>oi` nests one level
+  deeper and lands after the children for the same reason.
+
+The meta-arrows are the same verbs under org's own spelling, and they mean
+whatever is under the cursor — see **Lists** below, where `<M-Right>` indents
+an item instead of demoting a headline. `<M-S-Up>` and `<M-S-Down>` are
+accepted as peers of `<M-Up>` / `<M-Down>`: on a headline both spellings move
+the subtree, which is what org does.
+
+`<M-CR>` and friends need a terminal that can send them. Lattice asks for the
+keyboard-enhancement protocol at startup where the terminal supports it; if
+yours does not, or you turn it off with `:set ui.keyboard_enhancement=off`,
+every one of these keeps its `<leader>` spelling.
 
 ### Archiving
 
@@ -618,7 +635,9 @@ open it — emacs has been writing those log lines for years.
 
 | | |
 |---|---|
-| `<C-Space>` | toggle the checkbox on this line |
+| `<C-Space>` | toggle the checkbox on this line, or every box in a region |
+| `<M-S-CR>` | new checkbox item below this one |
+| `<leader>o_` | drop the box, turning the item back into prose |
 
 ```org
 * Shopping [1/3]
@@ -640,6 +659,82 @@ to its own parent, because a grandchild's state is already reflected in its
 parent's box.
 
 `[-]` is org's partial state. Toggling one completes it.
+
+Over a Visual region every box flips from **its own** state, rather than being
+driven to a common value — `<C-Space>` means toggle. It is one edit, so one
+`u` puts the whole region back.
+
+Un-itemising a checkbox with `<leader>o_` drops its box, and every cookie
+counting it is rewritten in the same edit — the box and the number above it
+never disagree, not even for a keystroke. A new item from `<M-S-CR>` always
+starts unticked, whatever the item you pressed it on: copying `[X]` would tick
+a task nobody has done.
+
+## Lists
+
+| | |
+|---|---|
+| `<M-CR>` | new item below this one, same shape |
+| `<M-S-CR>` | new item of the *other* shape — plain gains a box, boxed loses one |
+| `<M-Right>` `<M-Left>` | indent / outdent the item |
+| `<M-S-Right>` `<M-S-Left>` | indent / outdent the item **and its children** |
+| `<M-Up>` `<M-Down>` | move the item past its sibling, children and all |
+| `<C-t>` `<C-d>` | indent / outdent **while typing** (Insert mode) |
+| `<leader>o-` `<C-c>-` | cycle every bullet in the list to the next shape |
+| `<leader>o_` | turn this line into a list item, or back into prose |
+| `<leader>o*` | turn this item into a headline |
+
+```org
+- milk
+- bread
+  - sourdough
+1. first
+2. second
+```
+
+Four bullet shapes cycle in order: `-` → `+` → `1.` → `1)` → `-`. Cycling
+acts on the **whole list**, not the item under the cursor — a list with mixed
+bullets is not something org produces, and cycling one item would create one.
+A nested sublist keeps its own shape; it is its own list.
+
+Ordered lists renumber themselves. Inserting, moving or indenting an item
+rewrites the numbers **in the same edit**, so one `u` undoes the insert and
+the renumbering together, and the numbers always describe positions rather
+than following the items around: swapping `1. a` with `2. b` gives `1. b` and
+`2. a`, never `2. b` and `1. a`.
+
+Indenting nests the item under the item above it, so the new indent is that
+item's *content* column — two under `- a`, three under `2. b`. That is what
+makes a sublist line up with the text it belongs to.
+
+Every one of these takes a **region**. Select lines in Visual mode and the
+verb applies to every item the selection touches, in one edit, returning you
+to Normal the way an operator does. A mixed-level region shifts by one level
+and keeps its shape — a child stays a child — rather than flattening
+everything to a common level.
+
+Four refusals are deliberate:
+
+- **Outdenting an item at column zero is refused**, not silently turned into a
+  headline. `<leader>o*` is how an item becomes a headline, and it is a
+  different gesture on purpose.
+- **Indenting the first item of a list is refused.** There is nothing above it
+  to nest under, and inventing a parent would produce a sublist with no owner.
+- **Moving stops at the sibling chain.** At either end the item stays put
+  rather than being spliced into a neighbouring list — `- b` sitting below
+  `- a`'s child is `- a`'s peer, not the child's.
+- **A region refuses whole.** If any item in the selection cannot move, none
+  of them do. Applying to the two thirds that could move is not a state one
+  `u` gets you out of.
+
+Each refusal says so in the echo line, because a key that is bound and does
+nothing is indistinguishable from one that is not bound at all.
+
+`<C-t>` and `<C-d>` are the only org keys that get out of the way. Over
+ordinary prose they fall through to vim's own indent, which is what you meant
+by pressing them. On a headline they promote and demote instead: a headline's
+level is its stars, and indenting one would push it off column zero and stop
+it being a headline at all.
 
 ## Tables
 

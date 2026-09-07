@@ -322,16 +322,15 @@ async fn press_chord(editor: &mut Editor, keys: &str) {
     let expanded = editor.keymap.expand_leader(keys);
     let seq = parse_chord_sequence(&expanded).expect("parses");
     let mut partial: Vec<KeyChord> = Vec::new();
-    let mut resolved = None;
     for c in seq {
-        resolved = Some(editor.dispatch_chord(c, &mut partial));
-    }
-    // `dispatch_chord` already RAN the action; re-running it through
-    // `dispatch` would double-apply. Instead the effects are recovered by
-    // re-dispatching only when the resolved action is an invocation, which is
-    // the only shape that carries them here.
-    if let Some(lattice_host::action::Action::Invoke(inv)) = resolved {
-        let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
+        // `dispatch_chord_with_outcome` RUNS the chord and hands back the
+        // effects it produced. The previous shape re-dispatched the resolved
+        // `Action::Invoke` to recover them, which ran the action a SECOND time:
+        // one `<leader><CR>` inserted two items, under a comment claiming it
+        // avoided exactly that. Every chord's effects are applied, not just the
+        // last one's, so a multi-key sequence behaves like the TUI's per-key
+        // cycle.
+        let (_action, out) = editor.dispatch_chord_with_outcome(c, &mut partial);
         apply_renderer_effects(editor, out).await;
     }
 }
@@ -771,7 +770,7 @@ async fn the_boot_subscription_expands_rows_without_any_keypress() {
 
     let org = ModeId::new("org-mode");
     let seq = parse_chord_sequence("dar").expect("parses");
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         if matches!(
             editor
                 .keymap
@@ -2199,7 +2198,7 @@ fn picker_labels(editor: &Editor) -> Vec<String> {
 /// broken source.
 async fn open_refile(editor: &mut Editor) {
     let _ = editor.open_picker("org-refile".to_string(), Vec::new());
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         let _ = editor.drain_pending_picker_init();
         if editor.picker.is_some() {
             return;
@@ -2229,7 +2228,7 @@ fn pick(editor: &mut Editor, query: &str) {
 /// applies the outcome. In production the actor's `async_landed` wake drives
 /// that; here the test does, because there is no keystroke coming.
 async fn settle_accept(editor: &mut Editor) {
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         let _ = editor.drain_pending_picker_accept();
         editor.run_tick_pending();
         if editor.pending_picker_accept.is_none() {
@@ -5773,4 +5772,68 @@ async fn a_region_verb_leaves_visual_mode() {
         "still in Visual after a region edit: {:?}",
         editor.modal
     );
+}
+
+/// **A harness regression test, not a feature test.**
+///
+/// `press_chord` used to re-dispatch the resolved `Action::Invoke` in order to
+/// recover its effects — but `dispatch_chord` had ALREADY run it, so every
+/// editing chord applied twice. Measured during OS.4: `<leader><CR>` on a list
+/// inserted TWO items through `press_chord` and one through `press`, while the
+/// helper carried a comment asserting it avoided exactly that.
+///
+/// It is pinned here because the failure is silent in every direction that
+/// matters: a doubled insert still leaves a well-formed buffer, no test asserted
+/// the helper's own behaviour, and the plan's helper table actively recommended
+/// `press_chord` "for anything that edits".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn press_chord_applies_an_editing_action_exactly_once() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n- eggs\n").await;
+
+    goto(&mut editor, 0, 0);
+    press_chord(&mut editor, "<leader><CR>").await;
+    assert_eq!(
+        text(&editor),
+        "- milk\n- \n- eggs\n",
+        "one new item, not two"
+    );
+
+    // And it agrees with `press`, which never had the doubling.
+    let base2 = tempfile::tempdir().unwrap();
+    let mut editor2 = org_editor(base2.path(), "- milk\n- eggs\n").await;
+    goto(&mut editor2, 0, 0);
+    press(&mut editor2, "<leader><CR>");
+    assert_eq!(text(&editor), text(&editor2), "both helpers agree");
+}
+
+/// Scale a settle loop's poll budget for machine load.
+///
+/// Every wait in this suite is `for _ in 0..N { if done { break } sleep(ms) }`,
+/// which budgets ITERATIONS. That is fine on an idle machine and wrong under a
+/// full `cargo test`: the work being waited on — a wasm instantiation, a guest
+/// scan, an off-thread index — slows down with contention while the budget does
+/// not stretch to match, so the loop gives up on work that was still coming.
+///
+/// Three suites flaked exactly this way in one session (`org_roam_index` twice,
+/// on two different tests, and `org_highlight_from_component` once), each
+/// passing cleanly in isolation. A red that is sometimes noise is a red that
+/// gets argued with instead of obeyed, which is the real cost.
+///
+/// **A wider budget is close to free.** These loops exit the moment their
+/// condition holds, so raising the ceiling costs nothing on the passing path;
+/// it is only paid when something is genuinely broken, and waiting longer to
+/// report a real failure is the cheaper mistake.
+///
+/// `LATTICE_TEST_SETTLE_SCALE` overrides the factor for a slower machine.
+fn settle_budget(base: usize) -> usize {
+    let scale: usize = std::env::var("LATTICE_TEST_SETTLE_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10);
+    base.saturating_mul(scale)
 }

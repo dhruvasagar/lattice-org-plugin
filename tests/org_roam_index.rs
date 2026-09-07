@@ -52,12 +52,11 @@ async fn press_chord(editor: &mut Editor, keys: &str) {
     let expanded = editor.keymap.expand_leader(keys);
     let seq = parse_chord_sequence(&expanded).expect("parses");
     let mut partial = Vec::new();
-    let mut resolved = None;
     for c in seq {
-        resolved = Some(editor.dispatch_chord(c, &mut partial));
-    }
-    if let Some(lattice_host::action::Action::Invoke(inv)) = resolved {
-        let out = editor.dispatch(lattice_host::action::Action::Invoke(inv));
+        // See `org_structure.rs`'s copy: re-dispatching the resolved action to
+        // recover its effects RAN IT TWICE. `dispatch_chord_with_outcome` hands
+        // the effects back from the single run that already happened.
+        let (_action, out) = editor.dispatch_chord_with_outcome(c, &mut partial);
         apply_renderer_effects(editor, out);
     }
 }
@@ -366,7 +365,7 @@ async fn sync(editor: &Editor) {
 /// actor's own task, so there is nothing to await — and deliberately nothing to
 /// press, either.
 async fn settle(mut f: impl FnMut() -> bool) -> bool {
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         if f() {
             return true;
         }
@@ -565,7 +564,7 @@ async fn open_find_node(editor: &mut Editor) -> Vec<String> {
     // opens against a half-written index. That was the actual bug the re-open
     // loop was papering over.
     let _ = editor.open_picker("org-roam-node".to_string(), Vec::new());
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         editor.run_tick_pending();
         let rows: Vec<String> = editor
@@ -836,7 +835,7 @@ async fn creating_a_note_opens_a_draft_with_an_id_and_title() {
         })
     };
     let mut found = None;
-    for _ in 0..240 {
+    for _ in 0..settle_budget(240) {
         editor.run_tick_pending();
         found = draft(&editor);
         if found.is_some() {
@@ -918,6 +917,8 @@ async fn find_node_with_no_directory_says_so() {
     }
 
     let _ = editor.open_picker("org-roam-node".to_string(), Vec::new());
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         editor.run_tick_pending();
@@ -1055,6 +1056,8 @@ async fn complete_in_org(editor: &mut Editor, corpus: &Path, line: &str) -> Vec<
     // opened without ticking between has the major and none of the plugin
     // minors. `ActiveCompletionSources` is rebuilt on each transition, and
     // reading it before both drains have run shows only the native sources.
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         editor.run_tick_pending();
@@ -1066,7 +1069,7 @@ async fn complete_in_org(editor: &mut Editor, corpus: &Path, line: &str) -> Vec<
     // The fan-out runs off-thread, so settle on the ASYNC ROUND finishing —
     // not on "any rows", which the sync buffer-words source satisfies
     // immediately and which would read every async result as absent.
-    for _ in 0..100 {
+    for _ in 0..settle_budget(100) {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         editor.drain_pending_insert_completion_lsp();
         if editor.pending_insert_completion_async_token.is_none() {
@@ -1217,7 +1220,7 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
 
 /// Drain until the picker's async source has seated its rows.
 async fn settle_picker_rows(editor: &mut Editor) -> Vec<String> {
-    for _ in 0..100 {
+    for _ in 0..settle_budget(100) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         editor.run_tick_pending();
         let rows: Vec<String> = editor
@@ -1251,6 +1254,8 @@ async fn settle_picker_rows(editor: &mut Editor) -> Vec<String> {
 /// as "following is broken" when following was never asked for.
 async fn open_at_link(editor: &mut Editor, file: &Path, line: u32) {
     editor.do_edit(Some(file.to_path_buf()), false);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         editor.run_tick_pending();
@@ -1271,6 +1276,8 @@ async fn open_at_link(editor: &mut Editor, file: &Path, line: u32) {
 /// not about links.
 async fn open_at(editor: &mut Editor, file: &Path, line: u32) {
     editor.do_edit(Some(file.to_path_buf()), false);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         editor.run_tick_pending();
@@ -1628,6 +1635,8 @@ async fn run_dailies(editor: &mut Editor, line: &str) {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.execute_ex_line(line, &mut out);
     apply_renderer_effects(editor, out);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         editor.run_tick_pending();
@@ -1858,6 +1867,8 @@ async fn goto_date_without_one_prompts_and_the_submit_opens_the_day() {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_prompt_line_submit(&mut out);
     apply_renderer_effects(&mut editor, out);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         editor.run_tick_pending();
@@ -2019,7 +2030,7 @@ async fn a_corpus_larger_than_one_batch_indexes_without_trapping() {
     // 25 tree-sitter parses under a debug host. The point is that the chain
     // FINISHES, not that it finishes fast.
     let mut ok = false;
-    for _ in 0..600 {
+    for _ in 0..settle_budget(600) {
         if index.nodes().len() >= FILES {
             ok = true;
             break;
@@ -2157,7 +2168,7 @@ async fn a_templated_note_expands_its_fields() {
     // writing the stub without asking.
     let out = editor.do_picker_accept();
     apply_accept_effects(&mut editor, out);
-    for _ in 0..80 {
+    for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
         if editor
             .picker
@@ -2303,7 +2314,7 @@ async fn a_templated_note_reads_its_body_from_a_file() {
 
     let out = editor.do_picker_accept();
     apply_accept_effects(&mut editor, out);
-    for _ in 0..80 {
+    for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
         if editor
             .picker
@@ -2392,7 +2403,7 @@ async fn an_unreadable_body_file_is_skipped_not_a_trap() {
 
     let out = editor.do_picker_accept();
     apply_accept_effects(&mut editor, out);
-    for _ in 0..80 {
+    for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
         if editor
             .picker
@@ -2416,6 +2427,8 @@ async fn an_unreadable_body_file_is_skipped_not_a_trap() {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_transient_trigger("s".to_string(), &mut out);
     apply_accept_effects(&mut editor, out);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..8 {
         editor.run_tick_pending();
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -2451,7 +2464,7 @@ async fn an_unreadable_body_file_is_skipped_not_a_trap() {
     assert_eq!(rows, vec!["Create note: Another Note"], "{rows:?}");
     let out = editor.do_picker_accept();
     apply_accept_effects(&mut editor, out);
-    for _ in 0..80 {
+    for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
         if editor
             .picker
@@ -2506,7 +2519,7 @@ fn note_buffer(editor: &Editor, corpus: &Path) -> Option<(std::path::PathBuf, St
 /// `document.path()` is `none` — which is the whole reason the destination is
 /// remembered guest-side rather than recovered from the buffer.
 async fn settle_roam_draft(editor: &mut Editor) -> Option<String> {
-    for _ in 0..240 {
+    for _ in 0..settle_budget(240) {
         editor.run_tick_pending();
         let mut found = None;
         let mut ids = Vec::new();
@@ -2552,6 +2565,8 @@ async fn dispatch_capture_action(editor: &mut Editor, name: &str) {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
     apply_accept_effects(editor, out);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..40 {
         editor.run_tick_pending();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2580,7 +2595,7 @@ async fn pick_roam_template(
 
     let out = editor.do_picker_accept();
     apply_accept_effects(editor, out);
-    for _ in 0..80 {
+    for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
         if editor
             .picker
@@ -2595,8 +2610,22 @@ async fn pick_roam_template(
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_transient_trigger(key.to_string(), &mut out);
     apply_accept_effects(editor, out);
-    for _ in 0..40 {
+    // Wait for the OUTCOME, not for a fixed number of ticks. Choosing a
+    // template arms the first `%^{...}` question's prompt (OR.17), and that is
+    // what every caller goes on to assert — so waiting for it is both correct
+    // and fast, where draining a fixed 40 ticks was a guess that held on an idle
+    // machine and lost under a full `cargo test`. Both
+    // `a_roam_template_asks_its_questions` and
+    // `a_body_file_templates_questions_are_asked_too` failed exactly here.
+    //
+    // A template with no questions arms no prompt, so the budget is still the
+    // floor: this exits early when there is something to wait for and behaves
+    // as before when there is not.
+    for _ in 0..settle_budget(40) {
         editor.run_tick_pending();
+        if editor.pending_prompt_submit_action.is_some() {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
@@ -2880,6 +2909,8 @@ async fn without_templates_a_note_is_still_the_built_in_stub() {
 
     let out = editor.do_picker_accept();
     apply_accept_effects(&mut editor, out);
+    // Unconditional drain — no condition to wait FOR, so a wider budget
+    // would only cost wall clock. Deliberately unscaled.
     for _ in 0..40 {
         editor.run_tick_pending();
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -2892,4 +2923,32 @@ async fn without_templates_a_note_is_still_the_built_in_stub() {
             .is_none(),
         "no menu is shown when nothing is configured"
     );
+}
+
+/// Scale a settle loop's poll budget for machine load.
+///
+/// Every wait in this suite is `for _ in 0..N { if done { break } sleep(ms) }`,
+/// which budgets ITERATIONS. That is fine on an idle machine and wrong under a
+/// full `cargo test`: the work being waited on — a wasm instantiation, a guest
+/// scan, an off-thread index — slows down with contention while the budget does
+/// not stretch to match, so the loop gives up on work that was still coming.
+///
+/// Three suites flaked exactly this way in one session (`org_roam_index` twice,
+/// on two different tests, and `org_highlight_from_component` once), each
+/// passing cleanly in isolation. A red that is sometimes noise is a red that
+/// gets argued with instead of obeyed, which is the real cost.
+///
+/// **A wider budget is close to free.** These loops exit the moment their
+/// condition holds, so raising the ceiling costs nothing on the passing path;
+/// it is only paid when something is genuinely broken, and waiting longer to
+/// report a real failure is the cheaper mistake.
+///
+/// `LATTICE_TEST_SETTLE_SCALE` overrides the factor for a slower machine.
+fn settle_budget(base: usize) -> usize {
+    let scale: usize = std::env::var("LATTICE_TEST_SETTLE_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10);
+    base.saturating_mul(scale)
 }

@@ -188,7 +188,7 @@ async fn settle_agenda(
     registry: &MultibufferRegistryHandle,
     view: lattice_core::BufferId,
 ) -> HeaderlineStatus {
-    for _ in 0..600 {
+    for _ in 0..settle_budget(600) {
         if let Some(h) = registry.handle(view) {
             let status = (*h.headerline()).clone();
             if matches!(
@@ -209,7 +209,7 @@ async fn settle_agenda(
 async fn settle_transient(
     editor: &mut Editor,
 ) -> Option<std::sync::Arc<lattice_picker::TransientSpec>> {
-    for _ in 0..200 {
+    for _ in 0..settle_budget(200) {
         editor.run_tick_pending();
         if let Some(spec) = editor.picker.as_ref().and_then(|p| p.transient.clone()) {
             return Some(spec);
@@ -476,7 +476,7 @@ async fn the_span_rows_change_the_span_and_the_header_says_so() {
         let _ = settle_transient(editor).await.expect("the menu opens");
         fire(editor, key);
         let mut seen = String::new();
-        for _ in 0..600 {
+        for _ in 0..settle_budget(600) {
             editor.run_tick_pending();
             if let Some(h) = mb.handle(view) {
                 if let HeaderlineStatus::Complete { summary, .. } = &*h.headerline() {
@@ -542,4 +542,32 @@ async fn the_log_row_flips_the_same_mode_the_bare_l_does() {
             .unwrap_or(false),
         "…and it must reach the view the menu was opened over"
     );
+}
+
+/// Scale a settle loop's poll budget for machine load.
+///
+/// Every wait in this suite is `for _ in 0..N { if done { break } sleep(ms) }`,
+/// which budgets ITERATIONS. That is fine on an idle machine and wrong under a
+/// full `cargo test`: the work being waited on — a wasm instantiation, a guest
+/// scan, an off-thread index — slows down with contention while the budget does
+/// not stretch to match, so the loop gives up on work that was still coming.
+///
+/// Three suites flaked exactly this way in one session (`org_roam_index` twice,
+/// on two different tests, and `org_highlight_from_component` once), each
+/// passing cleanly in isolation. A red that is sometimes noise is a red that
+/// gets argued with instead of obeyed, which is the real cost.
+///
+/// **A wider budget is close to free.** These loops exit the moment their
+/// condition holds, so raising the ceiling costs nothing on the passing path;
+/// it is only paid when something is genuinely broken, and waiting longer to
+/// report a real failure is the cheaper mistake.
+///
+/// `LATTICE_TEST_SETTLE_SCALE` overrides the factor for a slower machine.
+fn settle_budget(base: usize) -> usize {
+    let scale: usize = std::env::var("LATTICE_TEST_SETTLE_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10);
+    base.saturating_mul(scale)
 }

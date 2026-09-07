@@ -238,7 +238,7 @@ async fn settle_agenda(
     registry: &MultibufferRegistryHandle,
     view: lattice_core::BufferId,
 ) -> HeaderlineStatus {
-    for _ in 0..600 {
+    for _ in 0..settle_budget(600) {
         if let Some(h) = registry.handle(view) {
             let status = (*h.headerline()).clone();
             if matches!(
@@ -1857,3 +1857,31 @@ async fn an_unknown_command_key_falls_back_and_names_the_ones_that_exist() {
 // now, and a trie node cannot be both a terminal binding and a prefix. The
 // journey it protected — same keystrokes, through the menu — is asserted there,
 // where the harness declares the `transient-source` seam this one does not.
+
+/// Scale a settle loop's poll budget for machine load.
+///
+/// Every wait in this suite is `for _ in 0..N { if done { break } sleep(ms) }`,
+/// which budgets ITERATIONS. That is fine on an idle machine and wrong under a
+/// full `cargo test`: the work being waited on — a wasm instantiation, a guest
+/// scan, an off-thread index — slows down with contention while the budget does
+/// not stretch to match, so the loop gives up on work that was still coming.
+///
+/// Three suites flaked exactly this way in one session (`org_roam_index` twice,
+/// on two different tests, and `org_highlight_from_component` once), each
+/// passing cleanly in isolation. A red that is sometimes noise is a red that
+/// gets argued with instead of obeyed, which is the real cost.
+///
+/// **A wider budget is close to free.** These loops exit the moment their
+/// condition holds, so raising the ceiling costs nothing on the passing path;
+/// it is only paid when something is genuinely broken, and waiting longer to
+/// report a real failure is the cheaper mistake.
+///
+/// `LATTICE_TEST_SETTLE_SCALE` overrides the factor for a slower machine.
+fn settle_budget(base: usize) -> usize {
+    let scale: usize = std::env::var("LATTICE_TEST_SETTLE_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10);
+    base.saturating_mul(scale)
+}

@@ -5436,3 +5436,128 @@ async fn the_shift_meta_spellings_move_the_subtree_too() {
         "the child moved with its parent"
     );
 }
+
+// ── OS.8: `<C-t>` / `<C-d>` in Insert, declining off a list ────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_t_indents_the_list_item_being_typed() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n").await;
+
+    goto(&mut editor, 1, 3);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-t>");
+    assert_eq!(line_at(&editor, 1), "  - b");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_d_outdents_the_list_item_being_typed() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n  - a-a\n").await;
+
+    goto(&mut editor, 1, 5);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-d>");
+    assert_eq!(line_at(&editor, 1), "- a-a");
+}
+
+/// `<C-t>` is a SHARED chord — vim's Insert-mode shiftwidth indent lives
+/// underneath it. Off a list item org must decline and let the builtin run.
+///
+/// This is the test the slice exists for. It goes through a KEYPRESS on
+/// purpose: observing that the action returned `Declined` proves nothing about
+/// what the user actually gets, because the fall-through is the host's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_t_on_prose_still_runs_vims_indent() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\nsome prose\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-t>");
+    let after = line_at(&editor, 1);
+    assert!(
+        after.starts_with(' ') && after.trim_start() == "some prose",
+        "the builtin indent ran and org consumed nothing, got {after:?}"
+    );
+}
+
+/// On a headline these demote and promote, because a headline's level IS its
+/// leading stars and its indentation means nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_t_on_a_headline_demotes_it() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n").await;
+
+    goto(&mut editor, 0, 5);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-t>");
+    assert_eq!(line_at(&editor, 0), "** One");
+    press(&mut editor, "<C-d>");
+    assert_eq!(line_at(&editor, 0), "* One", "and back");
+}
+
+/// **The regression this arm exists to prevent, and it is corruption rather
+/// than mere inconvenience.** A headline must begin at column 0. Letting vim's
+/// indent run turns `* One` into `    * One`, which is no longer a headline —
+/// and which org then reads as a `Star` LIST ITEM, because an indented `*` is a
+/// bullet. One keystroke converts an outline node into a list item.
+///
+/// Measured before the fix: `<C-t>` on `* One` produced `"    * One"`. The
+/// earlier test asserted only that the line did not start with `**`, which that
+/// string satisfies, so the corruption passed green. Assert the leading
+/// character directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_t_never_indents_a_headline() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Two\n").await;
+
+    goto(&mut editor, 0, 5);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-t>");
+    let after = line_at(&editor, 0);
+    assert!(
+        after.starts_with('*'),
+        "a headline must still start at column 0, got {after:?}"
+    );
+}
+
+/// The headline arm is scoped to the headline LINE, not its subtree.
+///
+/// `at_point` answers `Headline` for anything inside a subtree — right for
+/// `<leader>oh`, whose documented meaning is "promote the headline I am under".
+/// Here it would make `<C-t>` in a paragraph promote the heading above it
+/// instead of indenting the paragraph, which is the opposite of what someone
+/// typing prose means. Body prose is prose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_t_in_a_headlines_body_indents_rather_than_demoting_the_headline() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\nsome prose\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "A");
+    press(&mut editor, "<C-t>");
+    assert_eq!(line_at(&editor, 0), "* One", "the heading was left alone");
+    assert!(
+        line_at(&editor, 1).starts_with(' '),
+        "and the paragraph got vim's indent"
+    );
+}

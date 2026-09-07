@@ -280,6 +280,10 @@ const SHIFT_META_RIGHT: u32 = 95;
 // OS.7: move an item or a subtree.
 const META_UP: u32 = 96;
 const META_DOWN: u32 = 97;
+// OS.8: the Insert-mode peers. Separate ActionIds from META_LEFT/RIGHT because
+// they DECLINE where those return `Effect::None` — see `insert_indent`.
+const INSERT_INDENT: u32 = 98;
+const INSERT_OUTDENT: u32 = 99;
 
 const AGENDA_FILTER_FILE: u32 = 79;
 
@@ -1959,6 +1963,11 @@ impl Guest for Component {
                 // distinction org does not make.
                 bind("<M-S-Up>", "org-meta-up"),
                 bind("<M-S-Down>", "org-meta-down"),
+                // OS.8. Insert ONLY, and the only org chords that DECLINE:
+                // vim's own `<C-t>` / `<C-d>` shiftwidth indent lives
+                // underneath them.
+                ibind("<C-t>", "org-indent-item-insert"),
+                ibind("<C-d>", "org-outdent-item-insert"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2807,6 +2816,18 @@ impl Guest for Component {
             "Demote the subtree, or indent the item and its children",
             &spec(),
             SHIFT_META_RIGHT,
+        );
+        register_action(
+            "org-indent-item-insert",
+            "Indent the list item being typed, or decline to vim's own indent",
+            &spec(),
+            INSERT_INDENT,
+        );
+        register_action(
+            "org-outdent-item-insert",
+            "Outdent the list item being typed, or decline to vim's own indent",
+            &spec(),
+            INSERT_OUTDENT,
         );
         register_action(
             "org-meta-up",
@@ -5581,6 +5602,66 @@ fn insert_todo_heading(
     }
 }
 
+/// `<C-t>` / `<C-d>` in Insert — restructure what is at point, or get out of the
+/// way.
+///
+/// **The only org chords that decline**, and only over PROSE. Every other org
+/// binding consumes its key because org owns the gesture; these two are SHARED
+/// — vim's own shiftwidth indent lives underneath them, the `<C-a>` / `<C-x>`
+/// argument moved into Insert mode. Over a paragraph, indentation is what the
+/// user meant, so org returns `Effect::Declined` and the builtin runs.
+///
+/// **A HEADLINE is not prose, and declining over one CORRUPTS the buffer.** A
+/// headline's level is its leading stars and its indentation is meaningless;
+/// org does not indent headlines at all (`org-indent-mode` aligns them
+/// visually, without touching the text). But a headline must begin at column 0,
+/// so letting vim's indent run turns `* One` into `    * One` — which is no
+/// longer a headline, and which [`list::parse_bullet`] then reads as a `Star`
+/// list item, because an indented `*` IS a bullet. One keystroke silently
+/// converts an outline node into a list item.
+///
+/// Measured, not reasoned: before this arm existed, `<C-t>` on `* One` produced
+/// `"    * One"`. The test that was supposed to cover it asserted only that the
+/// line did not start with `**`, which `"    * One"` satisfies — so the
+/// corruption passed a green test. `ctrl_t_on_a_headline_demotes_it` and
+/// `ctrl_t_never_indents_a_headline` replace it.
+///
+/// So on a headline these promote and demote, exactly as `<M-Left>` /
+/// `<M-Right>` do — the headline alone, not the subtree, matching those keys'
+/// unshifted meaning.
+///
+/// Declining is safe HERE and is not safe for `<leader>oh` and its peers, which
+/// return `Effect::None` instead. A declined chord is re-resolved with org's
+/// layer removed, and for a MULTI-KEY sequence that runs the trailing key alone
+/// — `<leader>oh` would move the caret. `<C-t>` is a single key, so there is no
+/// trailing key to leak.
+///
+/// Neither body is new: the item arm is OS.6's `meta_shift_item`, the headline
+/// arm is `shift`, which `<leader>oh` / `ol` have always called.
+fn insert_indent(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    delta: isize,
+) -> Vec<Effect> {
+    match at_point(doc, tree, ctx.cursor.line) {
+        Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
+            meta_shift_item(ctx, doc, tree, &item, delta, false)
+        }
+        // ONLY when the caret is on the headline LINE. `at_point`'s headline
+        // arm answers for anything inside the subtree — which is right for
+        // `<leader>oh`, whose documented meaning is "promote the headline I am
+        // under" — but here it would make `<C-t>` in a paragraph promote the
+        // heading above it instead of indenting the paragraph. Body prose is
+        // prose.
+        Some(AtPoint::Headline(start, _)) if start == ctx.cursor.line => {
+            shift(ctx, doc, tree, delta, false)
+        }
+        // Prose, headline body included: indentation is what the user meant.
+        _ => vec![Effect::Declined],
+    }
+}
+
 /// `<M-Up>` / `<M-Down>` — move a subtree or a list item past its sibling.
 ///
 /// On a headline this calls the existing [`move_subtree`], the body
@@ -6663,6 +6744,8 @@ impl GrammarCallbacks for Component {
             SHIFT_META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, true)),
             META_UP => Ok(meta_move(&ctx, doc, tree, -1)),
             META_DOWN => Ok(meta_move(&ctx, doc, tree, 1)),
+            INSERT_INDENT => Ok(insert_indent(&ctx, doc, tree, 1)),
+            INSERT_OUTDENT => Ok(insert_indent(&ctx, doc, tree, -1)),
             INSERT_SUBHEADING => Ok(insert_subheading(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),

@@ -3438,6 +3438,7 @@ dependencies = [
  "lattice-syntax",
  "lattice-theme",
  "lattice-wit",
+ "linkme",
  "notify",
  "thiserror 2.0.18",
  "tokio",

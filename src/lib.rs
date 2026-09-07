@@ -1916,6 +1916,14 @@ impl Guest for Component {
         // OS.4: the Insert-mode peer. A separate closure rather than a second
         // parameter on `bind`, so the forty-odd existing Normal binds below are
         // not all rewritten to say `Normal` out loud.
+        // OS.10: the Visual peer. Reachable at all only because OS.0d stopped
+        // Visual stripping ALT (and SHIFT, which is why `<M-S-Right>` and
+        // `<M-Right>` stayed distinct).
+        let vbind = |chord: &str, command: &str| ModeKeymapBinding {
+            binding_mode: BindingMode::Visual,
+            chord: chord.to_string(),
+            command: command.to_string(),
+        };
         let ibind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Insert,
             chord: chord.to_string(),
@@ -1977,6 +1985,15 @@ impl Guest for Component {
                 bind("<leader>o-", "org-cycle-list-bullet"),
                 bind("<C-c>-", "org-cycle-list-bullet"),
                 bind("<leader>o_", "org-toggle-item"),
+                // OS.10: the Visual peers. Every one routes through the same
+                // body as its Normal spelling; the region is read from
+                // `ctx.selection` (OS.2) and collapses to the point-scoped path
+                // when there is none.
+                vbind("<M-Left>", "org-meta-left"),
+                vbind("<M-Right>", "org-meta-right"),
+                vbind("<M-S-Left>", "org-shift-meta-left"),
+                vbind("<M-S-Right>", "org-shift-meta-right"),
+                vbind("<C-Space>", "org-toggle-checkbox"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -5885,6 +5902,41 @@ fn meta_move_item(
     )
 }
 
+/// Append `exit-visual` when the verb ran over a REGION.
+///
+/// Vim's convention, and the UX rule that follows it: an operator applied to a
+/// selection returns to Normal. Leaving Visual up would point a live selection
+/// at lines the edit has just rewritten, so the next keystroke would act on a
+/// region that no longer describes what the user highlighted — and `u`, which
+/// is lowercase-selection in Visual, would not even be undo.
+///
+/// Point-scoped firings are untouched: there is no selection to leave.
+fn leaving_visual(ctx: &ActionContext, mut effects: Vec<Effect>) -> Vec<Effect> {
+    if ctx.selection.is_some() && !matches!(effects.as_slice(), [Effect::None]) {
+        effects.push(Effect::AppAction(AppEffect::ExitVisual));
+    }
+    effects
+}
+
+/// The line range a Visual/Select region covers, or `None` outside one.
+///
+/// OS.2 carries `ctx.selection` across the WIT boundary; before it, a plugin
+/// action reached from a Visual chord saw strictly less than the same action
+/// reached natively.
+///
+/// `None` is not an error state — it is the point-scoped path. Every verb below
+/// collapses to "the thing at the cursor" when there is no region, so Normal
+/// mode is the same code with a one-line range rather than a special case.
+fn region_lines(ctx: &ActionContext) -> Option<(u32, u32)> {
+    let sel = ctx.selection?;
+    let (lo, hi) = if sel.start.line <= sel.end.line {
+        (sel.start.line, sel.end.line)
+    } else {
+        (sel.end.line, sel.start.line)
+    };
+    Some((lo, hi))
+}
+
 /// The meta-arrows: one gesture carrying two verbs, chosen by what is at point.
 ///
 /// On a headline this IS promote/demote — it calls [`shift`], the same body
@@ -5906,6 +5958,14 @@ fn meta_shift(
     whole: bool,
 ) -> Vec<Effect> {
     let at = ctx.cursor.line;
+    // OS.10: a region shifts every item it touches, uniformly and
+    // all-or-nothing. A single line falls through to the point-scoped path
+    // below — the region wrapper is not a special case, it is the general one.
+    if let Some((lo, hi)) = region_lines(ctx) {
+        if lo != hi {
+            return meta_shift_region(ctx, doc, tree, (lo, hi), delta);
+        }
+    }
     match at_point(doc, tree, at) {
         Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
             meta_shift_item(ctx, doc, tree, &item, delta, whole)
@@ -5914,6 +5974,47 @@ fn meta_shift(
         Some(AtPoint::Headline(..)) => shift(ctx, doc, tree, delta, whole),
         None => vec![Effect::None],
     }
+}
+
+/// Shift every item a region touches, in ONE edit.
+///
+/// All-or-nothing, and the echo names why: a partially-applied region is not a
+/// state one `u` gets you out of, and applying to the items that happened to be
+/// movable is the surprise §5.6.6 exists to prevent.
+fn meta_shift_region(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    range: (u32, u32),
+    delta: isize,
+) -> Vec<Effect> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    let Some(changes) = list::shift_region(&lists, range, delta) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: if delta < 0 {
+                "an item in the region is already at the outermost level".to_string()
+            } else {
+                "no list items in the region".to_string()
+            },
+        })];
+    };
+    let (lo, hi) = range;
+    let body: Vec<String> = (lo..=hi)
+        .map(|n| {
+            changes
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .or_else(|| doc.line(n))
+                .unwrap_or_default()
+        })
+        .collect();
+    let Some(last) = doc.line(hi) else {
+        return vec![Effect::None];
+    };
+    replace_lines(ctx, lo, hi, last.len() as u32, body.join("\n"), ctx.cursor)
 }
 
 /// Re-indent the item at point, renumbering the list in the SAME edit.
@@ -6858,10 +6959,10 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, tree, false)),
             META_RETURN => Ok(meta_return(&ctx, doc, tree)),
             INSERT_TODO_HEADING => Ok(insert_todo_heading(&ctx, doc, tree)),
-            META_LEFT => Ok(meta_shift(&ctx, doc, tree, -1, false)),
-            META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, false)),
-            SHIFT_META_LEFT => Ok(meta_shift(&ctx, doc, tree, -1, true)),
-            SHIFT_META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, true)),
+            META_LEFT => Ok(leaving_visual(&ctx, meta_shift(&ctx, doc, tree, -1, false))),
+            META_RIGHT => Ok(leaving_visual(&ctx, meta_shift(&ctx, doc, tree, 1, false))),
+            SHIFT_META_LEFT => Ok(leaving_visual(&ctx, meta_shift(&ctx, doc, tree, -1, true))),
+            SHIFT_META_RIGHT => Ok(leaving_visual(&ctx, meta_shift(&ctx, doc, tree, 1, true))),
             META_UP => Ok(meta_move(&ctx, doc, tree, -1)),
             META_DOWN => Ok(meta_move(&ctx, doc, tree, 1)),
             INSERT_INDENT => Ok(insert_indent(&ctx, doc, tree, 1)),
@@ -6896,7 +6997,7 @@ impl GrammarCallbacks for Component {
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
-            TOGGLE_CHECKBOX => Ok(toggle_checkbox(&ctx, doc, tree)),
+            TOGGLE_CHECKBOX => Ok(leaving_visual(&ctx, toggle_checkbox(&ctx, doc, tree))),
             // OE.3: the context dispatcher. Its arms call the two bodies
             // above rather than repeating them.
             CTRL_C_CTRL_C => Ok(ctrl_c_ctrl_c(&ctx, doc, tree)),
@@ -7877,20 +7978,36 @@ fn toggle_checkbox(
     // cannot say so — the text path both toggles it and counts it into the
     // enclosing cookie.
     let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
-    let Some(text) = doc.line(at) else {
-        return vec![Effect::None];
+
+    // OS.10: over a region, every box it touches flips — in ONE edit, so one
+    // `u` restores them all. Each box is toggled from its OWN state rather than
+    // driven to a common value: `<C-Space>` means toggle, and forcing a mixed
+    // region to all-ticked would be a different verb wearing the same key.
+    let region = region_lines(ctx).filter(|(lo, hi)| lo != hi);
+    let targets: Vec<u32> = match region {
+        Some((lo, hi)) => (lo..=hi).filter(|&n| cb.item_at(n).is_some()).collect(),
+        None => vec![at],
     };
-    let Some(item) = cb.item_at(at) else {
+    let mut rewritten: Vec<(u32, String)> = Vec::new();
+    for n in &targets {
+        let (Some(text), Some(item)) = (doc.line(*n), cb.item_at(*n)) else {
+            continue;
+        };
+        if let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) {
+            rewritten.push((*n, flipped));
+        }
+    }
+    if rewritten.is_empty() {
         return vec![Effect::None];
-    };
-    let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) else {
-        return vec![Effect::None];
-    };
+    }
+    // The cookie walk below is anchored at the LAST toggled line: ancestors are
+    // shared across a region inside one list, and the span it rewrites reaches
+    // from the topmost ancestor down to it.
+    let at = *targets.last().unwrap_or(&at);
 
     // Rewrite from the toggled line down to itself, then extend upward for
     // each ancestor whose cookie changes. The span is contiguous because an
     // ancestor is always above its children.
-    let mut rewritten: Vec<(u32, String)> = vec![(at, flipped)];
     for parent in cb.ancestors(at) {
         let Some(above) = line(parent.line()) else {
             continue;

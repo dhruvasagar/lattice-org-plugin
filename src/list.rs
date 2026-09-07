@@ -1052,6 +1052,53 @@ mod tests {
     /// out to the items around its parent.
     // ── OS.9: bullet cycling, and line <-> item ───────────────────────────
 
+    // ── OS.10: shift_region ───────────────────────────────────────────────
+
+    #[test]
+    fn a_region_shifts_every_item_it_touches() {
+        over("- a\n- b\n- c\n", |lists| {
+            assert_eq!(
+                shift_region(lists, (0, 1), 1).unwrap(),
+                vec![(0, "  - a".to_string()), (1, "  - b".to_string())],
+                "`- c` is outside the region"
+            );
+        });
+    }
+
+    /// Relative structure survives: a child must stay a child.
+    #[test]
+    fn a_mixed_level_region_shifts_by_one_and_keeps_its_shape() {
+        over("- a\n  - a-a\n- b\n", |lists| {
+            assert_eq!(
+                shift_region(lists, (0, 2), 1).unwrap(),
+                vec![
+                    (0, "  - a".to_string()),
+                    (1, "    - a-a".to_string()),
+                    (2, "  - b".to_string()),
+                ]
+            );
+        });
+    }
+
+    /// All-or-nothing: applying to the two thirds that could move is the class
+    /// of surprise §5.6.6 exists to prevent.
+    #[test]
+    fn a_region_containing_one_refusal_refuses_whole() {
+        over("- a\n  - a-a\n", |lists| {
+            assert!(
+                shift_region(lists, (0, 1), -1).is_none(),
+                "`- a` is at column 0, so nothing moves"
+            );
+        });
+    }
+
+    #[test]
+    fn a_region_with_no_items_answers_none() {
+        over("just prose\nmore prose\n", |lists| {
+            assert!(shift_region(lists, (0, 1), 1).is_none());
+        });
+    }
+
     #[test]
     fn cycling_walks_the_four_shapes_and_wraps() {
         for (before, after) in [
@@ -1381,4 +1428,68 @@ pub fn toggle_item(line: &str) -> Option<String> {
         return Some(format!("{}{rest}", " ".repeat(indent)));
     }
     Some(format!("{}- {}", " ".repeat(indent), line.trim_start()))
+}
+
+/// One level of list indentation, in columns.
+///
+/// Used only by [`shift_region`]. The single-item [`shift_item`] does NOT use
+/// it: indenting one item nests it under its previous sibling, so its target is
+/// that sibling's content column (3 under `2. b`, 2 under `- a`). A region has
+/// no single sibling to nest under — the first item it touches may have none at
+/// all — so it moves everything by a fixed step instead, which is what keeps
+/// relative structure intact.
+///
+/// The cost, named: an ordered region shifts by 2 rather than by its own
+/// content width, so `1. a` lands at column 2 where a single-item indent would
+/// have put it at 3. Uniformity inside the region is the property that matters
+/// here; making the step depend on each item's own width would move the
+/// region's items by DIFFERENT amounts and break exactly the shape this is
+/// preserving.
+const REGION_INDENT_STEP: usize = 2;
+
+/// Shift every item the line range touches by one level, uniformly.
+///
+/// **Preserves relative structure**: a mixed-level region moves by one step and
+/// keeps its shape, rather than flattening to a common level. A child stays a
+/// child.
+///
+/// **All-or-nothing.** If any item in the range would hit a refusal — an
+/// outdent with something already at column 0 — the whole call answers `None`
+/// and the caller changes nothing. Applying to the two thirds that could move
+/// is the class of surprise §5.6.6 exists to prevent, and a partially-applied
+/// region is not a state a user can undo their way out of in one press.
+///
+/// Answers the changed lines, or `None` if the range holds no items at all.
+pub fn shift_region(
+    lists: &Lists<'_>,
+    range: (u32, u32),
+    delta: isize,
+) -> Option<Vec<(u32, String)>> {
+    let (lo, hi) = range;
+    let mut saw_item = false;
+    for n in lo..=hi {
+        if let Some(item) = lists.item_at(n) {
+            saw_item = true;
+            if delta < 0 && item.indent == 0 {
+                return None;
+            }
+        }
+    }
+    if !saw_item {
+        return None;
+    }
+    let shift = delta * REGION_INDENT_STEP as isize;
+    let mut out = Vec::new();
+    for n in lo..=hi {
+        let Some(text) = lists.text(n) else { break };
+        if text.trim().is_empty() || crate::headline::headline_level(&text).is_some() {
+            continue;
+        }
+        let new_indent = (indent_of(&text) as isize + shift).max(0) as usize;
+        out.push((
+            n,
+            format!("{}{}", " ".repeat(new_indent), text.trim_start()),
+        ));
+    }
+    (!out.is_empty()).then_some(out)
 }

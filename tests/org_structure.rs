@@ -5657,3 +5657,120 @@ async fn toggle_heading_on_an_item_uses_the_enclosing_level() {
     press(&mut editor, "<leader>o*");
     assert_eq!(line_at(&editor, 2), "** milk");
 }
+
+// ── OS.10: the Visual peers ───────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_visual_region_indents_every_item_it_touches() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n- c\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "V");
+    // `goto`, not `j`: a Visual-mode `j` does not move the caret through this
+    // harness (`G` does), and the helper table has `goto` precisely so a test's
+    // setup cannot fail for a motion's reasons. The anchor stays where `V` put
+    // it, so this is a linewise region over lines 0-1.
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-Right>");
+    assert_eq!(text(&editor), "  - a\n  - b\n- c\n");
+}
+
+/// Relative structure survives: a child must stay a child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_level_region_shifts_by_one_and_keeps_its_shape() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n  - a-a\n- b\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "VG");
+    press(&mut editor, "<M-Right>");
+    assert_eq!(text(&editor), "  - a\n    - a-a\n  - b\n");
+}
+
+/// All-or-nothing: applying to the two thirds that could move is the class of
+/// surprise §5.6.6 exists to prevent, and a half-applied region is not a state
+/// one `u` gets you out of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_region_containing_one_refusal_refuses_whole() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n  - a-a\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "VG");
+    press(&mut editor, "<M-Left>");
+    assert_eq!(text(&editor), "- a\n  - a-a\n", "nothing moved");
+    assert!(last_echo(&editor).is_some(), "and it says what stopped it");
+}
+
+/// Every box in the region flips, in one edit — and each from its OWN state,
+/// because `<C-Space>` means toggle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_space_toggles_every_box_in_the_region() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* S [0/2]\n- [ ] a\n- [ ] b\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "V");
+    goto(&mut editor, 2, 0);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(text(&editor), "* S [2/2]\n- [X] a\n- [X] b\n");
+    // The region verb left Visual, vim-style — so `u` is UNDO here rather than
+    // Visual's lowercase-selection, and one press restores the whole edit.
+    press(&mut editor, "u");
+    assert_eq!(line_at(&editor, 0), "* S [0/2]", "one edit, one undo");
+}
+
+/// A Normal-mode firing has `selection: None` and must fall back to the
+/// point-scoped behaviour rather than erroring — the region wrapper is the
+/// general path, not a special case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_selection_falls_back_to_the_item_at_point() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-Right>");
+    assert_eq!(
+        text(&editor),
+        "- a\n  - b\n",
+        "the single-item rule ran: nested under its previous sibling"
+    );
+}
+
+/// A region verb returns to Normal, the way an operator applied to a Visual
+/// selection does in vim. Leaving Visual up would point a live selection at
+/// lines the edit has just rewritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_region_verb_leaves_visual_mode() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n- c\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "V");
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-Right>");
+    assert!(
+        !matches!(editor.modal, lattice_grammar::ModalState::Visual(_)),
+        "still in Visual after a region edit: {:?}",
+        editor.modal
+    );
+}

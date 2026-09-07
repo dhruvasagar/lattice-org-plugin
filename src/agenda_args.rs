@@ -57,7 +57,22 @@ pub struct ViewArgs {
     pub span: Option<u32>,
     /// How many spans forward (or back) of today the view is anchored.
     /// `0` is today, which is where every agenda opens.
+    ///
+    /// **Superseded by [`Self::anchor`] as the authority**, and kept because
+    /// `offset=` is a written arg a custom command may already use. `begin`
+    /// consults it only when no `date=` was given. It cannot be the carried
+    /// state: it is in units of SPANS, so the same `offset` means a different
+    /// DAY in a day view and a week view, and carrying it between views with
+    /// different spans silently moves the reader to another date.
     pub offset: i32,
+    /// The day this view is anchored to, as an epoch day — the first day it
+    /// renders. `None` means "not specified": `begin` inherits the day the
+    /// previous view was on, or falls back to today.
+    ///
+    /// A DATE rather than an offset because that is the thing that has to
+    /// survive a view switch. "Which day am I looking at" is answerable
+    /// without knowing the span; "offset 1" is not.
+    pub anchor: Option<i64>,
     /// The filters the user has narrowed by, in the order they added them.
     pub filters: Vec<FilterTerm>,
     /// OA.15: which log items this view admits, or `None` for log mode off —
@@ -74,6 +89,18 @@ pub struct ViewArgs {
     /// Arguments that were not understood, named for the headerline. Never
     /// fatal — see the module header.
     pub problems: Vec<String>,
+    /// Set when this arg list came from [`Self::to_args`] — i.e. it is the
+    /// COMPLETE state of a view being re-opened, not a fresh request.
+    ///
+    /// This is what makes inheritance decidable. `to_args` omits everything
+    /// at its default (no `offset=0`, no `span=` on the option default, no
+    /// filter tokens when the user cleared them), so "absent" cannot
+    /// distinguish "the caller did not say" from "the caller said none" —
+    /// and inheriting on absence would make `.` (back to today) and
+    /// filter-clear silently do nothing. Rather than teach every field to
+    /// carry an explicit-default spelling, the LIST says whether it is
+    /// complete, and `begin` inherits only when it is not.
+    pub complete: bool,
 }
 
 impl ViewArgs {
@@ -84,9 +111,11 @@ impl ViewArgs {
             command: String::new(),
             span: None,
             offset: 0,
+            anchor: None,
             filters: Vec::new(),
             log: None,
             problems: Vec::new(),
+            complete: false,
         }
     }
 
@@ -127,6 +156,19 @@ impl ViewArgs {
                             .problems
                             .push(format!("offset `{value}` is not a number")),
                     },
+                    // The anchor day, as an epoch day. Emitted by `to_args`
+                    // on every re-open so a carried view always states where
+                    // it is, rather than leaving it to be inferred.
+                    "date" => match value.parse::<i64>() {
+                        Ok(n) => out.anchor = Some(n),
+                        Err(_) => out
+                            .problems
+                            .push(format!("date `{value}` is not an epoch day")),
+                    },
+                    // Written only by `to_args`. Says "this list is the whole
+                    // state", which is what lets `begin` tell a re-open from a
+                    // fresh request and inherit only for the latter.
+                    "state" => out.complete = value == "complete",
                     // OA.15. `log=` with nothing after it is log mode OFF
                     // rather than a problem: it is what an empty item set
                     // renders to, and a round trip that turned "no items" into
@@ -169,8 +211,20 @@ impl ViewArgs {
         if let Some(span) = self.span {
             out.push(format!("span={span}"));
         }
-        if self.offset != 0 {
-            out.push(format!("offset={}", self.offset));
+        // The anchor is emitted whenever it is known, INCLUDING when it is
+        // today: a carried view states where it is, so `.` (back to today) is
+        // distinguishable from "the caller said nothing".
+        //
+        // `offset` is emitted only in its absence, and the pair is
+        // exclusive-or on purpose: emitting both would let them disagree, and
+        // dropping `offset` outright would stop `to_args` being the inverse of
+        // `parse` for a view that carries one — which a written custom command
+        // still can. `begin` resolves an anchor onto every view it scans, so
+        // the `offset` branch is the not-yet-scanned case only.
+        match self.anchor {
+            Some(day) => out.push(format!("date={day}")),
+            None if self.offset != 0 => out.push(format!("offset={}", self.offset)),
+            None => {}
         }
         // OA.15: emitted only when log mode is ON. An `log=` on every agenda
         // would make the default view's arguments say something about a mode
@@ -184,7 +238,42 @@ impl ViewArgs {
                 FilterTerm::File(f) => format!("file:{f}"),
             });
         }
+        // Last, so a human reading a log sees the interesting arguments first.
+        out.push("state=complete".to_string());
         out
+    }
+
+    /// Fill this view's unset display state from `prev` — the view the user
+    /// was just looking at.
+    ///
+    /// Span, anchor day, filters and log mode are properties of the READER,
+    /// not of the view: someone looking at next week, narrowed to `tag:work`,
+    /// who opens a different agenda is still looking at next week and still
+    /// cares about work. Resetting them makes every view switch cost the
+    /// reader their place.
+    ///
+    /// `command` is deliberately NOT inherited — it IS the view's identity,
+    /// and inheriting it would make every view open as the previous one.
+    ///
+    /// A no-op when `self.complete`: those args came from [`Self::to_args`]
+    /// and already say everything, so inheriting would resurrect state the
+    /// user just cleared.
+    pub fn inherit_display_state(&mut self, prev: &Self) {
+        if self.complete {
+            return;
+        }
+        if self.span.is_none() {
+            self.span = prev.span;
+        }
+        if self.anchor.is_none() && self.offset == 0 {
+            self.anchor = prev.anchor;
+        }
+        if self.filters.is_empty() {
+            self.filters = prev.filters.clone();
+        }
+        if self.log.is_none() {
+            self.log = prev.log;
+        }
     }
 
     /// Whether `path` survives the `file:` filters.
@@ -346,8 +435,74 @@ mod tests {
             "tag:work",
             "file:a.org",
         ]));
+        // `complete` is the one field the trip is meant to change: `original`
+        // came from a caller's raw args, and `to_args` stamps its output as
+        // the full state so `begin` knows not to inherit into it.
+        let mut expected = original.clone();
+        expected.complete = true;
         let round = ViewArgs::parse(&original.to_args());
-        assert_eq!(round, original);
+        assert_eq!(round, expected);
+    }
+
+    /// The anchor day is what survives a view switch, so it has to survive the
+    /// round trip that every switch goes through.
+    #[test]
+    fn an_anchor_day_round_trips_and_supersedes_a_stale_offset() {
+        let mut v = ViewArgs::parse(&args(&["r", "span=7", "offset=2"]));
+        // What `begin` does once it has resolved where the view actually is.
+        v.anchor = Some(20_000);
+        let round = ViewArgs::parse(&v.to_args());
+        assert_eq!(round.anchor, Some(20_000), "the day is carried");
+        assert_eq!(
+            round.offset, 0,
+            "and the offset it superseded is NOT re-emitted — two spellings of \
+             the same thing are two chances to disagree"
+        );
+    }
+
+    /// A fresh opener (a different agenda view) says nothing about span, day
+    /// or filters, so it inherits the reader's. This is the reported bug: set
+    /// a span, open another view, lose it.
+    #[test]
+    fn a_fresh_view_inherits_the_readers_span_day_and_filters() {
+        let prev = {
+            let mut p = ViewArgs::parse(&args(&["", "span=7", "tag:work"]));
+            p.anchor = Some(20_000);
+            p
+        };
+        let mut fresh = ViewArgs::parse(&args(&["refile"]));
+        fresh.inherit_display_state(&prev);
+        assert_eq!(fresh.command, "refile", "the view's own identity is kept");
+        assert_eq!(fresh.span, Some(7), "the span the reader chose");
+        assert_eq!(fresh.anchor, Some(20_000), "and the day they are reading");
+        assert_eq!(fresh.filters.len(), 1, "and the narrowing they applied");
+    }
+
+    /// The trap that makes inheritance-on-absence wrong without the marker:
+    /// a view the user just CLEARED emits nothing for the cleared field, which
+    /// looks identical to a caller that said nothing. `state=complete` is what
+    /// tells them apart, so `.` and filter-clear are not silently undone.
+    #[test]
+    fn a_carried_view_does_not_inherit_what_the_user_just_cleared() {
+        let prev = {
+            let mut p = ViewArgs::parse(&args(&["", "span=7", "tag:work"]));
+            p.anchor = Some(20_000);
+            p
+        };
+        // The user cleared the filter; the chord re-opens with the full state.
+        let cleared = {
+            let mut c = prev.clone();
+            c.filters.clear();
+            c
+        };
+        let mut reopened = ViewArgs::parse(&cleared.to_args());
+        assert!(reopened.complete, "a re-open states that it is complete");
+        reopened.inherit_display_state(&prev);
+        assert!(
+            reopened.filters.is_empty(),
+            "the cleared filter must stay cleared rather than being inherited \
+             back from the view it was cleared on"
+        );
     }
 
     // ── OA.15: log mode is an argument, so it round-trips like one ──────
@@ -422,11 +577,22 @@ mod tests {
             command: String::new(),
             span: None,
             offset: 0,
+            anchor: None,
             filters: vec![FilterTerm::Tag("work".into())],
             log: None,
             problems: Vec::new(),
+            // What `to_args` stamps on its output; the round trip has to read
+            // it back or the re-parsed view would ask to inherit.
+            complete: true,
         };
-        assert_eq!(a.to_args(), vec!["".to_string(), "tag:work".to_string()]);
+        assert_eq!(
+            a.to_args(),
+            vec![
+                "".to_string(),
+                "tag:work".to_string(),
+                "state=complete".to_string()
+            ]
+        );
         assert_eq!(ViewArgs::parse(&a.to_args()), a);
     }
 
@@ -631,7 +797,13 @@ mod filter_tests {
         assert!(a.is_filtered());
         // …and it survives the round trip every chord makes, which is what
         // makes `gr` preserve the filter for free.
-        assert_eq!(ViewArgs::parse(&a.to_args()), a);
+        //
+        // `complete` is the one field the round trip is expected to CHANGE:
+        // `a` was parsed from a caller's raw args, and `to_args` stamps its
+        // output as the full state so `begin` knows not to inherit into it.
+        let mut expected = a.clone();
+        expected.complete = true;
+        assert_eq!(ViewArgs::parse(&a.to_args()), expected);
     }
 }
 

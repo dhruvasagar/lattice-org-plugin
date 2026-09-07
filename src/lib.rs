@@ -3484,7 +3484,17 @@ impl Guest for Component {
     /// having run would answer for the PREVIOUS scan if the host ever reordered
     /// them — a header naming a filter that is no longer on is worse than none.
     fn describe(args: Vec<String>) -> String {
-        let view = agenda_args::ViewArgs::parse(&args);
+        let mut view = agenda_args::ViewArgs::parse(&args);
+        // OA.24: the SAME inheritance `begin` applies, or the header names the
+        // default span and day while the rows under it show the inherited
+        // ones — a header that lies, which is worse than no header.
+        //
+        // Safe in either call order, which is what the doc above is careful
+        // about. Called BEFORE `begin`, this reads the previous view and
+        // reaches the same answer `begin` is about to; called AFTER, it reads
+        // the view `begin` just resolved and the inherit is a no-op. The two
+        // orders agree because both inherit from the same slot.
+        view.inherit_display_state(&VIEW_ARGS.with_borrow(Clone::clone));
         let default_span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
             .trim()
             .parse::<u32>()
@@ -3497,7 +3507,14 @@ impl Guest for Component {
         // header that computed the window differently would eventually
         // disagree with the rows under it.
         let span = view.span.unwrap_or(default_span);
-        let anchor = today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1));
+        // OA.24: the same resolution `begin` performs — `date=` first, the
+        // legacy `offset=` second. `describe` re-parses rather than reading
+        // what `begin` stashed (see the doc above), so it has to resolve the
+        // anchor the same way or the header names a different day from the
+        // rows under it.
+        let anchor = view
+            .anchor
+            .unwrap_or_else(|| today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1)));
         agenda_args::describe(&view, default_span, anchor)
     }
 
@@ -3512,7 +3529,19 @@ impl Guest for Component {
         // than once. The problems ride to OA.22's headerline instead, which is
         // where a user would look for "why is my agenda not what I asked for"
         // anyway.
-        let view = agenda_args::ViewArgs::parse(&args);
+        let mut view = agenda_args::ViewArgs::parse(&args);
+        // OA.24: span, day, filters and log mode belong to the READER, not to
+        // the view. Someone looking at next week narrowed to `tag:work` who
+        // opens a different agenda is still looking at next week and still
+        // cares about work; resetting on every view switch costs them their
+        // place. Inherited HERE rather than at each opener, because an opener
+        // that forgets produces exactly this bug and says nothing — and there
+        // is one `begin` but a growing number of openers.
+        //
+        // A no-op for args that came from `to_args` (`state=complete`), which
+        // already say everything: inheriting into those would resurrect a
+        // filter the user just cleared.
+        view.inherit_display_state(&VIEW_ARGS.with_borrow(Clone::clone));
         let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
         // OA.20: `org.agenda-span` is what a FRESH agenda opens at; a view the
         // user has walked carries its own. Navigation must never rewrite the
@@ -3534,7 +3563,19 @@ impl Guest for Component {
         //
         // `max(1)` because the daily agenda is `span = 0`: a step of zero days
         // would make `f` a no-op on exactly the view people walk most.
-        let today = today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1));
+        // `date=` is the authority; `offset=` is the legacy spelling a written
+        // custom command may still use, resolved against THIS view's span
+        // because that is the only span it could have meant.
+        //
+        // `max(1)` because the daily agenda is `span = 0`: a step of zero days
+        // would make `f` a no-op on exactly the view people walk most.
+        let today = view
+            .anchor
+            .unwrap_or_else(|| today_epoch_day() + i64::from(view.offset) * i64::from(span.max(1)));
+        // Resolved, so the view now STATES where it is — `to_args` emits it and
+        // the next view inherits a day rather than re-deriving one from an
+        // offset whose span it may not share.
+        view.anchor = Some(today);
         // AS.2: the user's set if `org.agenda-sections` holds one, the
         // built-ins otherwise. Parsed on read and never cached, the
         // `capture-templates` precedent — `:set org.agenda-sections=…` must
@@ -7083,32 +7124,43 @@ impl GrammarCallbacks for Component {
             AGENDA_LATER | AGENDA_EARLIER | AGENDA_TODAY | AGENDA_SPAN_DAY | AGENDA_SPAN_WEEK
             | AGENDA_SPAN_MONTH | AGENDA_SPAN_YEAR => {
                 let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                // OA.24: steps move the anchor DAY by one span. `begin`
+                // resolves `anchor` on every scan, so it is always `Some`
+                // here; the fallback is only for a chord pressed before any
+                // agenda has been scanned, which cannot happen from a menu
+                // that lives in the agenda buffer.
+                let span_days = i64::from(view.span.unwrap_or(0).max(1));
+                let anchor = view.anchor.unwrap_or_else(today_epoch_day);
                 match callback {
-                    AGENDA_LATER => view.offset = view.offset.saturating_add(1),
-                    AGENDA_EARLIER => view.offset = view.offset.saturating_sub(1),
-                    // `.` resets the OFFSET, not the span: "take me back to
+                    AGENDA_LATER => view.anchor = Some(anchor + span_days),
+                    AGENDA_EARLIER => view.anchor = Some(anchor - span_days),
+                    // `.` resets the DAY, not the span: "take me back to
                     // today" is about where you are, not about how much you
                     // were looking at, and losing a week view to get home
                     // would make the key cost more than it gives.
-                    AGENDA_TODAY => view.offset = 0,
-                    // Changing the span re-anchors on today. A `offset=2` held
-                    // across a day→month switch means two MONTHS out, which is
-                    // never what the person pressing `v m` meant.
+                    AGENDA_TODAY => view.anchor = Some(today_epoch_day()),
+                    // Changing the span re-anchors on today, unchanged from
+                    // when the anchor was an offset. Keeping the day here
+                    // would be defensible — "the week around the day I am
+                    // reading" — but it is a different decision from the one
+                    // this slice was asked for, and reversing it silently
+                    // while changing the representation underneath is how a
+                    // deliberate behaviour gets lost.
                     AGENDA_SPAN_DAY => {
                         view.span = Some(0);
-                        view.offset = 0;
+                        view.anchor = Some(today_epoch_day());
                     }
                     AGENDA_SPAN_WEEK => {
                         view.span = Some(7);
-                        view.offset = 0;
+                        view.anchor = Some(today_epoch_day());
                     }
                     AGENDA_SPAN_MONTH => {
                         view.span = Some(30);
-                        view.offset = 0;
+                        view.anchor = Some(today_epoch_day());
                     }
                     _ => {
                         view.span = Some(365);
-                        view.offset = 0;
+                        view.anchor = Some(today_epoch_day());
                     }
                 }
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(

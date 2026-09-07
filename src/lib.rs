@@ -272,6 +272,11 @@ const ROAM_CREATE_FROM_TEMPLATE: u32 = 80;
 // (`CAPTURE_QUESTION_SUBMIT` = 89) rather than the next visible gap.
 const INSERT_TODO_HEADING: u32 = 90;
 const INSERT_SUBHEADING: u32 = 91;
+// OS.6: the meta-arrows. One gesture, two verbs, chosen by what is at point.
+const META_LEFT: u32 = 92;
+const META_RIGHT: u32 = 93;
+const SHIFT_META_LEFT: u32 = 94;
+const SHIFT_META_RIGHT: u32 = 95;
 
 const AGENDA_FILTER_FILE: u32 = 79;
 
@@ -1935,6 +1940,13 @@ impl Guest for Component {
                 // `<leader>oi` -- the letter OA.27 left deliberately free,
                 // noting `i` as "the natural prefix for inserting things".
                 bind("<leader>oi", "org-insert-subheading"),
+                // OS.6. Normal only: §5.6.2 puts restructuring verbs in Normal,
+                // and OS.8 gives Insert its own spelling. Reachable at all only
+                // because OS.0c stopped Normal stripping ALT.
+                bind("<M-Left>", "org-meta-left"),
+                bind("<M-Right>", "org-meta-right"),
+                bind("<M-S-Left>", "org-shift-meta-left"),
+                bind("<M-S-Right>", "org-shift-meta-right"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2759,6 +2771,30 @@ impl Guest for Component {
             "Insert the other kind: a checkbox item, a plain item, or a TODO heading",
             &spec(),
             INSERT_TODO_HEADING,
+        );
+        register_action(
+            "org-meta-left",
+            "Promote the headline, or outdent the list item, at the cursor",
+            &spec(),
+            META_LEFT,
+        );
+        register_action(
+            "org-meta-right",
+            "Demote the headline, or indent the list item, at the cursor",
+            &spec(),
+            META_RIGHT,
+        );
+        register_action(
+            "org-shift-meta-left",
+            "Promote the subtree, or outdent the item and its children",
+            &spec(),
+            SHIFT_META_LEFT,
+        );
+        register_action(
+            "org-shift-meta-right",
+            "Demote the subtree, or indent the item and its children",
+            &spec(),
+            SHIFT_META_RIGHT,
         );
         register_action(
             "org-insert-subheading",
@@ -5521,6 +5557,109 @@ fn insert_todo_heading(
     }
 }
 
+/// The meta-arrows: one gesture carrying two verbs, chosen by what is at point.
+///
+/// On a headline this IS promote/demote — it calls [`shift`], the same body
+/// `<leader>oh` / `ol` / `oH` / `oL` call, so there is exactly one promote
+/// implementation and nothing to drift. On a list item it is outdent/indent.
+/// They are the same operation on two structures, which is why org spells them
+/// with one key, and why the refusals differ: a level-1 subtree refuses to
+/// promote, a column-zero item refuses to outdent, and each says so in its own
+/// terms.
+///
+/// `whole` selects the wider unit on both sides — subtree for a headline,
+/// item-plus-children for a list item. That is the same split `<leader>ol` and
+/// `<leader>oL` already make.
+fn meta_shift(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    delta: isize,
+    whole: bool,
+) -> Vec<Effect> {
+    let at = ctx.cursor.line;
+    match at_point(doc, tree, at) {
+        Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
+            meta_shift_item(ctx, doc, tree, &item, delta, whole)
+        }
+        // The existing body, unchanged and not copied.
+        Some(AtPoint::Headline(..)) => shift(ctx, doc, tree, delta, whole),
+        None => vec![Effect::None],
+    }
+}
+
+/// Re-indent the item at point, renumbering the list in the SAME edit.
+///
+/// The refusal is an echo, not silence: "nothing happened" is
+/// indistinguishable from an unbound key, and this key IS bound.
+fn meta_shift_item(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+    item: &list::Item,
+    delta: isize,
+    with_children: bool,
+) -> Vec<Effect> {
+    let l = |n: u32| doc.line(n);
+    let lists = list::Lists::new(tree, &l, doc.line_count());
+    let Some(changes) = list::shift_item(&lists, item.line, delta, with_children) else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: if delta < 0 {
+                "already at the outermost level".to_string()
+            } else {
+                "no item above to nest under".to_string()
+            },
+        })];
+    };
+
+    // The whole list, because renumbering restarts each level at 1 across the
+    // span it is given, and an indent MOVES an item between levels -- both the
+    // level it left and the one it joined have to be recounted.
+    let (ls, le) = lists
+        .list_span(item.line)
+        .unwrap_or((item.line, lists.item_end(item.line)));
+    let shifted = |n: u32| -> Option<String> {
+        changes
+            .iter()
+            .find(|(i, _)| *i == n)
+            .map(|(_, t)| t.clone())
+            .or_else(|| doc.line(n))
+    };
+    // `None` for the tree: the snapshot describes the buffer BEFORE the shift,
+    // and an item that just changed level is exactly what renumbering must see
+    // in its new place. Indent structure is all this needs.
+    let after = list::Lists::new(None, &shifted, doc.line_count());
+    let renumbered = list::renumber(&after, (ls, le));
+
+    let mut out: Vec<String> = Vec::new();
+    for n in ls..=le {
+        let Some(base) = shifted(n) else { break };
+        out.push(
+            renumbered
+                .iter()
+                .find(|(i, _)| *i == n)
+                .map(|(_, t)| t.clone())
+                .unwrap_or(base),
+        );
+    }
+    let Some(last) = doc.line(le) else {
+        return vec![Effect::None];
+    };
+    // The caret rides the item: its line is unchanged, but its column moved
+    // with the indent, and leaving it behind would put it inside the bullet.
+    let moved = changes
+        .iter()
+        .find(|(i, _)| *i == item.line)
+        .map(|(_, t)| list::indent_of_public(t))
+        .unwrap_or(item.indent);
+    let cursor = Position {
+        line: item.line,
+        byte: (ctx.cursor.byte as i64 + moved as i64 - item.indent as i64).max(0) as u32,
+    };
+    replace_lines(ctx, ls, le, last.len() as u32, out.join("\n"), cursor)
+}
+
 /// `<leader>oi` — a heading one level DEEPER, after the existing children.
 ///
 /// Respect-content for the same reason [`meta_return`] has it: inserting
@@ -6391,6 +6530,10 @@ impl GrammarCallbacks for Component {
             MOVE_SUBTREE_DOWN => Ok(move_subtree(&ctx, doc, tree, false)),
             META_RETURN => Ok(meta_return(&ctx, doc, tree)),
             INSERT_TODO_HEADING => Ok(insert_todo_heading(&ctx, doc, tree)),
+            META_LEFT => Ok(meta_shift(&ctx, doc, tree, -1, false)),
+            META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, false)),
+            SHIFT_META_LEFT => Ok(meta_shift(&ctx, doc, tree, -1, true)),
+            SHIFT_META_RIGHT => Ok(meta_shift(&ctx, doc, tree, 1, true)),
             INSERT_SUBHEADING => Ok(insert_subheading(&ctx, doc, tree)),
             TOGGLE_HEADING => Ok(toggle_heading(&ctx, doc, tree)),
             ARCHIVE_SUBTREE => Ok(archive_subtree(&ctx, doc, tree)),

@@ -228,6 +228,12 @@ pub fn parse_bullet(line: &str, indent: usize) -> Option<Item> {
     parse_line(line, indent).map(|p| p.item)
 }
 
+/// The public peer of [`indent_of`], for callers outside this module that need
+/// to read an indent off a line this module produced.
+pub fn indent_of_public(text: &str) -> usize {
+    indent_of(text)
+}
+
 fn indent_of(text: &str) -> usize {
     text.len() - text.trim_start().len()
 }
@@ -933,4 +939,199 @@ mod tests {
             assert_eq!(renumber(lists, (0, 1)), vec![(1, "2. [ ] b".to_string())]);
         });
     }
+
+    // ── OS.6: shift_item ──────────────────────────────────────────────────
+
+    #[test]
+    fn indenting_an_item_carries_its_children() {
+        over("- a\n- b\n  - b-a\n", |lists| {
+            let out = shift_item(lists, 1, 1, true).unwrap();
+            assert_eq!(
+                out,
+                vec![(1, "  - b".to_string()), (2, "    - b-a".to_string())]
+            );
+        });
+    }
+
+    /// Without `with_children` the nested item stays where it is — the same
+    /// split `<leader>ol` / `<leader>oL` make for a headline and its subtree.
+    #[test]
+    fn indenting_without_children_leaves_them_behind() {
+        over("- a\n- b\n  - b-a\n", |lists| {
+            let out = shift_item(lists, 1, 1, false).unwrap();
+            assert_eq!(out, vec![(1, "  - b".to_string())]);
+        });
+    }
+
+    /// A continuation line is the item's own text and always travels with it,
+    /// children or not — otherwise the wrap would detach from its bullet.
+    #[test]
+    fn a_continuation_line_travels_with_its_item() {
+        over("- a\n- b\n  more b\n", |lists| {
+            let out = shift_item(lists, 1, 1, false).unwrap();
+            assert_eq!(
+                out,
+                vec![(1, "  - b".to_string()), (2, "    more b".to_string())]
+            );
+        });
+    }
+
+    /// The new indent is the previous sibling's CONTENT column, not a fixed
+    /// step: under `2. b` that is 3, so the nested item lines up with the text
+    /// it belongs to.
+    #[test]
+    fn the_new_indent_is_the_previous_siblings_content_column() {
+        over("1. a\n2. b\n1. c\n", |lists| {
+            let out = shift_item(lists, 2, 1, true).unwrap();
+            assert_eq!(out, vec![(2, "   1. c".to_string())]);
+        });
+    }
+
+    /// §5.6.6: an outdent at column zero is REFUSED, not silently turned into a
+    /// headline. `<leader>o*` is how an item becomes a headline and it is a
+    /// different gesture on purpose.
+    #[test]
+    fn outdenting_a_top_level_item_is_refused() {
+        over("- a\n", |lists| {
+            assert!(shift_item(lists, 0, -1, true).is_none());
+        });
+    }
+
+    /// The first item of a list has nothing to nest under, and inventing a
+    /// parent would produce a sublist with no owner.
+    #[test]
+    fn indenting_the_first_item_of_a_list_is_refused() {
+        over("- a\n- b\n", |lists| {
+            assert!(shift_item(lists, 0, 1, true).is_none());
+        });
+    }
+
+    #[test]
+    fn outdenting_returns_to_the_parents_own_indent() {
+        over("- a\n  - a-a\n", |lists| {
+            let out = shift_item(lists, 1, -1, true).unwrap();
+            assert_eq!(out, vec![(1, "- a-a".to_string())]);
+        });
+    }
+}
+
+/// The last line of the item at `start` NOT counting its nested children —
+/// the item's own text plus its continuation lines.
+///
+/// The peer of [`Lists::item_end`], which includes children. The two exist
+/// because the meta-arrows split exactly there: `<M-Right>` indents the item,
+/// `<M-S-Right>` indents the item and everything under it, and that is the same
+/// split `<leader>ol` / `<leader>oL` already make for headlines.
+fn own_end(lists: &Lists<'_>, item: &Item) -> u32 {
+    let mut end = item.line;
+    for n in (item.line + 1)..lists.line_count {
+        let Some(text) = lists.text(n) else { break };
+        if text.trim().is_empty() {
+            break;
+        }
+        if crate::headline::headline_level(&text).is_some() {
+            break;
+        }
+        // A deeper BULLET is a child; a deeper non-bullet line is this item's
+        // own wrapped text.
+        if lists.item_at(n).is_some() {
+            break;
+        }
+        if indent_of(&text) <= item.indent {
+            break;
+        }
+        end = n;
+    }
+    end
+}
+
+/// The indent an outdent moves to: the enclosing parent item's own indent.
+fn parent_indent(lists: &Lists<'_>, item: &Item) -> usize {
+    let mut n = item.line;
+    while n > 0 {
+        n -= 1;
+        let Some(text) = lists.text(n) else { break };
+        if text.trim().is_empty() {
+            continue;
+        }
+        if crate::headline::headline_level(&text).is_some() {
+            break;
+        }
+        if let Some(above) = lists.item_at(n) {
+            if above.indent < item.indent {
+                return above.indent;
+            }
+        }
+    }
+    0
+}
+
+/// Re-indent the item at `start` by `delta` levels, carrying its continuation
+/// lines and — when `with_children` — its nested items. Answers only the lines
+/// that CHANGE, so a caller can fold them into one edit. `None` when the shift
+/// is refused.
+///
+/// A "level" is not a fixed number of spaces. Indenting nests the item under
+/// its previous sibling, so the new indent is that sibling's CONTENT column:
+/// under `- a` that is 2, under `2. b` it is 3. Using a fixed step would leave
+/// an item that does not line up with the text it belongs to, which is what
+/// org's own indentation means.
+///
+/// Refused, each for its own reason:
+/// - **an outdent at column zero** — §5.6.6. A top-level item has nowhere to go,
+///   and silently turning it into a headline would be a restructure from a key
+///   that means "move left". `<leader>o*` is how an item becomes a headline and
+///   it is a different gesture on purpose.
+/// - **an indent with no previous sibling** — the first item of a list has
+///   nothing to nest under, and inventing a parent would produce a sublist with
+///   no owner.
+pub fn shift_item(
+    lists: &Lists<'_>,
+    start: u32,
+    delta: isize,
+    with_children: bool,
+) -> Option<Vec<(u32, String)>> {
+    let item = lists.item_at(start)?;
+    let target = match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            let prev = lists
+                .siblings(start)
+                .into_iter()
+                .take_while(|&n| n < start)
+                .last()?;
+            lists.item_at(prev)?.content_byte as usize
+        }
+        std::cmp::Ordering::Less => {
+            if item.indent == 0 {
+                return None;
+            }
+            parent_indent(lists, &item)
+        }
+        std::cmp::Ordering::Equal => return None,
+    };
+    let shift = target as isize - item.indent as isize;
+    if shift == 0 {
+        return None;
+    }
+
+    let end = if with_children {
+        lists.item_end(start)
+    } else {
+        own_end(lists, &item)
+    };
+    let mut out = Vec::new();
+    for n in start..=end {
+        let Some(text) = lists.text(n) else { break };
+        if text.trim().is_empty() {
+            continue;
+        }
+        // `max(0)`: an outdent whose carried children sit shallower than the
+        // shift would otherwise underflow. Clamping keeps the block's shape.
+        let new_indent = (indent_of(&text) as isize + shift).max(0) as usize;
+        out.push((
+            n,
+            format!("{}{}", " ".repeat(new_indent), text.trim_start()),
+        ));
+    }
+    Some(out)
 }

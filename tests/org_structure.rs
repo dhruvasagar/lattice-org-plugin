@@ -379,6 +379,21 @@ fn goto(editor: &mut Editor, line: u32, byte: u32) {
     editor.cursor.byte = byte;
 }
 
+fn line_at(editor: &Editor, n: u32) -> String {
+    text(editor)
+        .lines()
+        .nth(n as usize)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The most recent `Effect::Echo`. Every refusal test needs it: asserting
+/// "nothing changed" alone passes against a chord that is simply unbound, which
+/// is the opposite of what a refusal test is for.
+fn last_echo(editor: &Editor) -> Option<String> {
+    editor.last_message.as_ref().map(|m| m.text.clone())
+}
+
 fn cursor(editor: &Editor) -> (u32, u32) {
     (editor.cursor.line, editor.cursor.byte)
 }
@@ -5204,4 +5219,123 @@ async fn insert_subheading_declines_in_the_preamble() {
     goto(&mut editor, 0, 0);
     press(&mut editor, "<leader>oi");
     assert_eq!(text(&editor), "just prose\n");
+}
+
+// ── OS.6: the Meta-arrows — promote/demote IS indent/outdent ───────────────
+
+/// One gesture, two verbs, chosen by what is under the cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_right_demotes_a_headline_and_indents_an_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n- milk\n- eggs\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Right>");
+    assert_eq!(line_at(&editor, 0), "** One");
+
+    goto(&mut editor, 2, 0);
+    press(&mut editor, "<M-Right>");
+    assert_eq!(line_at(&editor, 2), "  - eggs");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_left_promotes_a_headline_and_outdents_an_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "** Two\n- a\n  - a-a\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Left>");
+    assert_eq!(line_at(&editor, 0), "* Two");
+
+    goto(&mut editor, 2, 0);
+    press(&mut editor, "<M-Left>");
+    assert_eq!(line_at(&editor, 2), "- a-a");
+}
+
+/// The existing refusal, reached through the NEW gesture — proving the arm
+/// routes to the same body rather than reimplementing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_left_refuses_to_promote_a_level_one_subtree() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* One\n** Child\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-S-Left>");
+    assert_eq!(text(&editor), "* One\n** Child\n", "refused whole");
+    assert!(last_echo(&editor).is_some(), "and it says so");
+}
+
+/// A column-zero item refuses too, and for its own reason — §5.6.6. Asserting
+/// only "unchanged" would pass against an unbound key, so the echo is the point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_left_refuses_to_outdent_a_top_level_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "<M-Left>");
+    assert_eq!(
+        text(&editor),
+        "- a\n",
+        "not silently turned into a headline"
+    );
+    assert!(last_echo(&editor).is_some(), "and it says so");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn indenting_into_an_ordered_sublist_renumbers_it() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "1. a\n2. b\n1. c\n").await;
+
+    goto(&mut editor, 2, 0);
+    press(&mut editor, "<M-Right>");
+    assert_eq!(text(&editor), "1. a\n2. b\n   1. c\n");
+}
+
+/// `<M-S-Right>` takes the children; `<M-Right>` leaves them. The same split
+/// `<leader>ol` / `<leader>oL` make for a headline and its subtree.
+///
+/// **This is OS.6 paying the tree-coverage debt**: `siblings` and `item_end`
+/// have no integration reach until a chord routes to them, and the corrected
+/// plan table makes that a requirement of this slice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_right_carries_children_and_meta_right_does_not() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- a\n- b\n  - b-a\n").await;
+
+    goto(&mut editor, 1, 0);
+    press(&mut editor, "<M-S-Right>");
+    assert_eq!(
+        text(&editor),
+        "- a\n  - b\n    - b-a\n",
+        "the child came along"
+    );
+
+    let base2 = tempfile::tempdir().unwrap();
+    let mut editor2 = org_editor(base2.path(), "- a\n- b\n  - b-a\n").await;
+    goto(&mut editor2, 1, 0);
+    press(&mut editor2, "<M-Right>");
+    assert_eq!(
+        text(&editor2),
+        "- a\n  - b\n  - b-a\n",
+        "the child stayed where it was"
+    );
 }

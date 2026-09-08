@@ -1203,6 +1203,19 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             } => {
                 editor.open_prompt_line(prompt, initial, on_submit_action, buffer_name);
             }
+            // OR.7c: the insert picker's whole payload. `handle_effect` DEFERS
+            // an `ApplyEdit` onto `next_actions` for the renderer to
+            // re-dispatch, so a harness that only walked `out.effects` would
+            // drop it — and a link that never lands is indistinguishable from
+            // a picker that never accepted.
+            lattice_grammar::Effect::ApplyEdit {
+                target,
+                edit,
+                cursor,
+            } => {
+                editor.apply_edit_effect_inline(target, edit, cursor);
+                editor.run_tick_pending();
+            }
             other => {
                 eprintln!("unapplied accept effect: {other:?}");
             }
@@ -2923,6 +2936,158 @@ async fn without_templates_a_note_is_still_the_built_in_stub() {
             .and_then(|p| p.transient.as_ref())
             .is_none(),
         "no menu is shown when nothing is configured"
+    );
+}
+
+// ── OR.7c: `C-c n i`, the insert-mode link picker ───────────────────────────
+
+/// Open the INSERT picker, the peer of [`open_find_node`]. Same
+/// open-once discipline and the same reason for it.
+async fn open_insert_node(editor: &mut Editor) -> Vec<String> {
+    let _ = editor.open_picker("org-roam-insert".to_string(), Vec::new());
+    for _ in 0..settle_budget(200) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        editor.run_tick_pending();
+        let rows: Vec<String> = editor
+            .picker
+            .as_ref()
+            .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+    }
+    Vec::new()
+}
+
+/// Type a chord sequence the way the user does — through the dispatcher, so
+/// the modal state gates it. Poking the trie answers a different question from
+/// "does this key work where I press it".
+///
+/// **`dispatch_chord_with_outcome`, and the effects are APPLIED.** The plain
+/// `dispatch_chord` builds the outcome and drops it, so a chord whose whole
+/// job is to return `Effect::OpenPicker` appears to do nothing — which is
+/// indistinguishable from an unbound key and is the exact trap
+/// `dispatch_chord_with_outcome`'s own doc comment was added for.
+fn press(editor: &mut Editor, keys: &str) {
+    let seq = lattice_protocol::parse_chord_sequence(keys).expect("parses");
+    let mut partial = Vec::new();
+    for c in seq {
+        let (_action, out) = editor.dispatch_chord_with_outcome(c, &mut partial);
+        apply_accept_effects(editor, out);
+    }
+}
+
+/// Put `text` in the buffer and seat the caret at `byte` on line 0.
+fn seed_line(editor: &mut Editor, text: &str, byte: u32) {
+    let target = editor.document_buffer_id;
+    editor.cursor = lattice_protocol::position::Position { line: 0, byte: 0 };
+    editor.apply_edit_effect_inline(
+        target,
+        lattice_protocol::edit::Edit::insert(editor.cursor, text.to_string()),
+        None,
+    );
+    editor.run_tick_pending();
+    editor.cursor = lattice_protocol::position::Position { line: 0, byte };
+}
+
+/// **`C-c n i` opens the picker from INSERT, and not from Normal.**
+///
+/// Pressed as a chord rather than asserted against the trie, because the
+/// modal scoping IS the behaviour under test — an `ibind` left as `bind`
+/// passes every other test in this file and fails only here.
+///
+/// The Normal half is not symmetry-for-its-own-sake: "insert at the cursor"
+/// has no answer a user would predict when the caret sits ON a glyph rather
+/// than between two, so the chord is deliberately absent there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_insert_chord_fires_in_insert_and_not_in_normal() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+
+    // Normal first, so a picker opened here cannot be mistaken for one the
+    // Insert press opened.
+    press(&mut editor, "<C-c>ni");
+    editor.run_tick_pending();
+    assert!(
+        editor.picker.is_none(),
+        "the chord is absent in Normal, where inserting at the caret is \
+         ambiguous"
+    );
+
+    editor.enter_mode(lattice_grammar::ModalState::Insert);
+    press(&mut editor, "<C-c>ni");
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if editor.picker.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        editor.picker.is_some(),
+        "`C-c n i` fires where a link is actually inserted — mid-sentence, \
+         in Insert"
+    );
+}
+
+/// **The link lands AT the caret**, with the rest of the line intact around it.
+///
+/// The caret is put part-way along a line on purpose. A test that inserted at
+/// column 0 of an empty buffer would pass against an implementation that
+/// ignored the cursor entirely, which is the failure most worth catching here
+/// — the picker seam has no cursor of its own, so the position has to survive
+/// a round trip out to the picker and back through an ex-command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insert_node_puts_the_link_at_the_cursor() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert!(settle(|| index.nodes().len() >= 4).await);
+
+    // A sentence with a gap in the middle, and the caret in the gap.
+    seed_line(&mut editor, "see  for more\n", 4);
+    editor.enter_mode(lattice_grammar::ModalState::Insert);
+
+    let rows = open_insert_node(&mut editor).await;
+    assert!(!rows.is_empty(), "the insert picker offers the corpus");
+    let _ = query_picker(&mut editor, "Zettelkasten");
+
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    for _ in 0..settle_budget(80) {
+        editor.run_tick_pending();
+        if editor
+            .document
+            .snapshot()
+            .buffer
+            .as_string()
+            .contains("[[id:")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let text = editor.document.snapshot().buffer.as_string();
+    assert!(
+        text.starts_with("see [[id:"),
+        "the link lands at the caret, not at the start or the end: {text:?}"
+    );
+    assert!(
+        text.contains("][Zettelkasten]] for more"),
+        "the description is the node title, and the tail of the line survives \
+         after it: {text:?}"
     );
 }
 

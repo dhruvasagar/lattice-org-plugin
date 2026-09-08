@@ -3103,6 +3103,107 @@ async fn a_template_without_questions_still_captures_in_one_hop() {
     assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
 }
 
+/// OC.10 — **`C-c C-c` files the capture from INSERT**, without an `<Esc>` first.
+///
+/// A capture buffer is one you arrive in already typing: the template seats
+/// the caret at `%?`. Requiring Normal before the commit chord makes it the
+/// only key in the flow that asks you to leave the mode you are in, which is
+/// friction emacs does not have — `org-capture-mode-map` is a minor-mode map
+/// and lives while you type.
+///
+/// Pressed as a chord from Insert rather than dispatched by name, because the
+/// modal scoping is the whole of what is under test. It is also a regression
+/// guard for a HOST bug this pair sits on top of: Insert-mode chords were
+/// capped at depth two by `dispatch_insert`'s partial branch, and `<C-c><C-c>`
+/// is exactly depth two — one key deeper and it would have been unreachable
+/// while still resolving `Bound` in the trie.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capture_commit_chord_fires_from_insert_mode() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+    assert!(editor.buffers.by_name("*org-capture:t*").is_some());
+
+    // Type the entry, then commit WITHOUT leaving Insert.
+    let target = editor.active_pane_buffer_id();
+    let at = editor.cursor;
+    editor.apply_edit_effect_inline(
+        target,
+        lattice_protocol::edit::Edit::insert(at, "call the bank".to_string()),
+        None,
+    );
+    editor.run_tick_pending();
+    editor.enter_mode(lattice_grammar::ModalState::Insert);
+
+    press_chord(&mut editor, "<C-c><C-c>").await;
+    editor.run_tick_pending();
+
+    assert_eq!(
+        text_of(&editor, &notes),
+        "* TODO call the bank\n",
+        "the entry was filed from Insert, with no `<Esc>` in the way"
+    );
+    // OC.10's host half: the capture buffer is gone, and Insert did not
+    // outlive it — the successor must not be receiving keystrokes as text.
+    assert_eq!(
+        editor.modal,
+        lattice_grammar::ModalState::Normal,
+        "deleting the buffer you were typing in returns you to Normal"
+    );
+}
+
+/// The abort half, from Insert too — and it must write NOTHING.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capture_abort_chord_fires_from_insert_mode() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+    editor.enter_mode(lattice_grammar::ModalState::Insert);
+
+    press_chord(&mut editor, "<C-c><C-k>").await;
+    editor.run_tick_pending();
+
+    assert!(
+        !notes.exists(),
+        "an aborted capture creates nothing — and with OC.9 saving the target, \
+         this assertion can finally fail if it ever does"
+    );
+    assert!(
+        editor.buffers.by_name("*org-capture:t*").is_none(),
+        "the draft is gone"
+    );
+}
+
 /// OR.17 — `<Esc>` mid-flow abandons the WHOLE capture: no note, no draft, and
 /// — the harder half — no stale accumulator for the NEXT capture to inherit.
 ///

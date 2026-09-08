@@ -2384,7 +2384,6 @@ impl Guest for Component {
                 // a terminal binding in another is the ambiguity vim settles
                 // with `timeoutlen`, which this editor does not have.
                 bind("<leader>onf", "org-roam-find-node"),
-                bind("<leader>oni", "org-roam-insert-node"),
                 // OR.10 — the journal, under `<leader>ond…` because emacs
                 // org-roam puts it under `C-c n d` and the letters are the
                 // same: `d` today, `y` yesterday, `t` tomorrow, `D` a date you
@@ -2417,8 +2416,32 @@ impl Guest for Component {
                 // No collision with magit's buffer-local `<C-c><C-c>` /
                 // `<C-c><C-k>`: those continue on a different second key.
                 bind("<C-c>nf", "org-roam-find-node"),
-                // OR.7c: emacs' own binding for `org-roam-node-insert`.
-                bind("<C-c>ni", "org-roam-insert-node"),
+                // OR.7c: emacs' own binding for `org-roam-node-insert`, and
+                // **Insert-mode ONLY** — deliberately not a Normal peer.
+                //
+                // Inserting a link is a mid-sentence act. You are writing
+                // prose, you reach a thing that has a note, and you want the
+                // link at the caret. In Normal the caret sits ON a character
+                // rather than between two, so "insert at the cursor" has no
+                // answer a user would predict — the link lands before or after
+                // the glyph under the block cursor depending on which rule you
+                // pick, and neither is what they meant.
+                //
+                // It is also the whole reason OR.7 chose a completion source
+                // over this picker in the first place: a Normal-mode chord
+                // makes you leave Insert, pick, and come back. Binding it in
+                // Normal would reintroduce exactly the friction the picker
+                // exists to remove, and `<leader>oni` was dropped for the same
+                // reason rather than kept "for symmetry" with `<leader>onf`.
+                //
+                // `:org-roam-insert-node` stays reachable from `:` regardless
+                // — an ex-command is not a modal surface and costs nothing.
+                //
+                // Safe as an Insert binding for the reason OC.10's capture
+                // chords are: `<C-c>` is a PREFIX and not a terminal in Insert
+                // (`keymap_insert` binds a/e/b/f/w/u/k/t/d/n/p/y/r/o/s and no
+                // `c`), so nothing that already worked is shadowed.
+                ibind("<C-c>ni", "org-roam-insert-node"),
                 bind("<C-c>ndd", "org-roam-dailies-today"),
                 bind("<C-c>ndy", "org-roam-dailies-yesterday"),
                 bind("<C-c>ndt", "org-roam-dailies-tomorrow"),
@@ -3250,18 +3273,39 @@ impl Guest for Component {
             CLOCK_PARSE,
             ROAM_INSERT_NODE,
         );
+        // Both of these CARRY a payload, so neither can use `CLOCK_PARSE` —
+        // that parser refuses arguments outright, and an `invoke-command`
+        // accept whose args it rejects fails at the parse hop with
+        // "this command takes no arguments". The picker looks like it accepted
+        // and nothing happens.
+        //
+        // `ROAM_CREATE_PARSE` is the existing string-taking parser
+        // `:org-roam-create-node` uses for exactly this reason: it is reached
+        // by a picker row carrying a title, not usually typed.
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-insert-link",
-            "Insert an already-resolved org-roam link at the cursor (dispatched by the picker).",
-            &clock_ex(),
-            CLOCK_PARSE,
+            "Insert an already-resolved org-roam link at the cursor. Dispatched by              `:org-roam-insert-node`'s picker, not usually typed.",
+            &lattice::plugin_host::types::ExCommandSpec {
+                latency_class: LatencyClass::Reflex,
+                accepts_bang: false,
+                accepts_range: false,
+                args_schema: Vec::new(),
+                surface_form: SurfaceForm::Keyword,
+            },
+            ROAM_CREATE_PARSE,
             ROAM_INSERT_LINK,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-create-and-insert",
-            "Create an org-roam note and link it from the cursor (dispatched by the picker).",
-            &clock_ex(),
-            CLOCK_PARSE,
+            "Create an org-roam note and link it from the cursor. Dispatched by              `:org-roam-insert-node`'s create row, not usually typed.",
+            &lattice::plugin_host::types::ExCommandSpec {
+                latency_class: LatencyClass::Reflex,
+                accepts_bang: false,
+                accepts_range: false,
+                args_schema: Vec::new(),
+                surface_form: SurfaceForm::Keyword,
+            },
+            ROAM_CREATE_PARSE,
             ROAM_CREATE_AND_INSERT,
         );
         lattice::plugin_host::grammar::register_ex_command(

@@ -107,6 +107,10 @@ impl Now {
             month: self.month,
             day: self.day,
             time: Some((self.hour, self.minute)),
+            // A clock stamp is a POINT — the moment the clock was punched.
+            // The range in a `CLOCK:` line is two of these with a `--`
+            // between them, which `clock_scan` reads as two stamps.
+            time_end: None,
             // A clock stamp never repeats: it records when something
             // happened, and an instant does not recur.
             cookies: Vec::new(),

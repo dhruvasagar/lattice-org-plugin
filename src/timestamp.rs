@@ -38,8 +38,23 @@ pub struct Stamp {
     pub year: i32,
     pub month: u32,
     pub day: u32,
-    /// `None` for a date-only stamp.
+    /// `None` for a date-only stamp. For a RANGE (`10:00-11:00`) this is the
+    /// start and [`time_end`](Self::time_end) is the end.
     pub time: Option<(u32, u32)>,
+    /// OA.30: the end of a time RANGE — `<2026-09-08 Tue 10:00-11:00>`.
+    ///
+    /// **Before this existed a ranged stamp did not parse AT ALL**, and the
+    /// failure was silent in the worst way: `parse_inner` split `10:00-11:00`
+    /// on its first `:`, tried to read `"00-11:00"` as the minute, and
+    /// returned `None` for the whole stamp — so the entry became UNDATED and
+    /// dropped out of the agenda entirely rather than merely losing its time.
+    /// A ranged appointment is one of org's most ordinary stamps, and it was
+    /// invisible.
+    ///
+    /// `None` for a point-in-time stamp. Never `Some` while
+    /// [`time`](Self::time) is `None` — an end with no start is not a thing
+    /// org can write, and `parse_inner` cannot produce one.
+    pub time_end: Option<(u32, u32)>,
     /// The repeater / warning cookies trailing the time, in the order they
     /// were written — `+3m`, `++3m`, `.+1d/3d`, `-2d`.
     ///
@@ -176,15 +191,27 @@ fn parse_inner(inner: &str) -> Option<Stamp> {
     // Anything after the date is an optional day name, an optional time, and
     // any number of repeater / warning cookies.
     let mut time = None;
+    let mut time_end = None;
     let mut cookies = Vec::new();
     for p in parts {
-        if let Some((h, m)) = p.split_once(':') {
-            let h: u32 = h.parse().ok()?;
-            let m: u32 = m.parse().ok()?;
-            if h > 23 || m > 59 {
-                return None;
+        if p.contains(':') {
+            // OA.30: a range splits on `-` FIRST. Reading the whole part as
+            // one clock time is what made `10:00-11:00` fail to parse and take
+            // the entry's date down with it.
+            //
+            // Split on the first `-` only, and only when what follows also
+            // looks like a clock — a trailing `-2d` warning cookie is
+            // whitespace-separated and never reaches here, but being strict
+            // about the right-hand side costs nothing and keeps a malformed
+            // range from being read as a bare time.
+            let (lhs, rhs) = match p.split_once('-') {
+                Some((l, r)) if r.contains(':') => (l, Some(r)),
+                _ => (p, None),
+            };
+            time = Some(parse_clock(lhs)?);
+            if let Some(r) = rhs {
+                time_end = Some(parse_clock(r)?);
             }
-            time = Some((h, m));
         } else if p.starts_with(['+', '-', '.']) {
             // A cookie, by its first character — `+1w`, `++3m`, `.+1d/3d`,
             // `-2d`. The day name is alphabetic and falls through here, which
@@ -201,8 +228,21 @@ fn parse_inner(inner: &str) -> Option<Stamp> {
         month,
         day,
         time,
+        time_end,
         cookies,
     })
+}
+
+/// OA.30: `HH:MM` — one clock time, range-checked.
+///
+/// Split out of [`parse_inner`] because a range needs it twice and the two
+/// halves must be validated identically; an end time that skipped the
+/// `h > 23` check would round-trip through [`render`] as a different stamp.
+fn parse_clock(s: &str) -> Option<(u32, u32)> {
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    (h <= 23 && m <= 59).then_some((h, m))
 }
 
 /// Which component `byte` sits on, within `stamp`.
@@ -337,6 +377,12 @@ pub fn render(s: &Stamp) -> String {
         ),
         None => format!("{open}{:04}-{:02}-{:02} {dow}", s.year, s.month, s.day),
     };
+    // OA.30: the range's end, written back for the reason cookies are —
+    // dropping it would turn `<C-a>` on a 10:00-11:00 meeting into "move the
+    // date and forget when it ends", and the line does not look wrong after.
+    if let Some((h, m)) = s.time_end {
+        out.push_str(&format!("-{h:02}:{m:02}"));
+    }
     for cookie in &s.cookies {
         out.push(' ');
         out.push_str(cookie);
@@ -367,6 +413,77 @@ mod tests {
         );
         // The day name is optional on input.
         assert_eq!(at("<2026-08-25>", 2).day, 25);
+    }
+
+    /// OA.30 — **a time RANGE parses at all.**
+    ///
+    /// This is a regression test for a silent data-loss bug, not a feature
+    /// test. `parse_inner` used to split `10:00-11:00` on its first `:`, try
+    /// to read `"00-11:00"` as the minute, and return `None` for the WHOLE
+    /// stamp — so `<2026-09-08 Tue 10:00-11:00>` did not merely lose its
+    /// time, it stopped being a date. The entry became undated and dropped
+    /// out of the agenda's dated sections entirely.
+    #[test]
+    fn a_time_range_parses_into_a_start_and_an_end() {
+        let s = at("<2026-09-08 Tue 10:00-11:30>", 2);
+        assert_eq!(
+            (s.year, s.month, s.day, s.time, s.time_end),
+            (2026, 9, 8, Some((10, 0)), Some((11, 30)))
+        );
+        assert!(s.active);
+    }
+
+    /// A point-in-time stamp has no end — an absent range and a zero-length
+    /// one are different facts, and `render` must not turn `14:00` into
+    /// `14:00-14:00`.
+    #[test]
+    fn a_point_in_time_stamp_has_no_end() {
+        assert_eq!(at("<2026-09-08 Tue 14:00>", 2).time_end, None);
+        assert_eq!(at("<2026-09-08 Tue>", 2).time_end, None);
+    }
+
+    /// A range survives a round trip, which is what stops `<C-a>` on a
+    /// 10:00-11:00 meeting from meaning "move the date and forget when it
+    /// ends" — the same failure dropping the cookies used to cause.
+    #[test]
+    fn a_range_round_trips_through_render() {
+        let line = "<2026-09-08 Tue 10:00-11:30>";
+        assert_eq!(render(&at(line, 2)), line);
+        // …including alongside a repeater, which sorts after the time.
+        let with_cookie = "<2026-09-08 Tue 10:00-11:30 +1w>";
+        assert_eq!(render(&at(with_cookie, 2)), with_cookie);
+    }
+
+    /// Stepping the DAY of a ranged stamp keeps the range. The bug this
+    /// forbids is the one `cookies` already documents, one field over.
+    #[test]
+    fn stepping_a_ranged_stamp_keeps_its_range() {
+        let line = "<2026-09-08 Tue 10:00-11:30>";
+        let s = at(line, 2);
+        let out = step(line, &s, Part::Day, 1);
+        assert!(
+            out.contains("10:00-11:30"),
+            "the range must survive a date step: {out}"
+        );
+        assert!(out.contains("2026-09-09"), "and the day moved: {out}");
+    }
+
+    /// A malformed range is refused as a range rather than silently read as a
+    /// bare time — `10:00-` and `10:00-xx` have no end, and inventing one
+    /// would write a stamp the user did not type.
+    #[test]
+    fn a_malformed_range_does_not_become_a_bare_time() {
+        // No `:` on the right — not a range at all, so the whole part must
+        // fail to parse as a clock rather than yielding `10:00`.
+        assert!(stamp_at("<2026-09-08 Tue 10:00-xx>", 2).is_none());
+    }
+
+    /// An out-of-range END is rejected like an out-of-range start. Both halves
+    /// go through one validator precisely so they cannot disagree.
+    #[test]
+    fn an_impossible_end_time_is_refused() {
+        assert!(stamp_at("<2026-09-08 Tue 10:00-25:00>", 2).is_none());
+        assert!(stamp_at("<2026-09-08 Tue 10:00-11:99>", 2).is_none());
     }
 
     #[test]

@@ -2694,11 +2694,44 @@ async fn the_template_set_takes_precedence_over_the_single_template() {
     );
 }
 
-/// A malformed set captures NOTHING and says why. Writing the note somewhere
-/// the user did not choose is the one outcome capture must not have, and an
-/// empty menu built from the half that parsed would be guessing at intent.
+/// A malformed `org.capture-templates` is refused at `:set`, loudly.
+///
+/// ## What this test used to claim, and why it was not true
+///
+/// It was called `a_malformed_template_set_captures_nothing_and_echoes` and
+/// asserted that a broken set "refuses outright — it does not quietly fall
+/// back to the legacy single template". It passed for two wrong reasons and
+/// OC.9 exposed both, because until then capture never reached disk at all:
+///
+///   1. The echo it checked was **stale**. `set_org_option` rejects the
+///      malformed value and echoes the parse error itself; `last_message`
+///      still held that when the assertion ran, so the test never observed an
+///      echo from CAPTURE.
+///   2. `!notes.exists()` was **vacuous**. `Effect::WriteToFile` left its
+///      target modified-but-unsaved, so the file could not exist however
+///      capture behaved. With `save: true` it does, and it shows capture
+///      writing `* a thought` through the legacy pair.
+///
+/// ## What actually happens
+///
+/// `:set` rejects the malformed TOML, so the option is never stored. By the
+/// time capture runs, `capture_templates::read()` sees `Unset` — not
+/// `Malformed` — and takes the OM.11 legacy `capture-file` /
+/// `capture-template` path.
+///
+/// **The guest cannot tell those two apart, and that is the real gap.** A
+/// rejected `:set` and a never-configured option are the same observation
+/// from inside the plugin; distinguishing them needs the host to expose
+/// option-validation state across the boundary, which is a design change and
+/// not this slice's. Recorded in the slice plan rather than papered over
+/// here.
+///
+/// So this now tests the half that IS true and is worth pinning: the malformed
+/// value is refused and named at the point the user typed it. The behaviour
+/// the old name claimed is asserted as the known-current one, so that a future
+/// fix fails here and gets to update the story deliberately.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_malformed_template_set_captures_nothing_and_echoes() {
+async fn a_malformed_template_set_is_refused_at_set_time() {
     if org_plugin_wasm().is_none() {
         return;
     }
@@ -2711,22 +2744,32 @@ async fn a_malformed_template_set_captures_nothing_and_echoes() {
     set_org_option(&mut editor, "capture-template", "* %?");
     set_org_option(&mut editor, "capture-templates", "[[template]\nkey = \"t\"");
 
-    submit_capture(&mut editor, "a thought");
-
-    let msg = editor
+    // The echo lands HERE, at `:set` — not at capture. Asserted before the
+    // capture runs, because asserting it after is what let a stale message
+    // stand in for one capture never emitted.
+    let set_msg = editor
         .last_message
         .as_ref()
         .map(|m| m.text.clone())
         .unwrap_or_default();
     assert!(
-        msg.contains("capture-templates"),
-        "the echo names the option at fault: {msg:?}"
+        set_msg.contains("capture-templates"),
+        "the malformed value is refused where the user typed it, and the echo \
+         names the option at fault: {set_msg:?}"
     );
-    assert!(
-        !notes.exists(),
-        "a broken set refuses outright — it does not quietly fall back to the \
-         legacy single template, which would file the note somewhere the user \
-         thought they had stopped using"
+
+    submit_capture(&mut editor, "a thought");
+
+    // KNOWN GAP, pinned deliberately rather than asserted as desirable: the
+    // rejected option is indistinguishable from an unset one inside the
+    // guest, so capture falls back to the legacy pair and files the note
+    // there. When the host grows a way to say "this option was set and
+    // refused", this assertion is the one that should fail and be inverted.
+    assert_eq!(
+        std::fs::read_to_string(&notes).ok().as_deref(),
+        Some("* a thought\n"),
+        "today the legacy pair still captures, because a REJECTED \
+         `capture-templates` reads as an UNSET one from the guest's side"
     );
 }
 

@@ -2455,6 +2455,26 @@ impl Guest for Component {
             keymap: vec![
                 bind("<C-c><C-c>", "org-capture-finalize"),
                 bind("<C-c><C-k>", "org-capture-abort"),
+                // OC.10 — the same two chords in INSERT.
+                //
+                // A capture buffer is one you arrive in already typing: the
+                // template puts the caret at `%?` and the whole interaction is
+                // "write the entry, file it". Requiring `<Esc>` first means
+                // the commit chord is the one key in the flow that needs you
+                // to leave the mode you are in to reach it, which is exactly
+                // the friction emacs does not have — `org-capture-mode-map`
+                // is a minor-mode map and minor-mode maps are live while you
+                // type.
+                //
+                // Safe to bind here for the reason the Normal pair is safe:
+                // this minor activates on ONE buffer, and `<C-c>` is a PREFIX
+                // rather than a terminal in Insert (`keymap_insert` binds
+                // a/e/b/f/w/u/k/t/d/n/p/y/r/o/s and no `c`), so nothing that
+                // already worked is shadowed. A depth-1 `<C-c>` binding would
+                // have made both of these unreachable — see the `<C-g>`
+                // cancel-chord note in `keymap_cancel.rs`.
+                ibind("<C-c><C-c>", "org-capture-finalize"),
+                ibind("<C-c><C-k>", "org-capture-abort"),
             ],
             target_language: None,
             // The capture buffer opens EXPANDED, overriding the `foldlevel=0`
@@ -3911,12 +3931,14 @@ impl Guest for Component {
                     );
                     agenda::entries_for_row(&row, &state.sections, &state.keywords, state.today)
                         .into_iter()
-                        .map(move |(group, label, sort_key)| Entry {
+                        .map(move |e| Entry {
                             line: row.line,
                             end_line: row.end_line,
-                            group,
-                            label,
-                            sort_key,
+                            group: e.key,
+                            label: e.label,
+                            sort_key: e.sort_key,
+                            // MH.A6: today's band.
+                            emphasis: e.emphasis,
                             spans: spans.clone(),
                             annotation: annotation.clone().map(|a| {
                                 lattice::plugin_host::scanned_excerpt_source::Annotation {
@@ -3976,6 +3998,12 @@ impl Guest for Component {
                             agenda::group_label(event.day, state.today)
                         ),
                         sort_key: agenda::log_sort_key(rank, event.day, event.within_day()),
+                        // MH.A6: a log block is never the emphasised one, even
+                        // on today. It answers "what happened", and the
+                        // emphasis marks the block you are meant to ACT on —
+                        // lifting a record of the past would compete with the
+                        // plan for exactly the attention the plan wants.
+                        emphasis: false,
                         // The headline's own colouring, exactly as a plan row
                         // gets it — a log row IS a headline, and painting it
                         // differently would make one task look like two.
@@ -5103,6 +5131,12 @@ fn archive_subtree(
         // The archive file sits BESIDE the source (`<this file>_archive`),
         // so its directory is the one the buffer is already open in.
         create_parents: false,
+        // OC.9: NOT saved, matching emacs — `org-archive-subtree` leaves the
+        // archive buffer modified and the user writes it. An archive moves
+        // text you were just looking at, so review before it hits disk is the
+        // point rather than an omission. (Capture is the opposite case: you
+        // are finished with it.)
+        save: false,
     })]
 }
 
@@ -5526,6 +5560,18 @@ fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
         // exactly the case the host's refusal exists for: a typo must not
         // silently build a tree.
         create_parents: false,
+        // OC.9 — **the one site in org that asks.** `C-c C-c` is a COMMIT:
+        // the buffer is dismissed on finalize, so a target left modified is
+        // one the user cannot see and will be asked about at `:q` without
+        // knowing why. Emacs agrees by default — `org-capture-finalize` runs
+        // `(unless (org-capture-get :no-save) (save-buffer))`.
+        //
+        // It is also what makes a captured TODO visible to `gr`: the agenda
+        // scan reads files from disk, so an unsaved capture cannot appear in
+        // a refresh however correct the buffer is.
+        //
+        // Archive and refile below deliberately do NOT ask — see each.
+        save: true,
     })
 }
 
@@ -5674,6 +5720,9 @@ fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -
         // A refile target is an existing headline in an existing file —
         // the picker only offers what it walked.
         create_parents: false,
+        // OC.9: NOT saved, for archive's reason and emacs's — `org-refile`
+        // leaves its target modified too.
+        save: false,
     })]
 }
 
@@ -8021,6 +8070,12 @@ impl GrammarCallbacks for Component {
                         // The roam directory is a path the user configured; if it
                         // does not exist that is worth saying, not papering over.
                         create_parents: false,
+                        // OC.9: not saved. This is create-AND-OPEN, not a
+                        // commit — the buffer lands in front of the user to
+                        // write the note in, so it is a file they are looking
+                        // at and `:w` is theirs to press. (Roam CAPTURE is a
+                        // different path and does go through `write_at`.)
+                        save: false,
                     }),
                     Effect::OpenBufferAt(lattice::plugin_host::types::OpenBufferAtPayload {
                         path: Some(path),
@@ -8647,6 +8702,9 @@ fn open_daily(date: roam_dailies::Date) -> Vec<Effect> {
         // `:org-roam-dailies-today` on a fresh corpus fails, which is
         // the one use where the feature has to work.
         create_parents: true,
+        // OC.9: not saved, for `org-roam-create-node`'s reason — the daily
+        // opens in front of the user to be written in.
+        save: false,
     })]
 }
 

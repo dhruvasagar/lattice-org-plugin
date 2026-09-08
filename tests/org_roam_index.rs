@@ -1132,8 +1132,9 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
                 text,
                 cut,
                 create_parents,
+                save,
             } => {
-                editor.apply_write_to_file(path, anchor, text, cut, create_parents);
+                editor.apply_write_to_file(path, anchor, text, cut, create_parents, save);
             }
             lattice_grammar::Effect::OpenPicker { source, args } => {
                 let _ = editor.open_picker(source, args);

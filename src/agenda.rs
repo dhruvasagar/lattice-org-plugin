@@ -125,6 +125,47 @@ pub struct Dated {
     /// Days since the Unix epoch.
     pub day: i64,
     pub kind: Kind,
+    /// OA.30: the stamp's time of day, `None` for a date-only stamp.
+    ///
+    /// `timestamp::Stamp` has parsed this all along and `Dated` threw it away,
+    /// so the agenda could not tell `<2026-09-08 Tue>` from
+    /// `<2026-09-08 Tue 14:00>`. A day's rows sorted by (kind, priority), so a
+    /// 09:00 standup could render below a 17:00 review, and no row showed a
+    /// time at all — the excerpt is the HEADLINE line and the stamp lives on
+    /// the planning line below it (OA.1). An agenda exists to answer "what,
+    /// and when", and it was silent on half of that.
+    ///
+    /// Minutes since midnight rather than `(hour, minute)`: everything
+    /// downstream either orders or formats it, and both are sharper on one
+    /// number. The pair comes back by `divmod 60` at the render site.
+    pub start_minute: Option<u32>,
+    /// OA.30: the END of a time RANGE (`<… 14:00-15:00>`), when the stamp
+    /// wrote one.
+    ///
+    /// Its own field rather than a duration, because an absent end and a
+    /// zero-length one are different facts and only the option can tell them
+    /// apart — a stamp with no range must render `14:00`, never `14:00-14:00`.
+    pub end_minute: Option<u32>,
+}
+
+#[cfg(test)]
+impl Dated {
+    /// OA.30: a date-only [`Dated`].
+    ///
+    /// `#[cfg(test)]` because the two production sites both build from a
+    /// `Stamp` and therefore always have a time to carry (or an honest
+    /// `None` from one). This is a fixture for the tests that predate the
+    /// time fields and do not care about them — kept rather than expanded
+    /// inline at each site so those tests keep reading as being about
+    /// something else.
+    pub fn on(day: i64, kind: Kind) -> Self {
+        Self {
+            day,
+            kind,
+            start_minute: None,
+            end_minute: None,
+        }
+    }
 }
 
 /// One agenda row, before it becomes one or more WIT `entry` values.
@@ -463,6 +504,8 @@ fn row_for_section(
         date: dated.map(|(kind, stamp, _)| Dated {
             day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
             kind,
+            start_minute: stamp.time.map(minutes_of),
+            end_minute: stamp.time_end.map(minutes_of),
         }),
         priority: parsed.priority,
         keyword: parsed.keyword.map(str::to_string),
@@ -685,6 +728,8 @@ pub fn scan_file(text: &str, keywords: &Keywords, admit_tag_only: bool) -> Vec<R
             date: dated.map(|(kind, stamp, _)| Dated {
                 day: timestamp::epoch_day(stamp.year, stamp.month, stamp.day),
                 kind,
+                start_minute: stamp.time.map(minutes_of),
+                end_minute: stamp.time_end.map(minutes_of),
             }),
             priority: headline.priority,
             keyword: headline.keyword.map(str::to_string),
@@ -750,6 +795,69 @@ pub fn group_key(day: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// OA.30: one `(group, label, sort-key)` a row contributes, plus whether its
+/// header is the emphasised one.
+///
+/// A named struct rather than the 4-tuple it grew into. The 3-tuple was
+/// already at the edge of readable at its call site (`|(group, label,
+/// sort_key)|`), and a fourth positional `bool` next to two `String`s is the
+/// shape where a caller swaps two fields and nothing complains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgendaEntry {
+    pub key: String,
+    pub label: String,
+    pub sort_key: i64,
+    /// MH.A6: render this row's header emphasised if it starts a group.
+    /// True for every row of TODAY, so the whole day reads as one band
+    /// rather than only its first header.
+    pub emphasis: bool,
+}
+
+/// OA.30: `2026-09-08 Tue, today` — [`group_label`]'s phrasing with the
+/// parenthetical unwrapped.
+///
+/// It exists because a time block nests this inside its own trailing `(…)`,
+/// and `group_label`'s output would make that `09:00 (2026-09-08 Tue
+/// (today))`. OA.7's splitter counts nesting so it would still dim the right
+/// run, but doubled parentheses are a thing a reader notices and no reader
+/// wants.
+fn day_phrase(day: i64, today: i64) -> String {
+    let label = group_label(day, today);
+    match label.split_once(" (") {
+        Some((date, note)) => format!("{date}, {}", note.trim_end_matches(')')),
+        None => label,
+    }
+}
+
+/// OA.30: `(hour, minute)` as minutes since midnight.
+///
+/// One number rather than a pair because every consumer either orders it or
+/// formats it, and both are sharper on a scalar.
+pub fn minutes_of((h, m): (u32, u32)) -> u32 {
+    h * 60 + m
+}
+
+/// OA.30: `540` → `"09:00"`.
+fn hhmm(minutes: u32) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// OA.30: how a timed row's own sub-group is spelled — `"09:00"`, or
+/// `"09:00-10:30"` when the stamp wrote a range.
+///
+/// This is the label a TIME block renders under, and it is deliberately just
+/// the clock: the day is already named by the date header immediately above
+/// it, and repeating `2026-09-08 Tue (today) · 09:00` on every block would
+/// make the column of headers unreadable by saying the same eleven characters
+/// four times.
+pub fn time_label(d: &Dated) -> Option<String> {
+    let start = d.start_minute?;
+    Some(match d.end_minute {
+        Some(end) => format!("{}-{}", hhmm(start), hhmm(end)),
+        None => hhmm(start),
+    })
+}
+
 /// The header a date group renders under: `2026-08-25 Tue`, annotated
 /// relative to the day the scan began.
 ///
@@ -773,10 +881,33 @@ pub fn group_label(day: i64, today: i64) -> String {
 
 /// The `sort-key` the host stable-sorts every file's rows on.
 ///
-/// Section dominates; then day; within a day, kind; within a kind, priority.
+/// Section dominates; then day; within a day, TIME; then kind; then priority.
 /// Packed into one `i64` because the ABI carries exactly one number — and
 /// packed with wide multipliers so a future tiebreaker has room rather than
 /// needing an ABI change to add one.
+///
+/// OA.30 widened the packing to fit the time term, which is why the
+/// multipliers below are not the ones the paragraph above was written for.
+/// The layout is now, most significant first:
+///
+/// ```text
+///   section  * 10^15
+///   day+bias * 10^8      (0 ..= 800_000)
+///   time     * 10^4      (0 for untimed, else 1 + minutes-since-midnight)
+///   kind     * 10^3
+///   priority             (0 ..= 100)
+/// ```
+///
+/// Every term is strictly narrower than its own multiplier, so none can carry
+/// into the one above it — the property `DAY_BIAS` exists to protect, held
+/// across three more fields than it used to be.
+///
+/// **Untimed sorts to 0, i.e. FIRST within its day, and that is a real
+/// decision rather than a fallout of the encoding.** An untimed TODO is an
+/// all-day item; putting it above the day's clock blocks means the day reads
+/// "here is what is due today, and here is when the fixed things are", which
+/// is how emacs' agenda reads with `org-agenda-time-grid` on. Sorting them
+/// last would bury the unscheduled work under the appointments.
 ///
 /// **Section rank in the high digits is the whole of the multi-section
 /// mechanism** (AS.1). The host stable-sorts on this number and knows nothing
@@ -801,7 +932,31 @@ const DAY_BIAS: i64 = 400_000;
 /// digits would file an evening event on the following morning and nothing
 /// downstream could tell.
 pub fn log_sort_key(section_rank: i64, day: i64, within_day: i64) -> i64 {
-    section_rank * 10_000_000_000_000 + (day + DAY_BIAS) * 10_000 + within_day.clamp(0, 9_999)
+    // OA.30: a log row has no stamp of its own, so it carries no TIME term —
+    // its `within_day` already IS its within-day order and occupies the two
+    // slots below the time. Clamped to keep it there.
+    section_rank * SECTION_MUL + (day + DAY_BIAS) * DAY_MUL + within_day.clamp(0, 9_999)
+}
+
+/// The multipliers of the packing [`DAY_BIAS`]'s doc lays out. Named rather
+/// than repeated as literals in two functions: OA.30 widened them, and the
+/// version of this code that had `10_000_000_000_000` written out twice is
+/// exactly the version where one of the two could have been missed.
+const SECTION_MUL: i64 = 1_000_000_000_000_000;
+const DAY_MUL: i64 = 100_000_000;
+const TIME_MUL: i64 = 10_000;
+
+/// OA.30: the time term — `0` for an untimed row, else `1 + minutes`.
+///
+/// The `+ 1` is what keeps untimed distinct from midnight. Without it a
+/// `00:00` appointment and an all-day TODO would pack identically and their
+/// order would depend on the walk, which is not something a user can predict
+/// or a test can pin.
+fn time_rank(row: &Row) -> i64 {
+    match row.date.and_then(|d| d.start_minute) {
+        Some(m) => 1 + i64::from(m),
+        None => 0,
+    }
 }
 
 pub fn sort_key_in_section(row: &Row, section_rank: i64, today: i64) -> i64 {
@@ -809,8 +964,9 @@ pub fn sort_key_in_section(row: &Row, section_rank: i64, today: i64) -> i64 {
         Some(c) if c.is_ascii_alphabetic() => (c.to_ascii_uppercase() as i64) - ('A' as i64),
         _ => 100,
     };
-    section_rank * 10_000_000_000_000
-        + (row.sort_day(today) + DAY_BIAS) * 10_000
+    section_rank * SECTION_MUL
+        + (row.sort_day(today) + DAY_BIAS) * DAY_MUL
+        + time_rank(row) * TIME_MUL
         + row.kind_rank() * 1_000
         + priority
 }
@@ -996,25 +1152,84 @@ pub fn entries_for_row(
     sections: &[Section],
     keywords: &Keywords,
     today: i64,
-) -> Vec<(String, String, i64)> {
+) -> Vec<AgendaEntry> {
     let mut out = Vec::new();
     for (rank, section) in sections.iter().enumerate() {
         if !section.admits(row, keywords, today) {
             continue;
         }
         let rank = rank as i64;
-        let (key, label) = match (section.filter.when.groups_by_date(), row.date) {
-            (true, Some(d)) => (
-                format!("{rank}:{}", group_key(d.day)),
-                format!("{} — {}", section.title, group_label(d.day, today)),
-            ),
+        let (key, label, emphasis) = match (section.filter.when.groups_by_date(), row.date) {
+            (true, Some(d)) => {
+                // OA.30: a TIMED row gets a sub-group of its own, keyed under
+                // its day so it still sorts inside it. The day header renders
+                // above the first block of the day; each time block then
+                // renders its own header reading just the clock.
+                //
+                //     2026-09-08 Tue (today)
+                //       * TODO Something all day
+                //     09:00
+                //       * TODO Standup
+                //     14:00-15:00
+                //       * TODO Review the diff
+                //
+                // Which is emacs' time grid arrived at from the other
+                // direction: the grid line and the group header are the same
+                // row, so nothing new had to be rendered to get it. The
+                // alternative — hanging the time under each row as an HB.5
+                // annotation — costs a screen line per appointment and puts
+                // the time BELOW the thing it qualifies.
+                //
+                // The KEY carries the day as well as the time, because two
+                // different days both holding a 09:00 must not merge into one
+                // block when the sort puts them next to each other.
+                match time_label(&d) {
+                    Some(time) => (
+                        format!("{rank}:{}:{time}", group_key(d.day)),
+                        // **The date rides along, and it has to.** A day whose
+                        // rows are ALL timed has no untimed block to render
+                        // the date header, so a bare `09:00` would be the
+                        // first thing the day showed and the user could not
+                        // tell which day it belonged to. The guest cannot
+                        // detect that case — whether an untimed row exists for
+                        // this day is a question about every OTHER file, after
+                        // a sort it has not seen — so the date is unconditional
+                        // rather than conditional-and-sometimes-wrong.
+                        //
+                        // In the TRAILING PARENTHETICAL, which is not
+                        // decoration: OA.7 dims a trailing `(…)` in the header
+                        // renderer, so the clock reads bright and the repeated
+                        // date recedes. That is what keeps a column of time
+                        // blocks from restating the same eleven characters at
+                        // full weight four times.
+                        format!("{time} ({})", day_phrase(d.day, today)),
+                        // The time blocks of today are part of today, so they
+                        // are emphasised too — the band is the whole day, not
+                        // just its first header.
+                        d.day == today,
+                    ),
+                    None => (
+                        format!("{rank}:{}", group_key(d.day)),
+                        format!("{} — {}", section.title, group_label(d.day, today)),
+                        d.day == today,
+                    ),
+                }
+            }
             // One block under the section's own title. Also the honest answer
             // for a date-grouping section handed an undated row, which
             // `When::admits` makes unreachable but which must not silently
             // produce a header reading the epoch if that ever changes.
-            _ => (format!("{rank}:"), section.title.clone()),
+            //
+            // Never emphasised: a section block spans days, so "is this
+            // today" has no answer for it.
+            _ => (format!("{rank}:"), section.title.clone(), false),
         };
-        out.push((key, label, sort_key_in_section(row, rank, today)));
+        out.push(AgendaEntry {
+            key,
+            label,
+            sort_key: sort_key_in_section(row, rank, today),
+            emphasis,
+        });
     }
     out
 }
@@ -1551,7 +1766,7 @@ mod tests {
             in_agenda: true,
             line: 0,
             end_line: 0,
-            date: Some(Dated { day, kind }),
+            date: Some(Dated::on(day, kind)),
             priority,
             keyword: Some("TODO".to_string()),
             tags: Vec::new(),
@@ -1602,10 +1817,7 @@ mod tests {
             in_agenda: true,
             line: 0,
             end_line: 0,
-            date: Some(Dated {
-                day: timestamp::epoch_day(y, m, d),
-                kind: Kind::Timestamp,
-            }),
+            date: Some(Dated::on(timestamp::epoch_day(y, m, d), Kind::Timestamp)),
             priority: None,
             keyword: Some("TODO".to_string()),
             tags: Vec::new(),
@@ -1681,10 +1893,7 @@ mod tests {
             in_agenda: true,
             line: 0,
             end_line: 0,
-            date: day.map(|day| Dated {
-                day,
-                kind: Kind::Scheduled,
-            }),
+            date: day.map(|day| Dated::on(day, Kind::Scheduled)),
             priority,
             keyword: keyword.map(str::to_string),
             tags: Vec::new(),
@@ -1700,8 +1909,7 @@ mod tests {
         let titles = |row: &Row| -> Vec<String> {
             entries_for_row(row, &s, &kw(), today)
                 .into_iter()
-                .enumerate()
-                .map(|(_, (key, _, _))| key.split(':').next().unwrap().to_string())
+                .map(|e| e.key.split(':').next().unwrap().to_string())
                 .collect()
         };
 
@@ -1735,13 +1943,13 @@ mod tests {
         );
         let ranks: Vec<&str> = out
             .iter()
-            .map(|(k, _, _)| k.split(':').next().unwrap())
+            .map(|e| e.key.split(':').next().unwrap())
             .collect();
         assert_eq!(ranks, ["0", "3"], "overdue and priority-A, got {out:?}");
 
         // Every emitted key sorts in its own section's band, so the host's
         // stable sort cannot interleave them.
-        assert!(out[0].2 < out[1].2);
+        assert!(out[0].sort_key < out[1].sort_key);
     }
 
     /// `min_priority` is a CEILING on the letter: `B` admits A and B.
@@ -1796,10 +2004,258 @@ mod tests {
         let out = entries_for_row(&r(Some(today), None, Some("TODO")), &s, &kw(), today);
         assert_eq!(out.len(), 2);
         assert_ne!(
-            out[0].0, out[1].0,
+            out[0].key, out[1].key,
             "same date in two sections must not share a group key"
         );
-        assert!(out[0].0.starts_with("0:") && out[1].0.starts_with("1:"));
+        assert!(out[0].key.starts_with("0:") && out[1].key.starts_with("1:"));
+    }
+
+    // ── OA.30: time of day ─────────────────────────────────────────────
+
+    /// A scan reads the time out of the planning line and keeps it.
+    ///
+    /// The whole feature rests on this: `Dated` used to drop it, so no amount
+    /// of grouping or labelling downstream could have shown a time that was
+    /// never carried this far.
+    #[test]
+    fn a_scan_carries_the_stamps_time_of_day() {
+        let rows = scan_file(
+            "* TODO Standup\n  SCHEDULED: <2026-09-08 Tue 09:30>\n",
+            &kw(),
+            false,
+        );
+        assert_eq!(rows.len(), 1);
+        let d = rows[0].date.expect("dated");
+        assert_eq!(d.start_minute, Some(9 * 60 + 30));
+        assert_eq!(d.end_minute, None);
+    }
+
+    /// **A ranged appointment is a row at all.**
+    ///
+    /// The regression that matters most in this slice. A stamp carrying
+    /// `10:00-11:00` did not parse, so the headline came back UNDATED and
+    /// vanished from every dated section — a whole class of ordinary org
+    /// entry was invisible in the agenda.
+    #[test]
+    fn a_ranged_appointment_is_dated_rather_than_dropped() {
+        let rows = scan_file(
+            "* TODO Review\n  SCHEDULED: <2026-09-08 Tue 14:00-15:30>\n",
+            &kw(),
+            false,
+        );
+        assert_eq!(rows.len(), 1);
+        let d = rows[0].date.expect("a ranged stamp still dates its row");
+        assert_eq!(d.start_minute, Some(14 * 60));
+        assert_eq!(d.end_minute, Some(15 * 60 + 30));
+    }
+
+    /// A timed row gets its own group, keyed under its day so it still sorts
+    /// inside it, and labelled with the clock.
+    #[test]
+    fn a_timed_row_groups_under_its_time() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let mut row = r(Some(today), None, Some("TODO"));
+        row.date = Some(Dated {
+            day: today,
+            kind: Kind::Scheduled,
+            start_minute: Some(9 * 60),
+            end_minute: None,
+        });
+        let out = entries_for_row(&row, &s, &kw(), today);
+        let dated = out
+            .iter()
+            .find(|e| e.key.starts_with("1:"))
+            .expect("the dated section takes it");
+        assert!(
+            dated.key.ends_with(":09:00"),
+            "the time is part of the key, under the day: {}",
+            dated.key
+        );
+        assert!(
+            dated.label.starts_with("09:00 ("),
+            "the clock leads and the date recedes into OA.7's dim              parenthetical: {}",
+            dated.label
+        );
+    }
+
+    /// A range labels both ends. `14:00-15:30`, never `14:00`.
+    #[test]
+    fn a_ranged_row_labels_both_ends() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let mut row = r(Some(today), None, Some("TODO"));
+        row.date = Some(Dated {
+            day: today,
+            kind: Kind::Scheduled,
+            start_minute: Some(14 * 60),
+            end_minute: Some(15 * 60 + 30),
+        });
+        let out = entries_for_row(&row, &s, &kw(), today);
+        let dated = out.iter().find(|e| e.key.starts_with("1:")).unwrap();
+        assert!(dated.label.starts_with("14:00-15:30 ("), "{}", dated.label);
+    }
+
+    /// **Two days that share a clock time must not merge.**
+    ///
+    /// The reason the key carries the day as well as the time. Without it a
+    /// 09:00 on Tuesday and a 09:00 on Wednesday would render as one block
+    /// the moment the sort put them next to each other, which it does exactly
+    /// when the days are adjacent — i.e. always.
+    #[test]
+    fn the_same_time_on_two_days_is_two_groups() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let at = |day: i64| {
+            let mut row = r(Some(day), None, Some("TODO"));
+            row.date = Some(Dated {
+                day,
+                kind: Kind::Scheduled,
+                start_minute: Some(9 * 60),
+                end_minute: None,
+            });
+            entries_for_row(&row, &s, &kw(), today)
+                .into_iter()
+                .find(|e| e.key.starts_with("1:"))
+                .unwrap()
+                .key
+        };
+        assert_ne!(at(today), at(today + 1));
+    }
+
+    /// Untimed rows keep the date header, and timed ones do not steal it.
+    #[test]
+    fn an_untimed_row_still_groups_by_date_alone() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let out = entries_for_row(&r(Some(today), None, Some("TODO")), &s, &kw(), today);
+        let dated = out.iter().find(|e| e.key.starts_with("1:")).unwrap();
+        assert!(!dated.key.ends_with(":09:00"));
+        assert!(
+            dated.label.contains("(today)"),
+            "the day block keeps its full date header: {}",
+            dated.label
+        );
+    }
+
+    /// Within a day: untimed first, then timed in clock order.
+    ///
+    /// An all-day TODO above the day's fixed appointments is how emacs' grid
+    /// reads, and it is what keeps unscheduled work from being buried under
+    /// the meetings.
+    #[test]
+    fn a_days_rows_sort_untimed_first_then_by_clock() {
+        let today = 20_000;
+        let timed = |minutes: Option<u32>| {
+            let mut row = r(Some(today), None, Some("TODO"));
+            row.date = Some(Dated {
+                day: today,
+                kind: Kind::Scheduled,
+                start_minute: minutes,
+                end_minute: None,
+            });
+            sort_key_in_section(&row, 0, today)
+        };
+        let all_day = timed(None);
+        let nine = timed(Some(9 * 60));
+        let five = timed(Some(17 * 60));
+        assert!(all_day < nine, "an all-day item leads its day");
+        assert!(nine < five, "and the clock orders the rest");
+    }
+
+    /// Midnight is a TIME, and must not collapse into "untimed".
+    ///
+    /// The `+ 1` in `time_rank` is what separates them; without it their keys
+    /// are equal and their order depends on the walk.
+    #[test]
+    fn midnight_is_distinct_from_untimed() {
+        let today = 20_000;
+        let key = |minutes: Option<u32>| {
+            let mut row = r(Some(today), None, Some("TODO"));
+            row.date = Some(Dated {
+                day: today,
+                kind: Kind::Scheduled,
+                start_minute: minutes,
+                end_minute: None,
+            });
+            sort_key_in_section(&row, 0, today)
+        };
+        assert!(key(None) < key(Some(0)));
+    }
+
+    /// The widened packing still cannot carry between terms: a late time on
+    /// one day must sort below anything on the next.
+    #[test]
+    fn the_time_term_cannot_carry_into_the_day() {
+        let today = 20_000;
+        let at = |day: i64, minutes: u32| {
+            let mut row = r(Some(day), None, Some("TODO"));
+            row.date = Some(Dated {
+                day,
+                kind: Kind::Scheduled,
+                start_minute: Some(minutes),
+                end_minute: None,
+            });
+            sort_key_in_section(&row, 0, today)
+        };
+        assert!(at(today, 23 * 60 + 59) < at(today + 1, 0));
+    }
+
+    /// …and neither can the DAY carry into the section, which the widening
+    /// re-opened the possibility of.
+    #[test]
+    fn the_day_term_still_cannot_carry_into_the_section() {
+        let today = 20_000;
+        let at = |day: i64, rank: i64| {
+            let mut row = r(Some(day), None, Some("TODO"));
+            row.date = Some(Dated {
+                day,
+                kind: Kind::Scheduled,
+                start_minute: Some(23 * 60 + 59),
+                end_minute: None,
+            });
+            sort_key_in_section(&row, rank, today)
+        };
+        // The furthest-future row in section 0 still sorts below the
+        // earliest row in section 1.
+        assert!(at(today + 100_000, 0) < at(today - 100_000, 1));
+    }
+
+    /// MH.A6: every block of TODAY is emphasised — the untimed one and each
+    /// time block — so the day reads as one band rather than one lit header
+    /// followed by three flat ones.
+    #[test]
+    fn todays_blocks_are_emphasised_and_other_days_are_not() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let emph = |day: i64, minutes: Option<u32>| {
+            let mut row = r(Some(day), None, Some("TODO"));
+            row.date = Some(Dated {
+                day,
+                kind: Kind::Scheduled,
+                start_minute: minutes,
+                end_minute: None,
+            });
+            entries_for_row(&row, &s, &kw(), today)
+                .into_iter()
+                .find(|e| e.key.starts_with("1:"))
+                .unwrap()
+                .emphasis
+        };
+        assert!(emph(today, None), "today's all-day block");
+        assert!(emph(today, Some(9 * 60)), "and today's time blocks");
+        assert!(!emph(today + 1, None), "tomorrow is not today");
+        assert!(!emph(today + 1, Some(9 * 60)));
+    }
+
+    /// A section block spans days, so "is this today" has no answer for it
+    /// and it is never the emphasised one.
+    #[test]
+    fn a_block_section_is_never_emphasised() {
+        let today = 20_000;
+        let s = default_sections(7);
+        let out = entries_for_row(&r(None, None, Some("TODO")), &s, &kw(), today);
+        assert!(out.iter().all(|e| !e.emphasis));
     }
 
     /// A non-date-grouping section renders ONE header, its own title — not a
@@ -1810,9 +2266,9 @@ mod tests {
         let s = default_sections(7);
         let a = entries_for_row(&r(None, None, Some("TODO")), &s, &kw(), today);
         let b = entries_for_row(&r(None, None, Some("NEXT")), &s, &kw(), today);
-        assert_eq!(a[0].0, b[0].0, "one group key for the whole block");
-        assert_eq!(a[0].1, "Unscheduled");
-        assert_eq!(b[0].1, "Unscheduled");
+        assert_eq!(a[0].key, b[0].key, "one group key for the whole block");
+        assert_eq!(a[0].label, "Unscheduled");
+        assert_eq!(b[0].label, "Unscheduled");
     }
 
     /// A done row is not a row at all, so no section can resurrect it — the

@@ -92,7 +92,7 @@ pub fn init() -> Result<Vec<(RawCandidate, RoutingPayload)>, String> {
 /// `display`, and both are the title because that is what the user is looking
 /// for. Aliases and tags ride as **annotations**, which the picker shows beside
 /// the row without matching them positionally.
-fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
+pub fn candidate_for(node: &Node) -> (RawCandidate, RoutingPayload) {
     let mut annotations = Vec::new();
     if !node.aliases.is_empty() {
         annotations.push(Annotation::Custom(AnnotationCustom {

@@ -178,6 +178,7 @@ mod roam_dailies;
 mod roam_find;
 // OR.11b: what a new roam note starts as.
 mod roam_index;
+mod roam_insert;
 mod roam_scan;
 mod roam_templates;
 mod roam_tree;
@@ -639,6 +640,19 @@ const AGENDA_FILTER_BODY: u32 = 103;
 const AGENDA_FILTER_CATEGORY: u32 = 104;
 const AGENDA_FILTER_REGEXP: u32 = 105;
 const AGENDA_FILTER_FILE_PROMPT: u32 = 106;
+
+/// OR.7c — `C-c n i`. Three callbacks, because the flow has three steps that
+/// run in different places: open the picker (no cursor available), insert the
+/// link a row chose (grammar seam, where there IS one), and the create row's
+/// mint-then-link.
+///
+/// `INSERT_LINK` is separate from `INSERT_NODE` rather than one action that
+/// sometimes opens a picker and sometimes edits, for `TODO_SELECT` /
+/// `TODO_SET`'s reason: a row fires the second with args of its own, and
+/// collapsing them would make those args ambiguous.
+const ROAM_INSERT_NODE: u32 = 107;
+const ROAM_INSERT_LINK: u32 = 108;
+const ROAM_CREATE_AND_INSERT: u32 = 109;
 
 /// OA.15 — `l`, emacs' `org-agenda-log-mode`. What you DID, beside what you
 /// plan to do.
@@ -1357,6 +1371,10 @@ impl Guest for Component {
         // OR.6: roam's find-node. The SECOND source from this component, which
         // is what OR.5b existed to make possible.
         lattice::plugin_host::picker_registry::register_picker_source(&roam_find::spec());
+        // OR.7c: a SECOND source over the same corpus. Distinct id, because
+        // two sources sharing one would have the host resolve whichever it saw
+        // last and silently drop the other.
+        lattice::plugin_host::picker_registry::register_picker_source(&roam_insert::spec());
         // OR.9: what points at the note you are in. A picker rather than a
         // multibuffer because backlinks is navigation — you look at what links
         // here and go read it — and a picker is what navigation wants. The
@@ -2366,6 +2384,7 @@ impl Guest for Component {
                 // a terminal binding in another is the ambiguity vim settles
                 // with `timeoutlen`, which this editor does not have.
                 bind("<leader>onf", "org-roam-find-node"),
+                bind("<leader>oni", "org-roam-insert-node"),
                 // OR.10 — the journal, under `<leader>ond…` because emacs
                 // org-roam puts it under `C-c n d` and the letters are the
                 // same: `d` today, `y` yesterday, `t` tomorrow, `D` a date you
@@ -2398,6 +2417,8 @@ impl Guest for Component {
                 // No collision with magit's buffer-local `<C-c><C-c>` /
                 // `<C-c><C-k>`: those continue on a different second key.
                 bind("<C-c>nf", "org-roam-find-node"),
+                // OR.7c: emacs' own binding for `org-roam-node-insert`.
+                bind("<C-c>ni", "org-roam-insert-node"),
                 bind("<C-c>ndd", "org-roam-dailies-today"),
                 bind("<C-c>ndy", "org-roam-dailies-yesterday"),
                 bind("<C-c>ndt", "org-roam-dailies-tomorrow"),
@@ -3221,6 +3242,27 @@ impl Guest for Component {
             &clock_ex(),
             CLOCK_PARSE,
             ROAM_FIND_NODE,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-insert-node",
+            "Insert a link to an org-roam note, chosen from a picker.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_INSERT_NODE,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-insert-link",
+            "Insert an already-resolved org-roam link at the cursor (dispatched by the picker).",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_INSERT_LINK,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
+            "org-roam-create-and-insert",
+            "Create an org-roam note and link it from the cursor (dispatched by the picker).",
+            &clock_ex(),
+            CLOCK_PARSE,
+            ROAM_CREATE_AND_INSERT,
         );
         lattice::plugin_host::grammar::register_ex_command(
             "org-roam-backlinks",
@@ -7944,6 +7986,96 @@ impl GrammarCallbacks for Component {
             // OR.4: ring the doorbell; the event store walks. See
             // `EV_ROAM_SYNC` for why this is not done here.
             // OR.6: open the picker. The host owns the picker; this names it.
+            // OR.7c: open the insert picker. No cursor is needed HERE — the
+            // row that gets chosen fires `ROAM_INSERT_LINK`, which runs on
+            // this same seam and has one.
+            ROAM_INSERT_NODE => Ok(vec![Effect::OpenPicker(
+                lattice::plugin_host::types::OpenPickerPayload {
+                    source: roam_insert::INSERT_NODE_PICKER.to_string(),
+                    args: Vec::new(),
+                },
+            )]),
+            // OR.7c: the link the picker resolved, inserted at the cursor.
+            //
+            // The link arrives whole rather than as an id, because the picker
+            // had the node in hand and re-deriving the title here would mean
+            // consulting the index for something already known — and would
+            // silently insert a link with no description if the index had been
+            // re-synced between the open and the accept.
+            ROAM_INSERT_LINK => {
+                let Args::String(link) = &ctx.args else {
+                    return Ok(vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: "org-roam: insert-link got no link".to_string(),
+                    })]);
+                };
+                Ok(vec![insert_at_cursor(&ctx, link)])
+            }
+            // OR.7c: the create row — mint the note, then link it.
+            //
+            // **Two effects, and the order is the safe one.** The write runs
+            // first and the link second, so the failure mode is a note with
+            // nothing pointing at it rather than a link pointing at nothing.
+            // Both are recoverable, but only one of them is VISIBLE: an orphan
+            // note is findable by `C-c n f` and readable on disk, while a
+            // broken `id:` link looks exactly like a working one until someone
+            // presses `<CR>` on it, possibly months later.
+            //
+            // This is the asymmetry `cross-file-writes.md` §8 reasons about in
+            // the opposite direction (there, the SOURCE must survive a failed
+            // insert); here nothing is being moved, so the question is only
+            // which artefact is better to be left holding.
+            ROAM_CREATE_AND_INSERT => {
+                let title = match &ctx.args {
+                    Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    _ => {
+                        return Ok(vec![Effect::Echo(EchoPayload {
+                            level: EchoLevel::Warn,
+                            text: "org-roam: a new note needs a title".to_string(),
+                        })]);
+                    }
+                };
+                let Some(dir) = roam_scan::roam_directory() else {
+                    return Ok(vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: "org-roam: set `org.roam-directory` first".to_string(),
+                    })]);
+                };
+                let id = match host_services::new_uuid() {
+                    Ok(id) => id,
+                    // Refuses rather than degrades, for `:org-roam-create-node`'s
+                    // reason: the id is written into a file and outlives the
+                    // session, and an empty one is worse than no note.
+                    Err(error) => {
+                        return Ok(vec![Effect::Echo(EchoPayload {
+                            level: EchoLevel::Error,
+                            text: format!("org-roam: cannot mint an id: {error}"),
+                        })]);
+                    }
+                };
+                let path = roam_new_note_path(&dir, &title);
+                let link = format!("[[id:{id}][{title}]]");
+                Ok(vec![
+                    Effect::WriteToFile(WriteToFilePayload {
+                        path,
+                        anchor: lattice::plugin_host::types::FileAnchor::End,
+                        text: roam_find::new_node_text(&id, &title),
+                        cut: None,
+                        // The roam directory is the user's own configured
+                        // path; a missing one is worth saying, not papering
+                        // over.
+                        create_parents: false,
+                        // SAVED, unlike `:org-roam-create-node`'s. That one
+                        // opens the note in front of you, so the buffer is
+                        // yours to write; this one does not open anything —
+                        // you stay in the sentence you were writing — so an
+                        // unsaved buffer would be a file nobody is looking at
+                        // and the index could not see it either.
+                        save: true,
+                    }),
+                    insert_at_cursor(&ctx, &link),
+                ])
+            }
             ROAM_FIND_NODE => Ok(vec![Effect::OpenPicker(
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: roam_find::FIND_NODE_PICKER.to_string(),
@@ -8021,17 +8153,7 @@ impl GrammarCallbacks for Component {
                         })]);
                     }
                 };
-                let slug = roam_find::slug(&title);
-                let stamp = roam_file_stamp();
-                let name = if slug.is_empty() {
-                    // A title of pure punctuation still gets a file, named by
-                    // its timestamp alone — refusing to create it would be the
-                    // picker declining a title the user deliberately typed.
-                    format!("{stamp}.org")
-                } else {
-                    format!("{stamp}-{slug}.org")
-                };
-                let path = format!("{}/{name}", dir.trim_end_matches('/'));
+                let path = roam_new_note_path(&dir, &title);
                 // TWO effects, in order, and deliberately no trailing echo.
                 //
                 // `WriteToFile` can fail — an unresolvable path, a denied
@@ -8228,6 +8350,17 @@ impl PickerSource for Component {
                 })
                 .collect());
         }
+        if source == roam_insert::INSERT_NODE_PICKER {
+            return Ok(roam_insert::init()?
+                .into_iter()
+                .map(|(candidate, routing)| {
+                    exports::lattice::plugin_host::picker_source::CandidatePair {
+                        candidate,
+                        routing,
+                    }
+                })
+                .collect());
+        }
         // `org-refile-targets`' `:maxlevel`, as a picker argument rather than
         // an option: the picker world has no `config` seam, and an argument is
         // per-invocation anyway — `:picker org-refile 5` when you know the
@@ -8313,6 +8446,9 @@ impl PickerSource for Component {
     ) -> Result<lattice::plugin_host::types::PickerAcceptOutcome, String> {
         if source == roam_backlinks::BACKLINKS_PICKER {
             return roam_backlinks::accept(routing);
+        }
+        if source == roam_insert::INSERT_NODE_PICKER {
+            return roam_insert::accept(routing);
         }
         if source == roam_find::FIND_NODE_PICKER {
             return roam_find::accept(routing);
@@ -8586,6 +8722,51 @@ fn open_link(ctx: &ActionContext, doc: &Document, on_miss: Effect) -> Vec<Effect
 /// The new node does not appear in the index until the file is SAVED and the
 /// watcher sees it — the same rule §5.2 sets for a created note, and the reason
 /// an abandoned edit never enters the index.
+/// OR.7c: where a NEW roam note lives — `<dir>/<stamp>-<slug>.org`.
+///
+/// Extracted when `:org-roam-create-and-insert` became the second caller.
+/// Copying the four lines would have been shorter and is exactly the shape
+/// that drifts: two commands that name the same note differently produce two
+/// files for one title, and nothing about either looks wrong on its own.
+fn roam_new_note_path(dir: &str, title: &str) -> String {
+    let slug = roam_find::slug(title);
+    let stamp = roam_file_stamp();
+    let name = if slug.is_empty() {
+        // A title of pure punctuation still gets a file, named by its
+        // timestamp alone — refusing would be the picker declining a title the
+        // user deliberately typed.
+        format!("{stamp}.org")
+    } else {
+        format!("{stamp}-{slug}.org")
+    };
+    format!("{}/{name}", dir.trim_end_matches('/'))
+}
+
+/// OR.7c: put `text` where the caret is.
+///
+/// An insert is a `Replace` over an EMPTY range, which is how every other
+/// insert in this file is written (`id_create`'s drawer, the checkbox toggles).
+///
+/// **The caret is left before the inserted text, not after it**, and that is
+/// the one thing here worth arguing about. Org-roam leaves you after the link
+/// so you can keep typing the sentence, and that is what this does: the edit
+/// applies at the cursor and the host advances it past the insertion, which is
+/// the ordinary behaviour of an insert at a point. Passing `cursor: None` is
+/// what asks for that — naming a position would PIN the caret and undo it.
+fn insert_at_cursor(ctx: &ExCommandContext, text: &str) -> Effect {
+    Effect::ApplyEdit(lattice::plugin_host::types::ApplyEditPayload {
+        target: ctx.buffer_id,
+        edit: Edit {
+            range: Range {
+                start: ctx.cursor,
+                end: ctx.cursor,
+            },
+            kind: EditKind::Replace(text.to_string()),
+        },
+        cursor: None,
+    })
+}
+
 fn id_create(ctx: &ExCommandContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let warn = |text: String| {
         vec![Effect::Echo(EchoPayload {
@@ -9778,7 +9959,6 @@ mod conceal_rule_tests {
 
 #[cfg(test)]
 mod agenda_files_tests {
-    use super::agenda_files;
 
     /// The two shapes one list carries — a directory and a single file — plus
     /// the annotation people add to configuration they will re-read in six

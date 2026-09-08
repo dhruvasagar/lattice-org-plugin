@@ -659,6 +659,7 @@ open it — emacs has been writing those log lines for years.
 | | |
 |---|---|
 | `<C-Space>` | toggle the checkbox on this line, or every box in a region |
+| `<C-c><C-x><C-b>` | set every box in the region — or under this headline — to one state |
 | `<M-S-CR>` | new checkbox item below this one |
 | `<leader>o_` | drop the box, turning the item back into prose |
 
@@ -681,11 +682,50 @@ Cookies count **direct children only**. In a nested list each level rolls up
 to its own parent, because a grandchild's state is already reflected in its
 parent's box.
 
-`[-]` is org's partial state. Toggling one completes it.
+### A parent's box is computed, not set
 
-Over a Visual region every box flips from **its own** state, rather than being
-driven to a common value — `<C-Space>` means toggle. It is one edit, so one
-`u` puts the whole region back.
+An item with checkboxes under it is a **parent**, and its box is a function of
+its children rather than a value of its own:
+
+| children | parent |
+|---|---|
+| some ticked, some not | `[-]` |
+| any child showing `[-]` | `[-]` |
+| all ticked | `[X]` |
+| none ticked | `[ ]` |
+| no boxes at all | left exactly as you wrote it |
+
+```org
+* Chores
+  - [-] kitchen        ← computed from the two below
+    - [X] dishes
+    - [ ] bins
+```
+
+Tick `bins` and `kitchen` becomes `[X]` on its own. This is org's
+`org-list-struct-fix-box`, and it cascades: a grandparent is computed from a
+parent that was just computed, deepest first.
+
+**So `<C-Space>` on a parent does nothing.** You set it, and it is immediately
+recomputed from children that did not move. That is not a limitation bolted
+on — it is what "computed" means, and org behaves the same way. To finish a
+whole list at once, use `<C-c><C-x><C-b>`.
+
+An item whose children carry **no** boxes is not a parent, and toggles
+normally.
+
+### Setting many at once
+
+`<C-c><C-x><C-b>` — org's `org-toggle-checkbox` — drives every box it reaches
+to **one** state: unticked if the first box it finds is ticked, else ticked.
+On a headline it reaches the whole subtree; over a region, that region; on a
+lone item, just that item.
+
+It is a different verb from `<C-Space>`, which flips each box from **its own**
+state. Over a mixed region `<C-Space>` inverts each one; `<C-c><C-x><C-b>`
+makes them agree. Both are one edit, so one `u` puts the whole thing back.
+
+Items with no checkbox are left alone — neither key adds one.
 
 Un-itemising a checkbox with `<leader>o_` drops its box, and every cookie
 counting it is rewritten in the same edit — the box and the number above it

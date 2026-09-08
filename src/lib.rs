@@ -654,6 +654,15 @@ const ROAM_INSERT_NODE: u32 = 107;
 const ROAM_INSERT_LINK: u32 = 108;
 const ROAM_CREATE_AND_INSERT: u32 = 109;
 
+/// OX.2 — `C-c C-x C-b`, org's `org-toggle-checkbox`.
+///
+/// A SEPARATE verb from `<C-Space>`, not a second key for it. `<C-Space>`
+/// flips each box from its own state (OS.10's deliberate choice); this drives
+/// every box it reaches to ONE value taken from the first, which is what org
+/// does and is the only way to tick a whole list at once now that a parent's
+/// box is derived (OX.1) and therefore not directly settable.
+const TOGGLE_CHECKBOX_SUBTREE: u32 = 110;
+
 /// OA.15 — `l`, emacs' `org-agenda-log-mode`. What you DID, beside what you
 /// plan to do.
 ///
@@ -2054,6 +2063,7 @@ impl Guest for Component {
                 vbind("<M-S-h>", "org-shift-meta-left"),
                 vbind("<M-S-l>", "org-shift-meta-right"),
                 vbind("<C-Space>", "org-toggle-checkbox"),
+                vbind("<C-c><C-x><C-b>", "org-toggle-checkbox-set"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
                 // OM.6b: org's own `C-c C-x C-a`, spelled the way
@@ -2150,6 +2160,9 @@ impl Guest for Component {
                 // OM.8: org's own binding. `<C-Space>` is unbound in vim's
                 // Normal mode, so nothing is shadowed.
                 bind("<C-Space>", "org-toggle-checkbox"),
+                // OX.2: org's own binding for `org-toggle-checkbox`, and its
+                // own verb — see `TOGGLE_CHECKBOX_SUBTREE`.
+                bind("<C-c><C-x><C-b>", "org-toggle-checkbox-set"),
                 // OM.9: `<C-a>` / `<C-x>` are vim's increment / decrement.
                 // These SHADOW them inside org buffers and DECLINE off a
                 // timestamp, so the builtin still works on ordinary numbers —
@@ -3192,6 +3205,13 @@ impl Guest for Component {
             "Toggle the checkbox on this line and update the parent's cookie",
             &spec(),
             TOGGLE_CHECKBOX,
+        );
+        register_action(
+            "org-toggle-checkbox-set",
+            "Set every checkbox in the region — or under this headline — to one \
+             state (C-c C-x C-b)",
+            &spec(),
+            TOGGLE_CHECKBOX_SUBTREE,
         );
         register_action(
             "org-toggle-inline-images",
@@ -7471,6 +7491,9 @@ impl GrammarCallbacks for Component {
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort()),
             TOGGLE_CHECKBOX => Ok(leaving_visual(&ctx, toggle_checkbox(&ctx, doc, tree))),
+            TOGGLE_CHECKBOX_SUBTREE => {
+                Ok(leaving_visual(&ctx, toggle_checkbox_set(&ctx, doc, tree)))
+            }
             // OE.3: the context dispatcher. Its arms call the two bodies
             // above rather than repeating them.
             CTRL_C_CTRL_C => Ok(ctrl_c_ctrl_c(&ctx, doc, tree)),
@@ -8596,6 +8619,79 @@ impl PickerSource for Component {
 ///
 /// Consumes the key rather than declining when there is no checkbox:
 /// `<C-Space>` is org's here and has nothing to fall through to.
+/// OX.2 — `C-c C-x C-b`: drive every box it reaches to ONE state.
+///
+/// Org's `org-toggle-checkbox`, and a different verb from `<C-Space>`:
+///
+/// | | `<C-Space>` | `C-c C-x C-b` |
+/// |---|---|---|
+/// | one item | toggles it | toggles it |
+/// | a region | flips each from its OWN state (OS.10) | drives all to one |
+/// | a headline | nothing | drives the whole subtree to one |
+///
+/// The reference state is org's: `[ ]` if the first box it finds is ticked,
+/// else `[X]`. Taken from the FIRST box rather than from the cursor line,
+/// because on a headline the cursor is not on a box at all.
+///
+/// **This is the escape hatch OX.1 requires.** A parent's box is derived from
+/// its children and therefore cannot be ticked directly; without a way to set
+/// the children en masse, a long list could only be completed one line at a
+/// time. Org has exactly this key for exactly this reason.
+///
+/// Items with NO box are left alone. Org adds boxes only under `C-u`, and
+/// putting one on every bullet in a subtree because the user wanted to tick
+/// three would be a much larger edit than the key implies.
+fn toggle_checkbox_set(
+    ctx: &ActionContext,
+    doc: &Document,
+    tree: Option<&TreeSnapshot>,
+) -> Vec<Effect> {
+    let line = |n: u32| doc.line(n);
+    let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
+
+    // The span: a region, else the subtree under the headline the cursor is
+    // in, else just this line. Org's three cases, in org's order.
+    let (lo, hi) = match region_lines(ctx).filter(|(lo, hi)| lo != hi) {
+        Some(span) => span,
+        None => {
+            let hl = headline::Headlines::new(tree, &line, doc.line_count());
+            match hl.enclosing(ctx.cursor.line) {
+                // On or under a headline, the whole subtree — which is what
+                // makes this reach a list the cursor is not inside.
+                Some((start, _)) => (start, hl.subtree_end(start)),
+                None => (ctx.cursor.line, ctx.cursor.line),
+            }
+        }
+    };
+
+    let boxes: Vec<u32> = (lo..=hi).filter(|&n| cb.item_at(n).is_some()).collect();
+    let Some(&first) = boxes.first() else {
+        return vec![Effect::None];
+    };
+    // Org's reference: unticked unless the first box is already ticked.
+    let reference = match cb.item_at(first).map(|i| i.state) {
+        Some(checkbox::Check::On) => checkbox::Check::Off,
+        _ => checkbox::Check::On,
+    };
+
+    let mut rewritten: Vec<(u32, String)> = Vec::new();
+    for n in &boxes {
+        let Some(text) = line(*n) else { continue };
+        if let Some(set) = checkbox::set_state(&text, reference) {
+            if set != text {
+                rewritten.push((*n, set));
+            }
+        }
+    }
+    if rewritten.is_empty() {
+        return vec![Effect::None];
+    }
+    // Derivation and cookies are the toggle's, reached through the same helper
+    // so the two verbs cannot drift about what a parent's box means.
+    derive_and_recount(&cb, &line, *boxes.last().unwrap_or(&first), &mut rewritten);
+    write_rewritten(ctx, &line, rewritten)
+}
+
 fn toggle_checkbox(
     ctx: &ActionContext,
     doc: &Document,
@@ -8635,39 +8731,114 @@ fn toggle_checkbox(
     // from the topmost ancestor down to it.
     let at = *targets.last().unwrap_or(&at);
 
-    // Rewrite from the toggled line down to itself, then extend upward for
-    // each ancestor whose cookie changes. The span is contiguous because an
-    // ancestor is always above its children.
-    for parent in cb.ancestors(at) {
-        let Some(above) = line(parent.line()) else {
-            continue;
-        };
+    derive_and_recount(&cb, &line, at, &mut rewritten);
+    write_rewritten(ctx, &line, rewritten)
+}
+
+/// OX.1 — recompute every line whose box or cookie is a FUNCTION of what just
+/// changed, deepest first.
+///
+/// `anchor` is the deepest line the edit touched; its ancestors are what the
+/// change can reach. The lines ALREADY rewritten come first and that is not
+/// incidental: one of them may be a PARENT, and org recomputes every parent in
+/// the list rather than only those above the edit
+/// (`org-list-struct-fix-box` walks `parent-list` sorted by decreasing
+/// indentation). That is what makes a parent's box read-only — you set it, and
+/// it is immediately recomputed from children that did not move.
+///
+/// Deepest-first for org's reason: a parent's new box is an input to ITS
+/// parent's box and to the grandparent's cookie. The other order would compute
+/// each level from the pre-edit state one below it.
+///
+/// Shared by both toggle verbs so they cannot drift about what a parent's box
+/// means.
+fn derive_and_recount(
+    cb: &checkbox::Checkboxes,
+    line: &impl Fn(u32) -> Option<String>,
+    anchor: u32,
+    rewritten: &mut Vec<(u32, String)>,
+) {
+    let already: Vec<u32> = rewritten.iter().map(|(n, _)| *n).rev().collect();
+    let parents: Vec<checkbox::Parent> = already
+        .iter()
+        .filter_map(|&n| cb.as_parent(n))
+        .chain(cb.ancestors(anchor))
+        .collect();
+    for parent in parents {
         // Structure from the locator, state from the buffer AS IT WILL BE —
-        // the toggled line included, or the cookie lags one keypress behind
-        // the box it is counting.
+        // the toggled lines included, or a cookie lags one keypress behind the
+        // box it counts. Read through `after` rather than `line` so a deeper
+        // pass's rewrite is visible to a shallower one, and take the LAST
+        // rewrite of a line for the same reason the write-out does.
         let after = |n: u32| -> Option<String> {
             rewritten
                 .iter()
+                .rev()
                 .find(|(i, _)| *i == n)
                 .map(|(_, t)| t.clone())
                 .or_else(|| line(n))
         };
-        let (done, total) = checkbox::tally_lines(&cb.child_item_lines(parent), after);
-        if let Some(updated) = checkbox::update_cookie(&above, done, total) {
-            if updated != above {
-                rewritten.push((parent.line(), updated));
+        let Some(before) = after(parent.line()) else {
+            continue;
+        };
+        let child_lines = cb.child_item_lines(parent);
+        let mut text = before.clone();
+        // The box, from the children. `None` leaves it alone — a parent whose
+        // children carry no boxes keeps whatever the user wrote. A headline
+        // has no box for `set_state` to rewrite and falls through to its
+        // cookie.
+        let states = child_lines
+            .iter()
+            .filter_map(|&n| after(n).as_deref().and_then(checkbox::parse_item))
+            .map(|i| i.state);
+        if let Some(derived) = checkbox::derive_state(states) {
+            if let Some(with_box) = checkbox::set_state(&text, derived) {
+                text = with_box;
             }
         }
+        // Then the cookie, over the SAME text — a line can carry both
+        // (`- [-] parent [1/2]`), and computing them into separate strings
+        // would have the second discard the first.
+        let (done, total) = checkbox::tally_lines(&child_lines, after);
+        if let Some(updated) = checkbox::update_cookie(&text, done, total) {
+            text = updated;
+        }
+        if text != before {
+            rewritten.push((parent.line(), text));
+        }
     }
+}
 
-    let top = rewritten.iter().map(|(i, _)| *i).min().unwrap_or(at);
-    let Some(last_text) = line(at) else {
+/// OX.1 — write a set of line rewrites out as ONE edit.
+///
+/// One edit rather than several so a single `u` reverses the whole thing: a
+/// half-undone list showing `[2/3]` above one ticked box is worse than either
+/// end state.
+///
+/// **The LAST rewrite of a line wins, not the first.** A line can be written
+/// twice in one pass — the user toggles a parent, and the derivation then
+/// recomputes that same line from children that did not move. Taking the first
+/// returned the toggle and discarded the derivation, which is precisely the
+/// "a parent cannot be ticked directly" rule failing to hold.
+fn write_rewritten(
+    ctx: &ActionContext,
+    line: &impl Fn(u32) -> Option<String>,
+    rewritten: Vec<(u32, String)>,
+) -> Vec<Effect> {
+    let Some(top) = rewritten.iter().map(|(i, _)| *i).min() else {
         return vec![Effect::None];
     };
-    let body: Vec<String> = (top..=at)
+    let Some(bottom) = rewritten.iter().map(|(i, _)| *i).max() else {
+        return vec![Effect::None];
+    };
+    let Some(last_text) = line(bottom) else {
+        return vec![Effect::None];
+    };
+    let body: Vec<String> = (top..=bottom)
         .map(|i| {
             rewritten
                 .iter()
+                .rev()
                 .find(|(j, _)| *j == i)
                 .map(|(_, t)| t.clone())
                 .or_else(|| line(i))
@@ -8678,9 +8849,12 @@ fn toggle_checkbox(
     replace_lines(
         ctx,
         top,
-        at,
+        bottom,
         last_text.len() as u32,
-        body.join("\n"),
+        body.join(
+            "
+",
+        ),
         ctx.cursor,
     )
 }

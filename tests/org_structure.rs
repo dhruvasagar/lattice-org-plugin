@@ -1525,6 +1525,289 @@ async fn toggling_a_checkbox_updates_the_parents_cookie_in_one_edit() {
     assert_eq!(text(&editor), original, "one undo reverses box and cookie");
 }
 
+// ── OX.1: a parent's box is derived from its children ───────────────────────
+
+/// **Ticking the last unticked child ticks the parent.**
+///
+/// A parent's box is a FUNCTION of its children, not a value of its own —
+/// `org-list-struct-fix-box`. Before OX.1 the parent's box never moved at all:
+/// `Check::Partial` was parsed and rendered and nothing ever produced it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticking_the_last_child_ticks_the_parent() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 3);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [X] parent\n    - [X] a\n    - [X] b\n",
+        "every child ticked, so the parent is ticked"
+    );
+}
+
+/// **A mixed set of children makes the parent `[-]`.**
+///
+/// The partial state exists in the type and had no producer. This is the arm
+/// that gives it one, and it is the state a half-done list spends most of its
+/// life in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_set_of_children_makes_the_parent_partial() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [ ] parent\n    - [ ] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
+        "one of two ticked is partial, not ticked"
+    );
+}
+
+/// Unticking the only ticked child takes the parent back to `[ ]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unticking_the_last_ticked_child_unticks_the_parent() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [ ] parent\n    - [ ] a\n    - [ ] b\n"
+    );
+}
+
+/// **A parent with boxed children cannot be ticked directly — it snaps back.**
+///
+/// This is the model, not a limitation bolted on: the parent is recomputed
+/// from children that did not move, so setting it has no lasting effect. Org
+/// behaves identically, and the escape hatch is setting the CHILDREN — over a
+/// region, or from the headline with `C-c C-x C-b`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_with_boxed_children_cannot_be_ticked_directly() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let original = "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n";
+    let mut editor = org_editor(base.path(), original).await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        original,
+        "the toggle is overwritten by the derivation, exactly as in org"
+    );
+}
+
+/// A parent whose children carry NO boxes is an ordinary item and toggles
+/// normally.
+///
+/// The `None` arm of `derive_state`, end to end. Collapsing it to "no ticked
+/// children, so untick the parent" would blank a perfectly good box every time
+/// something near it moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_without_boxed_children_still_toggles() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [ ] parent\n    - plain\n    - also plain\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [X] parent\n    - plain\n    - also plain\n",
+        "nothing beneath it is a checkbox, so nothing derives it"
+    );
+}
+
+/// **Derivation cascades, deepest first.**
+///
+/// A grandparent's box is computed from a parent whose box was itself just
+/// computed — which only works if the passes run deepest-first. Going the
+/// other way would read the pre-edit parent and leave the grandparent a level
+/// behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn derivation_cascades_up_through_grandparents() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [ ] grand\n    - [ ] parent\n      - [ ] a\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 3);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [X] grand\n    - [X] parent\n      - [X] a\n",
+        "the only leaf ticked, so every level above it is ticked"
+    );
+}
+
+/// A box and a cookie on the SAME line both update.
+///
+/// They are computed into one string rather than two — the second would
+/// otherwise discard the first, and `- [-] parent [1/2]` is an ordinary line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parent_carrying_both_a_box_and_a_cookie_updates_both() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [ ] parent [0/2]\n    - [ ] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-Space>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [-] parent [1/2]\n    - [X] a\n    - [ ] b\n",
+        "the box became partial and the cookie counted, in one line"
+    );
+}
+
+// ── OX.2: `C-c C-x C-b` sets many boxes to one state ────────────────────────
+
+/// **From a HEADLINE, the whole subtree is driven to ONE state.**
+///
+/// This is the escape hatch OX.1 requires: a parent's box is derived and
+/// cannot be ticked directly, so without a way to set the children en masse a
+/// long list could only be completed one line at a time. Org has this key for
+/// this reason.
+///
+/// The middle box starts ticked and STAYS ticked, which is what distinguishes
+/// this verb from `<C-Space>`: `<C-Space>` over a region flips each box from
+/// its own state (OS.10) and would have turned that one off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_set_chord_drives_a_whole_subtree_to_one_state() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Shopping [1/3]\n  - [ ] bread\n  - [X] milk\n  - [ ] eggs\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    assert_eq!(
+        text(&editor),
+        "* Shopping [3/3]\n  - [X] bread\n  - [X] milk\n  - [X] eggs\n",
+        "the first box was unticked, so everything is driven ON — including \
+         the one that was already on"
+    );
+}
+
+/// The reference state is org's: already-ticked means UNTICK everything.
+///
+/// Taken from the FIRST box rather than from the cursor line, because on a
+/// headline the cursor is not on a box at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_set_chord_unticks_when_the_first_box_is_ticked() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* Shopping [3/3]\n  - [X] bread\n  - [X] milk\n  - [X] eggs\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    assert_eq!(
+        text(&editor),
+        "* Shopping [0/3]\n  - [ ] bread\n  - [ ] milk\n  - [ ] eggs\n"
+    );
+}
+
+/// **It reaches a parent whose box is otherwise read-only.**
+///
+/// The pairing that makes OX.1 usable: `<C-Space>` on `- [-] parent` snaps
+/// back, and this sets the children so the parent derives to `[X]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_set_chord_completes_a_list_a_parent_toggle_cannot() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [X] parent\n    - [X] a\n    - [X] b\n",
+        "the children were set, so the parent derived to ticked"
+    );
+}
+
+/// Items with NO box are left alone.
+///
+/// Org adds boxes only under `C-u`. Putting one on every bullet in a subtree
+/// because the user wanted to tick three would be a far larger edit than the
+/// key implies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_set_chord_does_not_add_boxes_to_plain_items() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "* T\n  - [ ] boxed\n  - plain bullet\n").await;
+
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [X] boxed\n  - plain bullet\n",
+        "the plain bullet is untouched"
+    );
+}
+
 /// A percentage cookie stays a percentage — rewriting it as a ratio would
 /// change the document's style on a keypress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1583,8 +1866,9 @@ async fn nested_lists_roll_up_to_the_nearest_cookie() {
     press(&mut editor, "<C-Space>");
     let out = text(&editor);
     assert!(
-        out.contains("- [ ] a [1/2]"),
-        "the nearest cookie moved: {out}"
+        out.contains("- [-] a [1/2]"),
+        "the nearest cookie moved — and OX.1 derives the parent's own box from \
+         its now-mixed children, which is what `[-]` is for: {out}"
     );
     assert!(
         out.contains("* Top [0/2]"),
@@ -4093,16 +4377,23 @@ async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
     press(&mut editor, "<C-Space>");
     assert_eq!(
         text(&editor),
-        "* Top [0/2]\n- [ ] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
+        "* Top [0/2]\n- [-] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
         "the nested cookie moved and the outer one did not"
     );
 
-    // Tick the outer item itself: now `Top` moves.
-    goto_line(&mut editor, 1);
+    // Tick the REMAINING grandchild: `a` derives to ticked, and `Top` moves
+    // with it.
+    //
+    // Reaching `Top` by completing the children rather than by ticking `a`
+    // directly is the OX.1 model — a parent's box is a FUNCTION of its
+    // children, so `<C-Space>` on `a` would be recomputed straight back to
+    // `[-]`. This also exercises the full cascade in one keystroke: leaf →
+    // parent's box → parent's cookie → the headline's cookie.
+    goto_line(&mut editor, 3);
     press(&mut editor, "<C-Space>");
     assert_eq!(
         text(&editor),
-        "* Top [1/2]\n- [X] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
+        "* Top [1/2]\n- [X] a [2/2]\n  - [X] a1\n  - [X] a2\n- [ ] b\n",
     );
 }
 
@@ -5379,11 +5670,12 @@ async fn every_bullet_shape_moves_its_box_and_its_cookie_together() {
             "* S [0/1]\n- [ ] a\n",
             "* S [1/1]\n- [X] a\n",
         ),
-        (
-            "with a nested child below it",
-            "* S [0/1]\n  - [ ] a\n    - [ ] b\n",
-            "* S [1/1]\n  - [X] a\n    - [ ] b\n",
-        ),
+        // The "with a nested child below it" row moved out at OX.1. An item
+        // with a boxed child is a PARENT, and a parent's box is derived from
+        // its children rather than set — so that row stopped being about
+        // bullet shapes and became a parent-derivation case. It lives as
+        // `a_parent_with_boxed_children_cannot_be_ticked_directly`, where the
+        // assertion can say what it means.
         (
             "a two-space box is not a checkbox",
             "* S [0/1]\n  - [  ] a\n",

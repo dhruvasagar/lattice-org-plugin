@@ -258,6 +258,24 @@ impl<'a> Checkboxes<'a> {
         }
     }
 
+    /// OX.1 — line `n` viewed as a PARENT, so its own children can be asked
+    /// for.
+    ///
+    /// [`ancestors`](Self::ancestors) answers what is ABOVE a line, which is
+    /// what a cookie walk needs. Deriving a box needs the line itself too: the
+    /// item the user just toggled may be a parent, and org recomputes every
+    /// parent in the list rather than only the ones above the edit — which is
+    /// exactly what makes a parent's box read-only.
+    ///
+    /// `None` when `n` is not an item at all.
+    pub fn as_parent(&self, n: u32) -> Option<Parent> {
+        let item = self.text(n).as_deref().and_then(parse_item)?;
+        Some(Parent::Item {
+            line: n,
+            indent: item.indent,
+        })
+    }
+
     /// The lines carrying `parent`'s DIRECT child checkboxes.
     ///
     /// Direct only — a grandchild's state is already reflected in its own
@@ -464,6 +482,53 @@ impl<'a> Checkboxes<'a> {
     }
 }
 
+/// OX.1 — a parent's box, computed from its DIRECT children.
+///
+/// Org's `org-list-struct-fix-box`, arm for arm:
+///
+/// ```elisp
+/// ((and (member "[ ]" box-list) (member "[X]" box-list)) "[-]")
+/// ((member "[-]" box-list) "[-]")
+/// ((member "[X]" box-list) "[X]")
+/// ((member "[ ]" box-list) "[ ]")
+/// (t <leave the parent's box alone>)
+/// ```
+///
+/// **A parent's box is a FUNCTION of its children, not a value of its own.**
+/// That is the whole model, and it is why a parent with boxed children cannot
+/// be ticked directly: whatever you set it to, this recomputes it. The escape
+/// hatch is setting the children — over a region, or from the headline.
+///
+/// `None` means "no boxed children, so leave the box as the user wrote it".
+/// Distinct from `Some(Check::Off)`, which means "children exist and none are
+/// ticked" — collapsing the two would blank the box on any parent whose
+/// children happen to carry no boxes at all.
+pub fn derive_state(children: impl IntoIterator<Item = Check>) -> Option<Check> {
+    let (mut off, mut on, mut partial) = (false, false, false);
+    for c in children {
+        match c {
+            Check::Off => off = true,
+            Check::On => on = true,
+            Check::Partial => partial = true,
+        }
+    }
+    // Mixed first, matching org's arm order: a list holding both `[ ]` and
+    // `[X]` is partial even if it also holds a `[-]`, and the two arms answer
+    // the same there — but the order is org's and copying it keeps the next
+    // reader from having to re-derive that they agree.
+    if off && on {
+        Some(Check::Partial)
+    } else if partial {
+        Some(Check::Partial)
+    } else if on {
+        Some(Check::On)
+    } else if off {
+        Some(Check::Off)
+    } else {
+        None
+    }
+}
+
 /// Count `lines` as ticked-of-total, reading each box's state from `state_of`.
 ///
 /// Separate from [`Checkboxes`] because the caller supplies an accessor
@@ -486,6 +551,48 @@ pub fn tally_lines(lines: &[u32], state_of: impl Fn(u32) -> Option<String>) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── OX.1: a parent's box is derived from its children ──────────────
+
+    /// Org's arms, each one pinned. `org-list-struct-fix-box`:
+    ///
+    /// ```elisp
+    /// ((and (member "[ ]" box-list) (member "[X]" box-list)) "[-]")
+    /// ((member "[-]" box-list) "[-]")
+    /// ((member "[X]" box-list) "[X]")
+    /// ((member "[ ]" box-list) "[ ]")
+    /// (t <unchanged>)
+    /// ```
+    #[test]
+    fn a_parents_box_follows_orgs_arms() {
+        use Check::{Off, On, Partial};
+        // Mixed ticked and unticked.
+        assert_eq!(derive_state([Off, On]), Some(Partial));
+        // A partial child makes the parent partial however the rest look.
+        assert_eq!(derive_state([On, Partial]), Some(Partial));
+        assert_eq!(derive_state([Partial]), Some(Partial));
+        // All ticked, all unticked.
+        assert_eq!(derive_state([On, On]), Some(On));
+        assert_eq!(derive_state([Off, Off]), Some(Off));
+    }
+
+    /// **No boxed children leaves the parent alone**, which is not the same as
+    /// setting it to `[ ]`.
+    ///
+    /// A list item with sub-items that carry no checkboxes is an ordinary
+    /// ticked item; collapsing this to `Some(Off)` would blank it every time
+    /// anything near it was toggled.
+    #[test]
+    fn no_boxed_children_leaves_the_parent_alone() {
+        assert_eq!(derive_state([]), None);
+    }
+
+    /// One ticked child is enough on its own — `[X]`, not `[-]`. The mixed arm
+    /// requires BOTH an unticked and a ticked child.
+    #[test]
+    fn a_single_ticked_child_makes_the_parent_ticked() {
+        assert_eq!(derive_state([Check::On]), Some(Check::On));
+    }
 
     #[test]
     fn parses_the_bullet_forms_org_accepts() {

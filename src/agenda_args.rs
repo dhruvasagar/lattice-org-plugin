@@ -45,6 +45,58 @@ pub enum FilterTerm {
     /// the full path: the user filtered from a row they were looking at, and
     /// the name is what they saw.
     File(String),
+    /// OA.29 `title:ship` — the headline's own text, stars / keyword / tags
+    /// stripped. Case-INSENSITIVE substring, unlike `tag:`: a tag is an
+    /// identifier the user typed exactly once when they wrote it, and a title
+    /// is prose they are half-remembering.
+    Title(String),
+    /// OA.29 `body:invoice` — the entry's text BELOW the headline, down to the
+    /// next headline. Case-insensitive substring, like [`Self::Title`].
+    ///
+    /// The one filter that reads text no row displays, which is the point:
+    /// "the task where I wrote down the account number" is a real way to look
+    /// for something, and it is unanswerable from the agenda's own lines.
+    Body(String),
+    /// OA.29 `cat:work` — the row's org CATEGORY. Exact match,
+    /// case-insensitive.
+    ///
+    /// Resolved per org's own precedence: the headline's `CATEGORY` property,
+    /// else the file's `#+CATEGORY:`, else the file's stem.
+    Category(String),
+    /// OA.29 `re:^\*+ TODO` — a regexp over the row's SOURCE LINE.
+    ///
+    /// The source line rather than the title, because that is the closest
+    /// thing lattice has to what emacs' `org-agenda-filter-by-regexp` matches:
+    /// emacs applies it to the rendered agenda line, and here the rendered row
+    /// IS the headline line — stars, keyword, priority, title and tags. So a
+    /// pattern a user brings over from emacs mostly means the same thing.
+    Regexp(String),
+}
+
+impl FilterTerm {
+    /// The wire spelling, which is also what the headerline shows for
+    /// everything except a tag (org spells that `+work`).
+    fn key(&self) -> &'static str {
+        match self {
+            Self::Tag(_) => "tag",
+            Self::File(_) => "file",
+            Self::Title(_) => "title",
+            Self::Body(_) => "body",
+            Self::Category(_) => "cat",
+            Self::Regexp(_) => "re",
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::Tag(v)
+            | Self::File(v)
+            | Self::Title(v)
+            | Self::Body(v)
+            | Self::Category(v)
+            | Self::Regexp(v) => v,
+        }
+    }
 }
 
 /// The agenda view's arguments, parsed.
@@ -130,6 +182,8 @@ impl ViewArgs {
             // `key:value` before `key=value`: `tag:` and `file:` are the two
             // that read naturally with a colon, and a path can contain `=`.
             if let Some((key, value)) = arg.split_once(':') {
+                // `split_once` takes the FIRST colon, so a value may contain
+                // more of them — `re:^\*: ` and `title:notes: q3` both survive.
                 match key {
                     "tag" if !value.is_empty() => {
                         out.filters.push(FilterTerm::Tag(value.to_string()));
@@ -137,6 +191,38 @@ impl ViewArgs {
                     }
                     "file" if !value.is_empty() => {
                         out.filters.push(FilterTerm::File(value.to_string()));
+                        continue;
+                    }
+                    "title" if !value.is_empty() => {
+                        out.filters.push(FilterTerm::Title(value.to_string()));
+                        continue;
+                    }
+                    "body" if !value.is_empty() => {
+                        out.filters.push(FilterTerm::Body(value.to_string()));
+                        continue;
+                    }
+                    "cat" if !value.is_empty() => {
+                        out.filters.push(FilterTerm::Category(value.to_string()));
+                        continue;
+                    }
+                    // OA.29: validated HERE rather than where it is applied.
+                    //
+                    // A pattern that does not compile has three possible
+                    // behaviours and two of them are traps: matching nothing
+                    // empties the agenda while the header says it is filtered
+                    // (the worst thing this view can say incorrectly), and
+                    // matching everything shows an unfiltered agenda under a
+                    // filter the user believes is on. So it is DROPPED and
+                    // named, and the headerline carries the ⚠ — the same
+                    // treatment every other unusable argument gets.
+                    "re" if !value.is_empty() => {
+                        match regex_lite::Regex::new(value) {
+                            Ok(_) => out.filters.push(FilterTerm::Regexp(value.to_string())),
+                            Err(e) => out.problems.push(format!(
+                                "regexp `{value}` did not compile ({})",
+                                first_line(&e.to_string())
+                            )),
+                        }
                         continue;
                     }
                     _ => {}
@@ -233,10 +319,7 @@ impl ViewArgs {
             out.push(format!("log={}", items.to_spec()));
         }
         for f in &self.filters {
-            out.push(match f {
-                FilterTerm::Tag(t) => format!("tag:{t}"),
-                FilterTerm::File(f) => format!("file:{f}"),
-            });
+            out.push(format!("{}:{}", f.key(), f.value()));
         }
         // Last, so a human reading a log sees the interesting arguments first.
         out.push("state=complete".to_string());
@@ -288,7 +371,14 @@ impl ViewArgs {
             .iter()
             .filter_map(|f| match f {
                 FilterTerm::File(n) => Some(n),
-                FilterTerm::Tag(_) => None,
+                // Every other term is a ROW test, and this is a FILE test. A
+                // catch-all would be wrong the day someone adds a second
+                // file-shaped term, so they are named.
+                FilterTerm::Tag(_)
+                | FilterTerm::Title(_)
+                | FilterTerm::Body(_)
+                | FilterTerm::Category(_)
+                | FilterTerm::Regexp(_) => None,
             })
             .collect();
         if names.is_empty() {
@@ -307,7 +397,14 @@ impl ViewArgs {
     pub fn admits_tags(&self, tags: &[String]) -> bool {
         self.filters.iter().all(|f| match f {
             FilterTerm::Tag(t) => tags.iter().any(|x| x == t),
-            FilterTerm::File(_) => true,
+            // Not a tag test — answered by `admits_file` and `RowMatcher`
+            // respectively. Enumerated rather than `_`: a new term that is
+            // silently admitted here is a filter that does not filter.
+            FilterTerm::File(_)
+            | FilterTerm::Title(_)
+            | FilterTerm::Body(_)
+            | FilterTerm::Category(_)
+            | FilterTerm::Regexp(_) => true,
         })
     }
 
@@ -343,6 +440,123 @@ impl ViewArgs {
             vec![self.command.clone()]
         }
     }
+}
+
+/// OA.29 — the text facets of one row, for the filters that read them.
+///
+/// Borrowed rather than owned: the scan holds the file's text and the row's
+/// line for the length of the walk, so every field here is a slice into
+/// something already in hand. A row that survives no filter should cost no
+/// allocation.
+#[derive(Debug, Clone, Copy)]
+pub struct RowText<'a> {
+    /// The row's SOURCE LINE, verbatim — what `re:` matches, and what the view
+    /// actually renders.
+    pub headline: &'a str,
+    /// The headline's own text: stars, TODO keyword and trailing tags removed.
+    pub title: &'a str,
+    /// The entry's text below the headline, down to the next headline.
+    pub body: &'a str,
+    /// The resolved org CATEGORY for this row.
+    pub category: &'a str,
+}
+
+/// OA.29 — a view's text filters, compiled once for a whole scan.
+///
+/// **Built once per scan, not once per row.** `re:` has to compile, and
+/// compiling the same handful of patterns for every headline in a 700-file
+/// corpus is the kind of per-row cost that does not show up in a test and does
+/// show up in a scan. Lowercasing the substring needles once is the same trade.
+#[derive(Debug, Default)]
+pub struct RowMatcher {
+    /// Lowercased needles, ANDed — each `sT` narrows.
+    titles: Vec<String>,
+    /// Lowercased needles, ANDed.
+    bodies: Vec<String>,
+    /// Lowercased, ORed. A row has exactly ONE category, so ANDing two would be
+    /// unsatisfiable — the same reasoning `file:` terms are ORed under.
+    categories: Vec<String>,
+    /// Compiled patterns, ANDed. Only ones that compiled: `ViewArgs::parse`
+    /// drops and reports the rest, so an unusable pattern never reaches here.
+    regexes: Vec<regex_lite::Regex>,
+}
+
+impl RowMatcher {
+    /// Compile `view`'s text filters. Cheap and total — a view with none
+    /// produces an empty matcher that admits everything.
+    pub fn new(view: &ViewArgs) -> Self {
+        let mut out = Self::default();
+        for f in &view.filters {
+            match f {
+                FilterTerm::Title(t) => out.titles.push(t.to_lowercase()),
+                FilterTerm::Body(b) => out.bodies.push(b.to_lowercase()),
+                FilterTerm::Category(c) => out.categories.push(c.to_lowercase()),
+                // `parse` already rejected anything that does not compile, so
+                // this cannot normally fail. Skipping rather than unwrapping if
+                // it somehow does: a panic here takes the whole scan down, and
+                // the term was already reported.
+                FilterTerm::Regexp(r) => {
+                    if let Ok(re) = regex_lite::Regex::new(r) {
+                        out.regexes.push(re);
+                    }
+                }
+                FilterTerm::Tag(_) | FilterTerm::File(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Whether this matcher tests anything. An empty one admits every row, so
+    /// the scan can skip building [`RowText`] entirely.
+    pub fn is_empty(&self) -> bool {
+        self.titles.is_empty()
+            && self.bodies.is_empty()
+            && self.categories.is_empty()
+            && self.regexes.is_empty()
+    }
+
+    /// Whether `row` survives every text filter.
+    ///
+    /// Substring tests are case-INSENSITIVE and regexp tests are not. That is
+    /// not an inconsistency: a substring filter is someone half-remembering
+    /// prose, and a regexp is someone stating a pattern exactly — a `re:` that
+    /// silently ignored case could not express "the SHOUTING ones", and there
+    /// is no way to ask for case-sensitivity back. `(?i)` is how a regexp asks
+    /// for the other behaviour, which is the spelling its users already know.
+    pub fn admits(&self, row: &RowText<'_>) -> bool {
+        // Each block lowercases its haystack only when it has a needle for it.
+        // A body can be an entire subtree, so folding one per row for a view
+        // that never asked about bodies is the kind of cost that hides inside
+        // a 700-file scan.
+        if !self.titles.is_empty() {
+            let title = row.title.to_lowercase();
+            if !self.titles.iter().all(|n| title.contains(n.as_str())) {
+                return false;
+            }
+        }
+        if !self.bodies.is_empty() {
+            let body = row.body.to_lowercase();
+            if !self.bodies.iter().all(|n| body.contains(n.as_str())) {
+                return false;
+            }
+        }
+        if !self.categories.is_empty() {
+            let cat = row.category.to_lowercase();
+            if !self.categories.iter().any(|c| *c == cat) {
+                return false;
+            }
+        }
+        self.regexes.iter().all(|re| re.is_match(row.headline))
+    }
+}
+
+/// The first line of a multi-line error, for a headerline that is one line.
+///
+/// `regex-lite` reports a syntax error across several lines with a caret under
+/// the offending character; all of that in a modeline would push the window and
+/// the filter off the end of it.
+fn first_line(msg: &str) -> String {
+    msg.lines().next().unwrap_or(msg).trim().to_string()
 }
 
 #[cfg(test)]
@@ -845,10 +1059,12 @@ pub fn describe(view: &ViewArgs, default_span: u32, anchor: i64) -> String {
     }
     for f in &view.filters {
         parts.push(match f {
-            // `+work` and `file:notes.org` — org's own spellings, so what the
-            // header shows is what the user would type to reproduce it.
+            // `+work` is org's own spelling for a tag filter, so what the
+            // header shows is what the user would type to reproduce it. The
+            // rest carry their wire key, which is the same thing one step
+            // further: `cat:work` is exactly what `to_args` writes.
             FilterTerm::Tag(t) => format!("+{t}"),
-            FilterTerm::File(f) => format!("file:{f}"),
+            other => format!("{}:{}", other.key(), other.value()),
         });
     }
     // OA.15: log mode changes which rows exist, so the header has to say it —
@@ -902,6 +1118,175 @@ fn window(anchor: i64, span: u32) -> String {
             day(anchor),
             day(anchor + i64::from(span) - 1)
         )
+    }
+}
+
+#[cfg(test)]
+mod row_filter_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn v(items: &[&str]) -> ViewArgs {
+        ViewArgs::parse(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn row<'a>(headline: &'a str, title: &'a str, body: &'a str, category: &'a str) -> RowText<'a> {
+        RowText {
+            headline,
+            title,
+            body,
+            category,
+        }
+    }
+
+    #[test]
+    fn no_text_filter_admits_everything_and_builds_nothing() {
+        let m = RowMatcher::new(&v(&["", "tag:work", "file:a.org"]));
+        assert!(
+            m.is_empty(),
+            "tag and file terms are not text filters — the scan must be able to \
+             skip building row text entirely"
+        );
+        assert!(m.admits(&row("* TODO x", "x", "", "a")));
+    }
+
+    #[test]
+    fn a_title_filter_is_a_case_insensitive_substring() {
+        let m = RowMatcher::new(&v(&["", "title:SHIP"]));
+        assert!(m.admits(&row("* TODO Ship it", "Ship it", "", "work")));
+        assert!(m.admits(&row("* TODO shipping", "shipping", "", "work")));
+        assert!(!m.admits(&row("* TODO Invoice", "Invoice", "", "work")));
+    }
+
+    /// Title matches the TITLE, not the whole line — otherwise `sT TODO`
+    /// would match every unfinished row, which is not a title search.
+    #[test]
+    fn a_title_filter_does_not_see_the_keyword_or_tags() {
+        let m = RowMatcher::new(&v(&["", "title:todo"]));
+        assert!(!m.admits(&row("* TODO Ship it :todo:", "Ship it", "", "work")));
+    }
+
+    #[test]
+    fn a_body_filter_reads_below_the_headline() {
+        let m = RowMatcher::new(&v(&["", "body:invoice"]));
+        assert!(m.admits(&row(
+            "* TODO Ship it",
+            "Ship it",
+            "  the INVOICE is due\n",
+            "w"
+        )));
+        assert!(!m.admits(&row("* TODO Ship it", "Ship it", "  nothing here\n", "w")));
+    }
+
+    /// Two title terms NARROW. `sT` replaces its own kind on submit, so a view
+    /// carrying two came from written args — and there the only sane reading of
+    /// two substrings is "both".
+    #[test]
+    fn title_terms_narrow_rather_than_widen() {
+        let m = RowMatcher::new(&v(&["", "title:ship", "title:q3"]));
+        assert!(m.admits(&row("*", "Ship the Q3 report", "", "w")));
+        assert!(!m.admits(&row("*", "Ship the Q2 report", "", "w")));
+    }
+
+    /// Categories are ORed, for `file:`'s reason: a row has exactly ONE, so an
+    /// AND of two could never match anything.
+    #[test]
+    fn category_terms_widen_because_a_row_has_only_one() {
+        let m = RowMatcher::new(&v(&["", "cat:work", "cat:home"]));
+        assert!(m.admits(&row("*", "x", "", "work")));
+        assert!(m.admits(&row("*", "x", "", "home")));
+        assert!(!m.admits(&row("*", "x", "", "someday")));
+    }
+
+    #[test]
+    fn category_matching_ignores_case() {
+        let m = RowMatcher::new(&v(&["", "cat:Work"]));
+        assert!(m.admits(&row("*", "x", "", "WORK")));
+    }
+
+    /// The regexp matches the SOURCE LINE — stars, keyword, priority, title and
+    /// tags — which is the nearest thing here to emacs' "the agenda line".
+    #[test]
+    fn a_regexp_matches_the_whole_source_line() {
+        let m = RowMatcher::new(&v(&["", r"re:^\*+ TODO \[#A\]"]));
+        assert!(m.admits(&row("** TODO [#A] Ship it", "Ship it", "", "w")));
+        assert!(!m.admits(&row("** TODO [#B] Ship it", "Ship it", "", "w")));
+    }
+
+    /// Regexps are case-SENSITIVE where substrings are not, and `(?i)` is how
+    /// the other behaviour is asked for. A `re:` that folded case could not
+    /// express "the SHOUTING ones" and offered no way to get it back.
+    #[test]
+    fn a_regexp_is_case_sensitive_unless_it_says_otherwise() {
+        assert!(!RowMatcher::new(&v(&["", "re:ship"])).admits(&row("* SHIP", "SHIP", "", "w")));
+        assert!(RowMatcher::new(&v(&["", "re:(?i)ship"])).admits(&row("* SHIP", "SHIP", "", "w")));
+    }
+
+    /// A pattern that does not compile is DROPPED and named — never kept as a
+    /// filter that matches nothing, which would empty the agenda while the
+    /// header claims it is filtered.
+    #[test]
+    fn an_uncompilable_regexp_is_reported_and_not_applied() {
+        let view = v(&["", "re:[unclosed"]);
+        assert!(
+            view.filters.is_empty(),
+            "the term must not survive: {:?}",
+            view.filters
+        );
+        assert_eq!(view.problems.len(), 1, "{:?}", view.problems);
+        assert!(
+            view.problems[0].contains("did not compile"),
+            "{:?}",
+            view.problems
+        );
+        assert!(
+            !view.to_args().iter().any(|a| a.starts_with("re:")),
+            "and it is not re-emitted, so a typo does not become permanent"
+        );
+    }
+
+    /// Every new term round-trips, or a filter would quietly vanish the next
+    /// time any chord re-opened the view.
+    #[test]
+    fn every_filter_kind_round_trips() {
+        let original = v(&[
+            "r",
+            "tag:work",
+            "file:a.org",
+            "title:ship",
+            "body:invoice",
+            "cat:home",
+            "re:^x",
+        ]);
+        assert_eq!(original.filters.len(), 6, "{:?}", original.filters);
+        let mut expected = original.clone();
+        expected.complete = true;
+        assert_eq!(ViewArgs::parse(&original.to_args()), expected);
+    }
+
+    /// A value may contain colons — `split_once` takes the first one only.
+    /// A regexp with a `:` in it is ordinary, and so is a title.
+    #[test]
+    fn a_filter_value_may_contain_colons() {
+        let view = v(&["", "title:q3: revenue"]);
+        assert_eq!(
+            view.filters,
+            vec![FilterTerm::Title("q3: revenue".to_string())]
+        );
+    }
+
+    /// The headerline names every kind. A filtered agenda that looks unfiltered
+    /// is the trap OA.22 exists for, and four new kinds are four new ways in.
+    #[test]
+    fn the_header_names_every_filter_kind() {
+        let said = describe(
+            &v(&["", "title:ship", "body:inv", "cat:work", "re:^x"]),
+            7,
+            20698,
+        );
+        for want in ["title:ship", "body:inv", "cat:work", "re:^x"] {
+            assert!(said.contains(want), "{want} missing from {said:?}");
+        }
     }
 }
 

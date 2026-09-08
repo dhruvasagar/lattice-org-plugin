@@ -1005,6 +1005,59 @@ open agendas can sit on different windows.
 The headerline names the span and the dates it covers — `Week 2026-09-03 –
 2026-09-09` — so the view always says what it is showing.
 
+### Narrowing what you are looking at
+
+Filtering lives under **`s`**, which is where `evil-org-agenda` puts it — and
+the reason it is not on `/` is that `/` is your search key. An agenda is a
+buffer you want to search; taking `/` away inside it to buy one filter is a bad
+trade, and emacs only makes it because emacs has no `/` to lose.
+
+| | |
+|---|---|
+| `st` | tag |
+| `sT` | title — the headline's own text |
+| `sb` | body — the text *under* the headline |
+| `sc` | category |
+| `sf` | file |
+| `sr` | regexp, over the row's line |
+| `\` | narrow further by another tag |
+| `S` or `\|` | drop every filter |
+
+Each key prompts, and an **empty answer clears that kind** — so `sT <CR>` is how
+you back out of a title filter without touching the others.
+
+Each key also **replaces its own kind**: `sT ship` then `sT invoice` shows the
+invoice rows, because pressing a filter key twice is how you fix a typo. `\` is
+the exception — it *adds* a tag, so `st work` then `\urgent` is work **and**
+urgent.
+
+Filters compose across kinds: `sc work` then `sT ship` is the work category
+**and** a title containing "ship". Two files or two categories are an **or** — a
+row has only one of each, so requiring both could never match anything.
+
+**The headerline always names the filter that is on.** A narrowed agenda that
+looked unfiltered would be this view saying "you have nothing to do" when you
+have plenty.
+
+#### What the text filters read
+
+`sT` matches the headline's title — not its keyword or tags, so `sT todo` does
+not match every unfinished row. `sr` matches the whole source line, keyword and
+tags included, which is what emacs' regexp filter matches too.
+
+`sb` is the one that reads text the agenda does not show: everything under the
+headline down to the next one, planning and property lines included. It is for
+"the task where I wrote down the account number".
+
+`sc` uses org's own category order — the entry's `CATEGORY` property, else the
+file's `#+CATEGORY:`, else the file's name. So a corpus of `work.org` and
+`home.org` already has two categories in it without configuring anything.
+
+Substring filters ignore case; `sr` does not, because a regexp is exact by
+nature. Write `(?i)` when you want it to fold case. A pattern that does not
+compile is refused at the prompt rather than applied — it would otherwise empty
+the agenda while the header claimed it was filtering.
+
 #### `gD` — the view menu
 
 `gD` opens a menu of everything that changes **how the agenda is shown**, and

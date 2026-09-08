@@ -1019,6 +1019,178 @@ pub fn entries_for_row(
     out
 }
 
+/// OA.29 — whether `line` opens a headline: stars, then a space.
+///
+/// The space matters. `**bold**` at column 0 is emphasis, not a level-2
+/// headline, and a body filter that stopped there would read one line of an
+/// entry and call it the whole body.
+fn is_headline(line: &str) -> bool {
+    let stars = line.len() - line.trim_start_matches('*').len();
+    stars > 0 && line[stars..].starts_with(' ')
+}
+
+/// OA.29 — the byte offset every line starts at, plus a final sentinel at the
+/// text's end.
+///
+/// Computed once per file and only when a text filter is active. It exists so
+/// [`entry_body`] can return a SLICE of the file rather than joining lines into
+/// a fresh `String` per row — with a body filter on, that allocation would run
+/// once per headline in the corpus.
+pub fn line_starts(text: &str) -> Vec<usize> {
+    let mut out = vec![0usize];
+    out.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    out.push(text.len());
+    out
+}
+
+/// OA.29 — the entry body below `line`: every line down to the next headline.
+///
+/// Excludes the headline itself, which is what `title:` and `re:` already
+/// match — a `body:` that included it would make `sT foo` and `sb foo` the same
+/// filter for most rows, and the difference between them is the whole reason
+/// there are two.
+///
+/// Includes the planning and properties lines. They are part of what the user
+/// wrote under that headline, and excluding them would make `body:SCHEDULED`
+/// mean nothing while `body:` of an ordinary sentence works — a rule with no
+/// way to discover it.
+pub fn entry_body<'a>(text: &'a str, starts: &[usize], line: u32) -> &'a str {
+    let first = line as usize + 1;
+    // `starts` carries a trailing sentinel, so the last real line is
+    // `starts.len() - 2`. A headline on it has no body at all.
+    if first + 1 >= starts.len() {
+        return "";
+    }
+    let from = starts[first];
+    let mut n = first;
+    while n + 1 < starts.len() {
+        let end = starts[n + 1];
+        let this = text[starts[n]..end].trim_end_matches('\n');
+        if is_headline(this) {
+            break;
+        }
+        n += 1;
+    }
+    &text[from..starts[n].min(text.len())]
+}
+
+/// OA.29 — the file-level org CATEGORY: `#+CATEGORY:` if the file sets one,
+/// else the file's stem.
+///
+/// Org's own precedence, minus the per-headline `CATEGORY` property, which the
+/// caller layers on top because it is a property of the ROW rather than of the
+/// file.
+///
+/// The stem fallback is org's and it is the reason `sc` is useful without any
+/// configuration at all: a corpus of `work.org`, `home.org` and `someday.org`
+/// already has three categories in it whether or not anyone declared them.
+pub fn file_category(text: &str, path: &str) -> String {
+    for raw in text.lines() {
+        let line = raw.trim_start();
+        // Case-insensitively, because org's in-buffer keywords are — and a
+        // file written `#+category:` is not a file without a category.
+        if line.len() >= 11 && line[..11].eq_ignore_ascii_case("#+CATEGORY:") {
+            let value = line[11..].trim();
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        }
+        // Keywords live in the file's header. Stopping at the first headline
+        // keeps this O(preamble) rather than O(file) on every file in a corpus
+        // that mostly does not set one.
+        if is_headline(raw) {
+            break;
+        }
+    }
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.strip_suffix(".org").unwrap_or(name).to_string()
+}
+
+#[cfg(test)]
+mod oa29_text_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    fn body(text: &str, line: u32) -> String {
+        entry_body(text, &line_starts(text), line).to_string()
+    }
+
+    #[test]
+    fn a_body_is_everything_below_the_headline_up_to_the_next_one() {
+        let text = "* One\n  first\n  second\n* Two\n  other\n";
+        assert_eq!(body(text, 0), "  first\n  second\n");
+        assert_eq!(body(text, 3), "  other\n");
+    }
+
+    /// The headline itself is NOT in its body. `title:` and `re:` already match
+    /// it, and including it would make `sT foo` and `sb foo` the same filter for
+    /// most rows — which is the difference the two keys exist to draw.
+    #[test]
+    fn a_body_excludes_its_own_headline() {
+        assert!(!body("* Ship it\n  detail\n", 0).contains("Ship it"));
+    }
+
+    #[test]
+    fn a_headline_with_nothing_under_it_has_an_empty_body() {
+        assert_eq!(body("* One\n* Two\n", 0), "");
+        assert_eq!(
+            body("* Only\n", 0),
+            "",
+            "…including the last line of a file"
+        );
+    }
+
+    /// The planning and properties lines are part of the body. Excluding them
+    /// would make `body:SCHEDULED` mean nothing while `body:` of ordinary prose
+    /// works — a rule with no way to discover it.
+    #[test]
+    fn a_body_includes_the_planning_and_properties_lines() {
+        let text = "* TODO One\n  SCHEDULED: <2026-09-08 Tue>\n  :PROPERTIES:\n  :ID: x\n  :END:\n";
+        let b = body(text, 0);
+        assert!(b.contains("SCHEDULED"));
+        assert!(b.contains(":ID: x"));
+    }
+
+    /// `**bold**` at column 0 is emphasis, not a level-2 headline. A body walk
+    /// that stopped there would read one line and call it the entry.
+    #[test]
+    fn stars_without_a_space_do_not_end_a_body() {
+        let text = "* One\n**not a headline**\n  more\n* Two\n";
+        let b = body(text, 0);
+        assert!(b.contains("**not a headline**"), "got {b:?}");
+        assert!(b.contains("more"));
+        assert!(!b.contains("Two"));
+    }
+
+    #[test]
+    fn a_category_comes_from_the_file_keyword_when_there_is_one() {
+        let text = "#+TITLE: Notes\n#+CATEGORY: work\n\n* One\n";
+        assert_eq!(file_category(text, "/org/notes.org"), "work");
+    }
+
+    #[test]
+    fn a_category_keyword_is_case_insensitive() {
+        assert_eq!(file_category("#+category: home\n", "/org/x.org"), "home");
+    }
+
+    /// Org's own fallback, and the reason `sc` is useful with no configuration
+    /// at all: a corpus of `work.org` and `home.org` already has two categories.
+    #[test]
+    fn a_file_with_no_keyword_falls_back_to_its_stem() {
+        assert_eq!(file_category("* One\n", "/org/someday.org"), "someday");
+        assert_eq!(file_category("* One\n", "someday.org"), "someday");
+    }
+
+    /// The keyword search stops at the first headline: it is a header keyword,
+    /// and scanning every line of every file in a corpus to find one that is
+    /// usually absent is work with no answer at the end of it.
+    #[test]
+    fn a_category_below_the_first_headline_is_not_the_files() {
+        let text = "* One\n#+CATEGORY: sneaky\n";
+        assert_eq!(file_category(text, "/org/notes.org"), "notes");
+    }
+}
+
 /// Inverse of [`timestamp::epoch_day`] — Hinnant's `civil_from_days`.
 pub fn civil_from_epoch_day(day: i64) -> (i32, u32, u32) {
     let z = day + 719468;

@@ -620,6 +620,26 @@ const AGENDA_FILTER_TAG_ADD: u32 = 70;
 const AGENDA_FILTER_TAG_SUBMIT: u32 = 71;
 const AGENDA_FILTER_CLEAR: u32 = 73;
 
+/// OA.29 — the rest of the filter set, under evil-org-agenda's `s` prefix.
+///
+/// **`/` went back to being search.** It was the tag filter (emacs' spelling in
+/// the agenda), and taking vim's most-used key away inside one buffer is a
+/// trade nobody asked for — `s` is where evil-org-agenda puts filtering
+/// precisely so `/` does not have to move. `st` is the tag filter now; `/` is
+/// the builtin forward search again.
+///
+/// The letters follow evil-org where evil-org has an opinion (`st` tag, `sc`
+/// category, `sr` regexp, `S` remove-all) and fill free ones where it does not
+/// (`sT` title, `sb` body, `sf` file). `sc` is CATEGORY rather than content for
+/// that reason and it is worth naming: category is what the key means to
+/// anyone arriving from emacs, and muscle memory is the dominant cost on a
+/// surface like this one.
+const AGENDA_FILTER_TITLE: u32 = 102;
+const AGENDA_FILTER_BODY: u32 = 103;
+const AGENDA_FILTER_CATEGORY: u32 = 104;
+const AGENDA_FILTER_REGEXP: u32 = 105;
+const AGENDA_FILTER_FILE_PROMPT: u32 = 106;
+
 /// OA.15 — `l`, emacs' `org-agenda-log-mode`. What you DID, beside what you
 /// plan to do.
 ///
@@ -2555,9 +2575,31 @@ impl Guest for Component {
                 // is read-only, so a letter here shadows nothing that could be
                 // typed, and this mode activates on agenda views alone.
                 bind("l", "org-agenda-log-mode"),
-                // OA.21: emacs' filter keys. `/` replaces the tag filter,
-                // `\` narrows it further, `|` clears everything.
-                bind("/", "org-agenda-filter-by-tag"),
+                // OA.29: filtering lives under `s`, evil-org-agenda's prefix.
+                //
+                // **`/` is NOT bound here**, and that is the slice. It used to
+                // be the tag filter — emacs' own spelling in the agenda — which
+                // cost vim's search key inside every agenda buffer. evil-org
+                // moved filtering to `s` for exactly that reason, so `st` is
+                // the tag filter and `/` is the builtin forward search again.
+                //
+                // `s` is a PREFIX, so nothing may bind it alone in this layer:
+                // `KeymapTrie::lookup` answers `Bound` at the first node with a
+                // binding and never consults its children, so a bare `s` would
+                // leave all six of these dead — and dead quietly, since the
+                // trailing letter falls through to the grammar in a read-only
+                // view. That is the rule `gD` was already reshaped by (OA.18).
+                bind("st", "org-agenda-filter-by-tag"),
+                bind("sT", "org-agenda-filter-by-title"),
+                bind("sb", "org-agenda-filter-by-body"),
+                bind("sc", "org-agenda-filter-by-category"),
+                bind("sf", "org-agenda-filter-by-file-name"),
+                bind("sr", "org-agenda-filter-by-regexp"),
+                // Both spellings of remove-all: `S` is evil-org's, `|` is org's
+                // own. Two keys for one action rather than a choice between
+                // them — whichever the fingers reach for is right, and neither
+                // costs a key anything else wants.
+                bind("S", "org-agenda-filter-clear"),
                 bind("\\", "org-agenda-filter-add-tag"),
                 bind("|", "org-agenda-filter-clear"),
                 // OA.26: `<` restricts to the row's file, as emacs' `<` locks
@@ -3011,6 +3053,33 @@ impl Guest for Component {
                 "org-agenda-filter-clear",
                 "Drop every agenda filter",
                 AGENDA_FILTER_CLEAR,
+            ),
+            // OA.29 — the rest of the filter set. Each prompts; the submit
+            // handler is shared and reads back WHICH one asked.
+            (
+                "org-agenda-filter-by-title",
+                "Narrow the agenda to headlines whose title contains a string",
+                AGENDA_FILTER_TITLE,
+            ),
+            (
+                "org-agenda-filter-by-body",
+                "Narrow the agenda to entries whose body contains a string",
+                AGENDA_FILTER_BODY,
+            ),
+            (
+                "org-agenda-filter-by-category",
+                "Narrow the agenda to one org CATEGORY",
+                AGENDA_FILTER_CATEGORY,
+            ),
+            (
+                "org-agenda-filter-by-regexp",
+                "Narrow the agenda to rows whose line matches a regexp",
+                AGENDA_FILTER_REGEXP,
+            ),
+            (
+                "org-agenda-filter-by-file-name",
+                "Narrow the agenda to a named file",
+                AGENDA_FILTER_FILE_PROMPT,
             ),
             // OA.26: the two remaining consumers of OA.23's seam.
             (
@@ -3643,8 +3712,13 @@ impl Guest for Component {
         // OA.20: what the next span/filter chord modifies. The agenda is
         // `reuse: true`, so there is one view and one slot is the accurate
         // model; a chord reads this, changes one argument and re-opens.
+        // OA.29: compiled from the RESOLVED view, so an inherited filter (a
+        // view switch carrying the reader's narrowing) is honoured exactly as a
+        // freshly-typed one is.
+        let matcher = agenda_args::RowMatcher::new(&view);
         VIEW_ARGS.replace(view);
         SCAN.set(Some(ScanState {
+            matcher,
             today,
             keywords,
             sections,
@@ -3744,12 +3818,52 @@ impl Guest for Component {
             // block is FOR, the filter says what you are looking at right now,
             // and `r` then `/work` has to mean refile AND work rather than one
             // of them silently winning.
-            if view.is_filtered() {
-                rows.retain(|row| view.admits_tags(&row.tags));
-            }
             // OA.6 reads a row's own line to colour it; both scan paths report
-            // 0-based line numbers into this same split.
+            // 0-based line numbers into this same split. Hoisted above the
+            // filter because OA.29's text filters read the row's line too.
             let lines: Vec<&str> = text.lines().collect();
+            if view.is_filtered() {
+                // OA.29: the text filters cost more than a tag test — a body
+                // filter reads to the next headline, a category resolves the
+                // file's `#+CATEGORY:` — so they are set up ONCE per file and
+                // only when one is actually on. An agenda filtered by tags
+                // alone, which is most of them, pays nothing for this.
+                let text_filtered = !state.matcher.is_empty();
+                let starts = text_filtered
+                    .then(|| agenda::line_starts(&text))
+                    .unwrap_or_default();
+                let file_category = text_filtered
+                    .then(|| agenda::file_category(&text, &path))
+                    .unwrap_or_default();
+                rows.retain(|row| {
+                    if !view.admits_tags(&row.tags) {
+                        return false;
+                    }
+                    if !text_filtered {
+                        return true;
+                    }
+                    let headline = lines.get(row.line as usize).copied().unwrap_or("");
+                    let parsed = todo::parse(headline, &state.keywords.all);
+                    state.matcher.admits(&agenda_args::RowText {
+                        headline,
+                        // The stripped title when the line parses as a
+                        // headline, the raw line when it does not. Falling back
+                        // to the raw line rather than to empty keeps `sT` from
+                        // silently matching nothing on a row some other walk
+                        // admitted.
+                        title: parsed.as_ref().map(|h| h.title).unwrap_or(headline),
+                        body: agenda::entry_body(&text, &starts, row.line),
+                        // Org's precedence: the headline's own `CATEGORY`
+                        // property wins over the file's.
+                        category: row
+                            .properties
+                            .iter()
+                            .find(|(k, _)| k.eq_ignore_ascii_case("CATEGORY"))
+                            .map(|(_, v)| v.as_str())
+                            .unwrap_or(&file_category),
+                    })
+                });
+            }
             // AS.1: one row, zero or more entries. A row is a candidate and
             // each section decides whether it wants it, so an overdue `[#A]`
             // TODO is emitted three times and a headline nothing wants is
@@ -3934,17 +4048,29 @@ struct ScanState {
     /// window, or two files scanned a second apart would disagree about what
     /// "today" was.
     log: Option<(agenda_log::LogItems, std::ops::RangeInclusive<i64>)>,
+    /// OA.29: the view's TEXT filters — title, body, category, regexp —
+    /// compiled once for the whole scan.
+    ///
+    /// Here rather than derived per file for the reason `sections` is: a `re:`
+    /// term has to compile, and compiling the same pattern once per file of a
+    /// 700-file corpus is work nobody asked for. Empty for the overwhelmingly
+    /// common agenda that filters on nothing or on tags alone, and the walk
+    /// checks that before building any row text at all.
+    matcher: agenda_args::RowMatcher,
 }
 
 thread_local! {
-    /// OA.21: whether the filter prompt now open REPLACES the tag filter or
-    /// narrows it.
+    /// OA.21 / OA.29: which filter key opened the prompt now on screen.
     ///
-    /// `/` and `\` open the same prompt and submit through the same action —
-    /// the host's prompt seam carries text back, not which key opened it — so
-    /// the distinction has to be remembered here. One slot, because one prompt
-    /// is open at a time.
-    static FILTER_REPLACES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Seven keys open the same prompt and submit through the same action — the
+    /// host's prompt seam carries text back, not which key opened it — so the
+    /// kind has to be remembered here. One slot, because one prompt is open at
+    /// a time.
+    ///
+    /// The opener's own `ActionId`, rather than a decoded "kind" or the
+    /// `replacing: bool` this used to be: those are a second fact about one
+    /// prompt, and a second fact can disagree with the first.
+    static FILTER_PENDING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// OA.28: the AGENDA buffer `/` or `\` was pressed in.
     ///
@@ -6666,6 +6792,48 @@ fn row_source(ctx: &ActionContext) -> Option<host_services::SourceLocation> {
     host_services::excerpt_source(u64::from(ctx.buffer_id), ctx.cursor.line)
 }
 
+/// OA.29 — the prompt each filter key asks with.
+///
+/// Named rather than derived from the action id's registered doc: the doc is a
+/// sentence for `:describe-command` and a prompt is a label, and making one
+/// serve as the other reads badly in whichever place it was not written for.
+fn filter_prompt(opener: u32) -> &'static str {
+    match opener {
+        AGENDA_FILTER_TAG => "Filter by tag: ",
+        AGENDA_FILTER_TAG_ADD => "Also filter by tag: ",
+        AGENDA_FILTER_TITLE => "Filter by title: ",
+        AGENDA_FILTER_BODY => "Filter by body: ",
+        AGENDA_FILTER_CATEGORY => "Filter by category: ",
+        AGENDA_FILTER_REGEXP => "Filter by regexp: ",
+        _ => "Filter by file: ",
+    }
+}
+
+/// OA.29 — the term `opener` builds, carrying `value`.
+fn filter_term_of(opener: u32, value: String) -> agenda_args::FilterTerm {
+    use agenda_args::FilterTerm;
+    match opener {
+        AGENDA_FILTER_TITLE => FilterTerm::Title(value),
+        AGENDA_FILTER_BODY => FilterTerm::Body(value),
+        AGENDA_FILTER_CATEGORY => FilterTerm::Category(value),
+        AGENDA_FILTER_REGEXP => FilterTerm::Regexp(value),
+        AGENDA_FILTER_FILE_PROMPT => FilterTerm::File(value),
+        // Both tag keys. `\` differs from `st` in whether it clears first, not
+        // in what it builds.
+        _ => FilterTerm::Tag(value),
+    }
+}
+
+/// OA.29 — an empty term of `opener`'s kind, for the discriminant comparison
+/// that clears same-kind terms before adding the new one.
+///
+/// A value rather than a `FilterKind` enum: the kind IS the variant, and a
+/// parallel enum would be a second spelling of `FilterTerm`'s shape that has to
+/// be kept in step with it by hand.
+fn filter_kind_of(opener: u32) -> agenda_args::FilterTerm {
+    filter_term_of(opener, String::new())
+}
+
 /// OA.28 — what the view in `buffer` is showing, as this plugin's own arguments.
 ///
 /// The one way a chord learns the span, day, filters and command it is about to
@@ -7208,23 +7376,28 @@ impl GrammarCallbacks for Component {
                     },
                 ))])
             }
-            // OA.21: `/` and `\` prompt; the difference is whether the answer
-            // REPLACES the tag filter or narrows it, which the submit handler
-            // reads back off the prompt's own action name.
-            AGENDA_FILTER_TAG | AGENDA_FILTER_TAG_ADD => {
-                let replacing = callback == AGENDA_FILTER_TAG;
-                FILTER_REPLACES.replace(replacing);
+            // OA.21 / OA.29: every filter key prompts, and they all submit
+            // through ONE action — the host's prompt seam carries text back,
+            // not which key opened it, so the kind is remembered here.
+            AGENDA_FILTER_TAG
+            | AGENDA_FILTER_TAG_ADD
+            | AGENDA_FILTER_TITLE
+            | AGENDA_FILTER_BODY
+            | AGENDA_FILTER_CATEGORY
+            | AGENDA_FILTER_REGEXP
+            | AGENDA_FILTER_FILE_PROMPT => {
+                // The opener's own id IS the memory. It used to be a separate
+                // `replacing: bool`, which was a second fact about one prompt;
+                // with seven openers that would have become a second fact that
+                // could disagree with the first.
+                FILTER_PENDING.set(callback);
                 // OA.28: the submit fires in the PROMPT buffer, which is not a
                 // view. Remember the agenda this was pressed in — same seam,
                 // one prompt at a time.
                 FILTER_BUFFER.set(ctx.buffer_id);
                 Ok(vec![Effect::OpenPrompt(
                     lattice::plugin_host::types::OpenPromptPayload {
-                        prompt: if replacing {
-                            "Filter by tag: ".to_string()
-                        } else {
-                            "Also filter by tag: ".to_string()
-                        },
+                        prompt: filter_prompt(callback).to_string(),
                         initial: String::new(),
                         on_submit_action: "org-agenda-filter-submit".to_string(),
                         buffer_name: None,
@@ -7232,23 +7405,48 @@ impl GrammarCallbacks for Component {
                 )])
             }
             AGENDA_FILTER_TAG_SUBMIT => {
-                let tag = submitted_text(&ctx.args)
+                let answer = submitted_text(&ctx.args)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
+                let opener = FILTER_PENDING.get();
                 // OA.28: the agenda the prompt was opened from, not
                 // `ctx.buffer_id` — that is the minibuffer, and asking it what
                 // it is showing answers "nothing".
                 let mut view = view_of(FILTER_BUFFER.get());
-                if FILTER_REPLACES.get() {
+                // OA.29: every `s?` key REPLACES its own kind; `\` is the only
+                // one that adds. So `sT ship` then `sT invoice` shows the
+                // invoice rows rather than the empty intersection of two
+                // half-remembered titles — pressing a filter key twice is how
+                // a person corrects a typo, not how they compose a query.
+                if opener != AGENDA_FILTER_TAG_ADD {
+                    let kind = filter_kind_of(opener);
                     view.filters
-                        .retain(|f| !matches!(f, agenda_args::FilterTerm::Tag(_)));
+                        .retain(|f| std::mem::discriminant(f) != std::mem::discriminant(&kind));
                 }
-                // An empty answer CLEARS rather than filtering by nothing:
-                // `/` then `<CR>` is how a person backs out, and a filter on
-                // the empty tag would match no row and read as a broken agenda.
-                if !tag.is_empty() {
-                    view.filters.push(agenda_args::FilterTerm::Tag(tag));
+                // An empty answer CLEARS that kind rather than filtering by
+                // nothing: `st` then `<CR>` is how a person backs out, and a
+                // filter on the empty string would match nothing (or
+                // everything) and read as a broken agenda either way.
+                if !answer.is_empty() {
+                    // A regexp that does not compile is refused HERE, at the
+                    // prompt, where the person who typed it is looking — rather
+                    // than accepted and reported in the headerline after the
+                    // view has already re-scanned and shown them nothing.
+                    if opener == AGENDA_FILTER_REGEXP {
+                        if let Err(e) = regex_lite::Regex::new(&answer) {
+                            return Ok(vec![Effect::Echo(
+                                lattice::plugin_host::types::EchoPayload {
+                                    level: lattice::plugin_host::types::EchoLevel::Warn,
+                                    text: format!(
+                                        "org: {answer} is not a regexp ({})",
+                                        e.to_string().lines().next().unwrap_or("").trim()
+                                    ),
+                                },
+                            )]);
+                        }
+                    }
+                    view.filters.push(filter_term_of(opener, answer));
                 }
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {

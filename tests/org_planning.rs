@@ -1000,11 +1000,12 @@ async fn a_tag_filter_narrows_and_the_pipe_clears_it() {
         "both rows before any filter"
     );
 
-    // Narrow, the way `/` does — the chord opens a prompt, and the submit
-    // re-scans with the tag appended.
+    // Narrow, the way `st` does — the chord opens a prompt, and the submit
+    // re-scans with the tag appended. OA.29 moved this off `/`, which is the
+    // builtin search again.
     let _ = editor.activate_buffer(view);
     editor.cursor.line = 0;
-    let out = press_raw(&mut editor, "/");
+    let out = press_raw(&mut editor, "st");
     apply_effects(&mut editor, out);
     submit_prompt(&mut editor, "work");
     let narrowed = editor
@@ -1132,10 +1133,10 @@ async fn clearing_the_filter_keeps_the_span_the_reader_walked_to() {
         "the reader walked to a month: {walked:?}"
     );
 
-    // Narrow it.
+    // Narrow it. `st` since OA.29 — `/` is search.
     let _ = editor.activate_buffer(month_view);
     editor.cursor.line = 0;
-    let out = press_raw(&mut editor, "/");
+    let out = press_raw(&mut editor, "st");
     apply_effects(&mut editor, out);
     submit_prompt(&mut editor, "work");
     let narrowed_view = current(&editor);
@@ -1164,6 +1165,228 @@ async fn clearing_the_filter_keeps_the_span_the_reader_walked_to() {
          emacs' `org-agenda-filter-remove-all` leaves `org-agenda-span` alone. \
          Got {cleared:?} (was {narrowed:?})"
     );
+}
+
+/// OA.29 — `/` is the builtin forward search again, not the tag filter.
+///
+/// The slice's headline claim, and a chord test is the only thing that can see
+/// it: the filter action still exists and still works, so nothing about the
+/// guest says which key reaches it. What changed is the keymap, and the way
+/// that fails is silently — a `/` still bound here would open a filter prompt
+/// and the user would be unable to search inside the one buffer they most want
+/// to search.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slash_is_search_in_the_agenda_not_the_tag_filter() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, _mb) = agenda_with_rows(base.path()).await;
+    let _ = editor.activate_buffer(view);
+    editor.cursor.line = 0;
+
+    let out = press_raw(&mut editor, "/");
+    let opened_a_prompt = out.effects.iter().any(|e| {
+        matches!(
+            e,
+            lattice_grammar::Effect::OpenPrompt {
+                on_submit_action,
+                ..
+            } if on_submit_action.contains("filter")
+        )
+    });
+    assert!(
+        !opened_a_prompt,
+        "`/` must not reach org's filter prompt: {:?}",
+        out.effects
+    );
+}
+
+/// Every `s`-prefixed filter reaches its own action.
+///
+/// A prefix that is also bound alone is dead — `KeymapTrie::lookup` stops at
+/// the first node carrying a binding — and the failure is quiet, because the
+/// trailing letter falls through to the grammar in a read-only view. So this
+/// presses all six and asserts each opened the prompt it should have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_s_filter_chord_opens_its_own_prompt() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, _mb) = agenda_with_rows(base.path()).await;
+
+    for (chord, want) in [
+        ("st", "Filter by tag: "),
+        ("sT", "Filter by title: "),
+        ("sb", "Filter by body: "),
+        ("sc", "Filter by category: "),
+        ("sf", "Filter by file: "),
+        ("sr", "Filter by regexp: "),
+        ("\\", "Also filter by tag: "),
+    ] {
+        let _ = editor.activate_buffer(view);
+        editor.cursor.line = 0;
+        let out = press_raw(&mut editor, chord);
+        let prompt = out.effects.iter().find_map(|e| match e {
+            lattice_grammar::Effect::OpenPrompt { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            prompt.as_deref(),
+            Some(want),
+            "`{chord}` must open its own prompt"
+        );
+        // Open it for real, then back out with an empty answer — otherwise the
+        // next chord is pressed into a minibuffer this one left open.
+        apply_effects(&mut editor, out);
+        submit_prompt(&mut editor, "");
+        editor.run_tick_pending();
+    }
+}
+
+/// The four text filters narrow a REAL agenda — the half a unit test cannot
+/// reach, because it is the SCAN that has to consult them.
+///
+/// Asserted on what each filter claims rather than on a row count: a row is
+/// fanned across every section that admits it (AS.1), so three headlines are
+/// four entries and an exact number would be pinning the section set rather
+/// than the filter. What matters is that a filter admits strictly less than no
+/// filter, that a term matching nothing yields nothing — the sharpest single
+/// check that it is applied at all — and that `S` puts everything back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_text_filters_narrow_a_real_agenda() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, view, mb) = agenda_with_rows(base.path()).await;
+    let baseline = mb.handle(view).unwrap().excerpts().len();
+    assert!(baseline >= 3, "the corpus produced rows: {baseline}");
+
+    fn current(editor: &Editor) -> lattice_core::BufferId {
+        editor
+            .services
+            .get::<lattice_mode::BufferStoreHandle>()
+            .unwrap()
+            .find_by_name("*agenda*")
+            .expect("the agenda is open under its own name")
+    }
+
+    for (chord, answer, expect_some, why) in [
+        ("sT", "ship", true, "title matches one headline"),
+        (
+            "sT",
+            "nothing-matches-this",
+            false,
+            "a title nothing carries",
+        ),
+        ("sb", "invoice", true, "body text no row displays"),
+        (
+            "sb",
+            "nothing-matches-this",
+            false,
+            "a body nothing carries",
+        ),
+        ("sc", "work", true, "the work.org category"),
+        ("sc", "nosuchcategory", false, "a category nothing carries"),
+        ("sr", "\\[#A\\]", true, "the one priority-A row"),
+        ("sr", "^zzz", false, "a pattern nothing matches"),
+    ] {
+        let open_in = current(&editor);
+        let _ = editor.activate_buffer(open_in);
+        editor.cursor.line = 0;
+        let out = press_raw(&mut editor, chord);
+        apply_effects(&mut editor, out);
+        submit_prompt(&mut editor, answer);
+        let filtered = current(&editor);
+        settle_agenda(&mb, filtered).await;
+        let n = mb.handle(filtered).unwrap().excerpts().len();
+        if expect_some {
+            assert!(
+                n > 0 && n < baseline,
+                "`{chord} {answer}` — {why}: got {n} of {baseline}"
+            );
+        } else {
+            assert_eq!(n, 0, "`{chord} {answer}` — {why}: got {n}");
+        }
+        // The headerline has to SAY it, or a narrowed agenda reads as an empty
+        // one — the trap OA.22 exists for, and four new kinds are four ways in.
+        let said = match &*mb.handle(filtered).unwrap().headerline() {
+            HeaderlineStatus::Complete { summary, .. } => summary.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            said.contains(answer),
+            "the header must name the filter: {said:?}"
+        );
+
+        // Clear, so each case is measured from the same baseline.
+        let _ = editor.activate_buffer(filtered);
+        editor.cursor.line = 0;
+        let out = press_raw(&mut editor, "S");
+        apply_effects(&mut editor, out);
+        let cleared = current(&editor);
+        settle_agenda(&mb, cleared).await;
+        assert_eq!(
+            mb.handle(cleared).unwrap().excerpts().len(),
+            baseline,
+            "`S` restores every row after `{chord} {answer}`"
+        );
+    }
+}
+
+/// A corpus with two files, three dated rows, a distinguishing body and one
+/// `[#A]` — so every filter under test can tell some rows from others.
+async fn agenda_with_rows(
+    base: &std::path::Path,
+) -> (Editor, lattice_core::BufferId, MultibufferRegistryHandle) {
+    let plugins_dir = base.join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().unwrap());
+    let notes = base.join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        format!(
+            "* TODO [#A] Ship it :urgent:\n  SCHEDULED: {}\n  the invoice is due\n\
+             * TODO Review the deck\n  SCHEDULED: {}\n",
+            today_stamp(),
+            today_stamp()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        notes.join("home.org"),
+        format!("* TODO Water the plants\n  SCHEDULED: {}\n", today_stamp()),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base)
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    expand_plugin_keymaps(&editor);
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+    let view = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+    };
+    settle_agenda(&mb, view).await;
+    (editor, view, mb)
 }
 
 /// `f` walks by the view's OWN span, and keeps walking.

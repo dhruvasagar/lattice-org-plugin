@@ -41,6 +41,17 @@ serde = { version = "1", default-features = false, features = ["derive", "alloc"
 # size of a blob the picker reads on every open. Pure-Rust and wasm-friendly,
 # and the same crate the SDK already uses for plugin event payloads.
 rmp-serde = "1.3"
+# OA.29: `sr`, the agenda's regexp filter. `regex-lite` rather than `regex`
+# because this component is BUILT ON BOOT by the plugin manager and already
+# ships as a 1.3M artefact — `regex`'s unicode tables are most of a megabyte
+# spent on character classes an agenda filter does not reach for. Pure Rust and
+# dependency-free, so it compiles for `wasm32-wasip2` like the rest of the guest.
+#
+# The cost it does carry: no `\p{…}` unicode classes and no look-around. A
+# pattern using them fails to COMPILE, which `ViewArgs::parse` reports in the
+# headerline — the term is dropped rather than silently matching nothing, since
+# an empty agenda that looks like a working filter is the worst answer here.
+regex-lite = "0.1"
 
 
 # The moved-from-lattice integration tests drive a REAL editor: they boot one,

@@ -2748,10 +2748,12 @@ async fn the_template_set_takes_precedence_over_the_single_template() {
 /// not this slice's. Recorded in the slice plan rather than papered over
 /// here.
 ///
-/// So this now tests the half that IS true and is worth pinning: the malformed
-/// value is refused and named at the point the user typed it. The behaviour
-/// the old name claimed is asserted as the known-current one, so that a future
-/// fix fails here and gets to update the story deliberately.
+/// **OC.11c closed it, and this test flipped.** `config::option-diagnostic`
+/// now lets the guest ask why an option is empty, so capture distinguishes
+/// "your templates did not load" from "you have no templates" and REFUSES
+/// instead of filing through the legacy pair. What used to be pinned here as
+/// known-wrong is now asserted as correct — which is what the note about a
+/// future fix "getting to update the story deliberately" was for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_template_set_is_refused_at_set_time() {
     if org_plugin_wasm().is_none() {
@@ -2782,16 +2784,98 @@ async fn a_malformed_template_set_is_refused_at_set_time() {
 
     submit_capture(&mut editor, "a thought");
 
-    // KNOWN GAP, pinned deliberately rather than asserted as desirable: the
-    // rejected option is indistinguishable from an unset one inside the
-    // guest, so capture falls back to the legacy pair and files the note
-    // there. When the host grows a way to say "this option was set and
-    // refused", this assertion is the one that should fail and be inverted.
-    assert_eq!(
-        std::fs::read_to_string(&notes).ok().as_deref(),
-        Some("* a thought\n"),
-        "today the legacy pair still captures, because a REJECTED \
-         `capture-templates` reads as an UNSET one from the guest's side"
+    // OC.11c: nothing is written. The legacy pair is configured and would
+    // happily have taken this note — capture declines because the templates
+    // the user DID configure failed to load, which is a different situation
+    // from having none.
+    assert!(
+        !notes.exists(),
+        "a set that failed to load must not fall back to the legacy file the \
+         user is migrating away from"
+    );
+
+    // And the refusal carries the host's own message, so the user is told
+    // what to fix rather than that something is unset.
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("did not load"),
+        "the message says the option failed, not that it is missing: {msg:?}"
+    );
+    assert!(msg.contains("capture-templates"), "and names it: {msg:?}");
+}
+
+/// OC.11c — the MENU refuses too, rather than offering emacs's default row.
+///
+/// OC.11d made an unset set open the menu with `t Task` pointing at
+/// `org.capture-file`. That is right for a user who never configured
+/// templates and wrong for one whose templates failed to load: the row would
+/// send their note to the file they are migrating away from, which is the
+/// whole failure OC.11 is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_set_that_failed_to_load_does_not_get_the_default_menu_row() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* TODO %?");
+    // The assignment fails: the option keeps its empty default, exactly as if
+    // it had never been set.
+    set_org_option(&mut editor, "capture-templates", "[[template]\nkey = \"t\"");
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_none(),
+        "a set that failed to load is not an unset one, so the default row is \
+         not the right answer"
+    );
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("did not load"),
+        "and the menu says why: {msg:?}"
+    );
+}
+
+/// A genuinely UNSET set still gets emacs's default row — OC.11d, unchanged.
+///
+/// The half that keeps OC.11c from swallowing OC.11d: only a FAILED
+/// assignment refuses, and a user who never configured templates still
+/// captures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_configured_set_still_gets_the_default_menu_row() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    // No `capture-templates` assignment at all — never touched.
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some(),
+        "never-configured is still emacs's substitute-a-default case"
     );
 }
 

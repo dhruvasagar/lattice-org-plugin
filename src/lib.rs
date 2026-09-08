@@ -5260,6 +5260,13 @@ fn selected_template(
     let set = match capture_templates::read() {
         Ok(set) => Some(set),
         // "Unset" is not a failure — it is the OM.11 fallback path below.
+        //
+        // OC.11c: and `NotLoaded` is NOT Unset, which is why it is a separate
+        // variant rather than a flag on this one. It falls through to the arm
+        // below and refuses: a user whose templates failed to load HAS
+        // configured capture, and filing their note through `capture-file`
+        // because their TOML had a typo is how it ends up somewhere they
+        // thought they had stopped using.
         Err(capture_templates::TemplateError::Unset) => None,
         Err(e) => {
             return Err(Effect::Echo(EchoPayload {
@@ -9874,6 +9881,11 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // the variable is nil; a value that exists and does not work is a thing
         // to fix, not to paper over — and unlike the unset case there is no
         // reading under which the user meant the legacy path.
+        //
+        // OC.11c: `NotLoaded` is not `Unset` and lands in the refusing arm — a
+        // set that failed to load must not be answered with emacs's default
+        // row, because the user did configure templates and the menu would be
+        // pointing them at a file they have migrated away from.
         let set = match capture_templates::read() {
             Ok(set) => Some(set),
             Err(capture_templates::TemplateError::Unset) => None,

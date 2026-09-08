@@ -123,6 +123,20 @@ pub enum TemplateError {
     Malformed(String),
     /// It parsed, but every template in it was rejected.
     Empty,
+    /// OC.11c: the user SET this option and the assignment failed, so the
+    /// value being read is the empty default rather than anything they wrote.
+    ///
+    /// Indistinguishable from [`Unset`](Self::Unset) by reading the option —
+    /// that is the whole reason `config::option-diagnostic` exists. The
+    /// difference matters because `Unset` takes the OM.11 legacy path and this
+    /// must not: a user whose templates failed to load has configured capture,
+    /// and filing their note through `org.capture-file` because their TOML had
+    /// a typo is how the note ends up somewhere they thought they had stopped
+    /// using.
+    ///
+    /// Carries the host's message, which for a composite includes the schema
+    /// path — the fix location, at the moment they tried to capture.
+    NotLoaded(String),
 }
 
 impl TemplateError {
@@ -135,6 +149,9 @@ impl TemplateError {
             TemplateError::Malformed(e) => format!("org.capture-templates: {e}"),
             TemplateError::Empty => {
                 "org.capture-templates: no usable templates in the set".to_string()
+            }
+            TemplateError::NotLoaded(why) => {
+                format!("org.capture-templates did not load: {why}")
             }
         }
     }
@@ -250,14 +267,29 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
 /// The one entry point production code uses; `from_declared` is split out so
 /// the resolution rules are testable without a host.
 pub fn read() -> Result<ParsedSet, TemplateError> {
-    match crate::config_shape::read_option::<Declared>("capture-templates") {
+    let out = match crate::config_shape::read_option::<Declared>("capture-templates") {
         Some(Ok(raw)) => from_declared(raw),
         // The host validated the write, so this is the residue a schema cannot
         // express. Carry the path it came with rather than flattening it to
         // "malformed" — the location is the whole value of reporting it.
         Some(Err(e)) => Err(TemplateError::Malformed(e.to_string())),
         None => Err(TemplateError::Unset),
+    };
+    // OC.11c: an empty read is ambiguous, so ask why it is empty.
+    //
+    // A failed assignment leaves the option at its registered default, which
+    // for this one is an empty list — and `from_declared` maps empty to
+    // `Unset`. So "the user's templates did not parse" and "the user has no
+    // templates" arrive here identically, and only the host can tell them
+    // apart. Asked ONLY on the empty path: an option that loaded fine has
+    // nothing to explain, and a stale diagnostic cannot exist anyway (the
+    // registry drops it the moment an assignment succeeds).
+    if matches!(out, Err(TemplateError::Unset)) {
+        if let Some(why) = crate::config_shape::option_failure("capture-templates") {
+            return Err(TemplateError::NotLoaded(why));
+        }
     }
+    out
 }
 
 /// A parsed set plus what it could not use. The skips ride along rather than

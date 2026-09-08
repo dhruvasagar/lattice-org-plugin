@@ -97,6 +97,32 @@ pub fn read_option<T: ConfigShape>(name: &str) -> Option<Result<T, ShapeError>> 
     Some(unflatten_value(&nodes, raw.root).and_then(|v| T::from_value(&v)))
 }
 
+/// OC.11c: why `name`'s value is not what the user wrote, if their last
+/// attempt to set it failed.
+///
+/// A failed assignment is a no-op — vim's rule — so the option keeps its
+/// previous value, which for one never successfully set is its registered
+/// DEFAULT. [`read_option`] therefore cannot tell "configured, and it did not
+/// parse" from "never configured": both hand back the default. This can.
+///
+/// Returns the host's own message, which for a composite carries the schema
+/// PATH (`[2].target.file: expected string, got integer`) — the fix location,
+/// which is the whole point of asking. The source file is prefixed when the
+/// assignment came from one, because "go fix your config" and "what you just
+/// typed did not take" send the user to different places.
+///
+/// `None` means the last assignment succeeded or there never was one. Those
+/// are deliberately not distinguished: the question is "can I trust this
+/// value", and both answers are yes.
+pub fn option_failure(name: &str) -> Option<String> {
+    let d = config::option_diagnostic(name)?;
+    Some(if d.source.is_empty() {
+        d.message
+    } else {
+        format!("{} ({})", d.message, d.source)
+    })
+}
+
 /// Declare `name` with `T`'s shape and `default`'s value.
 ///
 /// Returns `false` exactly when the host refused, which it does for a name

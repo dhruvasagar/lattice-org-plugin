@@ -293,6 +293,28 @@ async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch
                 });
                 let _ = out;
             }
+            // OC.11b: the harness swallowed `Echo`, so any message an action
+            // produced was invisible to a test while landing perfectly well in
+            // production — the same "dropped effect looks like a dead feature"
+            // trap the arms above were each added for. Applied last-wins, as
+            // `handle_effect` does, which is what makes "which message is left
+            // on screen" testable at all.
+            lattice_grammar::Effect::Echo { level, text } => {
+                // The two `EchoLevel`s are distinct types (grammar's and the
+                // host's); mapped rather than `into`d because no conversion
+                // exists and inventing one for a test harness would be the
+                // wrong place to put it.
+                use lattice_grammar::EchoLevel as G;
+                use lattice_host::action::EchoLevel as H;
+                let level = match level {
+                    G::Trace => H::Trace,
+                    G::Debug => H::Debug,
+                    G::Info => H::Info,
+                    G::Warn => H::Warn,
+                    G::Error => H::Error,
+                };
+                editor.set_message(level, text);
+            }
             _ => {}
         }
     }
@@ -3101,6 +3123,188 @@ async fn a_template_without_questions_still_captures_in_one_hop() {
     finalize_capture(&mut editor, "call the bank").await;
 
     assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
+}
+
+/// OC.11d — **an unset template set opens the menu, it does not refuse.**
+///
+/// `org-capture-select-template` substitutes a built-in row when
+/// `org-capture-templates` is nil:
+///
+/// ```elisp
+/// (or (org-contextualize-keys …)
+///     '(("t" "Task" entry (file+headline "" "Tasks") "* TODO %?\n  %u\n  %a")))
+/// ```
+///
+/// so emacs opens the menu anyway and never says "no capture templates". The
+/// `""` file there is `org-default-notes-file`, which is what
+/// `org.capture-file` is here.
+///
+/// Refusing was the divergence, and it cost something real: OM.11 documents
+/// `org.capture-file` alone as supported, and it was unreachable from the only
+/// chord that ships.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_template_set_still_opens_the_capture_menu() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* TODO %?");
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    let menu = editor
+        .picker
+        .as_ref()
+        .and_then(|p| p.transient.as_ref())
+        .expect("the menu opened rather than refusing");
+    let rows: Vec<String> = menu
+        .groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .map(|i| format!("{} {}", i.key.join(""), i.label))
+        .collect();
+    assert!(
+        rows.iter().any(|r| r == "t Task"),
+        "emacs's own key and description for the default row: {rows:?}"
+    );
+}
+
+/// A MALFORMED set still refuses.
+///
+/// Emacs substitutes only when the variable is nil; a value that exists and
+/// does not work is a thing to fix. Unlike the unset case there is no reading
+/// under which the user meant the legacy path, so opening a menu over it would
+/// be guessing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_template_set_still_refuses_to_open_the_menu() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    // A set that PARSES into the declared shape but yields nothing usable —
+    // `Empty`, not `Unset`. A TOML-level typo is refused at `:set` and never
+    // reaches the guest as malformed at all (that is OC.11c's whole subject),
+    // so this is the reachable half of "the value exists and does not work".
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        "[[template]]\nkey = \"\"\ndescription = \"\"\n\
+         target = { file = \"/tmp/x.org\" }\nbody = \"* %?\"\n",
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+
+    assert!(
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_none(),
+        "a set that exists and yields nothing usable is a thing to fix, not to \
+         paper over with the default row"
+    );
+}
+
+/// OC.11b — **the legacy path says so, and says where the note went.**
+///
+/// This fallback was silent, and the silence is what made a refused
+/// `org.capture-templates` cost a note: `:set` rejects the malformed set, the
+/// option stays at its empty default, and from inside the guest that is
+/// indistinguishable from never having configured one — so capture quietly
+/// filed through `org.capture-file` while the user believed they had migrated.
+///
+/// The guest still cannot tell those two apart (OC.11c, if a seam is ever
+/// worth it). What it can do is stop being quiet about which path it took,
+/// which is the part that actually costs the user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_legacy_capture_path_names_the_file_it_filed_through() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    // The legacy pair, and NO templates — the state a refused
+    // `capture-templates` leaves behind, and the state a user who never
+    // configured templates is in. Identical from here, which is the point.
+    set_org_option(&mut editor, "capture-file", notes.to_str().unwrap());
+    set_org_option(&mut editor, "capture-template", "* TODO %?");
+
+    // OC.11d: through the CHORD, which is what a legacy-only user presses.
+    // The menu substitutes emacs's default row rather than refusing, so this
+    // reaches the OM.11 path the way a real user does.
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("org.capture-file"),
+        "the note names the OPTION in play: {msg:?}"
+    );
+    assert!(
+        msg.contains(notes.to_str().unwrap()),
+        "and the file it is filing into: {msg:?}"
+    );
+    assert!(
+        msg.contains("no capture templates"),
+        "and why it took that path, which is the clue a mid-migration user \
+         needs: {msg:?}"
+    );
+    // The note must be the LAST message, not merely present: opening the draft
+    // sets its own `switched to buffer …` chrome, and a note placed before it
+    // is overwritten and never read. That is how the first cut of this failed.
+    assert!(
+        !msg.contains("switched to buffer"),
+        "the note is what is left on screen, not the buffer chrome: {msg:?}"
+    );
+}
+
+/// A CONFIGURED template says nothing.
+///
+/// The other half, and the one that keeps OC.11b from being noise: a user who
+/// set up templates is getting the path they asked for, and a message on every
+/// capture would train them to ignore the one that matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configured_template_captures_without_a_note() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            notes.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        !msg.contains("no capture templates"),
+        "a configured set is not the fallback and must not announce itself: \
+         {msg:?}"
+    );
 }
 
 /// OC.10 — **`C-c C-c` files the capture from INSERT**, without an `<Esc>` first.

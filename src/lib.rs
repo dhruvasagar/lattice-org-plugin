@@ -4399,7 +4399,11 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
     // template — there is no seed to pass.
     match flow.kind {
         QuestionFlowKind::Capture { key } => {
-            let template = match selected_template(Some(&key)) {
+            // `_note` is always empty on this path: it is reached only with
+            // a KEY, which only a configured set can supply. Destructured
+            // rather than ignored so a future path that CAN arrive here
+            // without one fails to compile instead of dropping the note.
+            let (template, _note) = match selected_template(Some(&key)) {
                 Ok(t) => t,
                 Err(effect) => return vec![effect],
             };
@@ -5250,7 +5254,9 @@ fn archive_subtree(
 ///
 /// Falls back to the single `capture-file` / `capture-template` pair when
 /// `capture-templates` is unset, so an existing config keeps working unchanged.
-fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, Effect> {
+fn selected_template(
+    key: Option<&str>,
+) -> Result<(capture_templates::Template, Vec<Effect>), Effect> {
     let set = match capture_templates::read() {
         Ok(set) => Some(set),
         // "Unset" is not a failure — it is the OM.11 fallback path below.
@@ -5274,15 +5280,43 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
                     .to_string(),
             }));
         }
-        return Ok(capture_templates::Template {
-            key: String::new(),
-            description: "capture".to_string(),
-            target: capture_templates::Target::File { file },
-            body: option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE),
-            // The bare `org.capture-file` path has no template table to carry a
-            // `clock-in` key, so it never clocks.
-            clock_in: false,
+        // OC.11b — **say that this is the legacy path, and where it went.**
+        //
+        // This fallback was silent, and silence is what made a refused
+        // `org.capture-templates` cost the user a note. `:set` rejects a
+        // malformed set, the option stays at its empty default, and from here
+        // that is INDISTINGUISHABLE from never having configured one — so
+        // capture quietly filed through `org.capture-file` while the user
+        // believed they had migrated. The guest cannot tell those two apart
+        // (that is OC.11c, if it is ever worth a seam); it can stop being
+        // quiet about which path it took, which is what actually costs them.
+        //
+        // Info, not Warn: for someone who deliberately uses the simple
+        // `capture-file` path nothing is wrong, and a warning on every capture
+        // would train them to ignore it. It names both options so the message
+        // reads as "here is what happened" rather than "you did something
+        // wrong".
+        //
+        // Returned as a LEADING effect so it lands before the write. An echo
+        // after a `WriteToFile` would overwrite the message a failed write
+        // sets — the trap `:org-roam-create-node` records — and a failure is
+        // the more important thing to be looking at.
+        let note = Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: format!("org: no capture templates; using org.capture-file → {file}"),
         });
+        return Ok((
+            capture_templates::Template {
+                key: String::new(),
+                description: "capture".to_string(),
+                target: capture_templates::Target::File { file },
+                body: option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE),
+                // The bare `org.capture-file` path has no template table to
+                // carry a `clock-in` key, so it never clocks.
+                clock_in: false,
+            },
+            vec![note],
+        ));
     };
 
     // The skips are NOT surfaced here. They ride back on `ParsedSet` and
@@ -5295,17 +5329,24 @@ fn selected_template(key: Option<&str>) -> Result<capture_templates::Template, E
     // fifth repeat of the TC.6 multi-seam-linker rule and it is a host fix, not
     // something to work around here (noted in the slice plan).
 
+    // A CONFIGURED template needs no note — the user is getting the path they
+    // asked for, and saying so on every capture is the noise OC.11b is careful
+    // not to add.
     match key {
-        Some(k) => set.by_key(k).cloned().ok_or_else(|| {
-            Effect::Echo(EchoPayload {
-                level: EchoLevel::Warn,
-                text: format!("org: no capture template keyed `{k}`"),
-            })
-        }),
+        Some(k) => set
+            .by_key(k)
+            .cloned()
+            .map(|t| (t, Vec::new()))
+            .ok_or_else(|| {
+                Effect::Echo(EchoPayload {
+                    level: EchoLevel::Warn,
+                    text: format!("org: no capture template keyed `{k}`"),
+                })
+            }),
         // No key and one template: there is nothing to choose. No key and
         // several: say which keys exist. OC.3 replaces this echo with the
         // menu that offers them, and the key argument stays exactly as it is.
-        None if set.templates.len() == 1 => Ok(set.templates[0].clone()),
+        None if set.templates.len() == 1 => Ok((set.templates[0].clone(), Vec::new())),
         None => Err(Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: format!(
@@ -5338,7 +5379,7 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     CAPTURE_ORIGIN.with(|c| *c.borrow_mut() = origin);
 
     let key = submitted_text(&ctx.args).filter(|k| !k.is_empty());
-    let template = match selected_template(key.as_deref()) {
+    let (template, note) = match selected_template(key.as_deref()) {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
@@ -5355,20 +5396,44 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     // is one `%?`, typed directly into the buffer.
     let questions = capture_flow::questions(&template.body);
     if !questions.is_empty() {
-        return start_question_flow(QuestionFlowKind::Capture { key: template.key }, questions);
+        // The legacy path has no `%^{…}` questions to ask (its body comes from
+        // `org.capture-template`, a plain string), so `note` is empty here in
+        // practice; prepended anyway rather than dropped, because "in
+        // practice" is how a message goes missing when the shape changes.
+        let mut out = note;
+        out.extend(start_question_flow(
+            QuestionFlowKind::Capture { key: template.key },
+            questions,
+        ));
+        return out;
     }
 
     // OC.7b: the BUFFER, not a one-line prompt. Before this the template was
     // never shown — it was expanded only at submit — so the user typed into an
     // empty minibuffer and found out what the template did afterwards.
-    open_capture_buffer(
+    // OC.11b: the note goes LAST on this path, and that is the opposite of
+    // where it goes in `capture_submit` — deliberately, because the two paths
+    // end in different things.
+    //
+    // Opening the draft sets its own message (`switched to buffer #4 (no
+    // file)`), so a leading note is overwritten by buffer chrome and the user
+    // never sees which path their capture is on. Filing, by contrast, can FAIL
+    // and say so, and that message must be the one left standing — so there
+    // the note leads.
+    //
+    // The rule is the same in both: the last message should be the most
+    // important thing that happened. Here that is the note; there it is the
+    // failure.
+    let mut out = open_capture_buffer(
         capture_buffer_name(&template.key),
         CaptureDestination::of(&template),
         &template.body,
         &[],
         "",
         &capture_origin(),
-    )
+    );
+    out.extend(note);
+    out
 }
 
 /// OC.7b: open the capture BUFFER — the surface emacs has and the prompt was
@@ -5753,12 +5818,17 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
     // is the behaviour the option promises.
     let key = prompt_smuggled_state(&ctx.args);
     let key = key.as_deref().and_then(capture_key_from_prompt_name);
-    let template = match selected_template(key) {
+    let (template, note) = match selected_template(key) {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
     let text = capture::expand(&template.body, &entered, today_epoch_day(), &taken_origin());
-    capture_effects(&CaptureDestination::of(&template), text)
+    // OC.11b: BEFORE the write, so a failed `WriteToFile`'s message is the one
+    // left on screen. An echo after it would overwrite exactly the thing the
+    // user needs to see — the trap `:org-roam-create-node` records.
+    let mut out = note;
+    out.extend(capture_effects(&CaptureDestination::of(&template), text));
+    out
 }
 
 /// The second hop of `<leader>or`: file the subtree at the cursor into the
@@ -9771,26 +9841,90 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             }
         }
 
-        // An `err` echoes with the plugin named and the menu does not open —
-        // which is right for every one of these: an unset option, a value that
-        // does not fit the declared shape, and a set with nothing usable in it
-        // are all things the user must fix before a menu means anything. A menu
-        // that opens empty says none of that.
-        let set = capture_templates::read().map_err(|e| e.message())?;
+        // OC.11d — **an UNSET set is not an error; it is emacs's default
+        // template.**
+        //
+        // `org-capture-select-template` reads:
+        //
+        //     (let ((org-capture-templates
+        //            (or (org-contextualize-keys …)
+        //                '(("t" "Task" entry (file+headline "" "Tasks")
+        //                   "* TODO %?\n  %u\n  %a")))))
+        //
+        // — so with `org-capture-templates` nil emacs SUBSTITUTES a built-in
+        // row and opens the menu anyway. It never says "no capture templates".
+        // The `""` file in that target means `org-default-notes-file`, which is
+        // exactly what `org.capture-file` is here.
+        //
+        // Refusing was the divergence, and it had a real cost: OM.11 documents
+        // `org.capture-file` alone as a supported configuration, and it was
+        // unreachable from the only chord that ships — `<leader>oc` answered
+        // "set `org.capture-templates`" to a user whose capture config was
+        // valid and complete.
+        //
+        // **Falling back is only safe because OC.11a and OC.11b landed first.**
+        // The user this could hurt is mid-migration — a malformed set is
+        // refused at `:set`, leaves the option at its empty default, and
+        // arrives here as `Unset` rather than `Malformed`. They now get the
+        // rejection durably in `*messages*` (a) and an echo naming the file
+        // this filed through (b), so the fallback announces itself twice
+        // instead of being a silent write to the old file.
+        //
+        // A MALFORMED or EMPTY set still refuses. Emacs substitutes only when
+        // the variable is nil; a value that exists and does not work is a thing
+        // to fix, not to paper over — and unlike the unset case there is no
+        // reading under which the user meant the legacy path.
+        let set = match capture_templates::read() {
+            Ok(set) => Some(set),
+            Err(capture_templates::TemplateError::Unset) => None,
+            Err(e) => return Err(e.message()),
+        };
 
-        let mut items: Vec<TransientItem> = set
-            .templates
-            .iter()
-            .map(|t| TransientItem {
-                key: vec![t.key.clone()],
-                label: t.description.clone(),
-                description: format!("→ {}", t.target.file()),
-                kind: TransientItemKind::Action(TransientAction {
-                    command: "org-capture".to_string(),
-                    args: WitArgs::String(t.key.clone()),
-                }),
-            })
-            .collect();
+        let mut items: Vec<TransientItem> = match &set {
+            Some(set) => set
+                .templates
+                .iter()
+                .map(|t| TransientItem {
+                    key: vec![t.key.clone()],
+                    label: t.description.clone(),
+                    description: format!("→ {}", t.target.file()),
+                    kind: TransientItemKind::Action(TransientAction {
+                        command: "org-capture".to_string(),
+                        args: WitArgs::String(t.key.clone()),
+                    }),
+                })
+                .collect(),
+            None => {
+                // With no default notes file either, there is nothing to offer.
+                // Emacs falls back to `~/.notes`; this refuses instead, for the
+                // reason `DEFAULT_CAPTURE_FILE` records — a path nobody named
+                // scatters notes somewhere they will not think to look. The
+                // message already names both options.
+                let file = option_or("capture-file", DEFAULT_CAPTURE_FILE);
+                if file.trim().is_empty() {
+                    return Err(
+                        "org: set org.capture-templates (or org.capture-file) before capturing"
+                            .to_string(),
+                    );
+                }
+                // `t` / `Task` are emacs's own key and description for this
+                // row. The ARGS are `"t"` and the template's own key stays
+                // empty: `selected_template` ignores the key on the unset path
+                // and returns the legacy template, and an empty key is what
+                // `capture_buffer_name` / `capture_key_from_prompt_name` read
+                // as "the single-template capture" — a distinction OC.3a
+                // depends on and this must not disturb.
+                vec![TransientItem {
+                    key: vec!["t".to_string()],
+                    label: "Task".to_string(),
+                    description: format!("→ {file}"),
+                    kind: TransientItemKind::Action(TransientAction {
+                        command: "org-capture".to_string(),
+                        args: WitArgs::String("t".to_string()),
+                    }),
+                }]
+            }
+        };
         // A menu with no way out is a trap. `q` is the transient's own
         // convention and costs nothing.
         items.push(TransientItem {
@@ -9804,8 +9938,10 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // than dropped in silence. This is the one place a missing row is
         // noticeable — the user is looking at the menu and counting — and it
         // is once per open rather than once per capture.
-        let footer =
-            (!set.skipped.is_empty()).then(|| format!("skipped: {}", set.skipped.join("; ")));
+        let footer = set
+            .as_ref()
+            .filter(|s| !s.skipped.is_empty())
+            .map(|s| format!("skipped: {}", s.skipped.join("; ")));
 
         Ok(TransientSpec {
             title: "Capture".to_string(),

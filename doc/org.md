@@ -376,6 +376,21 @@ org.capture-file = "/home/you/org/inbox.org"
 org.capture-template = "* TODO %?\n  %U"
 ```
 
+With no templates configured, `<leader>oc` still opens the menu — it shows one
+row, `t Task`, filing into `org.capture-file`. That is emacs's own behaviour:
+`org-capture` substitutes a built-in `("t" "Task" …)` template when
+`org-capture-templates` is nil rather than refusing, and its target is
+`org-default-notes-file`, which is what `org.capture-file` is here.
+
+Capturing through that row says so — *"org: no capture templates; using
+org.capture-file → …"* — so if you meant to be using templates and are not,
+you find out at the moment it matters rather than by discovering notes in the
+wrong file later. A configured set says nothing.
+
+With neither `capture-templates` nor `capture-file` set, capture refuses and
+names both. Emacs would fall back to `~/.notes`; lattice would rather ask than
+put your notes somewhere you never chose.
+
 | | |
 |---|---|
 | `%?` | what you typed. A template without it appends your text on its own line. |

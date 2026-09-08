@@ -73,6 +73,19 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
             lattice_multibuffer::registry::MultibufferExcerptSource::new((*views).clone()),
         ));
     }
+    // OA.28: the same, for `view-args`. Unwired it answers an EMPTY LIST, which
+    // the guest reads as a fresh view — so every span/filter chord silently
+    // starts over from the default and the tests below pass on a build where
+    // the seam does nothing. That is the exact failure this suite exists to
+    // catch, so the harness has to mirror `install` here or catch nothing.
+    if let Some(scan_views) = editor
+        .services
+        .get::<lattice_multibuffer::providers::scan_view::ScanViewServiceHandle>(
+    ) {
+        host.set_view_args_resolver(Arc::new(
+            lattice_multibuffer::providers::scan_view::ScanViewArgs::new((*scan_views).clone()),
+        ));
+    }
     PluginLoader::with_services(
         host,
         LoaderServices {
@@ -1023,6 +1036,253 @@ async fn a_tag_filter_narrows_and_the_pipe_clears_it() {
         mb.handle(cleared).unwrap().excerpts().len(),
         2,
         "`|` restores every row — a filter you cannot undo is worse than none"
+    );
+}
+
+/// `|` clears the FILTER and nothing else — the span the reader walked to
+/// survives it.
+///
+/// Emacs' `org-agenda-filter-remove-all` removes the filters and redisplays;
+/// it does not touch `org-agenda-span`. The span is a property of the reader
+/// (OA.24), the same reasoning that makes it survive a view switch, and a
+/// clear that also snapped the view back to the default week would cost the
+/// reader their place for pressing the undo key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_the_filter_keeps_the_span_the_reader_walked_to() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().unwrap());
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("only.org"),
+        format!(
+            "* TODO Tagged one :work:\n  SCHEDULED: {}\n* TODO Untagged one\n  SCHEDULED: {}\n",
+            today_stamp(),
+            today_stamp()
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    expand_plugin_keymaps(&editor);
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+
+    let view = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+    };
+    settle_agenda(&mb, view).await;
+
+    // The agenda under its own name, whichever scan is current — every step
+    // below re-opens the view, and `reuse: true` keeps the name stable while
+    // the id need not be.
+    fn current(editor: &Editor) -> lattice_core::BufferId {
+        editor
+            .services
+            .get::<lattice_mode::BufferStoreHandle>()
+            .unwrap()
+            .find_by_name("*agenda*")
+            .expect("the agenda is open under its own name")
+    }
+    fn header(mb: &MultibufferRegistryHandle, view: lattice_core::BufferId) -> String {
+        match &*mb
+            .handle(view)
+            .expect("the view is registered")
+            .headerline()
+        {
+            HeaderlineStatus::Complete { summary, .. } => summary.clone(),
+            other => panic!("the agenda did not complete: {other:?}"),
+        }
+    }
+
+    // Walk to a month, the way `gD m` does.
+    let month_id = editor
+        .registry
+        .load()
+        .id_by_name("org-agenda-month-view")
+        .expect("`org-agenda-month-view` is registered");
+    let out = editor.dispatch(lattice_host::action::Action::Invoke(
+        lattice_grammar::CommandInvocation::of(month_id),
+    ));
+    apply_effects(&mut editor, out);
+    let month_view = current(&editor);
+    settle_agenda(&mb, month_view).await;
+    let walked = header(&mb, month_view);
+    assert!(
+        walked.contains("Month "),
+        "the reader walked to a month: {walked:?}"
+    );
+
+    // Narrow it.
+    let _ = editor.activate_buffer(month_view);
+    editor.cursor.line = 0;
+    let out = press_raw(&mut editor, "/");
+    apply_effects(&mut editor, out);
+    submit_prompt(&mut editor, "work");
+    let narrowed_view = current(&editor);
+    settle_agenda(&mb, narrowed_view).await;
+    let narrowed = header(&mb, narrowed_view);
+    assert!(
+        narrowed.contains("Month ") && narrowed.contains("+work"),
+        "the filter narrows the month rather than replacing it: {narrowed:?}"
+    );
+
+    // …and clear it. The span must still be a month.
+    let _ = editor.activate_buffer(narrowed_view);
+    editor.cursor.line = 0;
+    let out = press_raw(&mut editor, "|");
+    apply_effects(&mut editor, out);
+    let cleared_view = current(&editor);
+    settle_agenda(&mb, cleared_view).await;
+    let cleared = header(&mb, cleared_view);
+    assert!(
+        !cleared.contains("+work"),
+        "`|` dropped the filter: {cleared:?}"
+    );
+    assert!(
+        cleared.contains("Month "),
+        "`|` clears the filter and nothing else — the span survives it, as \
+         emacs' `org-agenda-filter-remove-all` leaves `org-agenda-span` alone. \
+         Got {cleared:?} (was {narrowed:?})"
+    );
+}
+
+/// `f` walks by the view's OWN span, and keeps walking.
+///
+/// The sharpest form of the OA.28 defect, and the one no single-keypress test
+/// could see: with the view's arguments unreadable, every press computed
+/// `today + 1 day` from a default view — so `f` moved one day instead of one
+/// month, and then never moved again, because the second press recomputed the
+/// same answer from the same default. Three presses, because one press is
+/// indistinguishable from a working build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_walks_by_the_views_own_span_and_keeps_walking() {
+    if org_plugin_wasm().is_none() {
+        eprintln!("skipping: component not built");
+        return;
+    }
+    /// `YYYY-MM-DD` for today + `days`, in LOCAL time like the guest.
+    fn day(days: i64) -> String {
+        (chrono::Local::now().date_naive() + chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &org_plugin_wasm().unwrap());
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("only.org"),
+        format!("* TODO Ship it\n  SCHEDULED: {}\n", today_stamp()),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    assert_eq!(
+        loader_over_editor(&editor, base.path())
+            .discover_and_load(&plugins_dir, TrustTier::Bundled)
+            .await,
+        1
+    );
+    expand_plugin_keymaps(&editor);
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .unwrap();
+    let view = match lattice_multibuffer::providers::scan_view::open_scan_view(
+        &mut editor,
+        &org_agenda_identity(),
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => panic!("{message}"),
+    };
+    settle_agenda(&mb, view).await;
+
+    fn current(editor: &Editor) -> lattice_core::BufferId {
+        editor
+            .services
+            .get::<lattice_mode::BufferStoreHandle>()
+            .unwrap()
+            .find_by_name("*agenda*")
+            .expect("the agenda is open under its own name")
+    }
+    fn header(mb: &MultibufferRegistryHandle, view: lattice_core::BufferId) -> String {
+        match &*mb
+            .handle(view)
+            .expect("the view is registered")
+            .headerline()
+        {
+            HeaderlineStatus::Complete { summary, .. } => summary.clone(),
+            other => panic!("the agenda did not complete: {other:?}"),
+        }
+    }
+    fn invoke(editor: &mut Editor, name: &str) {
+        let id = editor
+            .registry
+            .load()
+            .id_by_name(name)
+            .unwrap_or_else(|| panic!("`{name}` is registered"));
+        let out = editor.dispatch(lattice_host::action::Action::Invoke(
+            lattice_grammar::CommandInvocation::of(id),
+        ));
+        apply_effects(editor, out);
+    }
+
+    invoke(&mut editor, "org-agenda-month-view");
+    let v = current(&editor);
+    settle_agenda(&mb, v).await;
+    assert!(header(&mb, v).contains(&day(0)), "a month starting today");
+
+    // Three steps of thirty days. The SECOND is what fails on a build that
+    // reads a default view: it recomputes the first answer and stands still.
+    for step in 1..=3 {
+        invoke(&mut editor, "org-agenda-later");
+        let v = current(&editor);
+        settle_agenda(&mb, v).await;
+        let head = header(&mb, v);
+        let want = day(30 * step);
+        assert!(
+            head.contains("Month "),
+            "press {step} kept the span: {head:?}"
+        );
+        assert!(
+            head.contains(&want),
+            "press {step} must land on {want} — one month per press, from where \
+             the view already was. Got {head:?}"
+        );
+    }
+
+    // `.` comes home without giving up the span.
+    invoke(&mut editor, "org-agenda-today");
+    let v = current(&editor);
+    settle_agenda(&mb, v).await;
+    let home = header(&mb, v);
+    assert!(
+        home.contains("Month ") && home.contains(&day(0)),
+        "`.` resets the day, not the span: {home:?}"
     );
 }
 

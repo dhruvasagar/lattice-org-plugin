@@ -1798,9 +1798,9 @@ impl Guest for Component {
         // mode's new state and re-open the view — the mode is the truth, the
         // argument is its shadow.
         if handler == ON_AGENDA_LOG_MODE {
-            let (mode, on) = match &ev {
-                Event::MinorActivated(m) => (m.mode.as_str(), true),
-                Event::MinorDeactivated(m) => (m.mode.as_str(), false),
+            let (mode, on, m_buffer) = match &ev {
+                Event::MinorActivated(m) => (m.mode.as_str(), true, m.buffer as u32),
+                Event::MinorDeactivated(m) => (m.mode.as_str(), false, m.buffer as u32),
                 _ => return,
             };
             // Filtered by NAME here rather than by the subscription, because
@@ -1810,7 +1810,10 @@ impl Guest for Component {
             if mode != AGENDA_LOG_MODE_ID {
                 return;
             }
-            let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+            // OA.28: `event-mode-lifecycle` carries the buffer the mode went
+            // on in, so this reads the view directly. It used to read the scan
+            // seam's copy from the EVENTS seam — a third Store, a third default.
+            let mut view = view_of(m_buffer);
             view.log = on.then(|| {
                 // Read from the option every time the mode goes ON rather than
                 // remembered from last time: `:set org.agenda-log-mode-items`
@@ -3942,18 +3945,34 @@ thread_local! {
     /// the distinction has to be remembered here. One slot, because one prompt
     /// is open at a time.
     static FILTER_REPLACES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+
+    /// OA.28: the AGENDA buffer `/` or `\` was pressed in.
+    ///
+    /// The submit handler fires in the PROMPT buffer, so its `ctx.buffer_id` is
+    /// the minibuffer's and `view-args` on it answers "not a view". The opener
+    /// knows the right buffer and stashes it here.
+    ///
+    /// A `thread_local` is the correct carrier here and the wrong one for the
+    /// view's arguments, and the difference is the whole of OA.28: both halves
+    /// of a prompt run on the GRAMMAR seam, one after the other, so they share
+    /// a Store. `begin` does not — it runs on the scan seam, with its own
+    /// memory — which is why what the view is showing has to come from the host.
+    static FILTER_BUFFER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
-    /// OA.20: the arguments the agenda view on screen was opened with.
+    /// The arguments the scan now running was started with.
     ///
-    /// A span or filter chord is "re-open this view with one argument
-    /// different", so it has to know what the others were. The agenda is
-    /// `reuse: true` — one view, re-scanned in place — so a single slot is the
-    /// accurate model rather than a convenient one.
+    /// **Scan-seam state only.** `begin` writes it and `scan` reads it, so the
+    /// per-file walk can answer `admits_file` without re-parsing the argument
+    /// list once per file. Both run on the `scanned-excerpt-source` seam,
+    /// within one scan.
     ///
-    /// Written by `begin`, which is the only thing that knows a scan is
-    /// starting and with what.
+    /// It is NOT what a chord reads — a chord runs on the grammar seam, whose
+    /// Store never sees this write. That is what OA.28's `view-args` is for,
+    /// and reading this from a handler is the bug that slice fixed: every chord
+    /// saw a default view, so `f` stepped one day from today forever and `|`
+    /// dropped the span along with the filter.
     static VIEW_ARGS: std::cell::RefCell<agenda_args::ViewArgs> =
         const { std::cell::RefCell::new(agenda_args::ViewArgs::new()) };
 }
@@ -6647,6 +6666,20 @@ fn row_source(ctx: &ActionContext) -> Option<host_services::SourceLocation> {
     host_services::excerpt_source(u64::from(ctx.buffer_id), ctx.cursor.line)
 }
 
+/// OA.28 — what the view in `buffer` is showing, as this plugin's own arguments.
+///
+/// The one way a chord learns the span, day, filters and command it is about to
+/// change ONE of. The host owns them (it routed them to `begin` and kept them);
+/// asking is the only correct way to read them, because the seam a chord runs on
+/// has its own memory and never saw the scan.
+///
+/// A buffer that is not the agenda answers an empty list, which parses to a
+/// default view — the same thing a fresh agenda carries, so a chord fired
+/// somewhere unexpected re-opens a plain agenda rather than misbehaving.
+fn view_of(buffer: u32) -> agenda_args::ViewArgs {
+    agenda_args::ViewArgs::parse(&host_services::view_args(u64::from(buffer)))
+}
+
 /// OA.25 — where `s` / `d` are about to write, whichever surface they fired on.
 ///
 /// Both surfaces from one struct, which is the point: the two differ only in
@@ -7123,7 +7156,11 @@ impl GrammarCallbacks for Component {
             // buffer re-scans in place, so this is the whole implementation.
             AGENDA_LATER | AGENDA_EARLIER | AGENDA_TODAY | AGENDA_SPAN_DAY | AGENDA_SPAN_WEEK
             | AGENDA_SPAN_MONTH | AGENDA_SPAN_YEAR => {
-                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                // OA.28: the view's OWN arguments, from the host. A guest-side
+                // copy is not available here — `begin` wrote one on a different
+                // seam — and reading a default meant `f` stepped one day from
+                // today on every press, whatever span was on screen.
+                let mut view = view_of(ctx.buffer_id);
                 // OA.24: steps move the anchor DAY by one span. `begin`
                 // resolves `anchor` on every scan, so it is always `Some`
                 // here; the fallback is only for a chord pressed before any
@@ -7177,6 +7214,10 @@ impl GrammarCallbacks for Component {
             AGENDA_FILTER_TAG | AGENDA_FILTER_TAG_ADD => {
                 let replacing = callback == AGENDA_FILTER_TAG;
                 FILTER_REPLACES.replace(replacing);
+                // OA.28: the submit fires in the PROMPT buffer, which is not a
+                // view. Remember the agenda this was pressed in — same seam,
+                // one prompt at a time.
+                FILTER_BUFFER.set(ctx.buffer_id);
                 Ok(vec![Effect::OpenPrompt(
                     lattice::plugin_host::types::OpenPromptPayload {
                         prompt: if replacing {
@@ -7195,7 +7236,10 @@ impl GrammarCallbacks for Component {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                // OA.28: the agenda the prompt was opened from, not
+                // `ctx.buffer_id` — that is the minibuffer, and asking it what
+                // it is showing answers "nothing".
+                let mut view = view_of(FILTER_BUFFER.get());
                 if FILTER_REPLACES.get() {
                     view.filters
                         .retain(|f| !matches!(f, agenda_args::FilterTerm::Tag(_)));
@@ -7260,7 +7304,7 @@ impl GrammarCallbacks for Component {
                 // (see `agenda_args`), so a full path would match nothing and
                 // read as a key that empties the agenda.
                 let name = loc.path.rsplit('/').next().unwrap_or(&loc.path).to_string();
-                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                let mut view = view_of(ctx.buffer_id);
                 view.filters
                     .retain(|f| !matches!(f, agenda_args::FilterTerm::File(_)));
                 view.filters.push(agenda_args::FilterTerm::File(name));
@@ -7278,7 +7322,7 @@ impl GrammarCallbacks for Component {
             // and `gr` carries it forward for free.
             // OA.15b: `l` flips the MODE and nothing else.
             //
-            // It does not touch `VIEW_ARGS`, and that is the slice's whole
+            // It does not re-open the view, and that is the slice's whole
             // shape. The mode is the single source of truth for whether log
             // rows are on; the `log=` scan argument is derived from it in the
             // lifecycle handler (`ON_AGENDA_LOG_MODE`). A chord that wrote the
@@ -7292,7 +7336,12 @@ impl GrammarCallbacks for Component {
             // command are one switch rather than two paths that can differ.
             AGENDA_LOG_MODE => Ok(vec![Effect::ToggleMode(AGENDA_LOG_MODE_ID.to_string())]),
             AGENDA_FILTER_CLEAR => {
-                let mut view = VIEW_ARGS.with_borrow(Clone::clone);
+                // OA.28: the filter is dropped and NOTHING else — the span and
+                // the day the reader walked to are carried through, because
+                // they come back from the view rather than from a default.
+                // Emacs' `org-agenda-filter-remove-all` leaves `org-agenda-span`
+                // alone, and so does this.
+                let mut view = view_of(ctx.buffer_id);
                 view.filters.clear();
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {
@@ -8720,7 +8769,8 @@ fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
 /// in one prompt line; a menu has room to say which is which.
 ///
 /// **No row shows its own on/off state**, and that is deliberate rather than
-/// unfinished. Log mode's state is derivable here (`VIEW_ARGS.log`), the clock
+/// unfinished. Log mode's state is derivable here (OA.28's `view-args` carries
+/// the `log=` argument), the clock
 /// report's is not — it is a NATIVE mode and the guest has no query for mode
 /// state at all. One row reporting state beside one that cannot is worse than
 /// neither reporting it: the silent row reads as "off". Emacs shows no state

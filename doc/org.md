@@ -658,7 +658,7 @@ open it — emacs has been writing those log lines for years.
 
 | | |
 |---|---|
-| `<C-Space>` | toggle the checkbox on this line, or every box in a region |
+| `<C-c><C-c>` | toggle the checkbox on this line |
 | `<C-c><C-x><C-b>` | set every box in the region — or under this headline — to one state |
 | `<M-S-CR>` | new checkbox item below this one |
 | `<leader>o_` | drop the box, turning the item back into prose |
@@ -706,10 +706,14 @@ Tick `bins` and `kitchen` becomes `[X]` on its own. This is org's
 `org-list-struct-fix-box`, and it cascades: a grandparent is computed from a
 parent that was just computed, deepest first.
 
-**So `<C-Space>` on a parent does nothing.** You set it, and it is immediately
-recomputed from children that did not move. That is not a limitation bolted
-on — it is what "computed" means, and org behaves the same way. To finish a
-whole list at once, use `<C-c><C-x><C-b>`.
+**So toggling a parent does not set it.** Whatever you ask for, it is
+recomputed from children that did not move — which usually looks like nothing
+happening, and is not: a box that disagreed with its children gets *corrected*.
+Toggling a hand-written `[X]` over mixed children leaves `[-]`, neither the
+value it had nor the one you asked for.
+
+That is not a limitation bolted on — it is what "computed" means, and org
+behaves the same way. To finish a whole list at once, use `<C-c><C-x><C-b>`.
 
 An item whose children carry **no** boxes is not a parent, and toggles
 normally.
@@ -721,9 +725,12 @@ to **one** state: unticked if the first box it finds is ticked, else ticked.
 On a headline it reaches the whole subtree; over a region, that region; on a
 lone item, just that item.
 
-It is a different verb from `<C-Space>`, which flips each box from **its own**
-state. Over a mixed region `<C-Space>` inverts each one; `<C-c><C-x><C-b>`
-makes them agree. Both are one edit, so one `u` puts the whole thing back.
+`<C-c><C-c>` is the other verb: it toggles the one box under the cursor. Both
+are org's, and they are the only two — an earlier `<C-Space>` binding was
+retired because it is not org's (in emacs `C-SPC` sets the mark) and evil-org
+leaves org's checkbox keys alone.
+
+Setting a region is one edit, so one `u` puts the whole thing back.
 
 Items with no checkbox are left alone — neither key adds one.
 

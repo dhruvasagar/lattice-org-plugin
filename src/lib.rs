@@ -311,7 +311,9 @@ const DEADLINE_SUBMIT: u32 = 77;
 /// `<leader>oI` (IM.7).
 const TOGGLE_INLINE_IMAGES: u32 = 16;
 
-/// `<C-Space>` (OM.8).
+/// Toggle the box at point. Reached through `C-c C-c`'s context dispatcher —
+/// org's own key for it — since OX.3 retired the `<C-Space>` binding this
+/// used to carry.
 const TOGGLE_CHECKBOX: u32 = 17;
 
 /// `<C-a>` / `<C-x>` (OM.9).
@@ -656,11 +658,10 @@ const ROAM_CREATE_AND_INSERT: u32 = 109;
 
 /// OX.2 — `C-c C-x C-b`, org's `org-toggle-checkbox`.
 ///
-/// A SEPARATE verb from `<C-Space>`, not a second key for it. `<C-Space>`
-/// flips each box from its own state (OS.10's deliberate choice); this drives
-/// every box it reaches to ONE value taken from the first, which is what org
-/// does and is the only way to tick a whole list at once now that a parent's
-/// box is derived (OX.1) and therefore not directly settable.
+/// A SEPARATE verb from `C-c C-c`, which toggles the single box at point.
+/// This drives every box it reaches to ONE value taken from the first, which
+/// is what org does — and it is the only way to tick a whole list at once now
+/// that a parent's box is derived (OX.1) and therefore not directly settable.
 const TOGGLE_CHECKBOX_SUBTREE: u32 = 110;
 
 /// OA.15 — `l`, emacs' `org-agenda-log-mode`. What you DID, beside what you
@@ -2062,7 +2063,11 @@ impl Guest for Component {
                 vbind("<M-l>", "org-meta-right"),
                 vbind("<M-S-h>", "org-shift-meta-left"),
                 vbind("<M-S-l>", "org-shift-meta-right"),
-                vbind("<C-Space>", "org-toggle-checkbox"),
+                // OX.3: `C-c C-x C-b` is org's region verb, and the only one
+                // — it drives every box in the region to ONE state. The
+                // `<C-Space>` peer that used to sit here flipped each box from
+                // its own state (OS.10), which org has no equivalent of; it
+                // went with the chord.
                 vbind("<C-c><C-x><C-b>", "org-toggle-checkbox-set"),
                 bind("<leader><CR>", "org-meta-return"),
                 bind("<leader>o*", "org-toggle-heading"),
@@ -2157,11 +2162,16 @@ impl Guest for Component {
                 // IM.7: images are off by default, so the toggle is how most
                 // users will ever turn them on.
                 bind("<leader>oI", "org-toggle-inline-images"),
-                // OM.8: org's own binding. `<C-Space>` is unbound in vim's
-                // Normal mode, so nothing is shadowed.
-                bind("<C-Space>", "org-toggle-checkbox"),
-                // OX.2: org's own binding for `org-toggle-checkbox`, and its
-                // own verb — see `TOGGLE_CHECKBOX_SUBTREE`.
+                // OX.3: the checkbox verbs are org's, and only org's.
+                //
+                // `<C-Space>` used to be bound here under a comment calling it
+                // "org's own binding". It is not: `C-SPC` is emacs'
+                // `set-mark-command`, and evil-org does not rebind checkboxes
+                // at all. Org has exactly two — `C-c C-c` on a box toggles it
+                // (the dispatcher above already routes that), and this one
+                // sets many at once. Muscle memory is the dominant cost on a
+                // surface like this, and an invented third chord spends it for
+                // nothing.
                 bind("<C-c><C-x><C-b>", "org-toggle-checkbox-set"),
                 // OM.9: `<C-a>` / `<C-x>` are vim's increment / decrement.
                 // These SHADOW them inside org buffers and DECLINE off a
@@ -6120,7 +6130,7 @@ fn cycle_list_bullet(
 ///
 /// Un-itemising a checkbox item DROPS ITS BOX, so every cookie counting it is
 /// wrong the instant the line changes. They are rewritten in the SAME edit --
-/// the rule `<C-Space>` already follows, and the reason one `u` restores both.
+/// the rule the toggle already follows, and the reason one `u` restores both.
 fn toggle_item(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
     let at = ctx.cursor.line;
     let line = |n: u32| doc.line(n);
@@ -8617,17 +8627,18 @@ impl PickerSource for Component {
 /// put both back — a half-undone list showing `[2/3]` above one ticked box is
 /// a worse state than either end.
 ///
-/// Consumes the key rather than declining when there is no checkbox:
-/// `<C-Space>` is org's here and has nothing to fall through to.
+/// Consumes the key rather than declining when there is no checkbox: it is
+/// reached through `C-c C-c`, whose whole job is to act on what is at point,
+/// and there is nothing beneath it here to fall through to.
 /// OX.2 — `C-c C-x C-b`: drive every box it reaches to ONE state.
 ///
-/// Org's `org-toggle-checkbox`, and a different verb from `<C-Space>`:
+/// Org's `org-toggle-checkbox`, and a different verb from `C-c C-c`:
 ///
-/// | | `<C-Space>` | `C-c C-x C-b` |
+/// | | `C-c C-c` | `C-c C-x C-b` |
 /// |---|---|---|
 /// | one item | toggles it | toggles it |
-/// | a region | flips each from its OWN state (OS.10) | drives all to one |
-/// | a headline | nothing | drives the whole subtree to one |
+/// | a region | — | drives all to one |
+/// | a headline | dispatches on the headline | drives the whole subtree to one |
 ///
 /// The reference state is org's: `[ ]` if the first box it finds is ticked,
 /// else `[X]`. Taken from the FIRST box rather than from the cursor line,
@@ -8705,31 +8716,23 @@ fn toggle_checkbox(
     // enclosing cookie.
     let cb = checkbox::Checkboxes::new(tree, &line, doc.line_count());
 
-    // OS.10: over a region, every box it touches flips — in ONE edit, so one
-    // `u` restores them all. Each box is toggled from its OWN state rather than
-    // driven to a common value: `<C-Space>` means toggle, and forcing a mixed
-    // region to all-ticked would be a different verb wearing the same key.
-    let region = region_lines(ctx).filter(|(lo, hi)| lo != hi);
-    let targets: Vec<u32> = match region {
-        Some((lo, hi)) => (lo..=hi).filter(|&n| cb.item_at(n).is_some()).collect(),
-        None => vec![at],
-    };
-    let mut rewritten: Vec<(u32, String)> = Vec::new();
-    for n in &targets {
-        let (Some(text), Some(item)) = (doc.line(*n), cb.item_at(*n)) else {
-            continue;
-        };
-        if let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) {
-            rewritten.push((*n, flipped));
-        }
-    }
-    if rewritten.is_empty() {
+    // OX.3: ONE box, the one at point.
+    //
+    // This took a region until the `<C-Space>` binding was retired. OS.10 had
+    // it flip every box in a Visual region from its OWN state, reasoning that
+    // "`<C-Space>` means toggle, and forcing a mixed region to all-ticked
+    // would be a different verb wearing the same key". That reasoning was
+    // sound and the chord it defended was not org's — org's region verb is
+    // `C-c C-x C-b`, which drives every box to one state
+    // (`toggle_checkbox_set`). With no Visual binding left, the region branch
+    // here was reachable from nothing.
+    let (Some(text), Some(item)) = (doc.line(at), cb.item_at(at)) else {
         return vec![Effect::None];
-    }
-    // The cookie walk below is anchored at the LAST toggled line: ancestors are
-    // shared across a region inside one list, and the span it rewrites reaches
-    // from the topmost ancestor down to it.
-    let at = *targets.last().unwrap_or(&at);
+    };
+    let Some(flipped) = checkbox::set_state(&text, checkbox::toggled(item.state)) else {
+        return vec![Effect::None];
+    };
+    let mut rewritten: Vec<(u32, String)> = vec![(at, flipped)];
 
     derive_and_recount(&cb, &line, at, &mut rewritten);
     write_rewritten(ctx, &line, rewritten)
@@ -8873,10 +8876,12 @@ fn write_rewritten(
 /// | Headline | set tags |
 /// | Anything else | say so |
 ///
-/// **The arms CALL the bodies the chords call.** `toggle_checkbox` and
-/// `set_tags_prompt` are the same functions `<C-Space>` and `<C-c><C-q>`
-/// reach, not copies — two spellings of one verb that could drift is the
-/// thing this file already avoids everywhere else.
+/// **The arms CALL the bodies, they do not reimplement them.**
+/// `toggle_checkbox` and `set_tags_prompt` are the same functions the other
+/// entry points reach — `set_tags_prompt` is also `<C-c><C-q>`'s, and
+/// `toggle_checkbox` is reached only from here since OX.3 retired
+/// `<C-Space>`. Two spellings of one verb that could drift is the thing this
+/// file avoids everywhere else.
 ///
 /// **No statistics-cookie arm**, and the slice plan said there would be one.
 /// Emacs spells that `C-c #` (`org-update-statistics-cookies`), and a cookie

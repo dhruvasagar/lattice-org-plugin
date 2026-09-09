@@ -1512,7 +1512,7 @@ async fn toggling_a_checkbox_updates_the_parents_cookie_in_one_edit() {
     let mut editor = org_editor(base.path(), original).await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* Shopping [2/3]\n  - [X] bread\n  - [X] milk\n  - [ ] eggs\n",
@@ -1545,7 +1545,7 @@ async fn ticking_the_last_child_ticks_the_parent() {
     .await;
 
     goto_line(&mut editor, 3);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [X] parent\n    - [X] a\n    - [X] b\n",
@@ -1571,7 +1571,7 @@ async fn a_mixed_set_of_children_makes_the_parent_partial() {
     .await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
@@ -1593,7 +1593,7 @@ async fn unticking_the_last_ticked_child_unticks_the_parent() {
     .await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [ ] parent\n    - [ ] a\n    - [ ] b\n"
@@ -1616,11 +1616,45 @@ async fn a_parent_with_boxed_children_cannot_be_ticked_directly() {
     let mut editor = org_editor(base.path(), original).await;
 
     goto_line(&mut editor, 1);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         original,
         "the toggle is overwritten by the derivation, exactly as in org"
+    );
+}
+
+/// **"No-op" is not quite it: the parent is RECOMPUTED, which can correct it.**
+///
+/// The precise rule is that a parent ends up at its derived value whatever the
+/// toggle did — usually indistinguishable from doing nothing, but not when the
+/// box disagreed with its children to begin with. A hand-written `[X]` over
+/// mixed children becomes `[-]`: neither the value it had nor the value the
+/// toggle asked for.
+///
+/// Worth its own test because "toggling a parent does nothing" is the easy
+/// thing to remember and is wrong in exactly this case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggling_an_inconsistent_parent_corrects_it_rather_than_toggling_it() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // `[X]` is a lie here — one child is unticked. A user can type this, and
+    // org will not leave it standing either.
+    let mut editor = org_editor(
+        base.path(),
+        "* T\n  - [X] parent\n    - [X] a\n    - [ ] b\n",
+    )
+    .await;
+
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+    assert_eq!(
+        text(&editor),
+        "* T\n  - [-] parent\n    - [X] a\n    - [ ] b\n",
+        "not `[X]` (what it was) and not `[ ]` (what the toggle asked for) — \
+         `[-]`, which is what the children say"
     );
 }
 
@@ -1643,7 +1677,7 @@ async fn a_parent_without_boxed_children_still_toggles() {
     .await;
 
     goto_line(&mut editor, 1);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [X] parent\n    - plain\n    - also plain\n",
@@ -1670,7 +1704,7 @@ async fn derivation_cascades_up_through_grandparents() {
     .await;
 
     goto_line(&mut editor, 3);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [X] grand\n    - [X] parent\n      - [X] a\n",
@@ -1695,7 +1729,7 @@ async fn a_parent_carrying_both_a_box_and_a_cookie_updates_both() {
     .await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* T\n  - [-] parent [1/2]\n    - [X] a\n    - [ ] b\n",
@@ -1728,7 +1762,7 @@ async fn the_set_chord_drives_a_whole_subtree_to_one_state() {
     .await;
 
     goto_line(&mut editor, 0);
-    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    press(&mut editor, "<C-c><C-x><C-b>");
     assert_eq!(
         text(&editor),
         "* Shopping [3/3]\n  - [X] bread\n  - [X] milk\n  - [X] eggs\n",
@@ -1754,7 +1788,7 @@ async fn the_set_chord_unticks_when_the_first_box_is_ticked() {
     .await;
 
     goto_line(&mut editor, 0);
-    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    press(&mut editor, "<C-c><C-x><C-b>");
     assert_eq!(
         text(&editor),
         "* Shopping [0/3]\n  - [ ] bread\n  - [ ] milk\n  - [ ] eggs\n"
@@ -1778,7 +1812,7 @@ async fn the_set_chord_completes_a_list_a_parent_toggle_cannot() {
     .await;
 
     goto_line(&mut editor, 0);
-    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    press(&mut editor, "<C-c><C-x><C-b>");
     assert_eq!(
         text(&editor),
         "* T\n  - [X] parent\n    - [X] a\n    - [X] b\n",
@@ -1800,7 +1834,7 @@ async fn the_set_chord_does_not_add_boxes_to_plain_items() {
     let mut editor = org_editor(base.path(), "* T\n  - [ ] boxed\n  - plain bullet\n").await;
 
     goto_line(&mut editor, 0);
-    press_chord(&mut editor, "<C-c><C-x><C-b>").await;
+    press(&mut editor, "<C-c><C-x><C-b>");
     assert_eq!(
         text(&editor),
         "* T\n  - [X] boxed\n  - plain bullet\n",
@@ -1823,7 +1857,7 @@ async fn a_percentage_cookie_keeps_its_form() {
     .await;
 
     goto_line(&mut editor, 1);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* Shopping [33%]\n  - [X] bread\n  - [ ] milk\n  - [ ] eggs\n",
@@ -1843,7 +1877,7 @@ async fn toggling_off_a_checkbox_line_does_nothing() {
     let mut editor = org_editor(base.path(), original).await;
 
     goto_line(&mut editor, 1);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(text(&editor), original);
 }
 
@@ -1863,7 +1897,7 @@ async fn nested_lists_roll_up_to_the_nearest_cookie() {
     .await;
 
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     let out = text(&editor);
     assert!(
         out.contains("- [-] a [1/2]"),
@@ -4336,7 +4370,7 @@ async fn a_checkbox_inside_a_block_is_neither_toggled_nor_counted() {
 
     // On the block's example line: nothing happens at all.
     goto_line(&mut editor, 3);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         original,
@@ -4346,7 +4380,7 @@ async fn a_checkbox_inside_a_block_is_neither_toggled_nor_counted() {
     // On the real item: it ticks, and the cookie counts ONE item — not the
     // two the indent walk finds.
     goto_line(&mut editor, 1);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* Shopping [1/1]\n- [X] milk\n#+BEGIN_SRC org\n- [ ] example\n#+END_SRC\n",
@@ -4371,10 +4405,12 @@ async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
     let original = "* Top [0/2]\n- [ ] a [0/2]\n  - [ ] a1\n  - [ ] a2\n- [ ] b\n";
     let mut editor = org_editor(base.path(), original).await;
 
-    // Tick a grandchild: `a`'s cookie moves, `Top`'s does not — `a` is still
-    // unticked, and `Top` counts boxes, not descendants.
+    // Tick a grandchild: `a`'s cookie moves and its BOX derives to `[-]`,
+    // while `Top`'s cookie does not move — `a` is not ticked (a cookie counts
+    // `[X]` only), and `Top` counts its direct children rather than
+    // descendants.
     goto_line(&mut editor, 2);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* Top [0/2]\n- [-] a [1/2]\n  - [X] a1\n  - [ ] a2\n- [ ] b\n",
@@ -4390,7 +4426,7 @@ async fn a_nested_list_still_rolls_up_one_level_at_a_time() {
     // `[-]`. This also exercises the full cascade in one keystroke: leaf →
     // parent's box → parent's cookie → the headline's cookie.
     goto_line(&mut editor, 3);
-    press(&mut editor, "<C-Space>");
+    press(&mut editor, "<C-c><C-c>");
     assert_eq!(
         text(&editor),
         "* Top [1/2]\n- [X] a [2/2]\n  - [X] a1\n  - [X] a2\n- [ ] b\n",
@@ -5686,7 +5722,7 @@ async fn every_bullet_shape_moves_its_box_and_its_cookie_together() {
         let base = tempfile::tempdir().unwrap();
         let mut editor = org_editor(base.path(), before).await;
         goto_line(&mut editor, 1);
-        press(&mut editor, "<C-Space>");
+        press(&mut editor, "<C-c><C-c>");
         assert_eq!(text(&editor), after, "{name}");
     }
 }
@@ -6435,25 +6471,38 @@ async fn a_region_containing_one_refusal_refuses_whole() {
     assert!(last_echo(&editor).is_some(), "and it says what stopped it");
 }
 
-/// Every box in the region flips, in one edit — and each from its OWN state,
-/// because `<C-Space>` means toggle.
+/// OX.3 — the REGION verb is `C-c C-x C-b`, and it drives every box to one
+/// state rather than flipping each.
+///
+/// This was `ctrl_space_toggles_every_box_in_the_region`, and OS.10 had it
+/// flip each box from its own state on the reasoning that "`<C-Space>` means
+/// toggle". The reasoning was sound; the chord was not org's. Org's region
+/// verb is `org-toggle-checkbox` on `C-c C-x C-b`, which takes a reference
+/// from the first box and makes every box in the region agree with it — so
+/// the MIXED case is the one worth pinning, since it is the only one where
+/// the two rules differ.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ctrl_space_toggles_every_box_in_the_region() {
+async fn the_region_verb_makes_every_box_agree_with_the_first() {
     if org_plugin_wasm().is_none() {
         return;
     }
     let base = tempfile::tempdir().unwrap();
-    let mut editor = org_editor(base.path(), "* S [0/2]\n- [ ] a\n- [ ] b\n").await;
+    let mut editor = org_editor(base.path(), "* S [1/2]\n- [ ] a\n- [X] b\n").await;
 
     goto(&mut editor, 1, 0);
     press(&mut editor, "V");
     goto(&mut editor, 2, 0);
-    press(&mut editor, "<C-Space>");
-    assert_eq!(text(&editor), "* S [2/2]\n- [X] a\n- [X] b\n");
-    // The region verb left Visual, vim-style — so `u` is UNDO here rather than
-    // Visual's lowercase-selection, and one press restores the whole edit.
+    press(&mut editor, "<C-c><C-x><C-b>");
+    assert_eq!(
+        text(&editor),
+        "* S [2/2]\n- [X] a\n- [X] b\n",
+        "the first box was unticked, so both are driven ON — a per-box flip \
+         would have turned `b` off"
+    );
+    // Still ONE edit: a single `u` restores the whole region, which is what
+    // keeps a list from being left showing `[1/2]` over two ticked boxes.
     press(&mut editor, "u");
-    assert_eq!(line_at(&editor, 0), "* S [0/2]", "one edit, one undo");
+    assert_eq!(line_at(&editor, 0), "* S [1/2]", "one edit, one undo");
 }
 
 /// A Normal-mode firing has `selection: None` and must fall back to the

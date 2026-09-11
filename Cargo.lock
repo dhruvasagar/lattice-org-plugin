@@ -3121,6 +3121,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3196,6 +3197,7 @@ dependencies = [
  "internment",
  "lattice-grammar",
  "lattice-protocol",
+ "linkme",
  "tracing",
 ]
 

@@ -7479,6 +7479,11 @@ impl GrammarCallbacks for Component {
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: REFILE_PICKER.to_string(),
                     args: Vec::new(),
+                    root: None,
+                    // PC.11: org opens every one of its pickers to ACT — the
+                    // accept routes through the source's own outcome. Nothing
+                    // here is waiting for a value, which is what `none` says.
+                    fill_action: None,
                 },
             )]),
             REFILE_TO => Ok(refile_to(&ctx, doc, tree)),
@@ -8147,6 +8152,11 @@ impl GrammarCallbacks for Component {
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: roam_insert::INSERT_NODE_PICKER.to_string(),
                     args: Vec::new(),
+                    root: None,
+                    // PC.11: org opens every one of its pickers to ACT — the
+                    // accept routes through the source's own outcome. Nothing
+                    // here is waiting for a value, which is what `none` says.
+                    fill_action: None,
                 },
             )]),
             // OR.7c: the link the picker resolved, inserted at the cursor.
@@ -8234,6 +8244,11 @@ impl GrammarCallbacks for Component {
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: roam_find::FIND_NODE_PICKER.to_string(),
                     args: Vec::new(),
+                    root: None,
+                    // PC.11: org opens every one of its pickers to ACT — the
+                    // accept routes through the source's own outcome. Nothing
+                    // here is waiting for a value, which is what `none` says.
+                    fill_action: None,
                 },
             )]),
             // OR.6: mint an id, write the note, open it.
@@ -9299,6 +9314,14 @@ fn backlinks_at_point(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect> {
         lattice::plugin_host::types::OpenPickerPayload {
             source: roam_backlinks::BACKLINKS_PICKER.to_string(),
             args: vec![id],
+            // PC.1: org's pickers build their candidate sets from org's own
+            // configuration (`org.roam-directory`, the refile targets) and
+            // never read the picker's workspace root, so there is nothing here
+            // to override. `none` is exactly today's behaviour.
+            root: None,
+            // PC.11: nor is anything waiting for a value — the backlinks
+            // picker acts on its accept rather than answering a caller.
+            fill_action: None,
         },
     )]
 }

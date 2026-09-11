@@ -71,7 +71,7 @@ async fn press_chord(editor: &mut Editor, keys: &str) {
 fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
     for effect in out.effects {
         match effect {
-            lattice_grammar::Effect::OpenPicker { source, args } => {
+            lattice_grammar::Effect::OpenPicker { source, args, .. } => {
                 let _ = editor.open_picker(source, args);
             }
             // OR.11b: with templates configured the accept opens the chooser
@@ -1136,7 +1136,7 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             } => {
                 editor.apply_write_to_file(path, anchor, text, cut, create_parents, save);
             }
-            lattice_grammar::Effect::OpenPicker { source, args } => {
+            lattice_grammar::Effect::OpenPicker { source, args, .. } => {
                 let _ = editor.open_picker(source, args);
             }
             // OR.13: RENDERER-applied, like `OpenTransient` / `OpenSyntheticBuffer`

@@ -9795,6 +9795,11 @@ fn roam_draft(
         Ok(body) => body,
         Err(message) => return Err(roam_warn(&format!("org-roam: {message}"))),
     };
+    // The `:ID:` is org-roam's to guarantee, not the template's — emacs writes
+    // it in `org-roam-capture--setup-target-location` and its own default
+    // template carries none. Applied AFTER `${…}` expansion so a template that
+    // spells `:ID: ${id}` itself is seen as already having one.
+    let body = roam_capture::ensure_id(&body, id);
     let name = roam_note_filename(template, &node);
     Ok(RoamDraft {
         asks_questions: answers.is_empty()

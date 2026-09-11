@@ -170,3 +170,155 @@ mod tests {
         assert_eq!(expand_fields("#+title: ${title}", &n), "#+title: 100% done");
     }
 }
+
+/// Guarantee the node's `:ID:` — org-roam's own rule, not the template's job.
+///
+/// `org-roam-capture.el` (`org-roam-capture--setup-target-location`):
+///
+/// ```elisp
+/// (if-let ((id (org-entry-get p "ID")))
+///     (setf (org-roam-node-id org-roam-capture--node) id)
+///   (org-entry-put p "ID" (org-roam-node-id org-roam-capture--node)))
+/// ```
+///
+/// Two halves, and both matter:
+///
+/// - **An existing `:ID:` is ADOPTED, never replaced.** A template that writes
+///   `:ID: ${id}` itself, or a target file that already carries one, keeps the
+///   id it has — the node record follows the file rather than the file being
+///   rewritten to match a freshly-minted id. Overwriting would silently
+///   re-identify a note every link in the corpus already points at.
+/// - **An absent one is WRITTEN.** An `:ID:` is not template content; it is what
+///   makes the file a node at all. org-roam's own default template carries none
+///   and still produces indexable notes, which is the clearest statement that
+///   this belongs to the create flow.
+///
+/// Without this a template that forgets `${id}` produces a file, no error, and a
+/// note that never appears in `find-node` — a silent failure whose only symptom
+/// is an absence.
+///
+/// ## Placement
+///
+/// A file-level drawer must be the **first element in the file**. So: if the
+/// body already opens with a `:PROPERTIES:` drawer the id joins it; otherwise a
+/// fresh drawer is prepended above everything, `#+title:` included. A drawer
+/// sitting further down (after the keywords, say) is NOT the file's property
+/// block and is left exactly where the template put it — it is the user's
+/// content, and quietly relocating it would be a second surprise on top of the
+/// one this fixes.
+pub fn ensure_id(body: &str, id: &str) -> String {
+    if file_level_id(body).is_some() {
+        return body.to_string();
+    }
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) == Some(":PROPERTIES:") {
+        // Opens with the file's drawer — put the id first inside it, which is
+        // where `org-entry-put` places a new property.
+        let rest: Vec<&str> = body.lines().skip(1).collect();
+        let mut out = String::from(":PROPERTIES:\n");
+        out.push_str(&format!(":ID:       {id}\n"));
+        out.push_str(&rest.join("\n"));
+        if body.ends_with('\n') {
+            out.push('\n');
+        }
+        return out;
+    }
+    format!(":PROPERTIES:\n:ID:       {id}\n:END:\n{body}")
+}
+
+/// The `:ID:` of the file-level drawer — the one that opens the file — or
+/// `None`.
+///
+/// Deliberately only the FIRST element: a `:PROPERTIES:` block further down
+/// belongs to a headline (or to nothing), and treating it as the file's would
+/// make a headline's id suppress the file node's.
+fn file_level_id(body: &str) -> Option<String> {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some(":PROPERTIES:") {
+        return None;
+    }
+    for line in lines {
+        let t = line.trim();
+        if t == ":END:" {
+            return None;
+        }
+        if let Some(rest) = t.strip_prefix(":ID:") {
+            let id = rest.trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod ensure_id_tests {
+    use super::*;
+
+    #[test]
+    fn a_body_with_no_drawer_gets_one_at_the_very_top() {
+        let out = ensure_id("#+title: T\n\n* Heading\n", "ABC");
+        assert!(
+            out.starts_with(":PROPERTIES:\n:ID:       ABC\n:END:\n#+title: T"),
+            "the drawer must precede the keywords — a file-level drawer is the \
+             FIRST element or it is not the file's: {out}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_opens_with_a_drawer_gains_the_id_inside_it() {
+        let out = ensure_id(":PROPERTIES:\n:TYPE: book\n:END:\n#+title: T\n", "ABC");
+        assert_eq!(
+            out,
+            ":PROPERTIES:\n:ID:       ABC\n:TYPE: book\n:END:\n#+title: T\n"
+        );
+    }
+
+    /// The half that is easy to get backwards: an id already present is
+    /// ADOPTED, not replaced. Overwriting would silently re-identify a note
+    /// every existing link points at.
+    #[test]
+    fn an_existing_id_is_left_alone() {
+        let body = ":PROPERTIES:\n:ID:       KEEP-ME\n:END:\n#+title: T\n";
+        assert_eq!(ensure_id(body, "FRESH"), body);
+    }
+
+    /// A template that spells it itself (`:ID: ${id}`) has already been
+    /// expanded by `expand_fields` before this runs, so it looks exactly like
+    /// the case above and must not produce a second `:ID:`.
+    #[test]
+    fn a_template_that_writes_its_own_id_gets_no_second_one() {
+        let expanded = expand_fields(
+            ":PROPERTIES:\n:ID: ${id}\n:END:\n#+title: ${title}\n",
+            &Node {
+                title: "T",
+                slug: "t",
+                id: "ABC",
+            },
+        );
+        let out = ensure_id(&expanded, "ABC");
+        assert_eq!(out.matches(":ID:").count(), 1, "exactly one id: {out}");
+    }
+
+    /// **The reported case.** A drawer AFTER the keywords is not the file's
+    /// property block, so the id still needs a drawer of its own at the top —
+    /// and the template's own drawer stays exactly where it was written.
+    #[test]
+    fn a_drawer_below_the_keywords_does_not_count_as_the_files() {
+        let body = "#+Title: test123\n#+Filetags: :source:book:\n:PROPERTIES:\n:TYPE: source\n:END:\n\n* Why\n";
+        let out = ensure_id(body, "ABC");
+        assert!(out.starts_with(":PROPERTIES:\n:ID:       ABC\n:END:\n#+Title: test123"));
+        assert!(
+            out.contains(":TYPE: source"),
+            "the template's own drawer is left where it put it: {out}"
+        );
+        assert_eq!(out.matches(":PROPERTIES:").count(), 2);
+    }
+
+    #[test]
+    fn an_empty_id_line_does_not_count_as_present() {
+        let out = ensure_id(":PROPERTIES:\n:ID:\n:END:\n", "ABC");
+        assert!(out.contains(":ID:       ABC"), "{out}");
+    }
+}

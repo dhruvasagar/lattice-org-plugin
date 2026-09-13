@@ -1371,6 +1371,16 @@ impl Guest for Component {
                 // walk on the typing path for a list that does not change while
                 // the picker is open.
                 live: false,
+                // PP.2: NOT rooted. Refile targets come from the org-agenda
+                // file set, not from the project — the same set whichever
+                // project you are standing in — so the root a rooted prompt
+                // would name has nothing to do with these rows.
+                rooted: false,
+                // PD.1: no delete verb. These rows are headlines inside
+                // files; removing one is an edit to a document, not a list
+                // being tidied, and `<C-d>` is neither the place nor the
+                // affordance for it.
+                delete_command: None,
                 // OR.5: refile moves a subtree UNDER an existing headline, so
                 // there is nothing here to create — a "create" row would have
                 // to invent a parent, which is not what the user asked for.
@@ -1731,6 +1741,7 @@ impl Guest for Component {
                 kinds: Some(vec![EventKind::Plugin]),
                 path_globs: None,
                 major_modes: None,
+                minor_modes: None,
             },
             ON_CLOCK_EVENT,
         );
@@ -1755,6 +1766,7 @@ impl Guest for Component {
                 kinds: Some(vec![EventKind::FilesChanged]),
                 path_globs: None,
                 major_modes: None,
+                minor_modes: None,
             },
             ON_ROAM_FILES_CHANGED,
         );
@@ -1772,6 +1784,7 @@ impl Guest for Component {
                 kinds: Some(vec![EventKind::OptionChanged]),
                 path_globs: None,
                 major_modes: None,
+                minor_modes: None,
             },
             ON_ROAM_OPTION_CHANGED,
         );
@@ -1787,6 +1800,7 @@ impl Guest for Component {
                 kinds: Some(vec![EventKind::MinorActivated, EventKind::MinorDeactivated]),
                 path_globs: None,
                 major_modes: None,
+                minor_modes: None,
             },
             ON_AGENDA_LOG_MODE,
         );

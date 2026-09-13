@@ -57,6 +57,20 @@ pub fn spec() -> PickerSourceSpec {
         // change while the picker is open. `gr`-style refresh is the
         // multibuffer's affordance, not a picker's.
         live: false,
+        // PP.2: NOT rooted. A rooted prompt is filled from the picker
+        // context's `workspace-root` — the PROJECT root — and this corpus is
+        // not the project: it is the org-roam directory, wherever config
+        // points it. The field's own test settles it — *would these results
+        // be different in another project?* They would not, so naming one
+        // would say something untrue about the rows.
+        rooted: false,
+        // PD.1: no delete verb. `<C-d>` must never be a filesystem delete —
+        // that is oil's job and the file tree's — and removing a note from
+        // the corpus is exactly that. A roam picker that deleted files on a
+        // keystroke would make the key mean something categorically more
+        // destructive here than in the project switcher, which is the
+        // inconsistency these key rules exist to prevent.
+        delete_command: None,
         create_label: None,
     }
 }

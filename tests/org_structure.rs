@@ -5749,11 +5749,17 @@ async fn meta_return_on_a_plain_item_inserts_a_plain_item() {
     );
 }
 
-/// A checkbox item is also a list item, so arm ORDER decides this one. The new
-/// box starts empty whatever the source item's state — copying `[X]` would tick
-/// a task the user has not done.
+/// `<M-CR>` never adds a box, and a checkbox item is where that is visible:
+/// emacs's `org-meta-return` calls `org-insert-item` INTERACTIVELY, so its
+/// `checkbox` argument is the prefix arg — nil — and `org-list-insert-item`
+/// reads `(box (and checkbox "[ ]"))`. The box therefore tracks the CHORD, not
+/// the item under the cursor.
+///
+/// This used to answer `- [ ] ` here, mirroring the source item's shape. That
+/// symmetry is not org's: it made `<M-CR>` do `<M-S-CR>`'s job on every
+/// checkbox list, which is the one place org users press it most.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn meta_return_on_a_checkbox_item_inserts_an_empty_checkbox_item() {
+async fn meta_return_on_a_checkbox_item_inserts_a_plain_item() {
     if org_plugin_wasm().is_none() {
         return;
     }
@@ -5764,9 +5770,26 @@ async fn meta_return_on_a_checkbox_item_inserts_an_empty_checkbox_item() {
     press(&mut editor, "<M-CR>");
     assert_eq!(
         text(&editor),
-        "- [X] bread\n- [ ] \n",
-        "a NEW box starts empty -- copying [X] would tick a task nobody did"
+        "- [X] bread\n- \n",
+        "emacs's M-RET inserts no box, whatever the item under the cursor has"
     );
+}
+
+/// The Insert-mode peer of the pair, because the bug they fix was reported from
+/// Insert: the chord is most useful mid-typing, and a Normal-only test would
+/// pass on a build where the Insert binding resolved to the other arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn meta_return_in_insert_on_a_checkbox_item_inserts_a_plain_item() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- [ ] milk\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "A"); // Insert, at end of line
+    press(&mut editor, "<M-CR>");
+    assert_eq!(text(&editor), "- [ ] milk\n- \n");
 }
 
 /// The headline arm is the pre-OS.4 behaviour, unchanged: respect-content, so
@@ -5883,10 +5906,11 @@ async fn meta_return_on_a_parent_item_lands_after_its_children() {
 
 // ── OS.5: `<M-S-CR>` — the variant, and the headline insert family ─────────
 
-/// The shift variant is the OTHER kind of item, not a second way to make the
-/// same one: off a plain item it gives you a box, off a boxed one it gives you
-/// a plain item. Emacs's `org-insert-todo-heading` reads the same way on
-/// headlines, which is why one action serves all three.
+/// The shift variant ALWAYS gives you a box on an item — emacs's
+/// `org-insert-todo-heading` calls `(org-insert-item 'checkbox)`, and its
+/// docstring says as much: "When called at a plain list item, insert a new item
+/// with an unchecked check box". On a headline the same action seeds the first
+/// TODO keyword, which is why one action serves both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shift_meta_return_upgrades_a_plain_item_to_a_checkbox_item() {
     if org_plugin_wasm().is_none() {
@@ -5900,8 +5924,15 @@ async fn shift_meta_return_upgrades_a_plain_item_to_a_checkbox_item() {
     assert_eq!(text(&editor), "- milk\n- [ ] \n");
 }
 
+/// The other half of "always a box": off a checkbox item you get another one,
+/// not a plain item. The pair used to be same-shape / inverse-shape, which left
+/// `<M-S-CR>` — the one chord whose name means "give me a checkbox" — taking
+/// the box AWAY on precisely the lists that have them.
+///
+/// The new box is empty whatever the source item's state: copying `[X]` would
+/// tick a task nobody has done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shift_meta_return_downgrades_a_checkbox_item_to_a_plain_one() {
+async fn shift_meta_return_on_a_checkbox_item_inserts_another_empty_box() {
     if org_plugin_wasm().is_none() {
         return;
     }
@@ -5910,7 +5941,26 @@ async fn shift_meta_return_downgrades_a_checkbox_item_to_a_plain_one() {
 
     goto(&mut editor, 0, 0);
     press(&mut editor, "<M-S-CR>");
-    assert_eq!(text(&editor), "- [X] bread\n- \n");
+    assert_eq!(
+        text(&editor),
+        "- [X] bread\n- [ ] \n",
+        "a NEW box starts empty -- copying [X] would tick a task nobody did"
+    );
+}
+
+/// `<M-S-CR>`'s Insert-mode peer, for [`meta_return_in_insert_on_a_checkbox_item_inserts_a_plain_item`]'s reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shift_meta_return_in_insert_on_a_plain_item_adds_a_box() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor(base.path(), "- milk\n").await;
+
+    goto(&mut editor, 0, 0);
+    press(&mut editor, "A"); // Insert, at end of line
+    press(&mut editor, "<M-S-CR>");
+    assert_eq!(text(&editor), "- milk\n- [ ] \n");
 }
 
 /// The keyword comes from the CONFIGURED sequence, not a hardcoded "TODO" --

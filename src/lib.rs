@@ -2974,13 +2974,13 @@ impl Guest for Component {
         );
         register_action(
             "org-meta-return",
-            "Insert a new headline at the same level, after this subtree",
+            "Insert a plain list item, or a headline at the same level, below the one at the cursor",
             &spec(),
             META_RETURN,
         );
         register_action(
             "org-insert-todo-heading",
-            "Insert the other kind: a checkbox item, a plain item, or a TODO heading",
+            "Insert a checkbox item, or a TODO heading, below the one at the cursor",
             &spec(),
             INSERT_TODO_HEADING,
         );
@@ -5994,8 +5994,9 @@ fn at_point(doc: &Document, tree: Option<&TreeSnapshot>, line: u32) -> Option<At
 /// dropping a sibling between a parent and its children reparents them, which is
 /// a silent restructure from a key that means "new item".
 ///
-/// The new box is always empty. Copying `[X]` from the item above would tick a
-/// task nobody has done.
+/// The new box — when `with_box`, i.e. when `<M-S-CR>` asked for one — is
+/// always empty. Copying `[X]` from the item above would tick a task nobody has
+/// done.
 fn meta_return_list(
     ctx: &ActionContext,
     doc: &Document,
@@ -6015,9 +6016,9 @@ fn meta_return_list(
         list::Bullet::Ordered { n, delim } => list::Bullet::Ordered { n: n + 1, delim },
         other => other,
     };
-    // OS.5: the CALLER decides, because `<M-S-CR>` means "the other kind".
-    // `<M-CR>` passes the item's own shape; the shift variant passes its
-    // inverse. Either way a new box starts empty.
+    // OS.5: the CALLER decides, because the box belongs to the CHORD, not to
+    // the item under the cursor — `<M-CR>` never passes one, `<M-S-CR>` always
+    // does. Either way a new box starts empty.
     let box_text = if with_box { "[ ] " } else { "" };
     let new_line = format!("{}{} {box_text}", " ".repeat(item.indent), bullet.render());
     let insert_at = end + 1;
@@ -6060,13 +6061,19 @@ fn meta_return_list(
 }
 
 fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -> Vec<Effect> {
-    // The checkbox arm before the plain-item arm: a checkbox item is also a
-    // list item, so order is what decides which one answers.
     match at_point(doc, tree, ctx.cursor.line) {
+        // NEVER a box, whichever kind of item is under the cursor. Emacs's
+        // `org-meta-return` calls `org-insert-item` interactively, so the
+        // `checkbox` argument is the prefix arg — nil — and
+        // `org-list-insert-item` builds the bullet from `(and checkbox "[ ]")`.
+        // The box tracks the CHORD, not the item.
+        //
+        // This used to pass the item's own shape, making `<M-CR>` and
+        // `<M-S-CR>` "same kind" and "other kind". That symmetry is tidier than
+        // org and wrong: on a checkbox list — where org users press this most —
+        // it made `<M-CR>` do `<M-S-CR>`'s job and `<M-S-CR>` undo it.
         Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
-            // The item's OWN shape: a checkbox item begets a checkbox item.
-            let with_box = item.checkbox.is_some();
-            meta_return_list(ctx, doc, tree, &item, with_box)
+            meta_return_list(ctx, doc, tree, &item, false)
         }
         Some(AtPoint::Headline(start, level)) => {
             meta_return_headline(ctx, doc, tree, start, level, None)
@@ -6075,12 +6082,15 @@ fn meta_return(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>)
     }
 }
 
-/// `<M-S-CR>` — the variant of [`meta_return`]: the OTHER kind of thing.
+/// `<M-S-CR>` — the variant of [`meta_return`]: the one that carries a state.
 ///
-/// Off a plain item you get a checkbox item, off a checkbox item a plain one,
-/// off a headline a TODO heading seeded with the first configured keyword.
-/// Emacs's `org-insert-todo-heading` reads the same way on headlines, which is
-/// why one action serves all three rather than three actions serving one each.
+/// On an item you always get a checkbox, on a headline a TODO heading seeded
+/// with the first configured keyword. Emacs's `org-insert-todo-heading` is one
+/// command for both — `(org-insert-item 'checkbox)` first, falling through to
+/// the heading path only when point is not in a list — which is why one action
+/// serves all three arms rather than three actions serving one each. Its
+/// docstring states the item half outright: "When called at a plain list item,
+/// insert a new item with an unchecked check box."
 ///
 /// An arm table, not a copy: every body here is [`meta_return`]'s, called with
 /// one argument flipped.
@@ -6090,10 +6100,14 @@ fn insert_todo_heading(
     tree: Option<&TreeSnapshot>,
 ) -> Vec<Effect> {
     match at_point(doc, tree, ctx.cursor.line) {
-        // The INVERSE of what is at point: a checkbox item's variant is the
-        // plain item, and a plain item's is the checkbox one.
-        Some(AtPoint::CheckboxItem(item)) => meta_return_list(ctx, doc, tree, &item, false),
-        Some(AtPoint::ListItem(item)) => meta_return_list(ctx, doc, tree, &item, true),
+        // ALWAYS a box, whichever kind of item is under the cursor — the
+        // mirror of `meta_return`'s never. The box is the chord's meaning, so a
+        // checkbox item begets another one rather than losing its box; the new
+        // one is empty regardless, because copying `[X]` would tick a task
+        // nobody has done.
+        Some(AtPoint::CheckboxItem(item)) | Some(AtPoint::ListItem(item)) => {
+            meta_return_list(ctx, doc, tree, &item, true)
+        }
         Some(AtPoint::Headline(start, level)) => {
             meta_return_headline(ctx, doc, tree, start, level, Some(&first_todo_keyword()))
         }

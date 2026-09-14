@@ -660,7 +660,7 @@ open it — emacs has been writing those log lines for years.
 |---|---|
 | `<C-c><C-c>` | toggle the checkbox on this line |
 | `<C-c><C-x><C-b>` | set every box in the region — or under this headline — to one state |
-| `<M-S-CR>` | new checkbox item below this one |
+| `<M-S-CR>` | new checkbox item below this one — `<M-CR>` gives you a plain one |
 | `<leader>o_` | drop the box, turning the item back into prose |
 
 ```org
@@ -740,12 +740,19 @@ never disagree, not even for a keystroke. A new item from `<M-S-CR>` always
 starts unticked, whatever the item you pressed it on: copying `[X]` would tick
 a task nobody has done.
 
+**Which of the two gives you a box is decided by the chord, not by the item you
+are standing on.** `<M-CR>` never adds one — press it on `- [ ] milk` and you
+get a plain `- ` — and `<M-S-CR>` always does. That is emacs' own split
+(`org-meta-return` passes no checkbox to `org-insert-item`; `org-insert-todo-heading`
+passes one), so a list of boxes is built by holding shift, and a stray `<M-CR>`
+inside one does not silently start a task you never declared.
+
 ## Lists
 
 | | |
 |---|---|
-| `<M-CR>` | new item below this one, same shape |
-| `<M-S-CR>` | new item of the *other* shape — plain gains a box, boxed loses one |
+| `<M-CR>` | new plain item below this one |
+| `<M-S-CR>` | new item **with a checkbox** |
 | `<M-Right>` `<M-Left>` | indent / outdent the item |
 | `<M-S-Right>` `<M-S-Left>` | indent / outdent the item **and its children** |
 | `<M-Up>` `<M-Down>` | move the item past its sibling, children and all |

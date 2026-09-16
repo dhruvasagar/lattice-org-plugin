@@ -977,6 +977,9 @@ mod tests {
                 "target",
                 "body",
                 "body-file",
+                "type",
+                "table-line-pos",
+                "prepend",
                 "clock-in"
             ],
             "field names cross kebab-cased — `clock-in` and CT.1's `body-file`, \
@@ -986,10 +989,11 @@ mod tests {
         let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
             required,
-            vec![true, false, true, false, false, false],
+            vec![true, false, true, false, false, false, false, false, false],
             "`key` and `target` are the two a template cannot do without — \
              CT.1's `body-file` is optional, and so is `body`, because a \
-             template may declare either or neither"
+             template may declare either or neither, and CT.4's three all \
+             default (`type` to `entry`, the placement pair to end-of-table)"
         );
 
         // CT.3: and the NESTED target record, which the assertions above do not

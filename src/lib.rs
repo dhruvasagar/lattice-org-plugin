@@ -4307,6 +4307,10 @@ struct CaptureDestination {
     /// OC.11 — org's `:clock-in`. Always false for roam, which has no
     /// equivalent: a new note is not an entry you are working on.
     clock_in: bool,
+    /// CT.4: what shape the text takes once it lands — `entry` or `table-line`.
+    entry_type: capture_templates::EntryType,
+    /// CT.4: for `table-line`, where in the table the row goes.
+    placement: capture_target::TablePlacement,
 }
 
 impl CaptureDestination {
@@ -4315,6 +4319,8 @@ impl CaptureDestination {
         Self {
             target: template.target.clone(),
             clock_in: template.clock_in,
+            entry_type: template.entry_type,
+            placement: template.placement.clone(),
         }
     }
 
@@ -4324,6 +4330,10 @@ impl CaptureDestination {
         Self {
             target: capture_templates::Target::File { file: path },
             clock_in: false,
+            // CT.4: roam makes a NOTE, which is an entry by construction —
+            // there is no table in a file that does not exist yet.
+            entry_type: capture_templates::EntryType::Entry,
+            placement: capture_target::TablePlacement::End,
         }
     }
 }
@@ -5368,6 +5378,11 @@ fn selected_template(
                 // `None` here is the honest answer, not a default filled in to
                 // make the struct compile.
                 body_file: None,
+                // CT.4: likewise no `type` key, and `entry` is what this path
+                // has always done — append an org entry to `org.capture-file`.
+                // A `table-line` here would have nothing to name a table in.
+                entry_type: capture_templates::EntryType::Entry,
+                placement: capture_target::TablePlacement::End,
                 // The bare `org.capture-file` path has no template table to
                 // carry a `clock-in` key, so it never clocks.
                 clock_in: false,
@@ -5842,6 +5857,46 @@ fn capture_effects_via(
             text
         }
     };
+    // CT.4: a `table-line` template puts a ROW into the table at the target,
+    // rather than an entry after the target's subtree. The target resolution is
+    // the same walk either way; what differs is the scope it produces and what
+    // is done inside it.
+    if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
+        let found = match &seek {
+            CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
+            CaptureSeek::Olp(olp) => capture_target::find_olp_in(&lines, &outline, olp),
+        };
+        let Some(entry) = found else {
+            // The target is missing, so there is nowhere to put a row. Append
+            // the raw text and warn, as the entry path does — losing the row is
+            // the one outcome capture must never produce.
+            return vec![
+                write_at(
+                    path.clone(),
+                    FileAnchor::End,
+                    capture_target::table_row_text(&text),
+                ),
+                Effect::Echo(EchoPayload {
+                    level: EchoLevel::Warn,
+                    text: format!(
+                        "org: no {} in {path}; appended the row at the end",
+                        seek.describe()
+                    ),
+                }),
+            ];
+        };
+        // The heading's BODY — org scopes a table-line search from the heading
+        // to the end of its body, never into the next heading.
+        let scope = (entry.line + 1, entry.end_line + 1);
+        let placed = capture_target::resolve_table_in(&lines, scope, &dest.placement);
+        let mut row = capture_target::table_row_text(&text);
+        if !placed.create.is_empty() {
+            row = format!("{}\n{row}", placed.create.join("\n"));
+        }
+        row.push('\n');
+        return vec![write_at(path, FileAnchor::Line(placed.line), row)];
+    }
+
     let insertion = match &seek {
         CaptureSeek::Headline(headline) => capture_target::resolve_in(&lines, &outline, headline),
         CaptureSeek::Olp(olp) => capture_target::resolve_olp_in(&lines, &outline, olp),
@@ -10647,7 +10702,12 @@ mod capture_effects_tests {
     /// The seam CT.4 carved: drive `capture_effects_via` over a fixture file
     /// instead of the two host calls.
     fn effects(target: capture_templates::Target, clock_in: bool, on_disk: &str) -> Vec<Effect> {
-        let dest = CaptureDestination { target, clock_in };
+        let dest = CaptureDestination {
+            target,
+            clock_in,
+            entry_type: capture_templates::EntryType::Entry,
+            placement: capture_target::TablePlacement::End,
+        };
         let owned = on_disk.to_string();
         capture_effects_via(
             &dest,
@@ -10765,6 +10825,131 @@ mod capture_effects_tests {
         assert!(matches!(anchor, FileAnchor::End));
         let warn = warned(&out).expect("a misplaced note must say so");
         assert!(warn.contains("headline `Nope`"), "{warn}");
+    }
+
+    /// CT.4 helper: as [`effects`], with an entry type and placement.
+    fn effects_typed(
+        target: capture_templates::Target,
+        entry_type: capture_templates::EntryType,
+        placement: capture_target::TablePlacement,
+        text: &str,
+        on_disk: &str,
+    ) -> Vec<Effect> {
+        let dest = CaptureDestination {
+            target,
+            clock_in: false,
+            entry_type,
+            placement,
+        };
+        let owned = on_disk.to_string();
+        capture_effects_via(
+            &dest,
+            text.to_string(),
+            move |_| Some(owned.clone()),
+            |_, lines| headline::outline_text(lines),
+        )
+    }
+
+    fn written_text(effects: &[Effect]) -> String {
+        for e in effects {
+            if let Effect::WriteToFile(p) = e {
+                return p.text.clone();
+            }
+        }
+        panic!("a capture always writes");
+    }
+
+    /// CT.4 end to end: a `table-line` template puts a ROW into the table under
+    /// its headline, scoped to that heading's body.
+    ///
+    /// The scope is what this pins. The file has a table under `Log` and
+    /// another under `Other`; a row for `Log` must not reach the second, which
+    /// a whole-file search would do the moment the first section had no table.
+    #[test]
+    fn a_table_line_row_lands_in_the_table_under_its_headline() {
+        let on_disk = "\
+* Log
+| when | what |
+|------+------|
+| mon  | a    |
+* Other
+| x |
+";
+        let out = effects_typed(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Log".to_string(),
+            },
+            capture_templates::EntryType::TableLine,
+            capture_target::TablePlacement::End,
+            "| tue | b |",
+            on_disk,
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(4)),
+            "after `| mon | a |`, NOT into Other's table: {anchor:?}"
+        );
+        assert_eq!(written_text(&out), "| tue | b |\n");
+    }
+
+    /// An `entry` template against the same file is unchanged — the axis is
+    /// what decides, and `entry` is still the default everywhere.
+    #[test]
+    fn the_same_target_as_an_entry_still_files_after_the_subtree() {
+        let on_disk = "* Log\n| when |\n* Other\n";
+        let out = effects_typed(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Log".to_string(),
+            },
+            capture_templates::EntryType::Entry,
+            capture_target::TablePlacement::End,
+            "** note\n",
+            on_disk,
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(2)),
+            "after Log's subtree: {anchor:?}"
+        );
+    }
+
+    /// A section with no table yet gets one, rather than losing the row.
+    #[test]
+    fn a_table_line_into_a_tableless_section_creates_the_table() {
+        let on_disk = "* Log\nsome prose\n* Other\n";
+        let out = effects_typed(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Log".to_string(),
+            },
+            capture_templates::EntryType::TableLine,
+            capture_target::TablePlacement::End,
+            "| a |",
+            on_disk,
+        );
+        assert_eq!(written_text(&out), "|   |\n|---|\n| a |\n");
+    }
+
+    /// A missing target keeps the row and warns — the same rule the entry path
+    /// follows, because losing a typed note is the one unacceptable outcome.
+    #[test]
+    fn a_table_line_with_a_missing_target_appends_and_warns() {
+        let out = effects_typed(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Nope".to_string(),
+            },
+            capture_templates::EntryType::TableLine,
+            capture_target::TablePlacement::End,
+            "| a |",
+            "* Other\n",
+        );
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::End));
+        let warn = warned(&out).expect("a misplaced row must say so");
+        assert!(warn.contains("appended the row at the end"), "{warn}");
     }
 
     /// A broken outline path quotes the WHOLE path, not the segment that broke

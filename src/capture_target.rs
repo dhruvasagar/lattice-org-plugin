@@ -71,24 +71,36 @@ pub fn resolve(text: &str, headline: &str) -> Insertion {
 /// from the `subtree_end` sharing this module's header describes, and for the
 /// same reason: the two insertion points must not drift.
 pub fn resolve_in(lines: &[&str], outline: &[crate::headline::Entry], headline: &str) -> Insertion {
+    match find_in(lines, outline, headline) {
+        Some(entry) => Insertion::AtLine(entry.end_line + 1),
+        None => Insertion::Append,
+    }
+}
+
+/// CT.4: the ENTRY a headline target resolves to, not just its insertion line.
+///
+/// `table-line` needs the subtree's whole span to scope its table search, and
+/// CT.6 / CT.7 will need the node itself to descend from. Splitting the find
+/// from the insertion-point arithmetic keeps one answer to "which headline is
+/// this" rather than two that can drift.
+pub fn find_in<'a>(
+    lines: &[&str],
+    outline: &'a [crate::headline::Entry],
+    headline: &str,
+) -> Option<&'a crate::headline::Entry> {
     let wanted = normalise(headline);
     if wanted.is_empty() {
-        return Insertion::Append;
+        return None;
     }
     // First match wins. A file with two headlines of the same name is already
     // ambiguous to a human reading it; picking the first is the answer that
     // matches how the user's eye finds it, and it is stable across edits below.
-    let found = outline.iter().find(|entry| {
+    outline.iter().find(|entry| {
         lines
             .get(entry.line as usize)
             .and_then(|l| l.get(entry.level..))
             .is_some_and(|rest| normalise(&strip_tags(rest)) == wanted)
-    });
-
-    match found {
-        Some(entry) => Insertion::AtLine(entry.end_line + 1),
-        None => Insertion::Append,
-    }
+    })
 }
 
 /// CT.3: resolve a full outline PATH — `file+olp`'s target.
@@ -121,8 +133,20 @@ pub fn resolve_olp_in(
     outline: &[crate::headline::Entry],
     olp: &[String],
 ) -> Insertion {
+    match find_olp_in(lines, outline, olp) {
+        Some(entry) => Insertion::AtLine(entry.end_line + 1),
+        None => Insertion::Append,
+    }
+}
+
+/// CT.4: the ENTRY an outline path resolves to — [`find_in`]'s peer.
+pub fn find_olp_in<'a>(
+    lines: &[&str],
+    outline: &'a [crate::headline::Entry],
+    olp: &[String],
+) -> Option<&'a crate::headline::Entry> {
     if olp.is_empty() || olp.iter().all(|s| normalise(s).is_empty()) {
-        return Insertion::Append;
+        return None;
     }
     // The scope starts as the whole file: any level, any line.
     let mut lo: u32 = 0;
@@ -133,7 +157,7 @@ pub fn resolve_olp_in(
     for segment in olp {
         let wanted = normalise(segment);
         if wanted.is_empty() {
-            return Insertion::Append;
+            return None;
         }
         let hit = outline.iter().find(|entry| {
             entry.line >= lo
@@ -145,7 +169,7 @@ pub fn resolve_olp_in(
                     .is_some_and(|rest| normalise(&strip_tags(rest)) == wanted)
         });
         let Some(entry) = hit else {
-            return Insertion::Append;
+            return None;
         };
         // Descend: the next segment must live inside THIS subtree and below it.
         lo = entry.line + 1;
@@ -154,9 +178,185 @@ pub fn resolve_olp_in(
         found = Some(entry);
     }
 
-    match found {
-        Some(entry) => Insertion::AtLine(entry.end_line + 1),
-        None => Insertion::Append,
+    found
+}
+
+/// CT.4: where a `table-line` row goes, and what has to be created first.
+///
+/// [`Insertion`] cannot express "make a table, then put the row in it", so
+/// this carries both: the line to insert before, and any table scaffolding
+/// that must precede the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableInsertion {
+    /// The 0-based line the text goes before.
+    pub line: u32,
+    /// Lines to write ahead of the row — `|   |` and `|---|` when the target
+    /// had no table. Empty in the ordinary case.
+    pub create: Vec<String>,
+}
+
+/// Where in the table a row lands, when the caller has a preference.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TablePlacement {
+    /// After the last row. Org's default.
+    #[default]
+    End,
+    /// The first data line after the first hline — org's `:prepend`.
+    Prepend,
+    /// Org's `:table-line-pos`, e.g. `"II-1"`: relative to the Nth hline.
+    Pos(String),
+}
+
+/// CT.4: resolve a `table-line` target — org's `org-capture-place-table-line`.
+///
+/// ## Scope
+///
+/// A heading-bearing target scopes the search to that heading's BODY, stopping
+/// at the next headline — org's rule, stated in `org-capture.el`'s own
+/// docstring: "table-line will be inserted into the nearest table, if any,
+/// searching from point to the end of current heading body". A whole-file
+/// target takes the first table in the file.
+///
+/// `scope` is the half-open line range to search; the caller derives it from
+/// whichever target shape it resolved, which is what lets CT.7 point this at a
+/// datetree node's descendant rather than at a top-level headline.
+///
+/// ## An absent table is CREATED
+///
+/// Org inserts `|   |` / `|---|` and uses that. Doing nothing because the
+/// section has no table yet would lose the row the user just typed — the one
+/// outcome capture must never produce — and refusing would lose it just as
+/// surely.
+///
+/// ## No alignment
+///
+/// Org realigns the table after inserting; this does not, and will not. Column
+/// alignment is table EDITING, and doing it here would rewrite lines the user
+/// did not capture. A ragged row is correct org and reads fine.
+pub fn resolve_table_in(
+    lines: &[&str],
+    scope: (u32, u32),
+    placement: &TablePlacement,
+) -> TableInsertion {
+    let (lo, hi) = scope;
+    let hi = hi.min(lines.len() as u32);
+
+    // The first run of table lines inside the scope.
+    let mut start: Option<u32> = None;
+    let mut end: u32 = lo;
+    for i in lo..hi {
+        let is_row = lines
+            .get(i as usize)
+            .is_some_and(|l| l.trim_start().starts_with('|'));
+        match (is_row, start) {
+            (true, None) => {
+                start = Some(i);
+                end = i + 1;
+            }
+            (true, Some(_)) => end = i + 1,
+            // A blank line inside a table ends it; so does any non-row line.
+            (false, Some(_)) => break,
+            (false, None) => {}
+        }
+    }
+
+    let Some(start) = start else {
+        // No table in scope: create one at the end of the scope, so the row
+        // lands under whatever prose the section already has rather than above
+        // it.
+        return TableInsertion {
+            line: hi,
+            create: vec!["|   |".to_string(), "|---|".to_string()],
+        };
+    };
+
+    let line = match placement {
+        TablePlacement::End => end,
+        TablePlacement::Prepend => first_data_line_after_hline(lines, start, end).unwrap_or(end),
+        TablePlacement::Pos(spec) => table_line_pos(lines, start, end, spec).unwrap_or(end),
+    };
+    TableInsertion {
+        line,
+        create: Vec::new(),
+    }
+}
+
+/// Org's `:prepend` — the first data line after the first hline, so a row goes
+/// at the TOP of the data rather than above the header.
+fn first_data_line_after_hline(lines: &[&str], start: u32, end: u32) -> Option<u32> {
+    let mut seen_hline = false;
+    for i in start..end {
+        let l = lines.get(i as usize)?.trim_start();
+        if is_hline(l) {
+            seen_hline = true;
+        } else if seen_hline {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Org's `:table-line-pos`, e.g. `"II-1"` or `"I+2"`.
+///
+/// The `I`s count which hline group, the signed number is the offset from it.
+/// Org's own regex is `\(I+\)\([-+][0-9]+\)`; the semantics are kept rather
+/// than re-derived, so a spec ported from an emacs config means the same thing.
+fn table_line_pos(lines: &[&str], start: u32, end: u32, spec: &str) -> Option<u32> {
+    let spec = spec.trim();
+    let bars = spec.chars().take_while(|c| *c == 'I').count();
+    if bars == 0 {
+        return None;
+    }
+    let rest = &spec[bars..];
+    let (sign, digits) = rest.split_at(rest.find(|c: char| c.is_ascii_digit())?);
+    let delta: i64 = digits.parse().ok()?;
+    let delta = if sign.starts_with('-') { -delta } else { delta };
+
+    // The `bars`-th hline, 1-based.
+    let hline = (start..end)
+        .filter(|i| {
+            lines
+                .get(*i as usize)
+                .is_some_and(|l| is_hline(l.trim_start()))
+        })
+        .nth(bars - 1)?;
+
+    let target = hline as i64 + delta;
+    // Clamped into the table: a spec pointing outside it is a config error the
+    // caller reports, not a write outside the table.
+    if target < start as i64 || target > end as i64 {
+        return None;
+    }
+    Some(target as u32)
+}
+
+/// `|---+---|` and friends — a table rule rather than a data row.
+///
+/// Org's own rule, and it is simpler than it looks: `org-table-hline-regexp` is
+/// `"^[ \t]*|-"`, with the dataline peer `"^[ \t]*|[^-]"`. The character
+/// immediately after the bar decides it, and nothing else is examined.
+///
+/// A first attempt here checked "every character after the bar is one of
+/// `-+| `, and there is at least one `-`", which READS as more careful and is
+/// wrong: `| - |` is a data cell containing a dash, and that spelling classed
+/// it as a rule. The consequence would have been silent — `prepend` landing
+/// above the header, and `End` off by one on any table whose last line is a
+/// rule. The test caught it; org's actual regexp is what fixed it.
+fn is_hline(line: &str) -> bool {
+    line.trim_start().starts_with("|-")
+}
+
+/// CT.4: the row text org would insert.
+///
+/// Trimmed, and prefixed with `"| "` only when it is not already a row — org's
+/// rule, so a template written as `| %^{a} | %^{b} |` is used as-is while a
+/// bare `%^{a}` still becomes a cell.
+pub fn table_row_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.starts_with('|') {
+        trimmed.to_string()
+    } else {
+        format!("| {trimmed}")
     }
 }
 
@@ -455,6 +655,120 @@ c body
         let text = "* Work\n";
         assert_eq!(resolve_olp(text, &[]), Insertion::Append);
         assert_eq!(resolve_olp(text, &["  "]), Insertion::Append);
+    }
+
+    /// CT.4 helper: resolve a table insertion over the whole of `text`.
+    fn table(text: &str, placement: TablePlacement) -> TableInsertion {
+        let lines: Vec<&str> = text.lines().collect();
+        let n = lines.len() as u32;
+        resolve_table_in(&lines, (0, n), &placement)
+    }
+
+    /// Org's default: after the last row.
+    #[test]
+    fn a_row_lands_after_the_last_row_by_default() {
+        let text = "| a | b |\n|---+---|\n| 1 | 2 |\n";
+        assert_eq!(
+            table(text, TablePlacement::End),
+            TableInsertion {
+                line: 3,
+                create: Vec::new()
+            }
+        );
+    }
+
+    /// Org's `:prepend`: the first data line AFTER the first hline, so a row
+    /// goes at the top of the data rather than above the header.
+    #[test]
+    fn prepend_lands_after_the_first_hline_not_above_the_header() {
+        let text = "| a | b |\n|---+---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        assert_eq!(
+            table(text, TablePlacement::Prepend),
+            TableInsertion {
+                line: 2,
+                create: Vec::new()
+            },
+            "above `| 1 | 2 |`, below the rule — NOT line 0, which would put \
+             the row above the header"
+        );
+    }
+
+    /// Org's `:table-line-pos`. `II-1` is the second hline group, one line up.
+    #[test]
+    fn a_table_line_pos_counts_hline_groups() {
+        // hlines at 1 and 4.
+        let text = "| h |\n|---|\n| 1 |\n| 2 |\n|---|\n| 3 |\n";
+        assert_eq!(
+            table(text, TablePlacement::Pos("II-1".to_string())).line,
+            3,
+            "one line above the second hline"
+        );
+        assert_eq!(
+            table(text, TablePlacement::Pos("I+1".to_string())).line,
+            2,
+            "one line below the first hline"
+        );
+    }
+
+    /// A spec naming an hline group that does not exist falls back to the end
+    /// rather than writing outside the table.
+    #[test]
+    fn an_out_of_range_table_line_pos_falls_back_to_the_end() {
+        let text = "| h |\n|---|\n| 1 |\n";
+        assert_eq!(
+            table(text, TablePlacement::Pos("III-1".to_string())).line,
+            3
+        );
+        assert_eq!(
+            table(text, TablePlacement::Pos("nonsense".to_string())).line,
+            3
+        );
+    }
+
+    /// An absent table is CREATED. Doing nothing would lose the row the user
+    /// just typed, which is the outcome capture must never produce.
+    #[test]
+    fn an_absent_table_is_created() {
+        let text = "some prose\nmore prose\n";
+        let got = table(text, TablePlacement::End);
+        assert_eq!(got.line, 2, "at the end of the scope, under the prose");
+        assert_eq!(got.create, vec!["|   |".to_string(), "|---|".to_string()]);
+    }
+
+    /// The table search stops at the first non-row line, so a second table
+    /// later in the scope is not mistaken for a continuation of the first.
+    #[test]
+    fn the_first_table_in_scope_wins() {
+        let text = "| a |\n|---|\n| 1 |\nprose\n| b |\n| 2 |\n";
+        assert_eq!(
+            table(text, TablePlacement::End).line,
+            3,
+            "the end of the FIRST table, not of the second"
+        );
+    }
+
+    /// A row already written as a row is used as-is; a bare value becomes a
+    /// cell. Org's rule, so `| %^{a} | %^{b} |` is not double-prefixed.
+    #[test]
+    fn a_row_is_prefixed_only_when_it_is_not_already_one() {
+        assert_eq!(table_row_text("| a | b |"), "| a | b |");
+        assert_eq!(table_row_text("  | a |  "), "| a |");
+        assert_eq!(table_row_text("bare"), "| bare");
+    }
+
+    /// An hline is a rule, not data — `|---+---|` must not be mistaken for a
+    /// row, or `prepend` would land above the header and `End` would be off by
+    /// one on a table ending in a rule.
+    #[test]
+    fn an_hline_is_not_a_data_row() {
+        assert!(is_hline("|---|"));
+        assert!(is_hline("|---+---|"));
+        assert!(is_hline("|--- | ---|"));
+        assert!(!is_hline("| a | b |"));
+        assert!(
+            !is_hline("| - |"),
+            "a single dash is a CELL containing a dash"
+        );
     }
 
     /// Segments normalise like a headline does — TODO keyword, tags, case and

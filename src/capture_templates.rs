@@ -134,6 +134,26 @@ impl Target {
     }
 }
 
+/// CT.4: WHAT a template inserts — org's capture entry type.
+///
+/// The third axis. `target` says where the capture lands and the body says what
+/// text it is; this says what SHAPE that text takes once it gets there. Org has
+/// five (`entry`, `item`, `checkitem`, `table-line`, `plain`); two are built.
+///
+/// Named here as a real enum rather than a validated string, unlike
+/// [`RawTarget::kind`]: these spellings contain no `+`, so the derive's
+/// kebab-casing produces exactly org's own names and the host validates the
+/// closed set for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ConfigShapeDerive)]
+pub enum EntryType {
+    /// An org entry — a headline and its body. Today's behaviour, and the
+    /// default, so a template that has never heard of this field is unchanged.
+    #[default]
+    Entry,
+    /// A row in a table at the target. Crosses as `table-line`.
+    TableLine,
+}
+
 /// One capture template: a key to press, a label for the menu, somewhere to
 /// put it, and the text to expand.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +177,10 @@ pub struct Template {
     ///
     /// [`BodySource`]: crate::template_body::BodySource
     pub body_file: Option<String>,
+    /// CT.4: what this template inserts — see [`EntryType`].
+    pub entry_type: EntryType,
+    /// CT.4: for `table-line`, where in the table the row goes.
+    pub placement: crate::capture_target::TablePlacement,
     /// OC.11 — org's `:clock-in`: start a clock on the entry this template
     /// captures, as part of capturing it.
     ///
@@ -280,6 +304,15 @@ pub struct RawTemplate {
     /// survives being stated: a body's SOURCE is orthogonal to a template's
     /// DESTINATION, which is the only axis roam actually differs on.
     pub body_file: Option<String>,
+    /// CT.4: org's capture entry type — `entry` (default) or `table-line`.
+    /// `r#type` so the wire name is org's own `type`.
+    pub r#type: Option<EntryType>,
+    /// CT.4: org's `:table-line-pos`, e.g. `"II-1"` — which hline group the
+    /// row goes relative to. Only meaningful for `table-line`.
+    pub table_line_pos: Option<String>,
+    /// CT.4: org's `:prepend` — put the row at the TOP of the table's data
+    /// rather than after the last row. Only meaningful for `table-line`.
+    pub prepend: Option<bool>,
     /// Start a clock on the entry this template captures (org's `:clock-in`).
     pub clock_in: Option<bool>,
 }
@@ -439,12 +472,29 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
                     continue;
                 }
             };
+        // CT.4: `table-line-pos` wins over `prepend`, which is org's own
+        // precedence (`org-capture-place-table-line` tests the pos spec first).
+        // Both declared is not an error — the specific one simply wins, the
+        // way it does in emacs.
+        let placement = match (
+            t.table_line_pos
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            t.prepend.unwrap_or(false),
+        ) {
+            (Some(spec), _) => crate::capture_target::TablePlacement::Pos(spec.to_string()),
+            (None, true) => crate::capture_target::TablePlacement::Prepend,
+            (None, false) => crate::capture_target::TablePlacement::End,
+        };
         templates.push(Template {
             key,
             description,
             target,
             body,
             body_file,
+            entry_type: t.r#type.unwrap_or_default(),
+            placement,
             clock_in: t.clock_in.unwrap_or(false),
         });
     }
@@ -524,6 +574,7 @@ mod tests {
             body: Some(body.to_string()),
             body_file: None,
             clock_in: None,
+            ..Default::default()
         }
     }
 
@@ -815,6 +866,7 @@ mod tests {
             body: None,
             body_file: Some("~/org/templates/habit.org".to_string()),
             clock_in: None,
+            ..Default::default()
         }])
         .expect("a body-file template is usable");
         assert_eq!(set.skipped, Vec::<String>::new());
@@ -842,6 +894,7 @@ mod tests {
                 body: Some("* TODO %?".to_string()),
                 body_file: Some("~/org/t.org".to_string()),
                 clock_in: None,
+                ..Default::default()
             },
             RawTemplate {
                 key: "t".to_string(),
@@ -854,6 +907,7 @@ mod tests {
                 body: Some("* TODO %?".to_string()),
                 body_file: None,
                 clock_in: None,
+                ..Default::default()
             },
         ])
         .expect("the usable template keeps the set alive");
@@ -880,6 +934,7 @@ mod tests {
             body: None,
             body_file: None,
             clock_in: None,
+            ..Default::default()
         }])
         .expect("a bodyless capture template is not an error");
         assert_eq!(set.skipped, Vec::<String>::new());
@@ -1078,6 +1133,7 @@ mod tests {
             body: None,
             body_file: None,
             clock_in: None,
+            ..Default::default()
         }])
         .expect("it resolves");
         assert_eq!(set.templates[0].description, "");

@@ -70,11 +70,22 @@ pub fn resolve(text: &str, headline: &str) -> Insertion {
 /// Shares [`crate::headline::Entry`] with `refile::targets_from`, one level up
 /// from the `subtree_end` sharing this module's header describes, and for the
 /// same reason: the two insertion points must not drift.
-pub fn resolve_in(lines: &[&str], outline: &[crate::headline::Entry], headline: &str) -> Insertion {
-    match find_in(lines, outline, headline) {
+/// Where an `entry` files under `entry` — the line after its whole subtree.
+///
+/// One named home for the rule, because this module's header commits to it not
+/// drifting from `refile::targets_in`'s `subtree_end(...) + 1`. Production and
+/// the test wrappers below both go through here rather than each adding one.
+pub fn after_subtree(entry: Option<&crate::headline::Entry>) -> Insertion {
+    match entry {
         Some(entry) => Insertion::AtLine(entry.end_line + 1),
         None => Insertion::Append,
     }
+}
+
+/// [`find_in`] as an insertion point.
+#[cfg(test)]
+pub fn resolve_in(lines: &[&str], outline: &[crate::headline::Entry], headline: &str) -> Insertion {
+    after_subtree(find_in(lines, outline, headline))
 }
 
 /// CT.4: the ENTRY a headline target resolves to, not just its insertion line.
@@ -128,15 +139,14 @@ pub fn find_in<'a>(
 /// A segment that is not found returns [`Insertion::Append`] — the whole point
 /// of this module's "an absent headline appends and says so" rule, applied to
 /// the first segment that breaks the chain rather than only to the last.
+/// [`find_olp_in`] as an insertion point.
+#[cfg(test)]
 pub fn resolve_olp_in(
     lines: &[&str],
     outline: &[crate::headline::Entry],
     olp: &[String],
 ) -> Insertion {
-    match find_olp_in(lines, outline, olp) {
-        Some(entry) => Insertion::AtLine(entry.end_line + 1),
-        None => Insertion::Append,
-    }
+    after_subtree(find_olp_in(lines, outline, olp))
 }
 
 /// CT.4: the ENTRY an outline path resolves to — [`find_in`]'s peer.
@@ -179,6 +189,93 @@ pub fn find_olp_in<'a>(
     }
 
     found
+}
+
+/// CT.5: re-level a captured body so it becomes a CHILD of its target.
+///
+/// ## Why this is not optional
+///
+/// Lattice inserts a capture body verbatim at a line boundary. Emacs does not:
+/// its `entry` type files the captured entry as a child of the target and
+/// re-levels it to fit. The difference was invisible while targets were
+/// top-level headlines, and the user init works around it in prose — its vocab
+/// template is written with `**` instead of `*`, with a comment explaining
+/// that a `*` heading "would close the `Vocabulary` subtree and land as its
+/// sibling instead of inside it".
+///
+/// Against a datetree it stops being a wart and becomes corruption.
+/// `org-datetree` puts the day node at LEVEL 3 (`* 2026` / `** 2026-09
+/// September` / `*** 2026-09-16 Wednesday`), so a template whose first line is
+/// `* How to use this` terminates the day node, the month and the year, and
+/// lands as a sibling of `* 2026` — silently reorganising a file the user was
+/// only adding a row to. That is why CT.5 lands before CT.6 rather than after.
+///
+/// ## The shift
+///
+/// The body's SHALLOWEST heading becomes a child of the target, and every
+/// deeper heading shifts by the same delta, so the body's internal structure
+/// survives. A body with no headings is returned untouched — there is nothing
+/// to re-level, and prose must not acquire stars.
+///
+/// The shift is signed: a body already deeper than its target is raised, not
+/// only lowered. A one-directional version would leave a `***` body under a
+/// `*` headline two levels too deep, which reads as nesting the user did not
+/// write.
+///
+/// Only headings move. A `*` inside a body line, a `#+BEGIN_SRC` block or a
+/// bold marker is not a heading and is left alone — [`heading_level`] is what
+/// decides, and it requires the stars to start the line and be followed by a
+/// space.
+pub fn relevel(body: &str, target_level: usize) -> String {
+    let shallowest = body.lines().filter_map(heading_level).min();
+    let Some(shallowest) = shallowest else {
+        return body.to_string();
+    };
+    // The body's top heading should sit one level below the target.
+    let wanted = target_level + 1;
+    if shallowest == wanted {
+        return body.to_string();
+    }
+    let delta = wanted as isize - shallowest as isize;
+
+    let mut out = String::with_capacity(body.len() + 8);
+    for (i, line) in body.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match heading_level(line) {
+            Some(level) => {
+                // `max(1)` because a heading cannot have zero stars; a body
+                // raised past the top of the outline clamps rather than
+                // becoming prose.
+                let new_level = (level as isize + delta).max(1) as usize;
+                out.push_str(&"*".repeat(new_level));
+                out.push_str(&line[level..]);
+            }
+            None => out.push_str(line),
+        }
+    }
+    if body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// The star count of an org heading, or `None` for any other line.
+///
+/// Requires the stars to START the line and be followed by a space, which is
+/// org's own rule. Without the trailing-space check a `**bold**` line at column
+/// zero would be read as a level-2 heading and re-levelled, corrupting a body
+/// that contained emphasis.
+fn heading_level(line: &str) -> Option<usize> {
+    let stars = line.chars().take_while(|c| *c == '*').count();
+    if stars == 0 {
+        return None;
+    }
+    match line[stars..].chars().next() {
+        Some(' ') | Some('\t') => Some(stars),
+        _ => None,
+    }
 }
 
 /// CT.4: where a `table-line` row goes, and what has to be created first.
@@ -655,6 +752,88 @@ c body
         let text = "* Work\n";
         assert_eq!(resolve_olp(text, &[]), Insertion::Append);
         assert_eq!(resolve_olp(text, &["  "]), Insertion::Append);
+    }
+
+    /// CT.5: a `*` body under a level-1 headline becomes `**` — a child, not a
+    /// sibling. Without this the body TERMINATES the target's subtree.
+    #[test]
+    fn a_body_becomes_a_child_of_its_target() {
+        assert_eq!(relevel("* note\nbody\n", 1), "** note\nbody\n");
+    }
+
+    /// Relative structure survives: every heading shifts by the same delta.
+    ///
+    /// Target level 2 means the body's shallowest heading becomes level 3, so
+    /// the delta is +2 and `*** c` goes to `***** c`. The gaps are what this
+    /// asserts: `c` stays two levels below `a`, `b` one.
+    #[test]
+    fn the_bodys_internal_nesting_is_preserved() {
+        assert_eq!(
+            relevel("* a\n*** c\n** b\n", 2),
+            "*** a\n***** c\n**** b\n",
+            "each shifted by +2, so `c` stays two below `a` and `b` one"
+        );
+    }
+
+    /// The shift is SIGNED — a body already too deep is raised. A
+    /// one-directional version would leave a `***` body under a `*` headline
+    /// two levels too deep, which reads as nesting the user did not write.
+    #[test]
+    fn a_body_deeper_than_its_target_is_raised() {
+        assert_eq!(relevel("*** deep\ntext\n", 1), "** deep\ntext\n");
+    }
+
+    /// Already correct is left exactly alone — no rewrite, no churn.
+    #[test]
+    fn a_body_at_the_right_level_is_untouched() {
+        let body = "** note\nbody\n";
+        assert_eq!(relevel(body, 1), body);
+    }
+
+    /// Prose must not acquire stars. A body with no headings is returned
+    /// verbatim — this is the common capture, one line of text.
+    #[test]
+    fn a_body_with_no_headings_is_untouched() {
+        let body = "just a note\nwith two lines\n";
+        assert_eq!(relevel(body, 3), body);
+        assert_eq!(relevel("", 1), "");
+    }
+
+    /// Only HEADINGS move. `**bold**` at column zero is not a heading — org
+    /// requires a space after the stars — and re-levelling it would corrupt a
+    /// body containing emphasis.
+    #[test]
+    fn emphasis_is_not_a_heading() {
+        assert_eq!(heading_level("**bold** text"), None);
+        assert_eq!(heading_level("* heading"), Some(1));
+        assert_eq!(heading_level("*"), None, "bare stars are not a heading");
+        assert_eq!(heading_level("no stars"), None);
+        assert_eq!(
+            relevel("* h\n**bold** line\n", 2),
+            "*** h\n**bold** line\n",
+            "the heading shifted, the emphasis did not"
+        );
+    }
+
+    /// The datetree case CT.6 depends on: a day node at level 3 takes a
+    /// `*`-rooted template body to `****`, so it lands INSIDE the day rather
+    /// than terminating the year.
+    #[test]
+    fn a_template_body_fits_under_a_level_three_datetree_node() {
+        let body = "* How to use this\n- stop\n* Daily Overview\n| a |\n";
+        assert_eq!(
+            relevel(body, 3),
+            "**** How to use this\n- stop\n**** Daily Overview\n| a |\n",
+            "both sections become children of the day node"
+        );
+    }
+
+    /// A trailing newline is preserved, and its absence is too — the body is
+    /// spliced into a file, so gaining or losing one shifts everything after.
+    #[test]
+    fn the_trailing_newline_is_preserved_either_way() {
+        assert_eq!(relevel("* a\n", 1), "** a\n");
+        assert_eq!(relevel("* a", 1), "** a");
     }
 
     /// CT.4 helper: resolve a table insertion over the whole of `text`.

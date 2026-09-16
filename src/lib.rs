@@ -5897,10 +5897,19 @@ fn capture_effects_via(
         return vec![write_at(path, FileAnchor::Line(placed.line), row)];
     }
 
-    let insertion = match &seek {
-        CaptureSeek::Headline(headline) => capture_target::resolve_in(&lines, &outline, headline),
-        CaptureSeek::Olp(olp) => capture_target::resolve_olp_in(&lines, &outline, olp),
+    let found = match &seek {
+        CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
+        CaptureSeek::Olp(olp) => capture_target::find_olp_in(&lines, &outline, olp),
     };
+    // CT.5: an `entry` becomes a CHILD of the headline it files under, which
+    // means its own headings shift to fit. Only when a target was actually
+    // found — an append has no parent to be a child of, so the body keeps the
+    // levels the user wrote.
+    let text = match found {
+        Some(entry) => capture_target::relevel(&text, entry.level),
+        None => text,
+    };
+    let insertion = capture_target::after_subtree(found);
     match insertion {
         capture_target::Insertion::AtLine(line) => {
             let text = clocked(text, line);

@@ -5719,7 +5719,48 @@ fn captured_title(text: &str) -> String {
     clock_title(text.lines().next().unwrap_or_default())
 }
 
+/// CT.4: the production wiring — the two host reads, and nothing else.
+///
+/// Split from [`capture_effects_via`] so everything BELOW the reads is
+/// testable. Before this the whole function was unreachable from a test: it
+/// calls `host-services.read-file` and `tree-sitter.parse-file` directly, so
+/// target resolution, the clock line count, the warn messages and (from CT.4)
+/// table placement were all covered only by their pure helpers, with the
+/// wiring between them covered by nothing. CT.2 recorded that as a known gap;
+/// `table-line` adds a second resolver over the same read, which is where the
+/// gap stopped being affordable.
+///
+/// `read_file` is a closure rather than a value so the laziness survives: a
+/// plain `file` target with no `clock-in` must not pay for a read it never
+/// needed, and passing the text in eagerly would have made every ordinary
+/// append capture read the file first.
 fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
+    capture_effects_via(
+        dest,
+        text,
+        |p| lattice::plugin_host::host_services::read_file(p).ok(),
+        |p, lines| match lattice::plugin_host::tree_sitter::parse_file(p) {
+            Some(snapshot) => {
+                let mut out = Vec::new();
+                headline::outline(&snapshot.root(), &mut out);
+                out
+            }
+            // `none` from `parse-file` is the ordinary first-capture case (no
+            // file yet) as much as it is a missing grammar, and both mean the
+            // same thing here: fall back to the text outline over whatever was
+            // read, which for an absent file is empty and appends.
+            None => headline::outline_text(lines),
+        },
+    )
+}
+
+/// [`capture_effects`] over injected reads.
+fn capture_effects_via(
+    dest: &CaptureDestination,
+    text: String,
+    read_file: impl Fn(&str) -> Option<String>,
+    outline_of: impl Fn(&str, &[&str]) -> Vec<headline::Entry>,
+) -> Vec<Effect> {
     // CT.2: expand `~` BEFORE anything reads this path.
     //
     // `host-services.read-file` and `tree-sitter.parse-file` do not expand a
@@ -5752,7 +5793,7 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
         // count. Read only when a clock is actually wanted — an ordinary capture
         // must not pay for it.
         let text = if dest.clock_in {
-            let at = lattice::plugin_host::host_services::read_file(&path)
+            let at = read_file(&path)
                 .map(|s| s.lines().count() as u32)
                 .unwrap_or(0);
             let title = captured_title(&text);
@@ -5776,7 +5817,7 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
     // An `Err` is the ordinary first-capture case (the file does not exist yet)
     // as often as it is a real problem, and both resolve to the same answer
     // here: nothing to search, so append.
-    let on_disk = lattice::plugin_host::host_services::read_file(&path).unwrap_or_default();
+    let on_disk = read_file(&path).unwrap_or_default();
     // OT.8: structure from `parse-file`, characters from the read above.
     //
     // Both cross the same grant (`parse-file` makes the identical check
@@ -5790,14 +5831,7 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
     // fall back to the text outline over whatever was read, which for an absent
     // file is empty and appends.
     let lines: Vec<&str> = on_disk.lines().collect();
-    let outline = match lattice::plugin_host::tree_sitter::parse_file(&path) {
-        Some(snapshot) => {
-            let mut out = Vec::new();
-            headline::outline(&snapshot.root(), &mut out);
-            out
-        }
-        None => headline::outline_text(&lines),
-    };
+    let outline = outline_of(&path, &lines);
     // The file is already read above for the target search, so the line the
     // entry lands on is known without a second read on either arm.
     let clocked = |text: String, at: u32| {
@@ -10602,5 +10636,152 @@ mod local_clock_tests {
         assert_eq!(epoch_day_from_local_secs(-86_400), -1);
         assert_eq!(epoch_day_from_local_secs(-86_401), -2);
         assert_eq!((-1_i64) / 86_400, 0, "the truncating division this avoids");
+    }
+}
+
+#[cfg(test)]
+mod capture_effects_tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+    use super::*;
+
+    /// The seam CT.4 carved: drive `capture_effects_via` over a fixture file
+    /// instead of the two host calls.
+    fn effects(target: capture_templates::Target, clock_in: bool, on_disk: &str) -> Vec<Effect> {
+        let dest = CaptureDestination { target, clock_in };
+        let owned = on_disk.to_string();
+        capture_effects_via(
+            &dest,
+            "* TODO note\n".to_string(),
+            move |_| Some(owned.clone()),
+            // The text outline, which is what production falls back to when
+            // `parse-file` answers `none`.
+            |_, lines| headline::outline_text(lines),
+        )
+    }
+
+    /// Where a write landed, as (path, anchor).
+    fn landed(effects: &[Effect]) -> (String, FileAnchor) {
+        for e in effects {
+            if let Effect::WriteToFile(p) = e {
+                return (p.path.clone(), p.anchor.clone());
+            }
+        }
+        panic!("a capture always writes: {effects:?}");
+    }
+
+    fn warned(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::Echo(p) if matches!(p.level, EchoLevel::Warn) => Some(p.text.clone()),
+            _ => None,
+        })
+    }
+
+    /// A plain `file` target appends and says nothing — appending is what it
+    /// asked for, not a failure.
+    #[test]
+    fn a_file_target_appends_without_a_warn() {
+        let out = effects(
+            capture_templates::Target::File {
+                file: "/tmp/x.org".to_string(),
+            },
+            false,
+            "* Existing\n",
+        );
+        let (path, anchor) = landed(&out);
+        assert_eq!(path, "/tmp/x.org");
+        assert!(matches!(anchor, FileAnchor::End));
+        assert_eq!(warned(&out), None);
+    }
+
+    /// A headline target lands after that headline's subtree — the behaviour
+    /// CT.2 fixed the tilde half of, now covered through the wiring rather
+    /// than only through `resolve_in`.
+    #[test]
+    fn a_headline_target_lands_after_its_subtree() {
+        let out = effects(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Vocabulary".to_string(),
+            },
+            false,
+            "* Vocabulary\nword\n* Next\n",
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(2)),
+            "after `word`, before `* Next`: {anchor:?}"
+        );
+        assert_eq!(warned(&out), None);
+    }
+
+    /// CT.3 end to end: an outline path picks the second `Inbox`, which the
+    /// headline target cannot reach.
+    #[test]
+    fn an_olp_target_descends_to_the_right_subtree() {
+        let text = "* Work\n** Inbox\nw\n* Home\n** Inbox\nh\n* End\n";
+        let out = effects(
+            capture_templates::Target::FileOlp {
+                file: "/tmp/x.org".to_string(),
+                olp: vec!["Home".to_string(), "Inbox".to_string()],
+            },
+            false,
+            text,
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(6)),
+            "after `h`, before `* End`: {anchor:?}"
+        );
+
+        // The headline target, same file, reaches only the first.
+        let out = effects(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Inbox".to_string(),
+            },
+            false,
+            text,
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(3)),
+            "the headline target reaches only the first: {anchor:?}"
+        );
+    }
+
+    /// A missing headline keeps the note and WARNS — losing it is the one
+    /// outcome capture must never produce.
+    #[test]
+    fn a_missing_headline_appends_and_warns_by_name() {
+        let out = effects(
+            capture_templates::Target::FileHeadline {
+                file: "/tmp/x.org".to_string(),
+                headline: "Nope".to_string(),
+            },
+            false,
+            "* Other\n",
+        );
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::End));
+        let warn = warned(&out).expect("a misplaced note must say so");
+        assert!(warn.contains("headline `Nope`"), "{warn}");
+    }
+
+    /// A broken outline path quotes the WHOLE path, not the segment that broke
+    /// the chain — the file may well have an `Inbox`, just not under `Work`.
+    #[test]
+    fn a_missing_olp_warns_with_the_whole_path() {
+        let out = effects(
+            capture_templates::Target::FileOlp {
+                file: "/tmp/x.org".to_string(),
+                olp: vec!["Work".to_string(), "Inbox".to_string()],
+            },
+            false,
+            "* Work\n** Notes\n* Inbox\n",
+        );
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::End));
+        let warn = warned(&out).expect("a misplaced note must say so");
+        assert!(warn.contains("outline path `Work/Inbox`"), "{warn}");
     }
 }

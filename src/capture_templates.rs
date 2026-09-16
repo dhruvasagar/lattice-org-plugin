@@ -15,9 +15,13 @@
 //!     description: string?,
 //!     target:      record { file: string, headline: string? },
 //!     body:        string?,
+//!     body-file:   string?,
 //!     clock-in:    bool?,
 //! }>
 //! ```
+//!
+//! CT.1: `body` and `body-file` are mutually exclusive — the body's SOURCE,
+//! shared with roam templates in [`crate::template_body`].
 //!
 //! and in `lattice.toml` it is written as itself, natively:
 //!
@@ -96,7 +100,18 @@ pub struct Template {
     pub description: String,
     pub target: Target,
     /// The template text, placeholders unexpanded.
+    ///
+    /// CT.1: **already resolved** — if the template declared a `body-file`,
+    /// `selected_template` has read it by the time a `Template` reaches any
+    /// consumer. So every existing reader of this field is unchanged, and the
+    /// file is read once per capture rather than once per hop.
     pub body: String,
+    /// CT.1: the unresolved `body-file` path, kept only so `selected_template`
+    /// knows whether to read one. Every consumer downstream of it reads
+    /// [`Self::body`], which is why this is not a [`BodySource`].
+    ///
+    /// [`BodySource`]: crate::template_body::BodySource
+    pub body_file: Option<String>,
     /// OC.11 — org's `:clock-in`: start a clock on the entry this template
     /// captures, as part of capturing it.
     ///
@@ -189,6 +204,16 @@ pub struct RawTemplate {
     pub target: RawTarget,
     /// The template text, with `%?` / `%U` / `%^{…}` placeholders.
     pub body: Option<String>,
+    /// CT.1: the template text read from a FILE instead of inlined — emacs
+    /// org-capture's `(file "…/template.org")`. Mutually exclusive with
+    /// [`Self::body`]; setting both is a configuration error that skips the
+    /// template and names it.
+    ///
+    /// Roam templates have had this since OR.14. The asymmetry was accidental
+    /// — that slice was scoped to roam — and there is no reason for it that
+    /// survives being stated: a body's SOURCE is orthogonal to a template's
+    /// DESTINATION, which is the only axis roam actually differs on.
+    pub body_file: Option<String>,
     /// Start a clock on the entry this template captures (org's `:clock-in`).
     pub clock_in: Option<bool>,
 }
@@ -247,11 +272,26 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             Some(headline) if !headline.is_empty() => Target::FileHeadline { file, headline },
             _ => Target::File { file },
         };
+        // CT.1: the same rules roam uses. Unlike roam, `Empty` is NOT a skip —
+        // a capture template with no body is a blank draft the user types into,
+        // which is a perfectly ordinary way to capture and was the behaviour
+        // before this field existed (`body` was `unwrap_or_default`).
+        let (body, body_file) =
+            match crate::template_body::classify(t.body.as_deref(), t.body_file.as_deref()) {
+                Ok(crate::template_body::BodySource::Empty) => (String::new(), None),
+                Ok(crate::template_body::BodySource::Inline(b)) => (b, None),
+                Ok(crate::template_body::BodySource::File(f)) => (String::new(), Some(f)),
+                Err(crate::template_body::BothSet) => {
+                    skipped.push(format!("`{key}` sets both `body` and `body-file`"));
+                    continue;
+                }
+            };
         templates.push(Template {
             key,
             description,
             target,
-            body: t.body.unwrap_or_default(),
+            body,
+            body_file,
             clock_in: t.clock_in.unwrap_or(false),
         });
     }
@@ -328,6 +368,7 @@ mod tests {
                 headline: headline.map(str::to_string),
             },
             body: Some(body.to_string()),
+            body_file: None,
             clock_in: None,
         }
     }
@@ -381,6 +422,93 @@ mod tests {
         assert_eq!(m.target.file(), "~/org/refile.org");
     }
 
+    /// CT.1: a capture template may name a FILE for its body, as a roam
+    /// template has been able to since OR.14.
+    ///
+    /// The path is carried UNRESOLVED — `selected_template` reads it when a
+    /// template is actually chosen, so building the menu does not read every
+    /// template's file.
+    #[test]
+    fn a_capture_template_can_take_its_body_from_a_file() {
+        let set = from_declared(vec![RawTemplate {
+            key: "h".to_string(),
+            description: Some("habit".to_string()),
+            target: RawTarget {
+                file: "~/org/habit.org".to_string(),
+                headline: None,
+            },
+            body: None,
+            body_file: Some("~/org/templates/habit.org".to_string()),
+            clock_in: None,
+        }])
+        .expect("a body-file template is usable");
+        assert_eq!(set.skipped, Vec::<String>::new());
+        assert_eq!(
+            set.templates[0].body_file.as_deref(),
+            Some("~/org/templates/habit.org")
+        );
+        assert_eq!(set.templates[0].body, "", "unresolved until it is chosen");
+    }
+
+    /// Both set is a configuration error, named by key — the same rule roam
+    /// has, now shared. Silently preferring either one uses the source the user
+    /// did not mean about half the time.
+    #[test]
+    fn a_template_setting_both_body_and_body_file_is_skipped_and_named() {
+        let set = from_declared(vec![
+            RawTemplate {
+                key: "b".to_string(),
+                description: Some("both".to_string()),
+                target: RawTarget {
+                    file: "~/org/x.org".to_string(),
+                    headline: None,
+                },
+                body: Some("* TODO %?".to_string()),
+                body_file: Some("~/org/t.org".to_string()),
+                clock_in: None,
+            },
+            RawTemplate {
+                key: "t".to_string(),
+                description: Some("fine".to_string()),
+                target: RawTarget {
+                    file: "~/org/x.org".to_string(),
+                    headline: None,
+                },
+                body: Some("* TODO %?".to_string()),
+                body_file: None,
+                clock_in: None,
+            },
+        ])
+        .expect("the usable template keeps the set alive");
+        assert_eq!(set.templates.len(), 1, "only `t` survives");
+        assert_eq!(set.templates[0].key, "t");
+        assert_eq!(set.skipped, vec!["`b` sets both `body` and `body-file`"]);
+    }
+
+    /// Capture and roam DISAGREE here, deliberately. A roam template with no
+    /// body is skipped — it would make an empty note, indistinguishable from a
+    /// failed create. A capture template with no body is a blank draft the user
+    /// types into, which is an ordinary way to capture and was the behaviour
+    /// before `body-file` existed.
+    #[test]
+    fn a_capture_template_with_no_body_at_all_is_still_usable() {
+        let set = from_declared(vec![RawTemplate {
+            key: "n".to_string(),
+            description: Some("blank".to_string()),
+            target: RawTarget {
+                file: "~/org/x.org".to_string(),
+                headline: None,
+            },
+            body: None,
+            body_file: None,
+            clock_in: None,
+        }])
+        .expect("a bodyless capture template is not an error");
+        assert_eq!(set.skipped, Vec::<String>::new());
+        assert_eq!(set.templates[0].body, "");
+        assert_eq!(set.templates[0].body_file, None);
+    }
+
     /// A multi-line body survives the crossing. This used to be the reason the
     /// option COULD be a string — a `"""` block keeps its newlines through the
     /// TOML-inside-TOML round trip — and it is now the field a TREE could
@@ -410,15 +538,25 @@ mod tests {
         let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["key", "description", "target", "body", "clock-in"],
-            "field names cross kebab-cased — `clock-in`, matching org's own \
-             `:clock-in` rather than a snake-case spelling invented here"
+            vec![
+                "key",
+                "description",
+                "target",
+                "body",
+                "body-file",
+                "clock-in"
+            ],
+            "field names cross kebab-cased — `clock-in` and CT.1's `body-file`, \
+             matching org's own `:clock-in` rather than a snake-case spelling \
+             invented here"
         );
         let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
             required,
-            vec![true, false, true, false, false],
-            "`key` and `target` are the two a template cannot do without"
+            vec![true, false, true, false, false, false],
+            "`key` and `target` are the two a template cannot do without — \
+             CT.1's `body-file` is optional, and so is `body`, because a \
+             template may declare either or neither"
         );
     }
 
@@ -522,6 +660,7 @@ mod tests {
                 headline: None,
             },
             body: None,
+            body_file: None,
             clock_in: None,
         }])
         .expect("it resolves");

@@ -182,6 +182,7 @@ mod roam_insert;
 mod roam_scan;
 mod roam_templates;
 mod roam_tree;
+mod template_body;
 mod timestamp;
 mod todo;
 mod tree;
@@ -5362,6 +5363,11 @@ fn selected_template(
                 description: "capture".to_string(),
                 target: capture_templates::Target::File { file },
                 body: option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE),
+                // CT.1: and no table to carry a `body-file` key either — this
+                // path's body IS `org.capture-template`, a plain string option.
+                // `None` here is the honest answer, not a default filled in to
+                // make the struct compile.
+                body_file: None,
                 // The bare `org.capture-file` path has no template table to
                 // carry a `clock-in` key, so it never clocks.
                 clock_in: false,
@@ -5384,20 +5390,21 @@ fn selected_template(
     // asked for, and saying so on every capture is the noise OC.11b is careful
     // not to add.
     match key {
-        Some(k) => set
-            .by_key(k)
-            .cloned()
-            .map(|t| (t, Vec::new()))
-            .ok_or_else(|| {
+        Some(k) => {
+            let chosen = set.by_key(k).cloned().ok_or_else(|| {
                 Effect::Echo(EchoPayload {
                     level: EchoLevel::Warn,
                     text: format!("org: no capture template keyed `{k}`"),
                 })
-            }),
+            })?;
+            Ok((resolve_template_body(chosen)?, Vec::new()))
+        }
         // No key and one template: there is nothing to choose. No key and
         // several: say which keys exist. OC.3 replaces this echo with the
         // menu that offers them, and the key argument stays exactly as it is.
-        None if set.templates.len() == 1 => Ok((set.templates[0].clone(), Vec::new())),
+        None if set.templates.len() == 1 => {
+            Ok((resolve_template_body(set.templates[0].clone())?, Vec::new()))
+        }
         None => Err(Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: format!(
@@ -5408,6 +5415,57 @@ fn selected_template(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+        })),
+    }
+}
+
+/// CT.1: read a `body-file` template's file, so everything downstream sees a
+/// `Template` whose `body` is just text.
+///
+/// ## Why here, and not per hop
+///
+/// `selected_template` is the ONE funnel every capture path goes through —
+/// `capture_open` on the first hop, `capture_question_submit` on the last, and
+/// the legacy `capture_submit`. Resolving at the funnel means the four existing
+/// readers of `template.body` are untouched, and the file is read once per
+/// capture rather than once per consumer.
+///
+/// It also makes OR.14's bug unrepresentable. Roam resolves its body per hop,
+/// and an earlier version of that feature resolved it in `roam_draft` but not
+/// in `roam_fields_menu` — so a file template showed ZERO question rows for
+/// questions the other hop had just decided to ask. Here both hops call this,
+/// because both hops call `selected_template`: there is no second place to
+/// forget.
+///
+/// ## No `${…}` pass
+///
+/// Capture has no node, so there is nothing to interpolate from — the path gets
+/// tilde expansion only. `%…` placeholders are expanded much later, by
+/// `capture::expand_for_buffer`, and must NOT be touched here: `%^{…}` has to
+/// still be in the text for `capture_flow::questions` to find.
+fn resolve_template_body(
+    mut template: capture_templates::Template,
+) -> Result<capture_templates::Template, Effect> {
+    let Some(path) = template.body_file.clone() else {
+        return Ok(template);
+    };
+    let source = template_body::BodySource::File(path);
+    match template_body::resolve(
+        &source,
+        &template.key,
+        |s| s.to_string(),
+        |p| host_services::read_file(p).map_err(|_| ()),
+    ) {
+        Ok(text) => {
+            template.body = text;
+            Ok(template)
+        }
+        // Refused, not degraded to an empty draft: a capture that silently
+        // opened blank because its template file moved is how a user files a
+        // note with none of the structure they expected.
+        Err(why) => Err(Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: {why}"),
         })),
     }
 }

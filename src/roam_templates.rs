@@ -63,12 +63,11 @@ pub type Declared = Vec<RawRoamTemplate>;
 pub struct RoamTemplate {
     pub key: String,
     pub description: String,
-    /// Inline text. Empty when [`Self::body_file`] is the source instead —
-    /// the two are mutually exclusive, enforced in [`from_declared`].
-    pub body: String,
-    /// A path to read at draft time — see [`resolve_body`]. Unexpanded: it may
-    /// still carry `${…}`, resolved once the node making it exists.
-    pub body_file: Option<String>,
+    /// CT.1: inline text or a path to read at draft time — one field rather
+    /// than a `String` plus an `Option<String>` that had to be kept mutually
+    /// exclusive by hand. `from_declared` enforces the exclusion once, here it
+    /// is simply unrepresentable.
+    pub body: crate::template_body::BodySource,
     pub file: Option<String>,
 }
 
@@ -128,30 +127,20 @@ pub fn from_declared(raw: Declared) -> RoamTemplateSet {
                 .push(format!("`{key}` is defined twice; the first one wins"));
             continue;
         }
-        // Blank is the same as absent for both — `a_blank_file_is_the_same_as_none`
-        // already established that pattern for `file`.
-        let inline_body = t.body.as_deref().map(str::trim).filter(|b| !b.is_empty());
-        let body_file = t
-            .body_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|f| !f.is_empty());
-        let (body, body_file) = match (inline_body, body_file) {
-            (Some(_), Some(_)) => {
-                // A template cannot say both "here is the text" and "read the
-                // text from here" — resolving the conflict silently in either
-                // direction would use whichever the user did NOT mean half the
-                // time.
-                out.skipped
-                    .push(format!("`{key}` sets both `body` and `body_file`"));
+        // CT.1: the body/body-file rules are shared with capture now — blank
+        // counts as absent, both set is refused. What stays HERE is the policy
+        // capture does not share: a roam template with no body at all would
+        // make an empty note, indistinguishable from a failed create, so roam
+        // refuses it where capture allows it.
+        let body = match crate::template_body::classify(t.body.as_deref(), t.body_file.as_deref()) {
+            Ok(crate::template_body::BodySource::Empty) => {
+                out.skipped.push(format!("`{key}` has no `body`"));
                 continue;
             }
-            (Some(b), None) => (b.to_string(), None),
-            (None, Some(f)) => (String::new(), Some(f.to_string())),
-            (None, None) => {
-                // A template that writes nothing would make an empty note,
-                // which is indistinguishable from a failed create.
-                out.skipped.push(format!("`{key}` has no `body`"));
+            Ok(source) => source,
+            Err(crate::template_body::BothSet) => {
+                out.skipped
+                    .push(format!("`{key}` sets both `body` and `body_file`"));
                 continue;
             }
         };
@@ -169,7 +158,6 @@ pub fn from_declared(raw: Declared) -> RoamTemplateSet {
             key,
             description,
             body,
-            body_file,
             file,
         });
     }
@@ -208,23 +196,17 @@ pub fn resolve_body(
     node: &crate::roam_capture::Node<'_>,
     read_file: impl FnOnce(&str) -> Result<String, ()>,
 ) -> Result<String, String> {
-    let raw = match &template.body_file {
-        Some(pattern) => {
-            let path =
-                crate::roam_scan::expand_tilde(&crate::roam_capture::expand_fields(pattern, node));
-            let text = read_file(&path)
-                .map_err(|()| format!("`{}`'s file could not be read: {path}", template.key))?;
-            if text.trim().is_empty() {
-                // Same reasoning as the inline `has no body` skip in
-                // `from_declared` — an empty file is indistinguishable from a
-                // failed create, just discovered a hop later.
-                return Err(format!("`{}`'s file is empty: {path}", template.key));
-            }
-            text
-        }
-        None => template.body.clone(),
-    };
-    Ok(crate::roam_capture::expand_fields(&raw, node))
+    // CT.1: the reading, the tilde expansion and the empty-file rule are
+    // shared. What is roam's, and stays here, is WHICH interpolation runs —
+    // `${slug}` / `${title}` / `${id}` mean something only because a node is
+    // being made, which is why the shared resolver takes the pass rather than
+    // the node.
+    crate::template_body::resolve(
+        &template.body,
+        &template.key,
+        |s| crate::roam_capture::expand_fields(s, node),
+        read_file,
+    )
 }
 
 #[cfg(test)]
@@ -266,7 +248,10 @@ mod tests {
     fn a_duplicate_key_keeps_the_first_and_says_so() {
         let set = from_declared(vec![t("d", "first"), t("d", "second")]);
         assert_eq!(set.templates.len(), 1);
-        assert_eq!(set.templates[0].body, "first");
+        assert_eq!(
+            set.templates[0].body,
+            crate::template_body::BodySource::Inline("first".to_string())
+        );
         assert_eq!(
             set.skipped,
             vec!["`d` is defined twice; the first one wins"]
@@ -313,10 +298,9 @@ mod tests {
         };
         let set = from_declared(vec![raw]);
         assert_eq!(set.skipped, Vec::<String>::new());
-        assert_eq!(set.templates[0].body, "");
         assert_eq!(
-            set.templates[0].body_file.as_deref(),
-            Some("~/templates/source.org")
+            set.templates[0].body,
+            crate::template_body::BodySource::File("~/templates/source.org".to_string())
         );
     }
 
@@ -363,8 +347,8 @@ mod tests {
         let set = from_declared(vec![raw]);
         assert_eq!(set.skipped, Vec::<String>::new());
         assert_eq!(
-            set.templates[0].body_file.as_deref(),
-            Some("~/templates/d.org")
+            set.templates[0].body,
+            crate::template_body::BodySource::File("~/templates/d.org".to_string())
         );
     }
 

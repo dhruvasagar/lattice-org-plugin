@@ -144,6 +144,7 @@ mod checkbox;
 mod clock;
 mod clock_scan;
 mod config_shape;
+mod datetree;
 mod habit_graph;
 mod habit_row;
 mod habit_stats;
@@ -5753,6 +5754,11 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
     capture_effects_via(
         dest,
         text,
+        // CT.6: the clock is a HOST call too, and it belongs on this side of
+        // the seam with the reads. A closure rather than a value so an ordinary
+        // capture does not ask the host what day it is when no target needs to
+        // know — the same laziness `read_file` has.
+        datetree::today_from_host,
         |p| lattice::plugin_host::host_services::read_file(p).ok(),
         |p, lines| match lattice::plugin_host::tree_sitter::parse_file(p) {
             Some(snapshot) => {
@@ -5773,6 +5779,7 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
 fn capture_effects_via(
     dest: &CaptureDestination,
     text: String,
+    today: impl Fn() -> crate::roam_dailies::Date,
     read_file: impl Fn(&str) -> Option<String>,
     outline_of: impl Fn(&str, &[&str]) -> Vec<headline::Entry>,
 ) -> Vec<Effect> {
@@ -5802,6 +5809,12 @@ fn capture_effects_via(
             Some(CaptureSeek::Headline(headline.clone()))
         }
         capture_templates::Target::FileOlp { olp, .. } => Some(CaptureSeek::Olp(olp.clone())),
+        capture_templates::Target::FileDatetree { olp, tree_type, .. } => {
+            Some(CaptureSeek::Datetree {
+                olp: olp.clone(),
+                tree_type: *tree_type,
+            })
+        }
     };
     let Some(seek) = seek else {
         // Appended at the end, so the entry starts at the file's current line
@@ -5865,6 +5878,11 @@ fn capture_effects_via(
         let found = match &seek {
             CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
             CaptureSeek::Olp(olp) => capture_target::find_olp_in(&lines, &outline, olp),
+            // CT.7 is what gives a datetree a table to aim at — a `sub-olp`
+            // naming a section inside the day node. Until then a `table-line`
+            // on a datetree has no table to find, and falls through to the
+            // keep-the-row-and-warn path below.
+            CaptureSeek::Datetree { .. } => None,
         };
         let Some(entry) = found else {
             // The target is missing, so there is nowhere to put a row. Append
@@ -5897,9 +5915,65 @@ fn capture_effects_via(
         return vec![write_at(path, FileAnchor::Line(placed.line), row)];
     }
 
+    // CT.6: a datetree resolves to a node that may not exist yet, so it is not
+    // a `find` — it plans creation as well as placement, and the created
+    // headings are written with the body in one effect.
+    if let CaptureSeek::Datetree { olp, tree_type } = &seek {
+        // The tree sits under `olp` when one is given — org's
+        // `file+olp+datetree` — and at top level otherwise.
+        let (scope, base_level) = if olp.is_empty() {
+            ((0u32, lines.len() as u32), 0usize)
+        } else {
+            match capture_target::find_olp_in(&lines, &outline, olp) {
+                Some(entry) => ((entry.line + 1, entry.end_line + 1), entry.level),
+                None => {
+                    // The path the tree is meant to live under is missing.
+                    // Appending keeps the note; creating an outline path the
+                    // user did not ask for would invent structure in a file
+                    // they may not have opened in months.
+                    return vec![
+                        write_at(path.clone(), FileAnchor::End, text),
+                        Effect::Echo(EchoPayload {
+                            level: EchoLevel::Warn,
+                            text: format!(
+                                "org: no {} in {path}; appended at the end",
+                                seek.describe()
+                            ),
+                        }),
+                    ];
+                }
+            }
+        };
+        let labels = datetree::labels(today(), *tree_type);
+        let spot = datetree::resolve(&lines, &outline, scope, base_level, &labels);
+        // CT.5: the body becomes a child of the date node, whatever level the
+        // tree put it at. Without this a `*`-rooted template terminates the day,
+        // the month AND the year.
+        let body = capture_target::relevel(&text, spot.level);
+        let mut out = String::new();
+        for heading in &spot.create {
+            out.push_str(heading);
+            out.push('\n');
+        }
+        out.push_str(&body);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let at = spot.line;
+        let out = if dest.clock_in {
+            let title = captured_title(&body);
+            clock_captured_entry(out, &path, at, &title)
+        } else {
+            out
+        };
+        return vec![write_at(path, FileAnchor::Line(at), out)];
+    }
+
     let found = match &seek {
         CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
         CaptureSeek::Olp(olp) => capture_target::find_olp_in(&lines, &outline, olp),
+        // Handled above; a datetree never reaches the entry/table paths.
+        CaptureSeek::Datetree { .. } => None,
     };
     // CT.5: an `entry` becomes a CHILD of the headline it files under, which
     // means its own headings shift to fit. Only when a target was actually
@@ -5939,6 +6013,12 @@ fn capture_effects_via(
 enum CaptureSeek {
     Headline(String),
     Olp(Vec<String>),
+    /// CT.6: today's date node, created if absent. `olp` is the path the TREE
+    /// sits under (org's `file+olp+datetree`), empty for a top-level tree.
+    Datetree {
+        olp: Vec<String>,
+        tree_type: capture_templates::TreeTypeAlias,
+    },
 }
 
 impl CaptureSeek {
@@ -5953,6 +6033,14 @@ impl CaptureSeek {
         match self {
             CaptureSeek::Headline(h) => format!("headline `{h}`"),
             CaptureSeek::Olp(olp) => format!("outline path `{}`", olp.join("/")),
+            // Unreachable in practice: a datetree CREATES what it cannot find,
+            // so it never reports a missing target. Spelled out rather than
+            // `unreachable!()` because a panic on a capture path would cost the
+            // user the note they just typed.
+            CaptureSeek::Datetree { olp, .. } if olp.is_empty() => "date tree".to_string(),
+            CaptureSeek::Datetree { olp, .. } => {
+                format!("date tree under `{}`", olp.join("/"))
+            }
         }
     }
 }
@@ -10721,11 +10809,27 @@ mod capture_effects_tests {
         capture_effects_via(
             &dest,
             "* TODO note\n".to_string(),
+            pinned_date,
             move |_| Some(owned.clone()),
             // The text outline, which is what production falls back to when
             // `parse-file` answers `none`.
             |_, lines| headline::outline_text(lines),
         )
+    }
+
+    /// CT.6: the date every datetree test resolves against.
+    ///
+    /// Pinned rather than taken from the host clock, so a test asserting
+    /// `2026-09-16 Wednesday` means the same thing tomorrow. This is what the
+    /// `today` closure on the seam is FOR — the clock is a host call, and one
+    /// inside `capture_effects_via` aborts the test process with `entered
+    /// unreachable code` from the `wit_bindgen` macro.
+    fn pinned_date() -> crate::roam_dailies::Date {
+        crate::roam_dailies::Date {
+            year: 2026,
+            month: 9,
+            day: 16,
+        }
     }
 
     /// Where a write landed, as (path, anchor).
@@ -10854,6 +10958,7 @@ mod capture_effects_tests {
         capture_effects_via(
             &dest,
             text.to_string(),
+            pinned_date,
             move |_| Some(owned.clone()),
             |_, lines| headline::outline_text(lines),
         )
@@ -10959,6 +11064,162 @@ mod capture_effects_tests {
         assert!(matches!(anchor, FileAnchor::End));
         let warn = warned(&out).expect("a misplaced row must say so");
         assert!(warn.contains("appended the row at the end"), "{warn}");
+    }
+
+    /// CT.6 helper: a datetree capture over a fixture file.
+    fn datetree_effects(
+        olp: Vec<String>,
+        tree_type: capture_templates::TreeTypeAlias,
+        text: &str,
+        on_disk: &str,
+    ) -> Vec<Effect> {
+        let dest = CaptureDestination {
+            target: capture_templates::Target::FileDatetree {
+                file: "/tmp/x.org".to_string(),
+                olp,
+                tree_type,
+            },
+            clock_in: false,
+            entry_type: capture_templates::EntryType::Entry,
+            placement: capture_target::TablePlacement::End,
+        };
+        let owned = on_disk.to_string();
+        capture_effects_via(
+            &dest,
+            text.to_string(),
+            pinned_date,
+            move |_| Some(owned.clone()),
+            |_, lines| headline::outline_text(lines),
+        )
+    }
+
+    /// CT.6 end to end: an empty file grows the whole tree, and the body is
+    /// RE-LEVELLED to sit under the day node.
+    ///
+    /// The re-levelling is the assertion that matters. Without CT.5 the body's
+    /// `* How to use this` would terminate the day, the month and the year, and
+    /// land as a sibling of `* <year>` — a file reorganised by someone adding
+    /// one note to it.
+    #[test]
+    fn a_datetree_creates_its_nodes_and_relevels_the_body() {
+        let out = datetree_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            "* How to use this\n- stop\n",
+            "",
+        );
+        let written = written_text(&out);
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(
+            lines[0].chars().filter(|c| *c == '*').count(),
+            1,
+            "the year"
+        );
+        assert_eq!(
+            lines[1].chars().filter(|c| *c == '*').count(),
+            2,
+            "the month"
+        );
+        assert_eq!(lines[2].chars().filter(|c| *c == '*').count(), 3, "the day");
+        assert!(
+            lines[3].starts_with("**** How to use this"),
+            "the body is a CHILD of the level-3 day node, not a sibling of the \
+             year: {:?}",
+            lines[3]
+        );
+        assert_eq!(lines[4], "- stop", "prose is untouched");
+    }
+
+    /// A second capture the same day reuses the node rather than growing a
+    /// parallel tree, and writes only the body.
+    #[test]
+    fn a_second_capture_the_same_day_reuses_the_node() {
+        // Build the file the first capture would have produced.
+        let first = written_text(&datetree_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            "* one\n",
+            "",
+        ));
+        let out = datetree_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            "* two\n",
+            &first,
+        );
+        let written = written_text(&out);
+        assert!(
+            !written.contains('\n') || !written.starts_with('*') || written.starts_with("**** "),
+            "only the re-levelled body is written, no second year node: {written:?}"
+        );
+        assert_eq!(written, "**** two\n");
+    }
+
+    /// An `olp` puts the tree UNDER that path — org's `file+olp+datetree` — and
+    /// the body re-levels against the deeper day node.
+    #[test]
+    fn an_olp_datetree_builds_the_tree_under_the_path() {
+        let out = datetree_effects(
+            vec!["Journal".to_string()],
+            capture_templates::TreeTypeAlias::Day,
+            "* note\n",
+            "* Journal\n* Other\n",
+        );
+        let written = written_text(&out);
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(
+            lines[0].chars().filter(|c| *c == '*').count(),
+            2,
+            "the year is a CHILD of Journal: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[3].starts_with("***** note"),
+            "the day is level 4 here, so the body is level 5: {:?}",
+            lines[3]
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(1)),
+            "inside Journal, before `* Other`: {anchor:?}"
+        );
+    }
+
+    /// A missing `olp` appends and warns rather than inventing the path. Date
+    /// nodes are GENERATED and get created; an outline path is AUTHORED, and
+    /// creating one puts structure in a file the user did not ask for.
+    #[test]
+    fn a_datetree_under_a_missing_path_appends_and_warns() {
+        let out = datetree_effects(
+            vec!["Nope".to_string()],
+            capture_templates::TreeTypeAlias::Day,
+            "* note\n",
+            "* Other\n",
+        );
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::End));
+        let warn = warned(&out).expect("a misplaced note must say so");
+        assert!(warn.contains("date tree under `Nope`"), "{warn}");
+    }
+
+    /// A week tree is two levels, not three — org's own arity.
+    #[test]
+    fn a_week_tree_stops_at_the_week() {
+        let out = datetree_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Week,
+            "* note\n",
+            "",
+        );
+        let written = written_text(&out);
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines.len(), 3, "year, week, body: {lines:?}");
+        assert!(lines[1].contains("-W"), "the week label: {:?}", lines[1]);
+        assert!(
+            lines[2].starts_with("*** note"),
+            "the body is level 3 under a level-2 week: {:?}",
+            lines[2]
+        );
     }
 
     /// A broken outline path quotes the WHOLE path, not the segment that broke

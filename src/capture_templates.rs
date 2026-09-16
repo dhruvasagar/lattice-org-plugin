@@ -14,14 +14,18 @@
 //!     key:         string,
 //!     description: string?,
 //!     target:      record {
-//!         kind:     string?,        // `file` | `file+headline` | `file+olp`
-//!         file:     string,
-//!         headline: string?,
-//!         olp:      list<string>?,
+//!         kind:      string?,   // file | file+headline | file+olp | file+datetree
+//!         file:      string,
+//!         headline:  string?,
+//!         olp:       list<string>?,
+//!         tree-type: enum?,     // day | week | month
 //!     },
-//!     body:        string?,
-//!     body-file:   string?,
-//!     clock-in:    bool?,
+//!     body:           string?,
+//!     body-file:      string?,
+//!     type:           enum?,    // entry | table-line
+//!     table-line-pos: string?,
+//!     prepend:        bool?,
+//!     clock-in:       bool?,
 //! }>
 //! ```
 //!
@@ -100,6 +104,15 @@ pub enum Target {
     /// for exactly this, and its docstring says so: "for non-unique headings,
     /// the full outline path is safer".
     FileOlp { file: String, olp: Vec<String> },
+    /// CT.6: today's node in a date tree, created if it is not there.
+    ///
+    /// `olp` is org's meaning — the outline path the tree is built UNDER, not
+    /// a path below the date node. (CT.7's `sub-olp` is the one that descends.)
+    FileDatetree {
+        file: String,
+        olp: Vec<String>,
+        tree_type: crate::datetree::TreeType,
+    },
 }
 
 impl Target {
@@ -112,7 +125,8 @@ impl Target {
         match self {
             Target::File { file }
             | Target::FileHeadline { file, .. }
-            | Target::FileOlp { file, .. } => file,
+            | Target::FileOlp { file, .. }
+            | Target::FileDatetree { file, .. } => file,
         }
     }
 
@@ -133,6 +147,9 @@ impl Target {
         crate::roam_scan::expand_tilde(self.file())
     }
 }
+
+/// CT.6: re-exported so consumers name one module for the template shape.
+pub type TreeTypeAlias = crate::datetree::TreeType;
 
 /// CT.4: WHAT a template inserts — org's capture entry type.
 ///
@@ -275,7 +292,13 @@ pub struct RawTarget {
     /// Insert under this headline's subtree instead of appending to the file.
     pub headline: Option<String>,
     /// CT.3: the full outline path, for `file+olp` — `["Work", "Inbox"]`.
+    ///
+    /// CT.6: on a `file+datetree` this is org's `file+olp+datetree` meaning —
+    /// the path the date tree is built UNDER. It is NOT a path below the date
+    /// node; that is `sub-olp`, which CT.7 adds.
     pub olp: Option<Vec<String>>,
+    /// CT.6: org's `:tree-type` — `day` (the default), `week` or `month`.
+    pub tree_type: Option<crate::datetree::TreeType>,
 }
 
 /// One `[[org.capture-templates]]` entry, as declared.
@@ -348,6 +371,7 @@ fn resolve_target(
     kind: Option<String>,
     headline: Option<String>,
     olp: Option<Vec<String>>,
+    tree_type: Option<crate::datetree::TreeType>,
 ) -> Result<Target, String> {
     let headline = headline
         .map(|h| h.trim().to_string())
@@ -393,12 +417,26 @@ fn resolve_target(
                 "`{key}`: `kind = \"file+olp\"` does not take `headline`"
             )),
         },
+        // CT.6: `olp` is OPTIONAL here and carries org's `file+olp+datetree`
+        // meaning — the path the tree is built UNDER. Absent puts the tree at
+        // top level, which is what a plain `file+datetree` means.
+        "file+datetree" => match headline {
+            None => Ok(Target::FileDatetree {
+                file,
+                olp: olp.unwrap_or_default(),
+                tree_type: tree_type.unwrap_or_default(),
+            }),
+            Some(_) => Err(format!(
+                "`{key}`: `kind = \"file+datetree\"` does not take `headline` \
+                 (use `olp` for the path the tree is built under)"
+            )),
+        },
         // Named rather than ignored: an unrecognised kind silently falling back
         // to `file` would append every capture to the end of the file while the
         // config plainly says otherwise.
         other => Err(format!(
             "`{key}`: unknown target `kind = \"{other}\"` \
-             (expected `file`, `file+headline` or `file+olp`)"
+             (expected `file`, `file+headline`, `file+olp` or `file+datetree`)"
         )),
     }
 }
@@ -450,14 +488,20 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             ));
             continue;
         }
-        let target =
-            match resolve_target(&key, file, t.target.kind, t.target.headline, t.target.olp) {
-                Ok(target) => target,
-                Err(why) => {
-                    skipped.push(why);
-                    continue;
-                }
-            };
+        let target = match resolve_target(
+            &key,
+            file,
+            t.target.kind,
+            t.target.headline,
+            t.target.olp,
+            t.target.tree_type,
+        ) {
+            Ok(target) => target,
+            Err(why) => {
+                skipped.push(why);
+                continue;
+            }
+        };
         // CT.1: the same rules roam uses. Unlike roam, `Empty` is NOT a skip —
         // a capture template with no body is a blank draft the user types into,
         // which is a perfectly ordinary way to capture and was the behaviour
@@ -637,6 +681,7 @@ mod tests {
                 file: "~/org/x.org".to_string(),
                 headline: headline.map(str::to_string),
                 olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
+                tree_type: None,
             },
             ..Default::default()
         }]
@@ -757,7 +802,7 @@ mod tests {
     /// says otherwise.
     #[test]
     fn an_unknown_kind_is_named() {
-        let mut declared = with_target(Some("file+datetree"), None, None);
+        let mut declared = with_target(Some("file+nonsense"), None, None);
         declared.push(RawTemplate {
             key: "ok".to_string(),
             body: Some("* TODO %?".to_string()),
@@ -770,12 +815,13 @@ mod tests {
         let set = from_declared(declared).expect("the survivor keeps the set alive");
         assert_eq!(set.skipped.len(), 1);
         assert!(
-            set.skipped[0].contains("unknown target `kind = \"file+datetree\"`"),
+            set.skipped[0].contains("unknown target `kind = \"file+nonsense\"`"),
             "{:?}",
             set.skipped[0]
         );
-        // `file+datetree` is CT.6's, and until then it must be refused rather
-        // than quietly behaving as `file`.
+        // CT.3 used `file+datetree` as the example here; CT.6 made it real, so
+        // the test now names a kind that is genuinely unknown. A test whose
+        // "invalid" input quietly becomes valid stops testing anything.
     }
 
     /// A blank `headline` or an all-blank `olp` is ABSENT, not an error — the
@@ -1011,16 +1057,16 @@ mod tests {
         let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             target_names,
-            vec!["kind", "file", "headline", "olp"],
+            vec!["kind", "file", "headline", "olp", "tree-type"],
             "the target record's shape is as user-visible as the template's"
         );
         let target_required: Vec<bool> = target_fields.iter().map(|f| f.required).collect();
         assert_eq!(
             target_required,
-            vec![false, true, false, false],
+            vec![false, true, false, false, false],
             "`file` is the only field every target shape needs — `kind` absent \
-             keeps the pre-CT.3 inference, and `headline` / `olp` belong to one \
-             kind each"
+             keeps the pre-CT.3 inference, `headline` / `olp` belong to one \
+             kind each, and CT.6's `tree-type` defaults to `day`"
         );
         assert!(
             matches!(

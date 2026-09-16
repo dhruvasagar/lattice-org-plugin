@@ -155,13 +155,28 @@ pub fn find_olp_in<'a>(
     outline: &'a [crate::headline::Entry],
     olp: &[String],
 ) -> Option<&'a crate::headline::Entry> {
+    // The whole file, any level — the widest seed of the same descent.
+    find_olp_within(lines, outline, (0, u32::MAX), 0, olp)
+}
+
+/// CT.7: [`find_olp_in`] starting from a SCOPE rather than the whole file.
+///
+/// The same descent, seeded differently — which is why CT.3 wrote the walk in
+/// terms of `(lo, hi, min_level)` instead of hard-coding the file. A `sub-olp`
+/// descends from the node a datetree resolved to; nothing about the walk
+/// changes, only where it begins.
+pub fn find_olp_within<'a>(
+    lines: &[&str],
+    outline: &'a [crate::headline::Entry],
+    scope: (u32, u32),
+    base_level: usize,
+    olp: &[String],
+) -> Option<&'a crate::headline::Entry> {
     if olp.is_empty() || olp.iter().all(|s| normalise(s).is_empty()) {
         return None;
     }
-    // The scope starts as the whole file: any level, any line.
-    let mut lo: u32 = 0;
-    let mut hi: u32 = u32::MAX;
-    let mut min_level: usize = 0;
+    let (mut lo, mut hi) = scope;
+    let mut min_level: usize = base_level;
     let mut found: Option<&crate::headline::Entry> = None;
 
     for segment in olp {

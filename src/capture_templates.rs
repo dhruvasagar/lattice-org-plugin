@@ -19,6 +19,7 @@
 //!         headline:  string?,
 //!         olp:       list<string>?,
 //!         tree-type: enum?,     // day | week | month
+//!         sub-olp:   list<string>?, // a path BELOW the date node
 //!     },
 //!     body:           string?,
 //!     body-file:      string?,
@@ -112,6 +113,9 @@ pub enum Target {
         file: String,
         olp: Vec<String>,
         tree_type: crate::datetree::TreeType,
+        /// CT.7: descend into this path below the date node before looking for
+        /// a table. Empty means the date node itself.
+        sub_olp: Vec<String>,
     },
 }
 
@@ -299,6 +303,19 @@ pub struct RawTarget {
     pub olp: Option<Vec<String>>,
     /// CT.6: org's `:tree-type` — `day` (the default), `week` or `month`.
     pub tree_type: Option<crate::datetree::TreeType>,
+    /// CT.7: an outline path BELOW the resolved node — the deliberate
+    /// departure from org.
+    ///
+    /// `olp` puts a date tree UNDER a path; this descends INTO the node the
+    /// target resolved to. Org has no combinator for it: `table-line`'s search
+    /// is bounded to "the end of current heading body" (`org-capture.el:260`),
+    /// so a day node holding `** Daily Overview` and `** Episode Tracker`
+    /// cannot have its second table addressed by any built-in target — in
+    /// emacs you would write a `(file+function …)` locator.
+    ///
+    /// Two fields rather than one overloaded one so a ported emacs config
+    /// cannot silently mean something else: `olp` keeps org's meaning.
+    pub sub_olp: Option<Vec<String>>,
 }
 
 /// One `[[org.capture-templates]]` entry, as declared.
@@ -372,6 +389,7 @@ fn resolve_target(
     headline: Option<String>,
     olp: Option<Vec<String>>,
     tree_type: Option<crate::datetree::TreeType>,
+    sub_olp: Option<Vec<String>>,
 ) -> Result<Target, String> {
     let headline = headline
         .map(|h| h.trim().to_string())
@@ -385,7 +403,26 @@ fn resolve_target(
     });
     let olp = olp.filter(|segments: &Vec<String>| !segments.is_empty());
 
+    let sub_olp: Option<Vec<String>> = sub_olp.map(|segments| {
+        segments
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let sub_olp = sub_olp.filter(|segments: &Vec<String>| !segments.is_empty());
+
     let kind = kind.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    // CT.7: only a datetree descends. On any other kind a `sub-olp` is a
+    // misunderstanding worth naming — `file+olp` already addresses a path, and
+    // silently ignoring the field would file the note somewhere the config does
+    // not describe.
+    if sub_olp.is_some() && kind.as_deref() != Some("file+datetree") {
+        return Err(format!(
+            "`{key}`: `sub-olp` belongs to `kind = \"file+datetree\"` \
+             (use `olp` to address a path directly)"
+        ));
+    }
     let Some(kind) = kind else {
         // The pre-CT.3 inference, unchanged.
         return Ok(match headline {
@@ -425,6 +462,7 @@ fn resolve_target(
                 file,
                 olp: olp.unwrap_or_default(),
                 tree_type: tree_type.unwrap_or_default(),
+                sub_olp: sub_olp.unwrap_or_default(),
             }),
             Some(_) => Err(format!(
                 "`{key}`: `kind = \"file+datetree\"` does not take `headline` \
@@ -495,6 +533,7 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             t.target.headline,
             t.target.olp,
             t.target.tree_type,
+            t.target.sub_olp,
         ) {
             Ok(target) => target,
             Err(why) => {
@@ -682,6 +721,7 @@ mod tests {
                 headline: headline.map(str::to_string),
                 olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
                 tree_type: None,
+                sub_olp: None,
             },
             ..Default::default()
         }]
@@ -1057,16 +1097,17 @@ mod tests {
         let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             target_names,
-            vec!["kind", "file", "headline", "olp", "tree-type"],
+            vec!["kind", "file", "headline", "olp", "tree-type", "sub-olp"],
             "the target record's shape is as user-visible as the template's"
         );
         let target_required: Vec<bool> = target_fields.iter().map(|f| f.required).collect();
         assert_eq!(
             target_required,
-            vec![false, true, false, false, false],
+            vec![false, true, false, false, false, false],
             "`file` is the only field every target shape needs — `kind` absent \
              keeps the pre-CT.3 inference, `headline` / `olp` belong to one \
-             kind each, and CT.6's `tree-type` defaults to `day`"
+             kind each, CT.6's `tree-type` defaults to `day`, and CT.7's \
+             `sub-olp` is optional (empty means the date node itself)"
         );
         assert!(
             matches!(

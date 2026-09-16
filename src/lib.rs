@@ -5809,12 +5809,16 @@ fn capture_effects_via(
             Some(CaptureSeek::Headline(headline.clone()))
         }
         capture_templates::Target::FileOlp { olp, .. } => Some(CaptureSeek::Olp(olp.clone())),
-        capture_templates::Target::FileDatetree { olp, tree_type, .. } => {
-            Some(CaptureSeek::Datetree {
-                olp: olp.clone(),
-                tree_type: *tree_type,
-            })
-        }
+        capture_templates::Target::FileDatetree {
+            olp,
+            tree_type,
+            sub_olp,
+            ..
+        } => Some(CaptureSeek::Datetree {
+            olp: olp.clone(),
+            tree_type: *tree_type,
+            sub_olp: sub_olp.clone(),
+        }),
     };
     let Some(seek) = seek else {
         // Appended at the end, so the entry starts at the file's current line
@@ -5874,6 +5878,126 @@ fn capture_effects_via(
     // rather than an entry after the target's subtree. The target resolution is
     // the same walk either way; what differs is the scope it produces and what
     // is done inside it.
+    // CT.7: the DATETREE branch runs first, and the order is load-bearing.
+    //
+    // A `table-line` aimed at a datetree has to resolve the date node before
+    // it can look for a table, so the generic table branch below — which
+    // resolves headline/olp targets and maps a datetree to `None` — would
+    // otherwise claim the capture, find nothing, and append the row at
+    // end-of-file with a warn. That is what it did: the CT.7 code inside this
+    // branch was unreachable for the exact case it was written for.
+
+    if let CaptureSeek::Datetree {
+        olp,
+        tree_type,
+        sub_olp,
+    } = &seek
+    {
+        // The tree sits under `olp` when one is given — org's
+        // `file+olp+datetree` — and at top level otherwise.
+        let (scope, base_level) = if olp.is_empty() {
+            ((0u32, lines.len() as u32), 0usize)
+        } else {
+            match capture_target::find_olp_in(&lines, &outline, olp) {
+                Some(entry) => ((entry.line + 1, entry.end_line + 1), entry.level),
+                None => {
+                    // The path the tree is meant to live under is missing.
+                    // Appending keeps the note; creating an outline path the
+                    // user did not ask for would invent structure in a file
+                    // they may not have opened in months.
+                    return vec![
+                        write_at(path.clone(), FileAnchor::End, text),
+                        Effect::Echo(EchoPayload {
+                            level: EchoLevel::Warn,
+                            text: format!(
+                                "org: no {} in {path}; appended at the end",
+                                seek.describe()
+                            ),
+                        }),
+                    ];
+                }
+            }
+        };
+        let labels = datetree::labels(today(), *tree_type);
+        let spot = datetree::resolve(&lines, &outline, scope, base_level, &labels);
+
+        // CT.7: descend from the date node into the section the template names.
+        //
+        // Only possible when the date node ALREADY EXISTS — a `sub-olp` names
+        // sections that live inside the day's own body, and on the capture that
+        // creates the day there is nothing yet to descend into. That is not a
+        // failure: the body being filed IS what brings those sections into
+        // being (the tracker template carries them), so the first capture of a
+        // day writes the whole day and later ones descend into it.
+        let sub = if spot.create.is_empty() && !sub_olp.is_empty() {
+            // The day node itself, found by its own label within the tree's
+            // scope — then the `sub-olp` descends from there.
+            let day = capture_target::find_olp_within(
+                &lines,
+                &outline,
+                (scope.0, spot.line),
+                spot.level.saturating_sub(1),
+                &labels[labels.len() - 1..],
+            );
+            day.and_then(|node| {
+                capture_target::find_olp_within(
+                    &lines,
+                    &outline,
+                    (node.line + 1, node.end_line),
+                    node.level,
+                    sub_olp,
+                )
+            })
+        } else {
+            None
+        };
+
+        // A `table-line` aimed at a section inside the day is the shape a
+        // tracker needs, and the one org cannot express with any built-in
+        // target. With the section found, the row goes into ITS table.
+        // This crate is edition 2021, so no let-chains — genuinely nested.
+        if let Some(section) = sub.as_ref() {
+            if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
+                let placed = capture_target::resolve_table_in(
+                    &lines,
+                    (section.line + 1, section.end_line + 1),
+                    &dest.placement,
+                );
+                let mut row = capture_target::table_row_text(&text);
+                if !placed.create.is_empty() {
+                    row = format!("{}\n{row}", placed.create.join("\n"));
+                }
+                row.push('\n');
+                return vec![write_at(path, FileAnchor::Line(placed.line), row)];
+            }
+            // An `entry` with a `sub-olp` files after that section's subtree.
+            let body = capture_target::relevel(&text, section.level);
+            return vec![write_at(path, FileAnchor::Line(section.end_line + 1), body)];
+        }
+
+        // CT.5: the body becomes a child of the date node, whatever level the
+        // tree put it at. Without this a `*`-rooted template terminates the day,
+        // the month AND the year.
+        let body = capture_target::relevel(&text, spot.level);
+        let mut out = String::new();
+        for heading in &spot.create {
+            out.push_str(heading);
+            out.push('\n');
+        }
+        out.push_str(&body);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        let at = spot.line;
+        let out = if dest.clock_in {
+            let title = captured_title(&body);
+            clock_captured_entry(out, &path, at, &title)
+        } else {
+            out
+        };
+        return vec![write_at(path, FileAnchor::Line(at), out)];
+    }
+
     if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
         let found = match &seek {
             CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
@@ -5918,57 +6042,6 @@ fn capture_effects_via(
     // CT.6: a datetree resolves to a node that may not exist yet, so it is not
     // a `find` — it plans creation as well as placement, and the created
     // headings are written with the body in one effect.
-    if let CaptureSeek::Datetree { olp, tree_type } = &seek {
-        // The tree sits under `olp` when one is given — org's
-        // `file+olp+datetree` — and at top level otherwise.
-        let (scope, base_level) = if olp.is_empty() {
-            ((0u32, lines.len() as u32), 0usize)
-        } else {
-            match capture_target::find_olp_in(&lines, &outline, olp) {
-                Some(entry) => ((entry.line + 1, entry.end_line + 1), entry.level),
-                None => {
-                    // The path the tree is meant to live under is missing.
-                    // Appending keeps the note; creating an outline path the
-                    // user did not ask for would invent structure in a file
-                    // they may not have opened in months.
-                    return vec![
-                        write_at(path.clone(), FileAnchor::End, text),
-                        Effect::Echo(EchoPayload {
-                            level: EchoLevel::Warn,
-                            text: format!(
-                                "org: no {} in {path}; appended at the end",
-                                seek.describe()
-                            ),
-                        }),
-                    ];
-                }
-            }
-        };
-        let labels = datetree::labels(today(), *tree_type);
-        let spot = datetree::resolve(&lines, &outline, scope, base_level, &labels);
-        // CT.5: the body becomes a child of the date node, whatever level the
-        // tree put it at. Without this a `*`-rooted template terminates the day,
-        // the month AND the year.
-        let body = capture_target::relevel(&text, spot.level);
-        let mut out = String::new();
-        for heading in &spot.create {
-            out.push_str(heading);
-            out.push('\n');
-        }
-        out.push_str(&body);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        let at = spot.line;
-        let out = if dest.clock_in {
-            let title = captured_title(&body);
-            clock_captured_entry(out, &path, at, &title)
-        } else {
-            out
-        };
-        return vec![write_at(path, FileAnchor::Line(at), out)];
-    }
-
     let found = match &seek {
         CaptureSeek::Headline(headline) => capture_target::find_in(&lines, &outline, headline),
         CaptureSeek::Olp(olp) => capture_target::find_olp_in(&lines, &outline, olp),
@@ -6018,6 +6091,9 @@ enum CaptureSeek {
     Datetree {
         olp: Vec<String>,
         tree_type: capture_templates::TreeTypeAlias,
+        /// CT.7: a path BELOW the date node — where a tracker's own sections
+        /// live. Empty means the date node itself.
+        sub_olp: Vec<String>,
     },
 }
 
@@ -11073,14 +11149,42 @@ mod capture_effects_tests {
         text: &str,
         on_disk: &str,
     ) -> Vec<Effect> {
+        datetree_effects_sub(
+            olp,
+            tree_type,
+            Vec::new(),
+            capture_templates::EntryType::Entry,
+            text,
+            on_disk,
+        )
+    }
+
+    /// CT.7: as above, with a path below the date node and an EXPLICIT entry
+    /// type.
+    ///
+    /// The type is a parameter rather than a default because hardcoding
+    /// `Entry` here made a `table-line` test silently take the entry path: in
+    /// this fixture the section's subtree ends on the same line its table does,
+    /// so both paths produce the same anchor and the assertion passed while
+    /// exercising the wrong branch. A helper that cannot express the thing
+    /// under test is worse than no helper.
+    fn datetree_effects_sub(
+        olp: Vec<String>,
+        tree_type: capture_templates::TreeTypeAlias,
+        sub_olp: Vec<String>,
+        entry_type: capture_templates::EntryType,
+        text: &str,
+        on_disk: &str,
+    ) -> Vec<Effect> {
         let dest = CaptureDestination {
             target: capture_templates::Target::FileDatetree {
                 file: "/tmp/x.org".to_string(),
                 olp,
                 tree_type,
+                sub_olp,
             },
             clock_in: false,
-            entry_type: capture_templates::EntryType::Entry,
+            entry_type,
             placement: capture_target::TablePlacement::End,
         };
         let owned = on_disk.to_string();
@@ -11220,6 +11324,115 @@ mod capture_effects_tests {
             "the body is level 3 under a level-2 week: {:?}",
             lines[2]
         );
+    }
+
+    /// The tracker, as it actually is: today's node holding three sections,
+    /// each with its own table.
+    fn tracker_on_disk() -> String {
+        "\
+* 2026
+** 2026-09 September
+*** 2026-09-16 Wednesday
+**** Daily Overview
+| Date | Urge | Episodes |
+|------+------+----------|
+| %U   |    3 |        1 |
+**** Urge / Habit Episode Tracker
+| Time | Thoughts | Urge |
+|------+----------+------|
+| 09:00 | bored   |    4 |
+**** End of Day Reflection
+| What pattern did I notice ? |   |
+"
+        .to_string()
+    }
+
+    /// CT.7, and the reason the whole plan exists: a row aimed at the Episode
+    /// Tracker lands in ITS table.
+    ///
+    /// Org cannot express this with any built-in target. `table-line`'s search
+    /// is bounded to "the end of current heading body"
+    /// (`org-capture.el:260`), so aiming at the day node finds `Daily
+    /// Overview` — the FIRST table — and files every episode into the wrong
+    /// one. `file+olp+datetree` does not help: its path goes ABOVE the tree,
+    /// not below the day. In emacs this needs a `(file+function …)` locator.
+    ///
+    /// The assertion is the line number. A resolver that scoped to the day
+    /// node instead of the section would write the right TEXT in the wrong
+    /// table, and a test checking only the row's content would pass.
+    #[test]
+    fn a_row_lands_in_the_section_it_names_not_the_first_table_of_the_day() {
+        let out = datetree_effects_sub(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["Urge / Habit Episode Tracker".to_string()],
+            capture_templates::EntryType::TableLine,
+            "| 14:00 | restless | 6 |",
+            &tracker_on_disk(),
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(11)),
+            "after `| 09:00 | bored | 4 |` in the EPISODE table (line 11), not \
+             line 7 which is the end of Daily Overview: {anchor:?}"
+        );
+        assert_eq!(written_text(&out), "| 14:00 | restless | 6 |\n");
+    }
+
+    /// The same template aimed at a different section goes to that one — the
+    /// sections are addressable, not just the first.
+    #[test]
+    fn a_row_can_name_any_section_of_the_day() {
+        let out = datetree_effects_sub(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["Daily Overview".to_string()],
+            capture_templates::EntryType::TableLine,
+            "| tomorrow | 2 | 0 |",
+            &tracker_on_disk(),
+        );
+        let (_, anchor) = landed(&out);
+        assert!(
+            matches!(anchor, FileAnchor::Line(7)),
+            "the end of Daily Overview's table: {anchor:?}"
+        );
+    }
+
+    /// An `entry` with a `sub-olp` files after that SECTION's subtree, and
+    /// re-levels against the section rather than the day — otherwise the body
+    /// is nested one level too shallow for where it is written.
+    #[test]
+    fn an_entry_with_a_sub_olp_files_under_that_section() {
+        let out = datetree_effects_sub(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["End of Day Reflection".to_string()],
+            capture_templates::EntryType::Entry,
+            "* a note\n",
+            &tracker_on_disk(),
+        );
+        assert_eq!(
+            written_text(&out),
+            "***** a note\n",
+            "a child of the level-4 section, not of the level-3 day"
+        );
+    }
+
+    /// A `sub-olp` naming a section that is not there keeps the note and warns
+    /// — the same rule every other missing target follows.
+    #[test]
+    fn a_missing_sub_olp_section_keeps_the_note() {
+        let out = datetree_effects_sub(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["Nope".to_string()],
+            capture_templates::EntryType::Entry,
+            "* a note\n",
+            &tracker_on_disk(),
+        );
+        // Falls back to the day node itself rather than losing the capture.
+        let written = written_text(&out);
+        assert!(written.contains("a note"), "the note survives: {written:?}");
     }
 
     /// A broken outline path quotes the WHOLE path, not the segment that broke

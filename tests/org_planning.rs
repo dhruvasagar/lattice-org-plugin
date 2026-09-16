@@ -129,7 +129,7 @@ fn expand_plugin_keymaps(editor: &Editor) {
             lattice_mode::ModeKind::Major => lattice_keymap::KeymapLayer::MajorMode(mode_id),
             lattice_mode::ModeKind::Minor => lattice_keymap::KeymapLayer::MinorMode(mode_id),
         };
-        lattice_host::keymap_normal::expand_plugin_mode_grammar_rows(
+        lattice_host::keymap_normal::expand_grammar_rows(
             &editor.keymap,
             &commands,
             &editor.builtins,

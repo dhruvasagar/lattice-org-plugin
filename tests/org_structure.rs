@@ -160,7 +160,7 @@ async fn org_editor_with_caps(
                 lattice_mode::ModeKind::Major => lattice_keymap::KeymapLayer::MajorMode(mode_id),
                 lattice_mode::ModeKind::Minor => lattice_keymap::KeymapLayer::MinorMode(mode_id),
             };
-            lattice_host::keymap_normal::expand_plugin_mode_grammar_rows(
+            lattice_host::keymap_normal::expand_grammar_rows(
                 &editor.keymap,
                 &commands,
                 &editor.builtins,
@@ -759,7 +759,7 @@ async fn parent_skips_siblings_where_prev_headline_would_not() {
 
 /// The boot wiring itself, not the function it calls.
 ///
-/// `org_editor` drives `expand_plugin_mode_grammar_rows` directly so the other
+/// `org_editor` drives `expand_grammar_rows` directly so the other
 /// tests are deterministic — which leaves the `PluginLoaded` subscription that
 /// runs it in production untested, and an unrun expansion is exactly the
 /// "works, but only after you press something" bug class. So this one loads

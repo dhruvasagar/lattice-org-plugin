@@ -5739,11 +5739,15 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
     // `CLOCK_GOTO_TARGET` gets the expanded form too, which is what it wants:
     // it exists to reopen the clocked entry.
     let path = dest.target.resolved_file();
-    let headline = match &dest.target {
+    // CT.3: what this target looks for inside the file, if anything.
+    let seek = match &dest.target {
         capture_templates::Target::File { .. } => None,
-        capture_templates::Target::FileHeadline { headline, .. } => Some(headline.clone()),
+        capture_templates::Target::FileHeadline { headline, .. } => {
+            Some(CaptureSeek::Headline(headline.clone()))
+        }
+        capture_templates::Target::FileOlp { olp, .. } => Some(CaptureSeek::Olp(olp.clone())),
     };
-    let Some(headline) = headline else {
+    let Some(seek) = seek else {
         // Appended at the end, so the entry starts at the file's current line
         // count. Read only when a clock is actually wanted — an ordinary capture
         // must not pay for it.
@@ -5804,7 +5808,11 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
             text
         }
     };
-    match capture_target::resolve_in(&lines, &outline, &headline) {
+    let insertion = match &seek {
+        CaptureSeek::Headline(headline) => capture_target::resolve_in(&lines, &outline, headline),
+        CaptureSeek::Olp(olp) => capture_target::resolve_olp_in(&lines, &outline, olp),
+    };
+    match insertion {
         capture_target::Insertion::AtLine(line) => {
             let text = clocked(text, line);
             vec![write_at(path, FileAnchor::Line(line), text)]
@@ -5820,9 +5828,34 @@ fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
             ),
             Effect::Echo(EchoPayload {
                 level: EchoLevel::Warn,
-                text: format!("org: no headline `{headline}` in {path}; appended at the end"),
+                text: format!("org: no {} in {path}; appended at the end", seek.describe()),
             }),
         ],
+    }
+}
+
+/// CT.3: what a capture target looks for inside its file.
+///
+/// A `File` target looks for nothing and never reaches here — it appends, which
+/// is not a failure and gets no warn.
+enum CaptureSeek {
+    Headline(String),
+    Olp(Vec<String>),
+}
+
+impl CaptureSeek {
+    /// How the warn names what it could not find.
+    ///
+    /// The olp arm quotes the WHOLE path rather than the segment that broke the
+    /// chain. Naming just the missing segment reads as though a headline called
+    /// `Inbox` is absent, when the file may well have one somewhere else and
+    /// the actual problem is that it is not under `Work` — which is the
+    /// distinction `file+olp` exists to make.
+    fn describe(&self) -> String {
+        match self {
+            CaptureSeek::Headline(h) => format!("headline `{h}`"),
+            CaptureSeek::Olp(olp) => format!("outline path `{}`", olp.join("/")),
+        }
     }
 }
 

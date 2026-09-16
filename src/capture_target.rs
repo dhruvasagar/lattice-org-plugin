@@ -91,6 +91,75 @@ pub fn resolve_in(lines: &[&str], outline: &[crate::headline::Entry], headline: 
     }
 }
 
+/// CT.3: resolve a full outline PATH — `file+olp`'s target.
+///
+/// ## Why a path, when a headline already works
+///
+/// `resolve_in` takes the first headline anywhere in the file with a matching
+/// name. That is right for a unique name and wrong for a repeated one: a file
+/// with `Inbox` under both `Work` and `Home` files every capture under
+/// whichever comes first, silently. An outline path says which one.
+///
+/// It is also the machinery CT.7's `sub-olp` needs — descending from a resolved
+/// node into a named child is this walk with a different starting scope — which
+/// is why it lands here rather than waiting for the slice that needs it most.
+///
+/// ## Descent, not search
+///
+/// Each segment after the first is looked for **inside the previous segment's
+/// subtree and strictly deeper than it**, so `["Work", "Inbox"]` cannot match a
+/// top-level `Inbox` that happens to appear after `Work` ends. Within that
+/// scope the first match wins, for the same reason `resolve_in` takes the first:
+/// a file with two identical siblings is already ambiguous to the human reading
+/// it.
+///
+/// A segment that is not found returns [`Insertion::Append`] — the whole point
+/// of this module's "an absent headline appends and says so" rule, applied to
+/// the first segment that breaks the chain rather than only to the last.
+pub fn resolve_olp_in(
+    lines: &[&str],
+    outline: &[crate::headline::Entry],
+    olp: &[String],
+) -> Insertion {
+    if olp.is_empty() || olp.iter().all(|s| normalise(s).is_empty()) {
+        return Insertion::Append;
+    }
+    // The scope starts as the whole file: any level, any line.
+    let mut lo: u32 = 0;
+    let mut hi: u32 = u32::MAX;
+    let mut min_level: usize = 0;
+    let mut found: Option<&crate::headline::Entry> = None;
+
+    for segment in olp {
+        let wanted = normalise(segment);
+        if wanted.is_empty() {
+            return Insertion::Append;
+        }
+        let hit = outline.iter().find(|entry| {
+            entry.line >= lo
+                && entry.line <= hi
+                && entry.level > min_level
+                && lines
+                    .get(entry.line as usize)
+                    .and_then(|l| l.get(entry.level..))
+                    .is_some_and(|rest| normalise(&strip_tags(rest)) == wanted)
+        });
+        let Some(entry) = hit else {
+            return Insertion::Append;
+        };
+        // Descend: the next segment must live inside THIS subtree and below it.
+        lo = entry.line + 1;
+        hi = entry.end_line;
+        min_level = entry.level;
+        found = Some(entry);
+    }
+
+    match found {
+        Some(entry) => Insertion::AtLine(entry.end_line + 1),
+        None => Insertion::Append,
+    }
+}
+
 /// A headline's text with its TODO keyword and tags removed, lowercased and
 /// whitespace-collapsed.
 ///
@@ -284,5 +353,119 @@ old things
     fn a_colon_that_is_not_a_tag_cluster_stays_in_the_title() {
         let text = "* See also: refs\nbody\n* Next\n";
         assert_eq!(resolve(text, "See also: refs"), Insertion::AtLine(2));
+    }
+
+    /// CT.3 helper: resolve an outline path over text, the way [`resolve`] does
+    /// for a single headline.
+    fn resolve_olp(text: &str, olp: &[&str]) -> Insertion {
+        let lines: Vec<&str> = text.lines().collect();
+        let outline = crate::headline::outline_text(&lines);
+        let olp: Vec<String> = olp.iter().map(|s| s.to_string()).collect();
+        resolve_olp_in(&lines, &outline, &olp)
+    }
+
+    /// The case `file+olp` exists for, and the one `file+headline` gets wrong.
+    ///
+    /// Two `Inbox` headlines, under `Work` and under `Home`. A bare headline
+    /// target takes the first and files everything there silently; the path
+    /// picks the one that was asked for.
+    #[test]
+    fn an_outline_path_picks_the_right_one_of_two_same_named_headlines() {
+        let text = "\
+* Work
+** Inbox
+work note
+** Done
+* Home
+** Inbox
+home note
+* End
+";
+        // `Work/Inbox` is lines 1..2, so the insert lands on line 3 (`** Done`).
+        assert_eq!(resolve_olp(text, &["Work", "Inbox"]), Insertion::AtLine(3));
+        // `Home/Inbox` is lines 5..6, so the insert lands on line 7 (`* End`).
+        assert_eq!(resolve_olp(text, &["Home", "Inbox"]), Insertion::AtLine(7));
+
+        // And this is what the bare headline does with the same file — it can
+        // only ever reach the first. Not a bug in `resolve_in`; the reason the
+        // path resolver exists.
+        assert_eq!(resolve(text, "Inbox"), Insertion::AtLine(3));
+    }
+
+    /// A segment must be found INSIDE the previous segment's subtree, not
+    /// merely after it. `Work/Later` must not match the top-level `Later` that
+    /// follows `Work` — that is the difference between descent and search, and
+    /// a resolver that searched would pass every other test in this file.
+    #[test]
+    fn a_path_descends_rather_than_searching_forward() {
+        let text = "\
+* Work
+** Notes
+* Later
+body
+";
+        assert_eq!(resolve_olp(text, &["Work", "Later"]), Insertion::Append);
+        // The same name IS reachable as a one-segment path, so the failure
+        // above is about scope and not about the name.
+        assert_eq!(resolve_olp(text, &["Later"]), Insertion::AtLine(4));
+    }
+
+    /// And strictly deeper: a sibling at the same level is not a child.
+    #[test]
+    fn a_path_segment_must_be_deeper_than_its_parent() {
+        let text = "\
+* Work
+* Inbox
+body
+";
+        assert_eq!(resolve_olp(text, &["Work", "Inbox"]), Insertion::Append);
+    }
+
+    /// A path can be deeper than two, and lands after the LAST segment's
+    /// subtree rather than after any ancestor's.
+    #[test]
+    fn a_three_segment_path_lands_after_its_own_subtree() {
+        let text = "\
+* A
+** B
+*** C
+c body
+*** D
+** E
+* F
+";
+        // `A/B/C` is lines 2..3, so the insert lands on line 4 (`*** D`).
+        assert_eq!(resolve_olp(text, &["A", "B", "C"]), Insertion::AtLine(4));
+    }
+
+    /// A broken chain appends, like an absent headline — the note is kept and
+    /// the caller says where it went.
+    #[test]
+    fn a_missing_segment_appends() {
+        let text = "* Work\n** Notes\n";
+        assert_eq!(resolve_olp(text, &["Work", "Nope"]), Insertion::Append);
+        assert_eq!(resolve_olp(text, &["Nope", "Notes"]), Insertion::Append);
+    }
+
+    /// An empty or all-blank path has nothing to resolve. It cannot arrive from
+    /// a config (`from_declared` filters blanks and refuses an empty `olp`),
+    /// so this pins the resolver's own contract rather than a reachable state.
+    #[test]
+    fn an_empty_path_appends() {
+        let text = "* Work\n";
+        assert_eq!(resolve_olp(text, &[]), Insertion::Append);
+        assert_eq!(resolve_olp(text, &["  "]), Insertion::Append);
+    }
+
+    /// Segments normalise like a headline does — TODO keyword, tags, case and
+    /// spacing — because both sides are hand-written and a user does not mean
+    /// `Work` and `work` to differ.
+    #[test]
+    fn path_segments_normalise_like_headlines() {
+        let text = "* TODO Work   Stuff :proj:\n** Inbox\n";
+        assert_eq!(
+            resolve_olp(text, &["work stuff", "INBOX"]),
+            Insertion::AtLine(2)
+        );
     }
 }

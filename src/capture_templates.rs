@@ -13,7 +13,12 @@
 //! list<record {
 //!     key:         string,
 //!     description: string?,
-//!     target:      record { file: string, headline: string? },
+//!     target:      record {
+//!         kind:     string?,        // `file` | `file+headline` | `file+olp`
+//!         file:     string,
+//!         headline: string?,
+//!         olp:      list<string>?,
+//!     },
 //!     body:        string?,
 //!     body-file:   string?,
 //!     clock-in:    bool?,
@@ -22,6 +27,14 @@
 //!
 //! CT.1: `body` and `body-file` are mutually exclusive — the body's SOURCE,
 //! shared with roam templates in [`crate::template_body`].
+//!
+//! CT.3: `target.kind` names the shape, in org's own vocabulary. **Absent keeps
+//! the pre-CT.3 inference** (`headline` present ⇒ `file+headline`, else `file`),
+//! so no existing config changes; every new shape says its name. It is a
+//! `string` rather than a schema `Enum` because the derive kebab-cases variant
+//! names and would spell `file+headline` as `file-headline` — the vocabulary a
+//! user already knows is worth more than host-side validation of a closed set,
+//! so [`resolve_target`] checks it and an unknown value is a named skip.
 //!
 //! and in `lattice.toml` it is written as itself, natively:
 //!
@@ -78,6 +91,15 @@ pub enum Target {
     /// it or refusing — the note is not lost, and the echo is what tells the
     /// user their target moved (§4).
     FileHeadline { file: String, headline: String },
+    /// CT.3: insert after the subtree at this full outline PATH.
+    ///
+    /// `FileHeadline` takes the first headline anywhere in the file with a
+    /// matching name, which is right for a unique name and wrong for a repeated
+    /// one — an `Inbox` under both `Work` and `Home` files everything under
+    /// whichever comes first. A path says which. Org's own `file+olp` exists
+    /// for exactly this, and its docstring says so: "for non-unique headings,
+    /// the full outline path is safer".
+    FileOlp { file: String, olp: Vec<String> },
 }
 
 impl Target {
@@ -88,7 +110,9 @@ impl Target {
     /// distinction is worth two methods.
     pub fn file(&self) -> &str {
         match self {
-            Target::File { file } | Target::FileHeadline { file, .. } => file,
+            Target::File { file }
+            | Target::FileHeadline { file, .. }
+            | Target::FileOlp { file, .. } => file,
         }
     }
 
@@ -205,17 +229,38 @@ impl TemplateError {
 // they have sensible empty defaults; `key` and `target` are not, because a
 // template without either is not a template.
 
-/// `target = { file = "…", headline = "…" }`.
-#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+/// `target = { kind = "…", file = "…", headline = "…", olp = […] }`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, ConfigShapeDerive)]
 pub struct RawTarget {
+    /// CT.3: which target shape this is — org's own vocabulary: `file`,
+    /// `file+headline`, `file+olp`.
+    ///
+    /// **Absent keeps today's inference** (`headline` present ⇒
+    /// `file+headline`, else `file`), so no existing config changes. Every NEW
+    /// shape must say its name, which is what makes an illegal combination
+    /// reportable instead of silently reinterpreted.
+    ///
+    /// A `String` rather than a schema `Enum`, and that is forced rather than
+    /// chosen: the derive kebab-cases variant names, which would spell org's
+    /// `file+headline` as `file-headline`. The vocabulary a user already knows
+    /// is worth more than host-side validation of a closed set, so the set is
+    /// checked here and an unknown value is a named skip.
+    pub kind: Option<String>,
     /// The file the capture is written to.
     pub file: String,
     /// Insert under this headline's subtree instead of appending to the file.
     pub headline: Option<String>,
+    /// CT.3: the full outline path, for `file+olp` — `["Work", "Inbox"]`.
+    pub olp: Option<Vec<String>>,
 }
 
 /// One `[[org.capture-templates]]` entry, as declared.
-#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+///
+/// CT.3: `Default` as well, because `RawTarget` reached four fields of which at
+/// most two are set by any one `kind`. Without it every declaration in
+/// `init.rs` carries `None`s that hide the fields it actually sets; with it a
+/// reader sees only what the template means.
+#[derive(Debug, Clone, PartialEq, Eq, Default, ConfigShapeDerive)]
 pub struct RawTemplate {
     /// The keystroke that selects this template in the capture menu.
     pub key: String,
@@ -241,6 +286,89 @@ pub struct RawTemplate {
 
 /// The declared shape of `org.capture-templates`, for the registration call.
 pub type Declared = Vec<RawTemplate>;
+
+/// CT.3: resolve a declared target into the shape it names.
+///
+/// ## `kind` absent is the old inference, deliberately
+///
+/// Before this there were two shapes and the presence of `headline` chose
+/// between them. That inference IS the shipped semantics, so it stays as the
+/// default rather than being replaced by a required field — every existing
+/// `org.capture-templates` keeps working untouched. What changes is that every
+/// NEW shape must name itself, so the tag is declared rather than guessed.
+///
+/// ## An illegal combination is named, not reinterpreted
+///
+/// `kind = "file"` beside a `headline` is a contradiction: the user wrote a
+/// headline and asked for a target that has none. Ignoring the extra field
+/// would file the note at end-of-file while the config says otherwise — the
+/// silent-misplacement failure CT.2 just fixed one layer down. Refusing the
+/// template and saying which field is the answer that sends them to the right
+/// line.
+///
+/// A blank `headline` or an all-blank `olp` is treated as ABSENT rather than as
+/// an error, matching the rule `file` and `body` already use: a half-finished
+/// edit is likelier than a deliberate empty string.
+fn resolve_target(
+    key: &str,
+    file: String,
+    kind: Option<String>,
+    headline: Option<String>,
+    olp: Option<Vec<String>>,
+) -> Result<Target, String> {
+    let headline = headline
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty());
+    let olp: Option<Vec<String>> = olp.map(|segments| {
+        segments
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let olp = olp.filter(|segments: &Vec<String>| !segments.is_empty());
+
+    let kind = kind.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let Some(kind) = kind else {
+        // The pre-CT.3 inference, unchanged.
+        return Ok(match headline {
+            Some(headline) => Target::FileHeadline { file, headline },
+            None => Target::File { file },
+        });
+    };
+
+    match kind.as_str() {
+        "file" => match (headline, olp) {
+            (None, None) => Ok(Target::File { file }),
+            _ => Err(format!(
+                "`{key}`: `kind = \"file\"` takes neither `headline` nor `olp`"
+            )),
+        },
+        "file+headline" => match (headline, olp) {
+            (Some(headline), None) => Ok(Target::FileHeadline { file, headline }),
+            (None, _) => Err(format!(
+                "`{key}`: `kind = \"file+headline\"` needs a `headline`"
+            )),
+            (Some(_), Some(_)) => Err(format!(
+                "`{key}`: `kind = \"file+headline\"` does not take `olp`"
+            )),
+        },
+        "file+olp" => match (headline, olp) {
+            (None, Some(olp)) => Ok(Target::FileOlp { file, olp }),
+            (_, None) => Err(format!("`{key}`: `kind = \"file+olp\"` needs an `olp`")),
+            (Some(_), Some(_)) => Err(format!(
+                "`{key}`: `kind = \"file+olp\"` does not take `headline`"
+            )),
+        },
+        // Named rather than ignored: an unrecognised kind silently falling back
+        // to `file` would append every capture to the end of the file while the
+        // config plainly says otherwise.
+        other => Err(format!(
+            "`{key}`: unknown target `kind = \"{other}\"` \
+             (expected `file`, `file+headline` or `file+olp`)"
+        )),
+    }
+}
 
 /// Read the option's value into the template set.
 ///
@@ -289,10 +417,14 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             ));
             continue;
         }
-        let target = match t.target.headline.map(|h| h.trim().to_string()) {
-            Some(headline) if !headline.is_empty() => Target::FileHeadline { file, headline },
-            _ => Target::File { file },
-        };
+        let target =
+            match resolve_target(&key, file, t.target.kind, t.target.headline, t.target.olp) {
+                Ok(target) => target,
+                Err(why) => {
+                    skipped.push(why);
+                    continue;
+                }
+            };
         // CT.1: the same rules roam uses. Unlike roam, `Empty` is NOT a skip —
         // a capture template with no body is a blank draft the user types into,
         // which is a perfectly ordinary way to capture and was the behaviour
@@ -387,6 +519,7 @@ mod tests {
             target: RawTarget {
                 file: file.to_string(),
                 headline: headline.map(str::to_string),
+                ..Default::default()
             },
             body: Some(body.to_string()),
             body_file: None,
@@ -441,6 +574,175 @@ mod tests {
             }
         );
         assert_eq!(m.target.file(), "~/org/refile.org");
+    }
+
+    /// CT.3 helper: one template with the given target fields.
+    fn with_target(kind: Option<&str>, headline: Option<&str>, olp: Option<Vec<&str>>) -> Declared {
+        vec![RawTemplate {
+            key: "t".to_string(),
+            body: Some("* TODO %?".to_string()),
+            target: RawTarget {
+                kind: kind.map(str::to_string),
+                file: "~/org/x.org".to_string(),
+                headline: headline.map(str::to_string),
+                olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
+            },
+            ..Default::default()
+        }]
+    }
+
+    /// CT.3: `kind` absent keeps the pre-CT.3 inference, so no existing config
+    /// changes. This is the compatibility guarantee the whole slice rests on.
+    #[test]
+    fn an_absent_kind_infers_the_two_legacy_shapes() {
+        let set = from_declared(with_target(None, None, None)).expect("resolves");
+        assert_eq!(
+            set.templates[0].target,
+            Target::File {
+                file: "~/org/x.org".to_string()
+            }
+        );
+
+        let set = from_declared(with_target(None, Some("Vocabulary"), None)).expect("resolves");
+        assert_eq!(
+            set.templates[0].target,
+            Target::FileHeadline {
+                file: "~/org/x.org".to_string(),
+                headline: "Vocabulary".to_string(),
+            }
+        );
+    }
+
+    /// Each kind names itself, in org's own vocabulary.
+    #[test]
+    fn each_kind_resolves_to_its_target_shape() {
+        let set = from_declared(with_target(Some("file"), None, None)).expect("resolves");
+        assert!(matches!(set.templates[0].target, Target::File { .. }));
+
+        let set =
+            from_declared(with_target(Some("file+headline"), Some("Vocab"), None)).expect("ok");
+        assert!(matches!(
+            set.templates[0].target,
+            Target::FileHeadline { .. }
+        ));
+
+        let set = from_declared(with_target(
+            Some("file+olp"),
+            None,
+            Some(vec!["Work", "Inbox"]),
+        ))
+        .expect("ok");
+        assert_eq!(
+            set.templates[0].target,
+            Target::FileOlp {
+                file: "~/org/x.org".to_string(),
+                olp: vec!["Work".to_string(), "Inbox".to_string()],
+            }
+        );
+    }
+
+    /// A kind carrying a field it does not take is REFUSED and named — never
+    /// silently ignored. Ignoring it would file the note at end-of-file while
+    /// the config plainly says otherwise, which is the silent-misplacement
+    /// failure CT.2 fixed one layer down.
+    #[test]
+    fn a_kind_carrying_a_field_it_does_not_take_is_named() {
+        for (kind, headline, olp, needle) in [
+            ("file", Some("H"), None, "takes neither"),
+            ("file+headline", None, None, "needs a `headline`"),
+            (
+                "file+headline",
+                Some("H"),
+                Some(vec!["A"]),
+                "does not take `olp`",
+            ),
+            ("file+olp", None, None, "needs an `olp`"),
+            (
+                "file+olp",
+                Some("H"),
+                Some(vec!["A"]),
+                "does not take `headline`",
+            ),
+        ] {
+            let err = from_declared(with_target(Some(kind), headline, olp))
+                .expect_err("the only template was refused, so the set is empty");
+            assert_eq!(
+                err,
+                TemplateError::Empty,
+                "kind `{kind}` should have left nothing usable"
+            );
+            // And the reason rides back through `skipped` when the set has a
+            // survivor — checked separately below, since `Empty` carries none.
+            let _ = needle;
+        }
+    }
+
+    /// The skip MESSAGE, on a set that survives — it must name the key and the
+    /// field, because "your config is wrong" without a location is what sends
+    /// someone looking in the wrong file.
+    #[test]
+    fn an_illegal_target_names_the_key_and_the_field() {
+        let mut declared = with_target(Some("file+olp"), Some("H"), Some(vec!["A"]));
+        declared.push(RawTemplate {
+            key: "ok".to_string(),
+            body: Some("* TODO %?".to_string()),
+            target: RawTarget {
+                file: "~/org/x.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let set = from_declared(declared).expect("the survivor keeps the set alive");
+        assert_eq!(set.templates.len(), 1);
+        assert_eq!(set.templates[0].key, "ok");
+        assert_eq!(
+            set.skipped,
+            vec!["`t`: `kind = \"file+olp\"` does not take `headline`"]
+        );
+    }
+
+    /// An unknown kind is named rather than falling back to `file` — a silent
+    /// fallback appends every capture to the end of the file while the config
+    /// says otherwise.
+    #[test]
+    fn an_unknown_kind_is_named() {
+        let mut declared = with_target(Some("file+datetree"), None, None);
+        declared.push(RawTemplate {
+            key: "ok".to_string(),
+            body: Some("* TODO %?".to_string()),
+            target: RawTarget {
+                file: "~/org/x.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let set = from_declared(declared).expect("the survivor keeps the set alive");
+        assert_eq!(set.skipped.len(), 1);
+        assert!(
+            set.skipped[0].contains("unknown target `kind = \"file+datetree\"`"),
+            "{:?}",
+            set.skipped[0]
+        );
+        // `file+datetree` is CT.6's, and until then it must be refused rather
+        // than quietly behaving as `file`.
+    }
+
+    /// A blank `headline` or an all-blank `olp` is ABSENT, not an error — the
+    /// rule `file` and `body` already use, because a half-finished edit is
+    /// likelier than a deliberate empty string.
+    #[test]
+    fn blank_target_fields_count_as_absent() {
+        let set = from_declared(with_target(None, Some("   "), None)).expect("resolves");
+        assert!(
+            matches!(set.templates[0].target, Target::File { .. }),
+            "a blank headline infers the plain file target"
+        );
+
+        let set = from_declared(with_target(Some("file"), None, Some(vec!["  ", ""]))).expect("ok");
+        assert!(
+            matches!(set.templates[0].target, Target::File { .. }),
+            "an all-blank olp is not a declaration"
+        );
     }
 
     /// CT.2: a `~/…` target is expanded for READING, and left alone for
@@ -508,6 +810,7 @@ mod tests {
             target: RawTarget {
                 file: "~/org/habit.org".to_string(),
                 headline: None,
+                ..Default::default()
             },
             body: None,
             body_file: Some("~/org/templates/habit.org".to_string()),
@@ -534,6 +837,7 @@ mod tests {
                 target: RawTarget {
                     file: "~/org/x.org".to_string(),
                     headline: None,
+                    ..Default::default()
                 },
                 body: Some("* TODO %?".to_string()),
                 body_file: Some("~/org/t.org".to_string()),
@@ -545,6 +849,7 @@ mod tests {
                 target: RawTarget {
                     file: "~/org/x.org".to_string(),
                     headline: None,
+                    ..Default::default()
                 },
                 body: Some("* TODO %?".to_string()),
                 body_file: None,
@@ -570,6 +875,7 @@ mod tests {
             target: RawTarget {
                 file: "~/org/x.org".to_string(),
                 headline: None,
+                ..Default::default()
             },
             body: None,
             body_file: None,
@@ -629,6 +935,43 @@ mod tests {
             "`key` and `target` are the two a template cannot do without — \
              CT.1's `body-file` is optional, and so is `body`, because a \
              template may declare either or neither"
+        );
+
+        // CT.3: and the NESTED target record, which the assertions above do not
+        // reach. `target` gained `kind` and `olp` in CT.3 and every one of the
+        // checks above still passed — a user-visible schema change that the
+        // contract test did not notice, which is precisely the drift this test
+        // exists to catch. Pinning the inner record closes it.
+        let target = fields
+            .iter()
+            .find(|f| f.name == "target")
+            .expect("a template has a target");
+        let Schema::Record(target_fields) = &target.schema else {
+            panic!("the target is a record");
+        };
+        let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            target_names,
+            vec!["kind", "file", "headline", "olp"],
+            "the target record's shape is as user-visible as the template's"
+        );
+        let target_required: Vec<bool> = target_fields.iter().map(|f| f.required).collect();
+        assert_eq!(
+            target_required,
+            vec![false, true, false, false],
+            "`file` is the only field every target shape needs — `kind` absent \
+             keeps the pre-CT.3 inference, and `headline` / `olp` belong to one \
+             kind each"
+        );
+        assert!(
+            matches!(
+                target_fields
+                    .iter()
+                    .find(|f| f.name == "olp")
+                    .map(|f| &f.schema),
+                Some(Schema::List(_))
+            ),
+            "`olp` is a list of strings — an outline PATH, not one heading"
         );
     }
 
@@ -730,6 +1073,7 @@ mod tests {
             target: RawTarget {
                 file: "~/org/x.org".to_string(),
                 headline: None,
+                ..Default::default()
             },
             body: None,
             body_file: None,

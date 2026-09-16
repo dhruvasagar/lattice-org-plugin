@@ -5720,7 +5720,25 @@ fn captured_title(text: &str) -> String {
 }
 
 fn capture_effects(dest: &CaptureDestination, text: String) -> Vec<Effect> {
-    let path = dest.target.file().to_string();
+    // CT.2: expand `~` BEFORE anything reads this path.
+    //
+    // `host-services.read-file` and `tree-sitter.parse-file` do not expand a
+    // tilde; `Effect::WriteToFile` does. A `~/…` `file+headline` target
+    // therefore wrote to the right file and searched the WRONG one — the read
+    // failed, the outline came back empty, the headline was not found, and the
+    // capture silently appended at end-of-file instead of under the headline.
+    // A write landing somewhere the user did not ask for, with no error: the
+    // user init documented it as a constraint ("paths are ABSOLUTE rather than
+    // `~/…`") rather than a bug, which is how it survived.
+    //
+    // Expanded once here because this is the only place the path is derived,
+    // and every reader and the writer take it from here. Handing `WriteToFile`
+    // an already-absolute path changes nothing — it expands what is already
+    // expanded — so the two halves agree instead of disagreeing.
+    //
+    // `CLOCK_GOTO_TARGET` gets the expanded form too, which is what it wants:
+    // it exists to reopen the clocked entry.
+    let path = dest.target.resolved_file();
     let headline = match &dest.target {
         capture_templates::Target::File { .. } => None,
         capture_templates::Target::FileHeadline { headline, .. } => Some(headline.clone()),

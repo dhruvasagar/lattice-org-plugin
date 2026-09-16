@@ -81,11 +81,32 @@ pub enum Target {
 }
 
 impl Target {
-    /// The file this target writes to, whichever shape it is.
+    /// The file this target writes to, whichever shape it is, **as declared**.
+    ///
+    /// Still carries a `~` if the user wrote one. Anything that READS the file
+    /// wants [`Self::resolved_file`] instead — see there for why the
+    /// distinction is worth two methods.
     pub fn file(&self) -> &str {
         match self {
             Target::File { file } | Target::FileHeadline { file, .. } => file,
         }
+    }
+
+    /// CT.2: the same file with `~` expanded — what every READ must use.
+    ///
+    /// The two host calls capture reads through, `host-services.read-file` and
+    /// `tree-sitter.parse-file`, do not expand a tilde. `Effect::WriteToFile`
+    /// does. So a `~/…` `file+headline` target used to write to the right file
+    /// while searching the wrong one: the read failed, the outline came back
+    /// empty, the headline was not found, and the note silently appended at
+    /// end-of-file instead of landing under its headline.
+    ///
+    /// A separate method rather than expanding inside [`Self::file`] because
+    /// the declared form is what belongs in a message to the user — echoing an
+    /// expanded `/Users/…` path back at someone who wrote `~/org/x.org` tells
+    /// them about their home directory rather than about their config.
+    pub fn resolved_file(&self) -> String {
+        crate::roam_scan::expand_tilde(self.file())
     }
 }
 
@@ -420,6 +441,57 @@ mod tests {
             }
         );
         assert_eq!(m.target.file(), "~/org/refile.org");
+    }
+
+    /// CT.2: a `~/…` target is expanded for READING, and left alone for
+    /// showing.
+    ///
+    /// The bug this closes was silent data misplacement: the reads
+    /// (`read-file`, `parse-file`) do not expand a tilde but the write does, so
+    /// a `~/…` `file+headline` target wrote to the right file while searching
+    /// the wrong one — no read, no outline, no headline match, and the note
+    /// appended at end-of-file instead of under its headline.
+    #[test]
+    fn a_tilde_target_is_expanded_for_reading_and_kept_for_showing() {
+        // SAFETY: single-threaded test, and the value is restored below.
+        let home = std::env::var("HOME").expect("HOME is set in the test env");
+
+        let t = Target::FileHeadline {
+            file: "~/org/refile.org".to_string(),
+            headline: "Vocabulary".to_string(),
+        };
+        assert_eq!(
+            t.resolved_file(),
+            format!("{home}/org/refile.org"),
+            "the read path must be absolute or the headline is never found"
+        );
+        assert_eq!(
+            t.file(),
+            "~/org/refile.org",
+            "the DECLARED form is what a message should quote back"
+        );
+
+        // The plain-file shape takes the same path.
+        let f = Target::File {
+            file: "~/org/inbox.org".to_string(),
+        };
+        assert_eq!(f.resolved_file(), format!("{home}/org/inbox.org"));
+    }
+
+    /// An absolute path is untouched, and `~user` is deliberately left verbatim
+    /// — expanding it against OUR home would produce a plausible path to the
+    /// wrong place, which is worse than one that visibly still has a `~`.
+    #[test]
+    fn an_absolute_target_is_unchanged_and_tilde_user_is_left_alone() {
+        let abs = Target::File {
+            file: "/srv/org/x.org".to_string(),
+        };
+        assert_eq!(abs.resolved_file(), "/srv/org/x.org");
+
+        let other = Target::File {
+            file: "~alice/org/x.org".to_string(),
+        };
+        assert_eq!(other.resolved_file(), "~alice/org/x.org");
     }
 
     /// CT.1: a capture template may name a FILE for its body, as a roam

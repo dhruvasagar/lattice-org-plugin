@@ -71,8 +71,15 @@ async fn press_chord(editor: &mut Editor, keys: &str) {
 fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutcome) {
     for effect in out.effects {
         match effect {
-            lattice_grammar::Effect::OpenPicker { source, args, .. } => {
-                let _ = editor.open_picker(source, args);
+            lattice_grammar::Effect::OpenPicker {
+                source,
+                args,
+                root,
+                fill_action,
+                query,
+            } => {
+                // CD.6: the host's own effect body, so a seeded `query` arrives.
+                let _ = editor.open_picker_for_effect(source, args, root, fill_action, query);
             }
             // OR.11b: with templates configured the accept opens the chooser
             // rather than writing. Without this arm the effect is printed and
@@ -295,6 +302,11 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
     let host = Arc::new(
         PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
     );
+    // CD.6b: `install` wires this in the editor; a hand-built loader does not,
+    // and unwired every caller reads as closed.
+    if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
+        host.set_buffer_store((*buffers).clone());
+    }
     let loader = loader_over_editor(&editor, host.clone());
     for found in discover(&plugins) {
         loader
@@ -532,6 +544,11 @@ async fn roam_is_inert_with_no_directory_configured() {
         PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
             .expect("host builds"),
     );
+    // CD.6b: `install` wires this in the editor; a hand-built loader does not,
+    // and unwired every caller reads as closed.
+    if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
+        host.set_buffer_store((*buffers).clone());
+    }
     let loader = loader_over_editor(&editor, host.clone());
     for found in discover(&plugins) {
         loader
@@ -920,6 +937,11 @@ async fn find_node_with_no_directory_says_so() {
         PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
             .expect("host builds"),
     );
+    // CD.6b: `install` wires this in the editor; a hand-built loader does not,
+    // and unwired every caller reads as closed.
+    if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
+        host.set_buffer_store((*buffers).clone());
+    }
     let loader = loader_over_editor(&editor, host.clone());
     for found in discover(&plugins) {
         loader
@@ -1148,8 +1170,15 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
             } => {
                 editor.apply_write_to_file(path, anchor, text, cut, create_parents, save);
             }
-            lattice_grammar::Effect::OpenPicker { source, args, .. } => {
-                let _ = editor.open_picker(source, args);
+            lattice_grammar::Effect::OpenPicker {
+                source,
+                args,
+                root,
+                fill_action,
+                query,
+            } => {
+                // CD.6: the host's own effect body, so a seeded `query` arrives.
+                let _ = editor.open_picker_for_effect(source, args, root, fill_action, query);
             }
             // OR.13: RENDERER-applied, like `OpenTransient` / `OpenSyntheticBuffer`
             // below — `handle_effect` deliberately does NOT apply it inline
@@ -1991,6 +2020,11 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
         PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
             .expect("host builds"),
     );
+    // CD.6b: `install` wires this in the editor; a hand-built loader does not,
+    // and unwired every caller reads as closed.
+    if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
+        host.set_buffer_store((*buffers).clone());
+    }
     let loader = loader_over_editor(&editor, host.clone());
     for found in discover(&plugins) {
         loader
@@ -3157,4 +3191,475 @@ fn settle_budget(base: usize) -> usize {
         .filter(|v| *v > 0)
         .unwrap_or(10);
     base.saturating_mul(scale)
+}
+
+// ── CD.6: `C-c n i` → create opens a child capture ─────────────────────────
+
+/// One template, no questions: the draft opens straight away.
+const CD6_TEMPLATES: &str = concat!(
+    "[[template]]\n",
+    "key = \"d\"\n",
+    "target = { kind = \"file\", file = \"${slug}.org\" }\n",
+    "body = \"#+title: ${title}\\n\\n%?\"\n",
+);
+
+fn pos(line: u32, byte: u32) -> lattice_protocol::position::Position {
+    lattice_protocol::position::Position { line, byte }
+}
+
+fn buffer_text(editor: &Editor, id: lattice_core::BufferId) -> String {
+    editor
+        .buffers
+        .document_handle(id)
+        .map(|h| lattice_runtime::Document::text(h.as_ref()))
+        .unwrap_or_else(|| panic!("buffer {id:?} is open"))
+}
+
+/// Drain a fixed number of ticks — for work with nothing to wait FOR.
+async fn drain(editor: &mut Editor) {
+    for _ in 0..20 {
+        editor.run_tick_pending();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The corpus, the templates, and a plain org file to start from: the caller
+/// is an ordinary file, not a capture, for the design's "the caller works
+/// identically when the parent is not a capture".
+async fn cd6_setup(
+    base: &Path,
+    corpus: &Path,
+    page: &str,
+    templates: bool,
+) -> Option<(Index, Editor, lattice_core::BufferId)> {
+    write_corpus(corpus);
+    let (index, mut editor) = index_corpus_with_editor(base, corpus).await?;
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    if templates {
+        editor.handle_effect(lattice_grammar::Effect::SetOption {
+            spec: format!("org.roam-capture-templates={CD6_TEMPLATES}"),
+        });
+    }
+    let path = base.join("page.org");
+    std::fs::write(&path, page).unwrap();
+    let _ = editor.do_edit(Some(path), false);
+    drain(&mut editor).await;
+    let id = editor.document_buffer_id;
+    Some((index, editor, id))
+}
+
+fn picker_rows(editor: &Editor) -> Vec<String> {
+    editor
+        .picker
+        .as_ref()
+        .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Wait for the insert picker to offer the create row for `title`, alone.
+async fn settle_create_row(editor: &mut Editor, title: &str) {
+    let want = vec![format!("Create and link: {title}")];
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if picker_rows(editor) == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "the create row for {title:?} is offered alone; rows: {:?}",
+        picker_rows(editor)
+    );
+}
+
+/// Wait for the template chooser.
+async fn settle_chooser(editor: &mut Editor) {
+    for _ in 0..settle_budget(80) {
+        editor.run_tick_pending();
+        if editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "the template chooser opened (last message: {:?})",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+}
+
+/// Accept the highlighted row, and settle the chooser that follows.
+async fn accept_create_row(editor: &mut Editor) {
+    let out = editor.do_picker_accept();
+    apply_accept_effects(editor, out);
+    settle_chooser(editor).await;
+}
+
+/// Pick template `d`, and return the draft that opened.
+async fn pick_d(editor: &mut Editor) -> lattice_core::BufferId {
+    let before = roam_drafts_open(editor);
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.do_transient_trigger("d".to_string(), &mut out);
+    apply_accept_effects(editor, out);
+    for _ in 0..settle_budget(80) {
+        editor.run_tick_pending();
+        if let Some(id) = roam_drafts_open(editor)
+            .into_iter()
+            .find(|id| !before.contains(id))
+        {
+            drain(editor).await;
+            assert_eq!(editor.document_buffer_id, id, "the new draft is in front");
+            return id;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "a draft opened (last message: {:?})",
+        editor.last_message.as_ref().map(|m| &m.text)
+    );
+}
+
+/// `C-c n i` in Insert at `at`, or where the caret already is.
+async fn open_insert_chord(editor: &mut Editor, at: Option<lattice_protocol::position::Position>) {
+    if let Some(at) = at {
+        editor.cursor = at;
+    }
+    editor.enter_mode(lattice_grammar::ModalState::Insert);
+    press(editor, "<C-c>ni");
+    for _ in 0..settle_budget(80) {
+        editor.run_tick_pending();
+        if editor.picker.is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("`C-c n i` opened the insert picker");
+}
+
+/// `C-c n i`, the create row for `title`, then template `d`. Returns the
+/// child draft.
+async fn create_and_insert(
+    editor: &mut Editor,
+    at: Option<lattice_protocol::position::Position>,
+    title: &str,
+) -> lattice_core::BufferId {
+    open_insert_chord(editor, at).await;
+    let _ = query_picker(editor, title);
+    settle_create_row(editor, title).await;
+    accept_create_row(editor).await;
+    let draft = pick_d(editor).await;
+    editor.enter_mode(lattice_grammar::ModalState::Normal);
+    draft
+}
+
+/// A `[[id:…][title]]` link, with whatever id was minted.
+fn has_link(text: &str, title: &str) -> bool {
+    text.contains("[[id:") && text.contains(&format!("][{title}]]"))
+}
+
+fn note(corpus: &Path, slug: &str) -> Option<String> {
+    std::fs::read_to_string(corpus.join(format!("{slug}.org"))).ok()
+}
+
+fn focus(editor: &mut Editor, id: lattice_core::BufferId) {
+    editor.do_focus_buffer(id);
+    editor.run_tick_pending();
+}
+
+/// **Three deep, committed innermost-out.** Each link lands in its own
+/// caller, each note is filed with the links its draft held, and focus walks
+/// back one level per commit — to a plain org file at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_creates_link_back_into_each_caller() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let mango = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Mango").await;
+    let kiwi = create_and_insert(&mut editor, None, "Zq Kiwi").await;
+    let _plum = create_and_insert(&mut editor, None, "Zq Plum").await;
+
+    finalize_roam_capture(&mut editor).await;
+    assert_eq!(
+        editor.document_buffer_id, kiwi,
+        "back to the draft it came from"
+    );
+    let kiwi_text = buffer_text(&editor, kiwi);
+    assert!(has_link(&kiwi_text, "Zq Plum"), "{kiwi_text:?}");
+    assert!(
+        note(&corpus, "zq_plum").is_some(),
+        "the innermost note is filed"
+    );
+
+    finalize_roam_capture(&mut editor).await;
+    assert_eq!(editor.document_buffer_id, mango);
+    assert!(has_link(&buffer_text(&editor, mango), "Zq Kiwi"));
+    let kiwi_note = note(&corpus, "zq_kiwi").expect("the middle note is filed");
+    assert!(
+        has_link(&kiwi_note, "Zq Plum"),
+        "…holding the link its draft was given: {kiwi_note:?}"
+    );
+
+    finalize_roam_capture(&mut editor).await;
+    assert_eq!(
+        editor.document_buffer_id, page,
+        "and home, to the plain org file"
+    );
+    let top = buffer_text(&editor, page);
+    assert!(
+        top.starts_with("top: [[id:") && top.ends_with("][Zq Mango]]\n"),
+        "the link lands at the recorded caret: {top:?}"
+    );
+    assert!(has_link(&note(&corpus, "zq_mango").unwrap(), "Zq Kiwi"));
+    assert!(
+        roam_drafts_open(&editor).is_empty(),
+        "no draft is left open"
+    );
+}
+
+/// **Any order.** Two children of one caller, committed oldest first — a
+/// stack would demand the reverse. Each link lands where its create started.
+///
+/// The two carets are on different lines so the first link cannot move the
+/// second's recorded position: that staleness is the accepted cost of a
+/// recorded range (design §10), not what this test is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_creates_commit_in_any_order() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) =
+        cd6_setup(base.path(), &corpus, "one\ntwo\n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let pear = create_and_insert(&mut editor, Some(pos(1, 3)), "Zq Pear").await;
+    focus(&mut editor, page);
+    let fig = create_and_insert(&mut editor, Some(pos(0, 3)), "Zq Fig").await;
+
+    focus(&mut editor, pear);
+    finalize_roam_capture(&mut editor).await;
+    assert_eq!(editor.document_buffer_id, page);
+    focus(&mut editor, fig);
+    finalize_roam_capture(&mut editor).await;
+    assert_eq!(editor.document_buffer_id, page);
+
+    let text = buffer_text(&editor, page);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("one[[id:") && lines[0].ends_with("][Zq Fig]]"),
+        "{text:?}"
+    );
+    assert!(
+        lines[1].starts_with("two[[id:") && lines[1].ends_with("][Zq Pear]]"),
+        "{text:?}"
+    );
+}
+
+/// **A discarded child** writes nothing anywhere and returns to its caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_discarded_child_links_nothing() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let _lime = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Lime").await;
+    abort_roam_capture(&mut editor).await;
+
+    assert_eq!(editor.document_buffer_id, page, "back where it started");
+    assert_eq!(buffer_text(&editor, page), "top: \n", "no link");
+    assert!(note(&corpus, "zq_lime").is_none(), "no note");
+    assert!(roam_drafts_open(&editor).is_empty());
+}
+
+/// **The token property.** A create-and-insert abandoned at the chooser must
+/// not hand its caller to the next roam create — which opens its draft through
+/// the very function that claims callers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_create_links_nothing_later() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    open_insert_chord(&mut editor, Some(pos(0, 5))).await;
+    let _ = query_picker(&mut editor, "Zq Date");
+    settle_create_row(&mut editor, "Zq Date").await;
+    accept_create_row(&mut editor).await;
+    // `<Esc>` at the chooser.
+    let _ = editor.do_picker_dismiss();
+    editor.enter_mode(lattice_grammar::ModalState::Normal);
+    drain(&mut editor).await;
+    assert!(roam_drafts_open(&editor).is_empty(), "nothing opened");
+
+    // An ordinary create, from the find picker.
+    let _ = open_find_node(&mut editor).await;
+    let rows = query_picker(&mut editor, "Zq Elder");
+    assert_eq!(rows, vec!["Create note: Zq Elder".to_string()], "{rows:?}");
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    settle_chooser(&mut editor).await;
+    let _elder = pick_d(&mut editor).await;
+    finalize_roam_capture(&mut editor).await;
+
+    assert!(note(&corpus, "zq_elder").is_some(), "the create filed");
+    assert_eq!(
+        buffer_text(&editor, page),
+        "top: \n",
+        "and linked nothing into the abandoned create's caller"
+    );
+}
+
+/// **A Visual region** seeds the picker and is replaced by the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_region_becomes_the_link() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) =
+        cd6_setup(base.path(), &corpus, "see Zq Region Words here\n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    // `Zq Region Words` is bytes 4..=18 — Visual's end is inclusive.
+    editor.cursor = pos(0, 4);
+    editor.enter_mode(lattice_grammar::ModalState::Visual(
+        lattice_grammar::VisualKind::Charwise,
+    ));
+    editor.visual_anchor = Some(pos(0, 4));
+    editor.cursor = pos(0, 18);
+    press(&mut editor, "<C-c>ni");
+    settle_create_row(&mut editor, "Zq Region Words").await;
+    assert_eq!(
+        editor.picker.as_ref().map(|p| p.query.clone()).as_deref(),
+        Some("Zq Region Words"),
+        "the picker opened on the selected text"
+    );
+    assert!(
+        !matches!(editor.modal, lattice_grammar::ModalState::Visual(_)),
+        "Visual is left, as after any verb on a region"
+    );
+    accept_create_row(&mut editor).await;
+    let _draft = pick_d(&mut editor).await;
+    finalize_roam_capture(&mut editor).await;
+
+    let text = buffer_text(&editor, page);
+    assert!(
+        text.starts_with("see [[id:") && text.ends_with("][Zq Region Words]] here\n"),
+        "the region, and only the region, became the link: {text:?}"
+    );
+}
+
+/// **The caller closed** before its child commits: the note is filed, and the
+/// message says the link had nowhere to go — and carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_caller_still_files_the_note_and_says_so() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let olive = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Olive").await;
+    focus(&mut editor, page);
+    assert!(editor.do_buffer_delete(true), "the caller closes");
+    focus(&mut editor, olive);
+    assert_eq!(editor.document_buffer_id, olive);
+    finalize_roam_capture(&mut editor).await;
+
+    assert!(note(&corpus, "zq_olive").is_some(), "the note is filed");
+    let message = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        message.contains("is closed") && has_link(&message, "Zq Olive"),
+        "the message names the problem and carries the link: {message:?}"
+    );
+}
+
+/// **The caller got shorter** while its child was open: the link is clamped
+/// into what is there, not dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shrunken_caller_gets_the_link_clamped() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) =
+        cd6_setup(base.path(), &corpus, "abc\ndefgh\n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let pepper = create_and_insert(&mut editor, Some(pos(1, 5)), "Zq Pepper").await;
+    // Delete the line the link was meant for.
+    editor.apply_edit_effect_inline(
+        page,
+        lattice_protocol::edit::Edit::replace(
+            lattice_protocol::position::Range::new(pos(1, 0), pos(2, 0)),
+            String::new(),
+        ),
+        None,
+    );
+    assert_eq!(buffer_text(&editor, page), "abc\n");
+    focus(&mut editor, pepper);
+    finalize_roam_capture(&mut editor).await;
+
+    let text = buffer_text(&editor, page);
+    assert!(
+        text.starts_with("abc\n[[id:") && text.ends_with("][Zq Pepper]]"),
+        "clamped to the end of the buffer: {text:?}"
+    );
+}
+
+/// **Without templates** nothing changed: the stub is written and linked at
+/// once, and no draft opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_templates_create_and_insert_is_one_step() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", false).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    open_insert_chord(&mut editor, Some(pos(0, 5))).await;
+    let _ = query_picker(&mut editor, "Zq Quince");
+    settle_create_row(&mut editor, "Zq Quince").await;
+    let out = editor.do_picker_accept();
+    apply_accept_effects(&mut editor, out);
+    drain(&mut editor).await;
+
+    assert!(roam_drafts_open(&editor).is_empty(), "no draft");
+    let text = buffer_text(&editor, page);
+    assert!(
+        text.starts_with("top: [[id:") && text.ends_with("][Zq Quince]]\n"),
+        "linked at once, at the caret: {text:?}"
+    );
+    let written = std::fs::read_dir(&corpus)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().ends_with("zq_quince.org"));
+    assert!(written, "and the stub is on disk");
 }

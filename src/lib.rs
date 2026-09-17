@@ -667,6 +667,11 @@ const AGENDA_FILTER_FILE_PROMPT: u32 = 106;
 const ROAM_INSERT_NODE: u32 = 107;
 const ROAM_INSERT_LINK: u32 = 108;
 const ROAM_CREATE_AND_INSERT: u32 = 109;
+/// CD.6 — `C-c n i` over a Visual region: the picker opens on the selected
+/// text, and the link a create commits REPLACES the region (org-roam's
+/// `org-roam-node-insert` with an active region). An action rather than the
+/// ex-command, because only an action is handed the selection.
+const ROAM_INSERT_NODE_REGION: u32 = 114;
 
 /// OX.2 — `C-c C-x C-b`, org's `org-toggle-checkbox`.
 ///
@@ -2536,6 +2541,11 @@ impl Guest for Component {
                 // (`keymap_insert` binds a/e/b/f/w/u/k/t/d/n/p/y/r/o/s and no
                 // `c`), so nothing that already worked is shadowed.
                 ibind("<C-c>ni", "org-roam-insert-node"),
+                // CD.6: the region form, org-roam's own. In Visual the caret
+                // question above does not arise — the selection says exactly
+                // what the link replaces. `<C-c>` is unbound in Visual (only
+                // `<Esc>`, `v` and `V` leave it), so nothing is shadowed.
+                vbind("<C-c>ni", "org-roam-insert-node-region"),
                 bind("<C-c>ndd", "org-roam-dailies-today"),
                 bind("<C-c>ndy", "org-roam-dailies-yesterday"),
                 bind("<C-c>ndt", "org-roam-dailies-tomorrow"),
@@ -3556,6 +3566,13 @@ impl Guest for Component {
              picker)",
             &spec(),
             CAPTURE_RESUME,
+        );
+        register_action(
+            "org-roam-insert-node-region",
+            "Insert a link to an org-roam note in place of the selected text, \
+             searching for that text",
+            &spec(),
+            ROAM_INSERT_NODE_REGION,
         );
         register_action(
             "org-capture-cleanup",
@@ -6569,6 +6586,16 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
     if !effects.iter().any(|e| matches!(e, Effect::WriteToFile(_))) {
         return effects;
     }
+    // CD.6: the link, into the caller — after the write, so a filing that
+    // fails writes no link to a note that does not exist.
+    let (write_back, closed) = match &state.caller {
+        Some(caller) => match &caller.on_commit {
+            Some(link) => write_back(caller, link),
+            None => (Vec::new(), None),
+        },
+        None => (Vec::new(), None),
+    };
+    effects.extend(write_back);
     // Close BEFORE focusing: `buffer-delete` closes the active buffer, which
     // after the focus would be the caller.
     effects.push(Effect::BufferDelete(true));
@@ -6581,7 +6608,242 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
             args: Args::String(id),
         },
     ));
+    // Last, so nothing the close or the cleanup says hides it.
+    effects.extend(closed);
     effects
+}
+
+/// CD.6: replace `caller.at` with `link` in the caller's buffer, clamped to
+/// what that buffer holds now.
+///
+/// Returns the edit, or — when the caller has closed — no edit and a warning
+/// that carries the link, so it can still be pasted by hand. The note itself
+/// is filed either way; only the link has nowhere to go.
+fn write_back(caller: &capture_drafts::Caller, link: &str) -> (Vec<Effect>, Option<Effect>) {
+    let clamp = |line, byte| host_services::clamp_position(caller.buffer, Position { line, byte });
+    let at = caller.at;
+    match (
+        clamp(at.start_line, at.start_byte),
+        clamp(at.end_line, at.end_byte),
+    ) {
+        (Some(start), Some(end)) => (
+            vec![Effect::ApplyEdit(
+                lattice::plugin_host::types::ApplyEditPayload {
+                    target: caller.buffer,
+                    edit: Edit {
+                        range: Range { start, end },
+                        kind: EditKind::Replace(link.to_string()),
+                    },
+                    cursor: None,
+                },
+            )],
+            None,
+        ),
+        _ => {
+            let place = caller
+                .path
+                .clone()
+                .unwrap_or_else(|| "the buffer it was started from".to_string());
+            (
+                Vec::new(),
+                Some(Effect::Echo(EchoPayload {
+                    level: EchoLevel::Warn,
+                    text: format!(
+                        "org-roam: note filed, but {place} is closed; link not inserted: {link}"
+                    ),
+                })),
+            )
+        }
+    }
+}
+
+/// CD.6: open the insert picker, recording where it was opened from.
+///
+/// A failed record is not a reason to refuse the picker: choosing an existing
+/// node never needs it, and a create falls back to the buffer it runs in.
+fn roam_insert_open(origin: capture_drafts::Caller, query: Option<String>) -> Vec<Effect> {
+    let recorded = capture_drafts::encode(&origin)
+        .ok_or_else(|| "could not encode".to_string())
+        .and_then(|bytes| host_services::store_put(capture_drafts::PENDING_ORIGIN, &bytes));
+    // Said after the open, so the picker does not hide it.
+    let warning = recorded.err().map(|reason| {
+        Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org-roam: a new note's link will go to the cursor ({reason})"),
+        })
+    });
+    let mut effects = vec![Effect::OpenPicker(
+        lattice::plugin_host::types::OpenPickerPayload {
+            source: roam_insert::INSERT_NODE_PICKER.to_string(),
+            args: Vec::new(),
+            root: None,
+            // PC.11: org opens every one of its pickers to ACT — the accept
+            // routes through the source's own outcome. Nothing here is waiting
+            // for a value, which is what `none` says.
+            fill_action: None,
+            query,
+        },
+    )];
+    effects.extend(warning);
+    effects
+}
+
+/// CD.6 — `C-c n i` in Visual: search for the selected text, and let the link
+/// replace it.
+fn roam_insert_region(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let origin = |at| capture_drafts::Caller {
+        buffer: ctx.buffer_id,
+        path: doc.path(),
+        at,
+        on_commit: None,
+    };
+    let Some(sel) = ctx.selection else {
+        return roam_insert_open(
+            origin(capture_drafts::Span::at(ctx.cursor.line, ctx.cursor.byte)),
+            None,
+        );
+    };
+    // Visual includes the character under its end; an edit range does not.
+    let end_byte = doc
+        .line(sel.end.line)
+        .map(|l| capture_drafts::past_char(&l, sel.end.byte))
+        .unwrap_or(sel.end.byte);
+    let end = Position {
+        line: sel.end.line,
+        byte: end_byte,
+    };
+    let text = doc
+        .get_text_range(Range {
+            start: sel.start,
+            end,
+        })
+        .unwrap_or_default();
+    let query = capture_drafts::region_query(&text);
+    roam_insert_open(
+        origin(capture_drafts::Span {
+            start_line: sel.start.line,
+            start_byte: sel.start.byte,
+            end_line: end.line,
+            end_byte: end.byte,
+        }),
+        (!query.is_empty()).then_some(query),
+    )
+}
+
+/// CD.6: the origin the insert picker recorded, taken — `None` when there is
+/// none, as when `:org-roam-create-and-insert` is typed rather than reached
+/// from the picker.
+fn take_pending_origin() -> Option<capture_drafts::Caller> {
+    let bytes = host_services::store_get(capture_drafts::PENDING_ORIGIN)?;
+    let _ = host_services::store_delete(capture_drafts::PENDING_ORIGIN);
+    capture_drafts::decode(&bytes)
+}
+
+/// CD.6: the caller waiting for node `id`, taken.
+fn claim_pending_caller(id: &str) -> Option<capture_drafts::Caller> {
+    let key = capture_drafts::pending_caller_key(id);
+    let bytes = host_services::store_get(&key)?;
+    let _ = host_services::store_delete(&key);
+    capture_drafts::decode(&bytes)
+}
+
+/// CD.6 — the insert picker's create row.
+fn roam_create_and_insert(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect> {
+    let title = match &ctx.args {
+        Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => return roam_warn("org-roam: a new note needs a title"),
+    };
+    let Some(dir) = roam_scan::roam_directory() else {
+        return roam_warn("org-roam: set `org.roam-directory` first");
+    };
+    // Where the link goes. The picker recorded it; a typed command has only
+    // the buffer it runs in.
+    let origin = take_pending_origin().unwrap_or_else(|| capture_drafts::Caller {
+        buffer: ctx.buffer_id,
+        path: doc.path(),
+        at: capture_drafts::Span::at(ctx.cursor.line, ctx.cursor.byte),
+        on_commit: None,
+    });
+    let templates = match roam_templates::read() {
+        Ok(_) => true,
+        Err(capture_templates::TemplateError::Unset) => false,
+        Err(e) => return roam_warn(&e.message_for(capture_templates::TemplateList::Roam)),
+    };
+    let id = match host_services::new_uuid() {
+        Ok(id) => id,
+        // Refuses rather than degrades, for `:org-roam-create-node`'s reason:
+        // the id is written into a file and outlives the session, and an empty
+        // one is worse than no note.
+        Err(error) => {
+            return vec![Effect::Echo(EchoPayload {
+                level: EchoLevel::Error,
+                text: format!("org-roam: cannot mint an id: {error}"),
+            })];
+        }
+    };
+    let link = format!("[[id:{id}][{title}]]");
+
+    if !templates {
+        // OR.7c, unchanged but for the region: write the stub, then the link.
+        //
+        // **Two effects, and the order is the safe one.** The write runs first
+        // and the link second, so the failure mode is a note with nothing
+        // pointing at it rather than a link pointing at nothing. An orphan note
+        // is findable by `C-c n f`; a broken `id:` link looks exactly like a
+        // working one until someone presses `<CR>` on it.
+        let mut effects = vec![Effect::WriteToFile(WriteToFilePayload {
+            path: roam_new_note_path(&dir, &title),
+            anchor: lattice::plugin_host::types::FileAnchor::End,
+            text: roam_find::new_node_text(&id, &title),
+            cut: None,
+            // The roam directory is the user's own configured path; a missing
+            // one is worth saying, not papering over.
+            create_parents: false,
+            // SAVED, unlike `:org-roam-create-node`'s: nothing is opened, so an
+            // unsaved buffer would be a file nobody is looking at, and the index
+            // could not see it either.
+            save: true,
+        })];
+        let (edit, closed) = write_back(&origin, &link);
+        effects.extend(edit);
+        effects.extend(closed);
+        return effects;
+    }
+
+    // Any caller still waiting belongs to a create that was abandoned at the
+    // chooser or a question — `<Esc>` there says nothing to the guest. Only one
+    // create runs its chooser at a time, so clearing them here is safe, and it
+    // keeps the store from collecting them.
+    for key in host_services::store_keys(capture_drafts::PENDING_CALLER_PREFIX) {
+        let _ = host_services::store_delete(&key);
+    }
+    let caller = capture_drafts::Caller {
+        on_commit: Some(link),
+        ..origin
+    };
+    let recorded = capture_drafts::encode(&caller)
+        .ok_or_else(|| "could not encode".to_string())
+        .and_then(|bytes| {
+            host_services::store_put(&capture_drafts::pending_caller_key(&id), &bytes)
+        });
+    if let Err(reason) = recorded {
+        // Refused: a create that could not remember where its link goes would
+        // file a note and silently link nothing.
+        return roam_warn(&format!(
+            "org-roam: cannot record where the link goes ({reason}); nothing was created"
+        ));
+    }
+    vec![Effect::OpenTransient(
+        lattice::plugin_host::types::OpenTransientPayload {
+            source: CAPTURE_TRANSIENT.to_string(),
+            args: Args::List(
+                [ORG_TRANSIENT_ROAM, title.as_str(), id.as_str()]
+                    .into_iter()
+                    .map(|s| lattice::plugin_host::types::ArgValue::String(s.to_string()))
+                    .collect(),
+            ),
+        },
+    )]
 }
 
 /// OC.7b — `C-c C-k`: throw the capture away.
@@ -8454,6 +8716,7 @@ impl GrammarCallbacks for Component {
             CAPTURE_ABORT => Ok(capture_abort(doc)),
             CAPTURE_CLEANUP => Ok(capture_cleanup(&ctx)),
             CAPTURE_RESUME => Ok(capture_resume(&ctx)),
+            ROAM_INSERT_NODE_REGION => Ok(leaving_visual(&ctx, roam_insert_region(&ctx, doc))),
             TOGGLE_CHECKBOX => Ok(leaving_visual(&ctx, toggle_checkbox(&ctx, doc, tree))),
             TOGGLE_CHECKBOX_SUBTREE => {
                 Ok(leaving_visual(&ctx, toggle_checkbox_set(&ctx, doc, tree)))
@@ -9099,18 +9362,18 @@ impl GrammarCallbacks for Component {
             // OR.7c: open the insert picker. No cursor is needed HERE — the
             // row that gets chosen fires `ROAM_INSERT_LINK`, which runs on
             // this same seam and has one.
-            ROAM_INSERT_NODE => Ok(vec![Effect::OpenPicker(
-                lattice::plugin_host::types::OpenPickerPayload {
-                    source: roam_insert::INSERT_NODE_PICKER.to_string(),
-                    args: Vec::new(),
-                    root: None,
-                    // PC.11: org opens every one of its pickers to ACT — the
-                    // accept routes through the source's own outcome. Nothing
-                    // here is waiting for a value, which is what `none` says.
-                    fill_action: None,
-                    query: None,
+            //
+            // CD.6: the origin is recorded HERE, where the cursor and the
+            // buffer are known, for the create row to find.
+            ROAM_INSERT_NODE => Ok(roam_insert_open(
+                capture_drafts::Caller {
+                    buffer: ctx.buffer_id,
+                    path: doc.path(),
+                    at: capture_drafts::Span::at(ctx.cursor.line, ctx.cursor.byte),
+                    on_commit: None,
                 },
-            )]),
+                None,
+            )),
             // OR.7c: the link the picker resolved, inserted at the cursor.
             //
             // The link arrives whole rather than as an id, because the picker
@@ -9127,71 +9390,14 @@ impl GrammarCallbacks for Component {
                 };
                 Ok(vec![insert_at_cursor(&ctx, link)])
             }
-            // OR.7c: the create row — mint the note, then link it.
+            // OR.7c / CD.6: the create row.
             //
-            // **Two effects, and the order is the safe one.** The write runs
-            // first and the link second, so the failure mode is a note with
-            // nothing pointing at it rather than a link pointing at nothing.
-            // Both are recoverable, but only one of them is VISIBLE: an orphan
-            // note is findable by `C-c n f` and readable on disk, while a
-            // broken `id:` link looks exactly like a working one until someone
-            // presses `<CR>` on it, possibly months later.
-            //
-            // This is the asymmetry `cross-file-writes.md` §8 reasons about in
-            // the opposite direction (there, the SOURCE must survive a failed
-            // insert); here nothing is being moved, so the question is only
-            // which artefact is better to be left holding.
-            ROAM_CREATE_AND_INSERT => {
-                let title = match &ctx.args {
-                    Args::String(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    _ => {
-                        return Ok(vec![Effect::Echo(EchoPayload {
-                            level: EchoLevel::Warn,
-                            text: "org-roam: a new note needs a title".to_string(),
-                        })]);
-                    }
-                };
-                let Some(dir) = roam_scan::roam_directory() else {
-                    return Ok(vec![Effect::Echo(EchoPayload {
-                        level: EchoLevel::Warn,
-                        text: "org-roam: set `org.roam-directory` first".to_string(),
-                    })]);
-                };
-                let id = match host_services::new_uuid() {
-                    Ok(id) => id,
-                    // Refuses rather than degrades, for `:org-roam-create-node`'s
-                    // reason: the id is written into a file and outlives the
-                    // session, and an empty one is worse than no note.
-                    Err(error) => {
-                        return Ok(vec![Effect::Echo(EchoPayload {
-                            level: EchoLevel::Error,
-                            text: format!("org-roam: cannot mint an id: {error}"),
-                        })]);
-                    }
-                };
-                let path = roam_new_note_path(&dir, &title);
-                let link = format!("[[id:{id}][{title}]]");
-                Ok(vec![
-                    Effect::WriteToFile(WriteToFilePayload {
-                        path,
-                        anchor: lattice::plugin_host::types::FileAnchor::End,
-                        text: roam_find::new_node_text(&id, &title),
-                        cut: None,
-                        // The roam directory is the user's own configured
-                        // path; a missing one is worth saying, not papering
-                        // over.
-                        create_parents: false,
-                        // SAVED, unlike `:org-roam-create-node`'s. That one
-                        // opens the note in front of you, so the buffer is
-                        // yours to write; this one does not open anything —
-                        // you stay in the sentence you were writing — so an
-                        // unsaved buffer would be a file nobody is looking at
-                        // and the index could not see it either.
-                        save: true,
-                    }),
-                    insert_at_cursor(&ctx, &link),
-                ])
-            }
+            // With templates configured this is the ordinary roam create — the
+            // chooser, the questions, a draft — and the LINK is the draft's
+            // to write, when it commits, into the buffer the picker was opened
+            // from. Without templates it stays one step: write the stub and
+            // link it now, as before.
+            ROAM_CREATE_AND_INSERT => Ok(roam_create_and_insert(&ctx, doc)),
             // CD.5: an ex-command, so it is applied here rather than in
             // `apply_action`.
             CAPTURE_DRAFTS => Ok(capture_drafts_open()),
@@ -10636,16 +10842,20 @@ const fn lattice_clock_report_toggle() -> &'static str {
 /// literal `%U` is inserted as TEXT rather than being re-read as a placeholder,
 /// so user data never becomes template syntax.
 fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
-    let (title, key) = match &ctx.args {
+    use lattice::plugin_host::types::ArgValue;
+    let (title, key, minted) = match &ctx.args {
         Args::List(items) => match items.as_slice() {
-            [lattice::plugin_host::types::ArgValue::String(t), lattice::plugin_host::types::ArgValue::String(k)] => {
-                (t.trim().to_string(), k.clone())
+            [ArgValue::String(t), ArgValue::String(k)] => (t.trim().to_string(), k.clone(), None),
+            // CD.6: a create-and-insert minted its id before the chooser, and
+            // its caller waits under it.
+            [ArgValue::String(t), ArgValue::String(k), ArgValue::String(id)] => {
+                (t.trim().to_string(), k.clone(), Some(id.clone()))
             }
             _ => return roam_warn("org-roam: a template needs a title and a key"),
         },
         _ => return roam_warn("org-roam: a template needs a title and a key"),
     };
-    let id = match host_services::new_uuid() {
+    let id = match minted.map(Ok).unwrap_or_else(host_services::new_uuid) {
         Ok(id) => id,
         // Refuses rather than degrades, for `:org-roam-create-node`'s reason:
         // an `:ID:` outlives the session, so an empty one is worse than no note.
@@ -10668,8 +10878,7 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
             // cannot conjure a question out of user data), so the questions
             // extracted from it are exactly the ones left to ask.
             let questions = capture_flow::questions(&draft.body);
-            // CD.4: no caller yet — a roam create returning to where it was
-            // fired from is CD.6 / CD.7's.
+            // The caller, if any, is claimed by id when the draft opens.
             start_question_flow(QuestionFlowKind::Roam { title, key, id }, questions, None)
         }
         Ok(draft) => draft.open(),
@@ -10679,6 +10888,8 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
 /// A roam note resolved far enough to know where it goes and what it says.
 struct RoamDraft {
     key: String,
+    /// The minted node id — CD.6's token for claiming a waiting caller.
+    id: String,
     title: String,
     dest: CaptureDestination,
     body: String,
@@ -10696,7 +10907,9 @@ impl RoamDraft {
                 label: format!("roam: {}", self.title),
                 key: self.key,
                 title: self.title,
-                caller: None,
+                // CD.6: a create-and-insert left its caller under this id.
+                // Any other create finds nothing and has no caller.
+                caller: claim_pending_caller(&self.id),
             },
             self.dest,
             &self.body,
@@ -10797,6 +11010,7 @@ fn roam_draft(
             && entered.is_empty()
             && !capture_flow::questions(&body).is_empty(),
         key: key.to_string(),
+        id: id.to_string(),
         title: title.to_string(),
         dest: CaptureDestination::roam(template, path, seed.as_deref()),
         body,
@@ -10822,7 +11036,10 @@ fn roam_warn(text: &str) -> Vec<Effect> {
 ///
 /// (This paragraph sat, orphaned, above `roam_note_filename` until CT.8
 /// removed that function — rustdoc had been attaching it to the wrong item.)
-fn roam_template_menu(title: &str) -> Result<lattice::plugin_host::types::TransientSpec, String> {
+fn roam_template_menu(
+    title: &str,
+    id: Option<&str>,
+) -> Result<lattice::plugin_host::types::TransientSpec, String> {
     use lattice::plugin_host::types::{
         ArgValue, Args as WitArgs, TransientAction, TransientGroup, TransientItem,
         TransientItemKind, TransientSpec,
@@ -10846,10 +11063,13 @@ fn roam_template_menu(title: &str) -> Result<lattice::plugin_host::types::Transi
             description: String::new(),
             kind: TransientItemKind::Action(TransientAction {
                 command: "org-roam-create-from-template".to_string(),
-                args: WitArgs::List(vec![
-                    ArgValue::String(title.to_string()),
-                    ArgValue::String(t.key.clone()),
-                ]),
+                args: WitArgs::List(
+                    [Some(title), Some(t.key.as_str()), id]
+                        .into_iter()
+                        .flatten()
+                        .map(|s| ArgValue::String(s.to_string()))
+                        .collect(),
+                ),
             }),
         })
         .collect();
@@ -11061,7 +11281,16 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
                 items.as_slice()
             {
                 if kind == ORG_TRANSIENT_ROAM {
-                    return roam_template_menu(title);
+                    return roam_template_menu(title, None);
+                }
+            }
+            // CD.6: a create-and-insert's chooser also carries the id it
+            // minted, which its caller is waiting under.
+            if let [lattice::plugin_host::types::ArgValue::String(kind), lattice::plugin_host::types::ArgValue::String(title), lattice::plugin_host::types::ArgValue::String(id)] =
+                items.as_slice()
+            {
+                if kind == ORG_TRANSIENT_ROAM {
+                    return roam_template_menu(title, Some(id));
                 }
             }
         }

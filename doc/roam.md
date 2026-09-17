@@ -172,6 +172,40 @@ snapshot and yours to edit; the `id:` is what keeps resolving after a rename.
 The source registers as `gen:org-roam-node`, so
 `:set completion.source.gen:org-roam-node.priority=…` moves it in the list.
 
+### From a picker: `C-c n i`
+
+`C-c n i` in Insert mode opens a picker over every node. Choosing one inserts
+its link at the cursor, and you carry on typing. Use it when you do not
+remember the title well enough for completion.
+
+**Select text first** and `C-c n i` in Visual mode opens the picker already
+searching for that text. The link then **replaces** the selection, which is
+org-roam's `org-roam-node-insert` with an active region. Select a phrase in
+your prose and it becomes a link.
+
+While you have typed something, the picker offers `Create and link: <title>`
+as its last row. With `org.roam-capture-templates` set, that row starts an
+ordinary note capture: the template menu, its questions, a draft. The link is
+**not** inserted yet; it is written into your text when you file the draft
+with `C-c C-c`, at the place you started from, and you are returned there.
+Throw the draft away with `C-c C-k` and no link is written.
+
+That makes notes **nest**. Inside a draft, `C-c n i` → create starts another
+draft whose link goes into the first, and so on as deep as you like. Each draft
+remembers its own caller, so you can file them in any order, leave one open
+and come back to it later, and the caller can be any buffer, not just an org
+file.
+
+Two things can happen to the caller while a draft is open:
+
+- **It got shorter.** The link goes to the nearest place that still exists,
+  such as the end of a line you shortened, rather than being lost.
+- **It was closed.** The note is still filed, and the message says the link
+  had nowhere to go and shows it, so you can paste it yourself.
+
+Without templates, `Create and link` stays a single step: the note is written
+from the built-in stub, saved, and linked at once.
+
 ### Following a link
 
 `<CR>` on an `[[id:…]]` link jumps to the node — file **and** line.
@@ -405,6 +439,7 @@ Everything here works in any buffer unless the entry says otherwise.
 | `<leader>ondt` | `C-c ndt` | `:org-roam-dailies-tomorrow` | tomorrow's |
 | `<leader>ondD` | `C-c ndD` | `:org-roam-dailies-goto-date` | a date you are asked for |
 | `<leader>oC` | | `:org-capture-drafts` | reopen a kept capture or note draft |
+| `C-c n i` | `C-c n i` | `:org-roam-insert-node` | pick a note and link it at the cursor — Insert mode; in Visual, the selection becomes the link |
 | | | `:org-roam-create-node <title>` | create and open a note |
 | | | `:org-roam-id-create` | `:ID:` for the headline at point — in an org file |
 | | | `:org-roam-backlinks` | what links to the node at point — in an org file |

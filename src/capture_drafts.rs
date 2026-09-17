@@ -131,6 +131,51 @@ pub fn is_under(path: &str, dir: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// CD.6: where `:org-roam-insert-node` leaves the buffer and range it was
+/// started from, for its create row to pick up.
+///
+/// **One slot, overwritten by every open.** The picker seam has no cursor and
+/// no document, so the origin has to be recorded when the picker OPENS; opening
+/// is the one step certain to come before any accept, so an overwrite there can
+/// never hand a later accept a stale origin. In the store rather than a guest
+/// `thread_local`, because a guest's memory is per seam.
+pub const PENDING_ORIGIN: &str = "capture-origin";
+
+/// CD.6: callers waiting for the roam draft that will claim them, keyed by the
+/// node id minted for it.
+///
+/// Keyed by id, not a single slot, because the template chooser and the
+/// questions sit between minting the id and opening the draft, and either can
+/// be abandoned with `<Esc>`, which tells the guest nothing. An abandoned
+/// create leaves an entry under an id no draft will ever present, so it is
+/// inert rather than stale: a later, unrelated capture cannot claim it. Not
+/// under [`STATE_PREFIX`], so the drafts picker never lists one.
+pub const PENDING_CALLER_PREFIX: &str = "capture-caller/";
+
+/// The store key for the caller waiting on node `id`.
+pub fn pending_caller_key(id: &str) -> String {
+    format!("{PENDING_CALLER_PREFIX}{id}")
+}
+
+/// CD.6: selected text as a picker query — one line, runs of whitespace
+/// collapsed, as org-roam trims the region it passes to `completing-read`.
+pub fn region_query(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// CD.6: the byte just past the character that starts at `byte` in `line`.
+///
+/// Visual mode's region is inclusive — the character under the cursor is
+/// selected — while an edit range is `[start, end)`. At or past the end of the
+/// line there is no character to include, so `byte` is returned unchanged.
+pub fn past_char(line: &str, byte: u32) -> u32 {
+    let at = byte as usize;
+    match line.get(at..).and_then(|rest| rest.chars().next()) {
+        Some(c) => (at + c.len_utf8()) as u32,
+        None => byte,
+    }
+}
+
 /// A range in the caller's buffer — `Range`'s shape, owned and serializable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
@@ -263,6 +308,30 @@ mod tests {
         };
         let back: Caller = decode(&encode(&caller).unwrap()).unwrap();
         assert_eq!(back, caller);
+    }
+
+    #[test]
+    fn a_region_becomes_a_one_line_query() {
+        assert_eq!(region_query("  Rust\n  Async  "), "Rust Async");
+        assert_eq!(region_query(""), "");
+    }
+
+    /// The inclusive end of a Visual region, made exclusive — by a whole
+    /// character, which is not always one byte.
+    #[test]
+    fn past_char_steps_over_one_character() {
+        assert_eq!(past_char("abc", 1), 2);
+        assert_eq!(past_char("aé", 1), 3, "é is two bytes");
+        assert_eq!(past_char("abc", 3), 3, "at the end: nothing to include");
+        assert_eq!(past_char("abc", 9), 9, "past it: unchanged");
+        assert_eq!(past_char("aé", 2), 2, "inside a character: unchanged");
+    }
+
+    /// The pending-caller keys cannot be mistaken for a capture's state.
+    #[test]
+    fn pending_keys_are_outside_the_drafts_prefix() {
+        assert!(!pending_caller_key("ABC").starts_with(STATE_PREFIX));
+        assert!(!PENDING_ORIGIN.starts_with(STATE_PREFIX));
     }
 
     #[test]

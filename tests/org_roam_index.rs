@@ -3195,12 +3195,22 @@ fn settle_budget(base: usize) -> usize {
 
 // ── CD.6: `C-c n i` → create opens a child capture ─────────────────────────
 
-/// One template, no questions: the draft opens straight away.
+/// Templates with no questions, so a draft opens straight away. `d` is a new
+/// note; `o` places `${origin}` itself (CD.7); `s` files into `shared.org`,
+/// which a test creates first, so its draft carries no `:ID:`.
 const CD6_TEMPLATES: &str = concat!(
     "[[template]]\n",
     "key = \"d\"\n",
     "target = { kind = \"file\", file = \"${slug}.org\" }\n",
     "body = \"#+title: ${title}\\n\\n%?\"\n",
+    "[[template]]\n",
+    "key = \"o\"\n",
+    "target = { kind = \"file\", file = \"${slug}.org\" }\n",
+    "body = \"#+title: ${title}\\nFrom: ${origin}\\n%?\"\n",
+    "[[template]]\n",
+    "key = \"s\"\n",
+    "target = { kind = \"file\", file = \"shared.org\" }\n",
+    "body = \"* ${title}\\n%?\"\n",
 );
 
 fn pos(line: u32, byte: u32) -> lattice_protocol::position::Position {
@@ -3301,9 +3311,14 @@ async fn accept_create_row(editor: &mut Editor) {
 
 /// Pick template `d`, and return the draft that opened.
 async fn pick_d(editor: &mut Editor) -> lattice_core::BufferId {
+    pick(editor, "d").await
+}
+
+/// Pick template `key`, and return the draft that opened.
+async fn pick(editor: &mut Editor, key: &str) -> lattice_core::BufferId {
     let before = roam_drafts_open(editor);
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
-    editor.do_transient_trigger("d".to_string(), &mut out);
+    editor.do_transient_trigger(key.to_string(), &mut out);
     apply_accept_effects(editor, out);
     for _ in 0..settle_budget(80) {
         editor.run_tick_pending();
@@ -3423,6 +3438,11 @@ async fn nested_creates_link_back_into_each_caller() {
         roam_drafts_open(&editor).is_empty(),
         "no draft is left open"
     );
+    // CD.7: `C-c n i` makes exactly one link, the forward one.
+    for slug in ["zq_mango", "zq_kiwi", "zq_plum"] {
+        let text = note(&corpus, slug).unwrap();
+        assert!(!text.contains("Reference:"), "{slug}: {text:?}");
+    }
 }
 
 /// **Any order.** Two children of one caller, committed oldest first — a
@@ -3662,4 +3682,187 @@ async fn without_templates_create_and_insert_is_one_step() {
         .filter_map(|e| e.ok())
         .any(|e| e.file_name().to_string_lossy().ends_with("zq_quince.org"));
     assert!(written, "and the stub is on disk");
+}
+
+// ── CD.7: `${origin}`, the reference back ──────────────────────────────────
+
+/// The `:ID:` in a draft's file-level drawer.
+fn draft_id(text: &str) -> String {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix(":ID:"))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| panic!("the draft has an :ID:: {text:?}"))
+}
+
+/// `C-c n f`, the create row for `title`, then template `key`.
+async fn find_create(editor: &mut Editor, title: &str, key: &str) -> lattice_core::BufferId {
+    let _ = open_find_node(editor).await;
+    let rows = query_picker(editor, title);
+    assert_eq!(rows, vec![format!("Create note: {title}")], "{rows:?}");
+    let out = editor.do_picker_accept();
+    apply_accept_effects(editor, out);
+    settle_chooser(editor).await;
+    pick(editor, key).await
+}
+
+/// **Created inside a capture**, a note links back to it, the caller gets no
+/// link, and filing returns to the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_created_inside_a_capture_references_it() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, _page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let parent = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Parent").await;
+    let parent_id = draft_id(&buffer_text(&editor, parent));
+    let before = buffer_text(&editor, parent);
+
+    let _nut = find_create(&mut editor, "Zq Nut", "d").await;
+    finalize_roam_capture(&mut editor).await;
+
+    assert_eq!(
+        editor.document_buffer_id, parent,
+        "back to the capture it came from"
+    );
+    assert_eq!(
+        buffer_text(&editor, parent),
+        before,
+        "no link written into it"
+    );
+    let nut = note(&corpus, "zq_nut").expect("filed");
+    assert!(
+        nut.contains(&format!("Reference: [[id:{parent_id}][Zq Parent]]")),
+        "the note links back by the parent's id: {nut:?}"
+    );
+}
+
+/// **A template that names `${origin}`** gets it there, and no extra line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_template_places_origin_itself() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, _page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let parent = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Parent").await;
+    let parent_id = draft_id(&buffer_text(&editor, parent));
+    let _hazel = find_create(&mut editor, "Zq Hazel", "o").await;
+    finalize_roam_capture(&mut editor).await;
+
+    let hazel = note(&corpus, "zq_hazel").expect("filed");
+    assert!(
+        hazel.contains(&format!("From: [[id:{parent_id}][Zq Parent]]")),
+        "{hazel:?}"
+    );
+    assert!(!hazel.contains("Reference:"), "not twice: {hazel:?}");
+}
+
+/// **A parent with no `:ID:`** is referenced by the file it will be filed
+/// into — and nothing is written into the parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parent_without_an_id_is_referenced_by_its_target() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    std::fs::create_dir_all(&corpus).unwrap();
+    std::fs::write(corpus.join("shared.org"), "#+title: Shared\n").unwrap();
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    // Into an existing file: the draft gets no `:ID:`.
+    focus(&mut editor, page);
+    let parent = find_create(&mut editor, "Zq Shared Entry", "s").await;
+    let before = buffer_text(&editor, parent);
+    assert!(!before.contains(":ID:"), "{before:?}");
+
+    let _oak = find_create(&mut editor, "Zq Oak", "d").await;
+    finalize_roam_capture(&mut editor).await;
+
+    assert_eq!(editor.document_buffer_id, parent);
+    assert_eq!(
+        buffer_text(&editor, parent),
+        before,
+        "the parent is untouched"
+    );
+    let oak = note(&corpus, "zq_oak").expect("filed");
+    let shared = corpus.join("shared.org");
+    assert!(
+        oak.contains(&format!(
+            "Reference: [[file:{}][Zq Shared Entry]]",
+            shared.display()
+        )),
+        "{oak:?}"
+    );
+}
+
+/// **The option off**: no reference anywhere, and `${origin}` is empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_option_off_there_is_no_reference() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, _page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    editor
+        .config
+        .parse_and_set_command("org.roam-capture-reference-origin=false")
+        .expect("the option is registered");
+
+    let _parent = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Parent").await;
+    let _nut = find_create(&mut editor, "Zq Nut", "d").await;
+    finalize_roam_capture(&mut editor).await;
+    let _hazel = find_create(&mut editor, "Zq Hazel", "o").await;
+    finalize_roam_capture(&mut editor).await;
+
+    let nut = note(&corpus, "zq_nut").unwrap();
+    assert!(
+        !nut.contains("Reference:") && !nut.contains("Zq Parent"),
+        "{nut:?}"
+    );
+    let hazel = note(&corpus, "zq_hazel").unwrap();
+    assert!(
+        hazel.contains("From: \n"),
+        "`${{origin}}` is empty: {hazel:?}"
+    );
+}
+
+/// **Not inside a capture**: no caller, no reference, and filing shows the
+/// note — org-roam's `find-file` finalize.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_created_elsewhere_is_opened_when_filed() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let _walnut = find_create(&mut editor, "Zq Walnut", "d").await;
+    finalize_roam_capture(&mut editor).await;
+    drain(&mut editor).await;
+
+    let active = editor
+        .buffers
+        .document_path(editor.document_buffer_id)
+        .unwrap_or_default();
+    assert!(
+        active.ends_with("zq_walnut.org"),
+        "the filed note is in front: {}",
+        active.display()
+    );
+    let walnut = note(&corpus, "zq_walnut").unwrap();
+    assert!(!walnut.contains("Reference:"), "{walnut:?}");
+    assert_eq!(buffer_text(&editor, page), "top: \n");
 }

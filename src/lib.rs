@@ -1576,6 +1576,17 @@ impl Guest for Component {
              `capture-file`. With none of those set a capture still works but \
              cannot be saved as a draft.",
         );
+        // CD.7: org-roam's reference back to the capture a note was started
+        // from, for the verbs that write no link into it.
+        let _ = register_option(
+            "roam-capture-reference-origin",
+            OptionType::Boolean,
+            "true",
+            "When a roam note is created from inside another capture (`C-c n f` \
+             → create in a draft), give the new note a link back to that \
+             capture: where its template says `${origin}`, else on a \
+             `Reference:` line at the end.",
+        );
         let _ = register_option(
             "capture-template",
             OptionType::String,
@@ -4374,6 +4385,11 @@ struct CaptureState {
     /// The draft file. Recorded rather than re-derived, so changing the
     /// drafts directory mid-capture does not orphan this one.
     draft: String,
+    /// CD.7: the file to open once this capture is filed, for a capture with
+    /// no caller — org-roam's `:finalize find-file`: a note you created is
+    /// shown to you. `default` so a state recorded before CD.7 still reads.
+    #[serde(default)]
+    open_on_commit: Option<String>,
 }
 
 /// OC.7b / OR.11b: what `C-c C-c` needs that the buffer cannot tell it.
@@ -4625,6 +4641,7 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
                     title: String::new(),
                     label: template.description.clone(),
                     caller,
+                    open_on_commit: None,
                 },
                 dest,
                 &template.body,
@@ -5745,6 +5762,7 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
             title: String::new(),
             label: template.description.clone(),
             caller,
+            open_on_commit: None,
         },
         dest,
         &template.body,
@@ -5814,6 +5832,7 @@ fn open_capture_buffer(
         label: draft.label,
         caller: draft.caller,
         draft: path.clone(),
+        open_on_commit: draft.open_on_commit,
     };
     // Recorded BEFORE the buffer opens: `C-c C-c` finds its destination here,
     // by the draft's path, and a buffer with no state behind it could never be
@@ -5864,6 +5883,8 @@ struct DraftSpec {
     title: String,
     label: String,
     caller: Option<capture_drafts::Caller>,
+    /// CD.7: see [`CaptureState::open_on_commit`].
+    open_on_commit: Option<String>,
 }
 
 thread_local! {
@@ -6608,6 +6629,20 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
             args: Args::String(id),
         },
     ));
+    // CD.7: no caller — show what was filed (org-roam's `find-file`).
+    if state.caller.is_none() {
+        if let Some(path) = &state.open_on_commit {
+            effects.push(Effect::OpenBufferAt(
+                lattice::plugin_host::types::OpenBufferAtPayload {
+                    path: Some(path.clone()),
+                    position: Position { line: 0, byte: 0 },
+                    force: false,
+                    content: None,
+                    activate_minor: None,
+                },
+            ));
+        }
+    }
     // Last, so nothing the close or the cleanup says hides it.
     effects.extend(closed);
     effects
@@ -6739,12 +6774,90 @@ fn take_pending_origin() -> Option<capture_drafts::Caller> {
     capture_drafts::decode(&bytes)
 }
 
-/// CD.6: the caller waiting for node `id`, taken.
-fn claim_pending_caller(id: &str) -> Option<capture_drafts::Caller> {
-    let key = capture_drafts::pending_caller_key(id);
-    let bytes = host_services::store_get(&key)?;
-    let _ = host_services::store_delete(&key);
+/// CD.6: what a create parked for node `id`, left in place.
+fn peek_pending(id: &str) -> Option<capture_drafts::Pending> {
+    let bytes = host_services::store_get(&capture_drafts::pending_caller_key(id))?;
     capture_drafts::decode(&bytes)
+}
+
+/// CD.6: what a create parked for node `id`, taken.
+fn claim_pending(id: &str) -> Option<capture_drafts::Pending> {
+    let found = peek_pending(id);
+    let _ = host_services::store_delete(&capture_drafts::pending_caller_key(id));
+    found
+}
+
+/// CD.6 / CD.7: park `pending` for the draft of node `id`, after clearing
+/// what abandoned creates left behind.
+///
+/// Any entry still parked belongs to a create abandoned at the chooser or a
+/// question — `<Esc>` there tells the guest nothing. Only one create runs its
+/// chooser at a time, so clearing them here is safe, and it keeps the store
+/// from collecting them.
+fn park_pending(id: &str, pending: &capture_drafts::Pending) -> Result<(), String> {
+    for key in host_services::store_keys(capture_drafts::PENDING_CALLER_PREFIX) {
+        let _ = host_services::store_delete(&key);
+    }
+    let bytes = capture_drafts::encode(pending).ok_or_else(|| "could not encode".to_string())?;
+    host_services::store_put(&capture_drafts::pending_caller_key(id), &bytes)
+}
+
+/// The roam template chooser for `title`, carrying `id` when a caller is
+/// parked under it.
+fn roam_chooser(title: &str, id: Option<&str>) -> Effect {
+    Effect::OpenTransient(lattice::plugin_host::types::OpenTransientPayload {
+        source: CAPTURE_TRANSIENT.to_string(),
+        args: Args::List(
+            [Some(ORG_TRANSIENT_ROAM), Some(title), id]
+                .into_iter()
+                .flatten()
+                .map(|s| lattice::plugin_host::types::ArgValue::String(s.to_string()))
+                .collect(),
+        ),
+    })
+}
+
+/// CD.7 — a roam create with templates: the chooser, and — when it was started
+/// inside a capture draft — a caller that returns there and a reference back
+/// to it.
+///
+/// "Inside a capture" is the buffer being a live capture (its path names one
+/// and the store has its state), not carried state. From anywhere else there
+/// is no caller, and filing shows the new note.
+fn roam_create_from_capture(ctx: &ExCommandContext, doc: &Document, title: &str) -> Vec<Effect> {
+    let Some((_, parent)) = capture_state_of(doc) else {
+        return vec![roam_chooser(title, None)];
+    };
+    let id = match host_services::new_uuid() {
+        Ok(id) => id,
+        Err(error) => {
+            return vec![Effect::Echo(EchoPayload {
+                level: EchoLevel::Error,
+                text: format!("org-roam: cannot mint an id: {error}"),
+            })];
+        }
+    };
+    let lines: Vec<String> = (0..doc.line_count()).filter_map(|n| doc.line(n)).collect();
+    let reference = capture_drafts::origin_reference(
+        lines.iter().map(String::as_str),
+        &parent.dest.target.resolved_file(),
+        parent.label.trim_start_matches("roam: "),
+    );
+    let pending = capture_drafts::Pending {
+        caller: capture_drafts::Caller {
+            buffer: ctx.buffer_id,
+            path: doc.path(),
+            at: capture_drafts::Span::at(ctx.cursor.line, ctx.cursor.byte),
+            on_commit: None,
+        },
+        reference: Some(reference),
+    };
+    if let Err(reason) = park_pending(&id, &pending) {
+        return roam_warn(&format!(
+            "org-roam: cannot record the capture this note comes from ({reason}); nothing was created"
+        ));
+    }
+    vec![roam_chooser(title, Some(&id))]
 }
 
 /// CD.6 — the insert picker's create row.
@@ -6810,40 +6923,22 @@ fn roam_create_and_insert(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect>
         return effects;
     }
 
-    // Any caller still waiting belongs to a create that was abandoned at the
-    // chooser or a question — `<Esc>` there says nothing to the guest. Only one
-    // create runs its chooser at a time, so clearing them here is safe, and it
-    // keeps the store from collecting them.
-    for key in host_services::store_keys(capture_drafts::PENDING_CALLER_PREFIX) {
-        let _ = host_services::store_delete(&key);
-    }
-    let caller = capture_drafts::Caller {
-        on_commit: Some(link),
-        ..origin
+    // CD.7: no back-reference — the forward link is this verb's one link.
+    let pending = capture_drafts::Pending {
+        caller: capture_drafts::Caller {
+            on_commit: Some(link),
+            ..origin
+        },
+        reference: None,
     };
-    let recorded = capture_drafts::encode(&caller)
-        .ok_or_else(|| "could not encode".to_string())
-        .and_then(|bytes| {
-            host_services::store_put(&capture_drafts::pending_caller_key(&id), &bytes)
-        });
-    if let Err(reason) = recorded {
+    if let Err(reason) = park_pending(&id, &pending) {
         // Refused: a create that could not remember where its link goes would
         // file a note and silently link nothing.
         return roam_warn(&format!(
             "org-roam: cannot record where the link goes ({reason}); nothing was created"
         ));
     }
-    vec![Effect::OpenTransient(
-        lattice::plugin_host::types::OpenTransientPayload {
-            source: CAPTURE_TRANSIENT.to_string(),
-            args: Args::List(
-                [ORG_TRANSIENT_ROAM, title.as_str(), id.as_str()]
-                    .into_iter()
-                    .map(|s| lattice::plugin_host::types::ArgValue::String(s.to_string()))
-                    .collect(),
-            ),
-        },
-    )]
+    vec![roam_chooser(&title, Some(&id))]
 }
 
 /// OC.7b — `C-c C-k`: throw the capture away.
@@ -9472,19 +9567,7 @@ impl GrammarCallbacks for Component {
                             text: e.message_for(capture_templates::TemplateList::Roam),
                         })]);
                     }
-                    Ok(_) => {
-                        return Ok(vec![Effect::OpenTransient(
-                            lattice::plugin_host::types::OpenTransientPayload {
-                                source: CAPTURE_TRANSIENT.to_string(),
-                                args: Args::List(vec![
-                                    lattice::plugin_host::types::ArgValue::String(
-                                        ORG_TRANSIENT_ROAM.to_string(),
-                                    ),
-                                    lattice::plugin_host::types::ArgValue::String(title),
-                                ]),
-                            },
-                        )]);
-                    }
+                    Ok(_) => return Ok(roam_create_from_capture(&ctx, doc, &title)),
                 }
                 let id = match host_services::new_uuid() {
                     Ok(id) => id,
@@ -10901,15 +10984,20 @@ struct RoamDraft {
 
 impl RoamDraft {
     fn open(self) -> Vec<Effect> {
+        // CD.6 / CD.7: a create started from a buffer that wants it back left
+        // its caller under this id. Any other create finds nothing, has no
+        // caller, and shows the note once it is filed (org-roam's
+        // `find-file` finalize).
+        let caller = claim_pending(&self.id).map(|p| p.caller);
+        let open_on_commit = caller.is_none().then(|| self.dest.target.resolved_file());
         open_capture_buffer(
             DraftSpec {
                 prefix: "org-roam-capture",
                 label: format!("roam: {}", self.title),
                 key: self.key,
                 title: self.title,
-                // CD.6: a create-and-insert left its caller under this id.
-                // Any other create finds nothing and has no caller.
-                caller: claim_pending_caller(&self.id),
+                caller,
+                open_on_commit,
             },
             self.dest,
             &self.body,
@@ -10968,10 +11056,27 @@ fn roam_draft(
         return Err(roam_warn(&format!("org-roam: no template `{key}`")));
     };
     let slug = roam_find::slug(title);
+    // CD.7: the back-reference, when a create inside a capture parked one and
+    // the option is on. The body is built with a sentinel in its place, so
+    // whether the template placed it — in `body`, `body-file` or `head` — can
+    // be read off the result.
+    let reference = peek_pending(id).and_then(|p| p.reference).filter(|_| {
+        option_or("roam-capture-reference-origin", "true").eq_ignore_ascii_case("true")
+    });
     let node = roam_capture::Node {
         title,
         slug: &slug,
         id,
+        origin: if reference.is_some() {
+            capture_drafts::ORIGIN_SENTINEL
+        } else {
+            ""
+        },
+    };
+    // The PATH never carries the reference: a link is not a filename.
+    let path_node = roam_capture::Node {
+        origin: "",
+        ..node.clone()
     };
     let body = match roam_templates::resolve_body(template, &node, |path| {
         host_services::read_file(path).map_err(|_| ())
@@ -10980,12 +11085,26 @@ fn roam_draft(
         Err(message) => return Err(roam_warn(&format!("org-roam: {message}"))),
     };
     // CT.8: the target path, filled and made absolute — org-roam's order.
-    let path = roam_templates::target_path(template.target.file(), &node, now_when(), &dir);
+    let path = roam_templates::target_path(template.target.file(), &path_node, now_when(), &dir);
     // Whether this capture CREATES the file decides whether the head and the
     // `:ID:` are written — org-roam's `new-file-p`. A read that fails is a file
     // that does not exist yet, which is the ordinary case for a new note.
     let is_new_file = host_services::read_file(&path).is_err();
     let body = roam_templates::draft_text(template, &node, &body, id, is_new_file);
+    let body = match &reference {
+        None => body,
+        Some(link) if body.contains(capture_drafts::ORIGIN_SENTINEL) => {
+            body.replace(capture_drafts::ORIGIN_SENTINEL, link)
+        }
+        Some(link) => {
+            let mut body = body;
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&format!("Reference: {link}\n"));
+            body
+        }
+    };
     // The seed's body, `${…}` filled over the same node. The seed is validated
     // to exist when the set was read, so a miss here is the option changing
     // between hops — refused, as a missing `key` is above.

@@ -42,6 +42,9 @@ pub struct Node<'a> {
     pub slug: &'a str,
     /// The freshly-minted `:ID:`.
     pub id: &'a str,
+    /// CD.7: a link back to the capture this note was started from, or empty
+    /// when there is none (or the option is off).
+    pub origin: &'a str,
 }
 
 /// Expand `${title}` / `${slug}` / `${id}` in `body`.
@@ -71,6 +74,7 @@ pub fn expand_fields(body: &str, node: &Node<'_>) -> String {
             "title" => out.push_str(node.title),
             "slug" => out.push_str(node.slug),
             "id" => out.push_str(node.id),
+            "origin" => out.push_str(node.origin),
             // Verbatim, braces included — see the module note.
             _ => {
                 out.push_str("${");
@@ -89,7 +93,29 @@ mod tests {
     use super::*;
 
     fn node<'a>(title: &'a str, slug: &'a str, id: &'a str) -> Node<'a> {
-        Node { title, slug, id }
+        Node {
+            title,
+            slug,
+            id,
+            origin: "",
+        }
+    }
+
+    /// CD.7: `${origin}` is the reference it was given, and empty without one.
+    #[test]
+    fn origin_expands_to_the_reference() {
+        let with = Node {
+            origin: "[[id:P][Parent]]",
+            ..node("T", "t", "I")
+        };
+        assert_eq!(
+            expand_fields("From: ${origin}", &with),
+            "From: [[id:P][Parent]]"
+        );
+        assert_eq!(
+            expand_fields("From: ${origin}", &node("T", "t", "I")),
+            "From: "
+        );
     }
 
     #[test]
@@ -295,6 +321,7 @@ mod ensure_id_tests {
                 title: "T",
                 slug: "t",
                 id: "ABC",
+                origin: "",
             },
         );
         let out = ensure_id(&expanded, "ABC");

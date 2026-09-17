@@ -145,7 +145,12 @@ mod tests {
     }
 
     fn node<'a>(title: &'a str, slug: &'a str, id: &'a str) -> crate::roam_capture::Node<'a> {
-        crate::roam_capture::Node { title, slug, id }
+        crate::roam_capture::Node {
+            title,
+            slug,
+            id,
+            origin: "",
+        }
     }
 
     /// 2026-09-16 14:05:09 local.

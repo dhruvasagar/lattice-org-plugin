@@ -172,6 +172,33 @@ snapshot and yours to edit; the `id:` is what keeps resolving after a rename.
 The source registers as `gen:org-roam-node`, so
 `:set completion.source.gen:org-roam-node.priority=…` moves it in the list.
 
+### Notes started inside a capture
+
+Start a note with `C-c n f` → create while you are writing another capture,
+and the two are connected by **one** link, in the direction that fits:
+
+- `C-c n i` → create links **forward**: the link goes into the capture you
+  were writing (below).
+- `C-c n f` → create links **back**: the new note gets a link to the capture
+  you were writing, and nothing is written into that capture. Filing the new
+  note returns you to it.
+
+The link back goes where the template says `${origin}`. A template that does
+not mention it gets a `Reference: <link>` line at the end instead. What it
+points at:
+
+| The capture you were writing | `${origin}` |
+|---|---|
+| a new roam note (it has an `:ID:`) | `[[id:…][its title]]`, which keeps working once that note is filed |
+| anything else | `[[file:…][its title]]` to the file it will be filed into. Its draft file is deleted when it is filed, so a link to the draft would break |
+
+No `:ID:` is ever added to the capture you were writing, and nothing in it
+changes. `org.roam-capture-reference-origin = false` turns the link back off;
+`${origin}` is then empty.
+
+Started anywhere other than a capture, a new note has no link back, and filing
+it opens it, as `org-roam-node-find` does in emacs.
+
 ### From a picker: `C-c n i`
 
 `C-c n i` in Insert mode opens a picker over every node. Choosing one inserts
@@ -344,6 +371,7 @@ path and a `body-file` path:
 | `${title}` | the title you typed |
 | `${slug}` | its slug: `rust_async` |
 | `${id}` | the minted id |
+| `${origin}` | a link back to the capture this note was started from, or nothing (see [Notes started inside a capture](#notes-started-inside-a-capture)) |
 
 The `%` placeholders fill in the *capture context* and `${}` fills in the
 *node*, which is why the two syntaxes live side by side. An unknown `${x}` is
@@ -385,7 +413,7 @@ cursor where `%?` was.
 
 | | |
 |---|---|
-| `C-c C-c` | file it: the note is written into its target and saved, and you return to where you were |
+| `C-c C-c` | file it: the note is written into its target and saved. Started inside another capture, you return there; started anywhere else, the new note is shown |
 | `C-c C-k` | throw it away. **Nothing is created, not even the id** |
 | `:w` | keep the draft to finish later |
 | `<leader>oC` | reopen a kept draft |
@@ -462,6 +490,7 @@ mounted after the editor started.
 | `org.roam-directory` | unset | where your notes live. `~` expanded. Unset means roam is inert |
 | `org.roam-dailies-directory` | `daily` | relative to `org.roam-directory` unless it starts with `/` |
 | `org.roam-capture-templates` | unset | what a new note starts as. Unset means the built-in stub and no menu |
+| `org.roam-capture-reference-origin` | `true` | give a note started inside another capture a link back to it |
 
 `:options org.roam-` lists them with their current values, which is more
 reliable than this table — it is generated from the plugin you actually have.

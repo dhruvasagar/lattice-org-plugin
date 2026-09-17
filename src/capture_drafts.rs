@@ -157,6 +157,80 @@ pub fn pending_caller_key(id: &str) -> String {
     format!("{PENDING_CALLER_PREFIX}{id}")
 }
 
+/// CD.6 / CD.7: what a create parks for the draft that will claim it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    /// Where the draft returns to, and what it writes there.
+    pub caller: Caller,
+    /// CD.7: a link back to the caller, for the new note's `${origin}` — set
+    /// only by the verbs that write nothing into the caller (design §8).
+    pub reference: Option<String>,
+}
+
+/// CD.7: what `${origin}` expands to while the draft is being built.
+///
+/// A placeholder rather than the link itself, so the build can tell whether
+/// the template placed the reference anywhere — in `body`, `body-file` or
+/// `head` alike — and append it only when it did not. Private-use characters,
+/// which no template contains.
+pub const ORIGIN_SENTINEL: &str = "\u{E000}origin\u{E000}";
+
+/// CD.7: the back-reference to a capture draft, from its text.
+///
+/// A draft whose file-level drawer carries an `:ID:` (a new roam note) is
+/// linked by id: the id resolves once the note is filed, wherever it lands.
+/// Any other draft is linked to `target`, the file it WILL be filed into. Its
+/// own file is deleted when it is filed, so a link to it — org's `%a` — would
+/// break the moment the parent is committed. Nothing is written into the
+/// parent either way; no id is minted for it.
+///
+/// The description is the draft's `#+title:`, else its first headline, else
+/// `fallback`.
+pub fn origin_reference<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    target: &str,
+    fallback: &str,
+) -> String {
+    let mut id = None;
+    let mut title = None;
+    let mut headline = None;
+    let mut in_drawer = false;
+    let mut seen_text = false;
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with('*') && t.trim_start_matches('*').starts_with(' ') {
+            headline = Some(t.trim_start_matches('*').trim().to_string());
+            break;
+        }
+        if t.eq_ignore_ascii_case(":PROPERTIES:") && !seen_text {
+            in_drawer = true;
+            continue;
+        }
+        if in_drawer {
+            if t.eq_ignore_ascii_case(":END:") {
+                in_drawer = false;
+            } else if let Some(rest) = t.strip_prefix(":ID:") {
+                id = Some(rest.trim().to_string()).filter(|v| !v.is_empty());
+            }
+            continue;
+        }
+        if !t.is_empty() {
+            seen_text = true;
+        }
+        // `get`, not indexing: byte 8 may fall inside a character.
+        if let (None, Some(key), Some(rest)) = (&title, t.get(..8), t.get(8..)) {
+            if key.eq_ignore_ascii_case("#+title:") {
+                title = Some(rest.trim().to_string()).filter(|v| !v.is_empty());
+            }
+        }
+    }
+    let name = title.or(headline).unwrap_or_else(|| fallback.to_string());
+    match id {
+        Some(id) => format!("[[id:{id}][{name}]]"),
+        None => format!("[[file:{target}][{name}]]"),
+    }
+}
+
 /// CD.6: selected text as a picker query — one line, runs of whitespace
 /// collapsed, as org-roam trims the region it passes to `completing-read`.
 pub fn region_query(text: &str) -> String {
@@ -325,6 +399,37 @@ mod tests {
         assert_eq!(past_char("abc", 3), 3, "at the end: nothing to include");
         assert_eq!(past_char("abc", 9), 9, "past it: unchanged");
         assert_eq!(past_char("aé", 2), 2, "inside a character: unchanged");
+    }
+
+    /// A new roam note's draft is referenced by the id it will keep.
+    #[test]
+    fn a_roam_draft_is_referenced_by_its_id() {
+        let text = ":PROPERTIES:\n:ID:       ABC-1\n:END:\n#+title: Parent\n\nbody\n";
+        assert_eq!(
+            origin_reference(text.lines(), "/org/x.org", "roam: Parent"),
+            "[[id:ABC-1][Parent]]"
+        );
+    }
+
+    /// A draft with no id is referenced by where it will be filed — never by
+    /// its own file, which is deleted when it is.
+    #[test]
+    fn a_draft_without_an_id_is_referenced_by_its_target() {
+        let text = "* TODO call the bank\n:PROPERTIES:\n:ID: not-file-level\n:END:\n";
+        assert_eq!(
+            origin_reference(text.lines(), "/org/inbox.org", "todo"),
+            "[[file:/org/inbox.org][TODO call the bank]]",
+            "a heading's drawer is not the file's"
+        );
+        assert_eq!(
+            origin_reference("".lines(), "/org/inbox.org", "todo"),
+            "[[file:/org/inbox.org][todo]]"
+        );
+        assert_eq!(
+            origin_reference("ééééé long line".lines(), "/o.org", "x"),
+            "[[file:/o.org][x]]",
+            "a multi-byte line does not panic"
+        );
     }
 
     /// The pending-caller keys cannot be mistaken for a capture's state.

@@ -248,146 +248,150 @@ writing the header onto a file that already has one.
 
 ## Templates
 
-Unset, creating a note writes the built-in stub above and asks nothing. That is
-the default on purpose — note creation has to work for someone who has never
-heard of templates.
+When templates are unset, creating a note writes the built-in stub above and
+asks nothing. That default is deliberate: note creation has to work for
+someone who has never heard of templates.
 
-Set `org.roam-capture-templates` and creating a note opens a **menu**, one key
-per template, the same shape `<leader>oc` uses for capture:
+Set `org.roam-capture-templates` and creating a note opens a **menu** instead,
+with one key per template, the same shape `<leader>oc` uses for capture:
 
 ```toml
-[org]
-roam-capture-templates = '''
-[[template]]
+[[org.roam-capture-templates]]
 key = "d"
 description = "default"
+target = { kind = "file", file = "%<%Y%m%d%H%M%S>-${slug}.org" }
 body = """
-:PROPERTIES:
-:ID:       ${id}
-:END:
 #+title: ${title}
 #+filetags: :note:
 
+%?
 """
 
-[[template]]
+[[org.roam-capture-templates]]
 key = "c"
 description = "concept"
-file = "${slug}.org"
+target = { kind = "file+head", file = "concepts/${slug}.org", head = "#+title: ${title}\n#+category: %^{Category}\n#+date: %U" }
 body = """
-:PROPERTIES:
-:ID:       ${id}
-:END:
-#+Title: ${title}
-#+category: %^{Category}
-#+date: %U
-
 * Summary
 %?
 """
-'''
 ```
 
-Roam templates are capture templates with one addition, and one subtraction.
+**A roam template is a capture template.** It has the same fields, the same
+target kinds, `type`, `body-file`, `seed`, and the same placeholders. The
+[capture documentation](help:org#templates) covers all of them. Roam differs in
+four places.
 
-**Added: `${…}`, which interpolates the node being created.**
+**`target` is required**, as it is in org-roam, which refuses a template
+without `:target`. Its `file` is where the note goes:
+
+- `${…}` and `%<fmt>` are filled in first.
+- A relative path is then taken as relative to `org.roam-directory`. An
+  absolute or `~/…` path is used as written.
+- `file = "%<%Y%m%d%H%M%S>-${slug}.org"` is org-roam's own default name.
+
+**Two more target kinds**, org-roam's:
+
+| `kind` | Fields | |
+|---|---|---|
+| `file+head` | `file`, `head`? | `file`, plus `head` written at the top **when the capture creates the file** |
+| `file+head+olp` | `file`, `olp`, `head`? | `file+olp`, with the same `head` rule |
+
+A capture into a file that already exists writes only the body; its head and
+`:ID:` are already there. Whether the file is new is decided when the draft
+opens, so the draft shows exactly what will be written. The capture list
+refuses both kinds by name, because `org-capture` has neither.
+
+**`${…}` fills in the node being created**, in the body, the head, the target
+path and a `body-file` path:
 
 | | |
 |---|---|
 | `${title}` | the title you typed |
-| `${slug}` | its slug — `rust_async` |
+| `${slug}` | its slug: `rust_async` |
 | `${id}` | the minted id |
 
-**Removed: `target`.** A capture template says *where* its text lands; a roam
-note's destination is a file that does not exist yet, named after the node
-being made. So there is no `target`, and an optional `file` names the note's
-**filename** instead — `${…}` expands there too. Absent, the timestamped
-default is used.
+The `%` placeholders fill in the *capture context* and `${}` fills in the
+*node*, which is why the two syntaxes live side by side. An unknown `${x}` is
+left alone, for the same reason an unknown `%x` is: the template is your text,
+and a placeholder that silently vanished could not be found and fixed. In a
+roam template, `%a` expands to nothing, because a new note has no buffer to
+link back to. `%^{…}` questions are asked before the draft opens, one prompt
+each, in template order.
 
-**`body-file` reads the body from a FILE**, emacs org-roam's
+**The `:ID:` is org-roam's job, not the template's.** A new file always gets a
+`:PROPERTIES:` drawer with the minted id at the top, above the head. A template
+that already writes `:ID: ${id}` is left as it is. So a template may have no
+`body` at all: a head alone is a complete note, and an empty body works as
+`%?`, as in emacs.
+
+`body-file` reads the body from a file, which is emacs org-roam's
 `(file "…/template.org")`:
 
 ```toml
-[[template]]
+[[org.roam-capture-templates]]
 key = "c"
 description = "concept"
+target = { kind = "file", file = "${slug}.org" }
 body-file = "~/org-files/roam/templates/pkos-concept.org"
 ```
 
-`body` and `body-file` are mutually exclusive — setting both skips the
-template and names it in the menu footer, the same way a duplicate key or a
-missing body does. `~` is expanded, and `${…}` expands on the PATH too, not
-just the text it names — the same as `file` above. Useful if you keep your
-templates as org files you edit directly (in emacs or in lattice) and do not
-want to keep a second, inlined copy in `init.rs` that drifts the moment either
-one changes.
-
-A `body-file` that names a path you cannot read — missing, permissions, a typo
-— skips the same way: the create stops with a message naming the template and
-the path, and nothing is written. This needs no capability beyond what
-archiving and capture already ask for: `fs:write:<prefix>` also permits
-reading under `<prefix>`, so a template file inside your `fs:write` grant is
-readable without a separate `fs:read:` entry. A template file OUTSIDE every
-granted prefix gets the same skip a missing file would.
-
-The two syntaxes answer different questions — `%` interpolates the *capture
-context*, `${}` interpolates the *node* — which is why they coexist rather than
-compete.
-
-Every `%` placeholder capture defines works here too:
-
-| | |
-|---|---|
-| `%?` | where the cursor lands in the draft |
-| `%^{Question}` | asked before the draft opens, one prompt per question, in template order |
-| `%U` `%T` `%t` | dates, exactly as in a capture template |
-| `%%` | a literal `%` |
-| `%a` | empty — a new note has no buffer you fired it from to link back to |
-
-An unknown `${x}` is left alone, for the same reason an unknown `%x` is: a
-template is your text, and a placeholder that vanished cannot be found and
-fixed.
+Keeping templates as org files you edit directly means there is no inlined
+copy in `init.rs` to drift out of step with them. A `body-file` you cannot read
+stops the create with a message naming the template and the path, and nothing
+is written. Reading it needs no extra capability: `fs:write:<prefix>` also
+permits reading under `<prefix>`. A template file outside every granted prefix
+behaves like a missing one.
 
 ### The draft
 
-Choosing a template does not write the note. It opens a **draft** — a real org
-buffer holding the template expanded, with the cursor where `%?` was:
+Choosing a template does not write the note. It opens a **draft**: the same
+capture buffer `<leader>oc` opens, holding the template expanded, with the
+cursor where `%?` was.
 
 | | |
 |---|---|
-| `C-c C-c` | file it — the note is created and opened |
-| `C-c C-k` | throw it away — **nothing is created, not even the id** |
+| `C-c C-c` | file it: the note is written into its target and saved, and you return to where you were |
+| `C-c C-k` | throw it away. **Nothing is created, not even the id** |
+| `:w` | keep the draft to finish later |
+| `<leader>oC` | reopen a kept draft |
 
-The same two chords capture uses, because it is the same buffer and the same
-minor mode. Edit it freely first: what gets filed is what is on screen when you
+A roam draft is an ordinary capture draft, so everything in
+[A capture is a file](help:org#a-capture-is-a-file) applies:
+
+- several can be open at once, and each files into its own target;
+- a draft survives a restart once saved;
+- the target is checked before the draft opens;
+- a write that fails leaves the draft open.
+
+Roam drafts live in the capture drafts directory. **Keep that directory
+outside `org.roam-directory`**: the index does not yet skip drafts, so an
+unfinished note inside the roam directory shows up as a node once it is saved.
+
+Edit the draft freely first. What gets filed is what is on screen when you
 press `C-c C-c`, not the template you started from.
 
-A template that asks `%^{…}` questions asks them first, one at a time —
-emacs's order, and capture's — and the draft opens once the last one lands,
-with the answers already in it.
-
-**An abandoned draft leaves nothing behind**, which is the reason this is a
-buffer rather than a write. The file is created on `C-c C-c`, so `C-c C-k` has
-nothing to undo, and the id minted for the note is simply discarded. Before
-this, picking the wrong template cost you a file with a real `:ID:` in it that
-the indexer would then pick up.
-
-A filed note is an **unsaved buffer** until you `:w` it — org-roam-capture's
-own model, where a new note is a draft you finalize. The watcher indexes it when
-it lands on disk.
+**An abandoned draft leaves nothing behind.** The note is created on
+`C-c C-c`, so `C-c C-k` has nothing to undo, and the id minted for the note is
+simply dropped. Before drafts, picking the wrong template cost you a file with
+a real `:ID:` in it, which the indexer would then pick up.
 
 **The zero-template path stays one step.** With `org.roam-capture-templates`
 unset there is no menu and no draft: creating a note opens the built-in stub
 directly, at its real path, with the cursor at the end. A stub has no `%?` and
-no questions, so a draft surface would add a `C-c C-c` to the one flow that
-should cost nothing.
+no questions, so a draft would only add a `C-c C-c` to the one flow that should
+cost nothing.
 
-A template missing a `key`, reusing one another template took, or setting both
-`body` and `body-file`, is skipped and the menu names it in the footer. TOML
-that does not parse at all refuses outright and names the option — a menu
-built from the half that survived would be guessing. A `body-file` that cannot
-be read is caught later, when you actually pick that template, because only
-then is the node known well enough to finish expanding its path — see above.
+A template that cannot be used is skipped, and the menu names it in its
+footer. That covers an empty `key`, a key already taken, `body` and
+`body-file` both set, or a target that does not resolve. (A template with no
+`target` at all does not fit the option's shape, so it is rejected when the
+option is set.) A set that failed
+to load entirely is **reported**, and the menu stays closed. It does not fall
+back to the stub, because a note created from a template you did not choose is
+worse than no note. A `body-file` that cannot be read is caught when you pick
+that template, because only then is the node known well enough to fill in its
+path.
 
 ## Keys and commands
 
@@ -400,6 +404,7 @@ Everything here works in any buffer unless the entry says otherwise.
 | `<leader>ondy` | `C-c ndy` | `:org-roam-dailies-yesterday` | yesterday's |
 | `<leader>ondt` | `C-c ndt` | `:org-roam-dailies-tomorrow` | tomorrow's |
 | `<leader>ondD` | `C-c ndD` | `:org-roam-dailies-goto-date` | a date you are asked for |
+| `<leader>oC` | | `:org-capture-drafts` | reopen a kept capture or note draft |
 | | | `:org-roam-create-node <title>` | create and open a note |
 | | | `:org-roam-id-create` | `:ID:` for the headline at point — in an org file |
 | | | `:org-roam-backlinks` | what links to the node at point — in an org file |

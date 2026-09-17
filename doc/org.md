@@ -300,130 +300,344 @@ You stay where you are. Refile files something; it does not navigate.
 
 ### Capturing
 
-`<leader>oc` (or `C-c c`) opens the **capture menu** — one key per template —
-and the key you press picks the template. A template that asks `%^{…}`
-questions asks them first, one at a time — the same order emacs asks in; then
-a **capture buffer** opens, holding the template expanded, with the cursor
-where `%?` was.
+`<leader>oc` (or `C-c c`) opens the **capture menu**, with one key per
+template. The key you press picks the template. If the template asks `%^{…}`
+questions, they come first, one at a time, in the same order emacs asks them.
+Then a **capture buffer** opens with the template expanded and the cursor where
+`%?` was.
 
 | | |
 |---|---|
-| `C-c C-c` | file it where the template says |
-| `C-c C-k` | throw it away — **nothing is written** |
+| `C-c C-c` | file it where the template says, then return to where you were |
+| `C-c C-k` | throw it away. **Nothing is filed** |
+| `:w` | save it as a draft, to finish later |
+| `<leader>oC` | `:org-capture-drafts`: pick a draft and carry on with it |
 
 It is a real org buffer: syntax highlighting, motions, folding and TODO
-cycling all work while you write. Only the two chords above are
-capture-specific, so `C-c C-c` in an ordinary org file still does nothing.
+cycling all work while you write. Only the chords above are capture-specific,
+so `C-c C-c` in an ordinary org file still does nothing.
 
-Edit it freely — what gets filed is what is on screen when you press
-`C-c C-c`, not the template you started from. A template with no `%?` leaves
-the cursor at the end.
+Edit it freely. What gets filed is what is on screen when you press `C-c C-c`,
+not the template you started from. A template with no `%?` leaves the cursor
+at the end.
 
-Two things to know: after filing, the pane does not yet return to the buffer
-you fired the capture from. And one capture runs at a time.
-
-**`<leader>oc` and `<leader>oa` work in ANY buffer**, not just org files. That
-is the point: the thought you are trying not to lose arrives while you are
+**`<leader>oc` and `<leader>oa` work in ANY buffer**, not just org files.
+That is the point: the thought you are trying not to lose arrives while you are
 reading code, not while you already have an org file open. Everything else
 under `<leader>o` acts on an org file and stays inside one.
 
-Templates live in **one option whose value is TOML**:
+#### A capture is a file
+
+Each capture buffer is a real file, a **draft**, named after the capture:
+`captures/a3f9c1.org`. That one fact gives capture the rest of its behaviour:
+
+- **Any number at once.** Start a second capture while writing the first, and
+  both stay open. `C-c C-c` in either one files *that* capture into *its*
+  template's target, and sends you back to the buffer *it* was started from.
+- **`:w` keeps a half-written capture.** Close the buffer, even quit the
+  editor, and the draft is still there. `<leader>oC` lists every draft as
+  `template: first line` and reopens the one you pick, ready for
+  `C-c C-c`. A row reading `(not saved)` is a capture still open that was never
+  written.
+- **The draft goes away when the capture ends.** Filing it or throwing it away
+  deletes the draft file. Nothing piles up in `captures/` except work you
+  chose to keep.
+
+Opening a draft file by hand (`:e captures/a3f9c1.org`) gives you a plain org
+buffer, without the capture chords. `<leader>oC` is how to resume one.
+
+Drafts live in the first of these that is set:
+
+| | |
+|---|---|
+| `org.capture-drafts-directory` | exactly this directory |
+| `org.directory` | its `captures/` subdirectory |
+| `org.capture-file` | a `captures/` directory beside it |
+
+Both fallbacks use a **subdirectory** on purpose. The agenda scans a directory
+one level deep, so a draft sitting next to your real org files would show up in
+it as though it were filed.
+
+With none of the three set, capture still works and `C-c C-c` still files. You
+just cannot save a draft: capture tells you so when the buffer opens, and `:w`
+fails on a path that names the fix (`/set-org.directory-to-save-capture-drafts`).
+Lattice would rather ask where your drafts go than choose a directory you would
+never think to look in.
 
 ```toml
 [org]
-capture-templates = '''
-[[template]]
+directory = "~/org"          # drafts go in ~/org/captures
+```
+
+#### Nothing is lost when filing fails
+
+The target is checked **when the capture opens**, before you type anything,
+the same moment emacs resolves it. If the file cannot be written (outside the
+plugin's `fs:write` grant, read-only, not valid UTF-8, or its directory does
+not exist), capture says why and opens nothing. That way you never write a
+note you cannot file.
+
+If the write still fails at `C-c C-c` (say the disk is full, or the file has
+become read-only since), the capture **stays open**. Its draft and its record are
+untouched, so you can fix the problem and press `C-c C-c` again. Only a write
+that landed closes the capture.
+
+#### Templates
+
+Templates live in `org.capture-templates`, one `[[org.capture-templates]]`
+table per template:
+
+```toml
+[[org.capture-templates]]
 key = "t"
 description = "todo"
-target = { file = "/home/you/org/refile.org" }
+target = { file = "~/org/refile.org" }
 body = """
 * TODO %?
 %U
 """
 
-[[template]]
+[[org.capture-templates]]
 key = "m"
 description = "Meeting"
-target = { file = "/home/you/org/refile.org", headline = "Meetings" }
+target = { kind = "file+headline", file = "~/org/refile.org", headline = "Meetings" }
 body = """
 * MEETING with %? :meeting:
 %U
 """
-'''
+
+[[org.capture-templates]]
+key = "j"
+description = "Journal"
+target = { kind = "file+datetree", file = "~/org/journal.org" }
+body = "* %<%H:%M> %?"
 ```
 
-TOML inside a string option is not a style choice: an option can only be a
-boolean, an integer or a string, and a template is a record. The `'''` block
-carries the payload verbatim, so a `"""` body keeps its newlines. `init.rs`
-sets the identical string as a Rust raw literal — one format, both homes.
+`init.rs` declares the same list as Rust values through the plugin's derive.
+Both homes share one schema, so a misspelt field in `init.rs` is a compile
+error, and `:describe-option org.capture-templates` shows the full shape.
 
-`target` is either `{ file = "…" }` (append at the end) or
-`{ file = "…", headline = "…" }` (after that headline's subtree). A named
-headline that is absent appends and says so, rather than creating it or
-refusing: the note is not lost, and the echo tells you your target moved.
+A template has three independent parts: **where** it lands (`target`),
+**what** it inserts (`type`), and **where its text comes from** (`body` or
+`body-file`). Every combination works.
 
-A template that cannot be used — no `key`, no `target.file`, or a key another
-template already took — is skipped and the rest of the set still works. One
-typo should not cost you the feature. A set whose **TOML** does not parse
-refuses outright and names the option, because a menu built from the half that
-survived would be guessing at what you meant.
+| Field | | |
+|---|---|---|
+| `key` | required | the key that picks it in the menu. Several characters are fine |
+| `description` | | what the menu row says |
+| `target` | required | where it lands. See [Targets](#targets) |
+| `body` | | the template text, placeholders and all |
+| `body-file` | | read the template text from this file instead, emacs's `(file "…")`. `~` is expanded |
+| `type` | | `entry` (the default) or `table-line` |
+| `table-line-pos` | | `table-line` only: org's `:table-line-pos`, e.g. `"II-1"` |
+| `prepend` | | `table-line` only: put the row first rather than last |
+| `clock-in` | | start a clock on the captured entry, org's `:clock-in` |
+| `seed` | | the key of the template that creates today's node when it is missing. See [`seed`](#seed) |
 
-The older single-template pair still works and is what runs when
+`body` and `body-file` cannot both be set. A body file that cannot be read
+stops the capture at open, naming the template and the path.
+
+##### Targets
+
+`target.kind` names the shape in org's own words. If you leave it out, a
+`headline` means `file+headline` and no `headline` means `file`, which is how
+templates were written before `kind` existed. Every other shape has to name
+itself.
+
+| `kind` | Fields | Lands |
+|---|---|---|
+| `file` | `file` | at the end of the file |
+| `file+headline` | `file`, `headline` | after that headline's whole subtree |
+| `file+olp` | `file`, `olp` | after the subtree at that outline path, e.g. `["Work", "Inbox"]` |
+| `file+datetree` | `file`, `olp`?, `tree-type`?, `sub-olp`? | under today's date node, creating it if needed |
+
+A path may start with `~`. The target is filed **after the subtree**, not
+directly under the headline. Filing at the top would put each new note in
+front of everything already there, so the subtree would read newest-first
+while the file around it reads oldest-first.
+
+A headline is matched ignoring case, extra spacing, a leading TODO keyword
+and trailing `:tags:`. Adding `:drill:` to a headline months later does not
+quietly send every future capture to the bottom of the file. The match comes
+from the org parse, so a `* Inbox` line inside a `#+BEGIN_SRC` block is not a
+target.
+
+A headline or outline path that is not there makes the capture append to the
+end of the file and say so. It neither creates the headline nor refuses: the
+note is kept, and the message tells you your target has moved.
+
+An **`entry` is re-levelled** to become a child of the headline it lands
+under. The shallowest heading in the body moves to one level below the target,
+and deeper headings move with it. A template written as `* TODO %?` therefore
+lands as `** TODO …` under a first-level headline, rather than closing the
+subtree and landing as its sibling. A body with no headings is left alone.
+
+##### `file+datetree`
+
+The target is today's node in a date tree, built exactly as `org-datetree`
+builds one, so emacs and lattice can share a file:
+
+```org
+* 2026
+** 2026-09 September
+*** 2026-09-17 Thursday
+```
+
+A missing year, month or day is created **in date order** among its siblings,
+so a tree that already holds later dates (written on another machine, say)
+stays in order. Only the missing levels are created: the first capture of a month adds
+the month and the day under the year that is already there.
+
+`tree-type` changes the grouping: `day` (the default), `month` (the
+`** 2026-09 September` node) or `week` (`** 2026-W38`). `olp` works as org's
+`file+olp+datetree`: it names the outline path the tree is built **under**,
+for a file that keeps its tree beneath a heading.
+
+##### `sub-olp`
+
+`sub-olp` goes where org cannot. It is an outline path **below** today's
+node, not above it. Take a daily tracker, where each day holds several
+sections and each section has its own table:
+
+```org
+*** 2026-09-17 Thursday
+**** Daily Overview
+| … |
+**** Episode Tracker
+| Time | Trigger | … |
+|------+---------+---|
+```
+
+Org's `table-line` only ever finds the day's *first* table, and its
+`file+olp+datetree` puts the path above the date. In emacs this needs a
+hand-written `file+function`. Here it is one field:
+
+```toml
+[[org.capture-templates]]
+key = "u"
+description = "Episode (tracker row)"
+target = { kind = "file+datetree", file = "~/org/tracker.org", sub-olp = ["Episode Tracker"] }
+type = "table-line"
+seed = "H"
+body = "| %<%H:%M> | %^{Trigger} | %^{After 0-10} |"
+```
+
+`olp` keeps org's meaning and `sub-olp` is the new one, so a config ported
+from emacs cannot quietly mean something else. `sub-olp` is refused on any
+kind other than `file+datetree`.
+
+A `sub-olp` that is not under today's node files the capture under the day
+itself, with a message. The note you just typed is the thing at risk, and
+under the day is a place you will see it.
+
+##### `seed`
+
+A `sub-olp` section lives *inside* the day, so on the first capture of a day it
+does not exist yet. `seed` names another template in the same list whose body
+**is** the day. In the example above that is `H`, the day's whole tracker
+sheet. When today's node is missing, the seed's body becomes the day and the
+row lands in the section that body brings, in one write.
+
+- Only a **missing day** is seeded. A day that exists without the section is
+  not given a second sheet: the capture goes under the day, with a message.
+- The seed's own `%^{…}` questions are **left blank**. A day sheet's questions
+  (how did today go?) have no answer at the first capture of the day, and the
+  middle of another capture is the wrong time to ask them.
+- A `seed` must name another template whose target is a date tree in the same
+  file, and the declaring template must have a date-tree `sub-olp`. Otherwise
+  the declaring template is skipped and named.
+
+Org has nothing like it.
+
+##### `table-line`
+
+`type = "table-line"` inserts a **table row** rather than an entry, as
+`org-capture-place-table-line` does:
+
+- **Where it looks.** Under a headline, date node or `sub-olp`, it searches
+  that heading's own body. For a bare `file`, it searches the whole file. The
+  first table it finds is used.
+- **No table yet?** It creates one (`|   |` over `|---|`) and puts the row
+  there, rather than dropping the note.
+- **Where the row goes.** `table-line-pos = "II-1"` places it relative to the
+  second hline, one line up, using org's syntax unchanged. `prepend = true`
+  puts it first among the data rows. By default it goes last. A
+  `table-line-pos` naming an hline that is not there puts the row last.
+- **The row.** The body is trimmed and gets `| ` in front if it does not
+  already start like a row. A body of several lines inserts several rows.
+
+The table is **not realigned**. A ragged row is valid org, and realigning
+would mean capture rewriting lines you did not capture.
+
+##### Placeholders
+
+| | |
+|---|---|
+| `%?` | where the cursor starts. A template without it puts your text on its own line at the end |
+| `%U` | today, inactive: `[2026-08-26 Wed]` |
+| `%T` | today, active: `<2026-08-26 Wed>`. The agenda sees this one |
+| `%t` | today, active, date only. Same as `%T` for now: `%T` will grow a time of day, `%t` never will |
+| `%<fmt>` | the current time through a `format-time-string` format: `%<%H:%M>`, `%<%Y%m%d%H%M%S>` |
+| `%^{Question}` | a value you are asked for, in a prompt of its own. Several are asked one after another, in template order |
+| `%a` | a link back to where you started the capture: `[[file:/path/notes.org::42][notes.org]]` |
+| `%%` | a literal `%` |
+
+Anything else is left alone, so a `%d` you meant as text stays `%d`.
+
+`%a` is what makes capturing while reading code useful: the note remembers the
+file and line you were looking at, in the link shape org itself writes, so
+following it works in emacs too. A capture started from a buffer with no file,
+such as a scratch buffer, expands `%a` to nothing. A link with an empty target
+would look followable and not be.
+
+##### When a template is wrong
+
+A template that cannot be used is skipped, and the rest of the set still works.
+That covers an empty `key` or `target.file`, a key another template already
+took, `body` and `body-file` both set, an unknown `kind`, or a field the `kind`
+does not take. The menu names each skipped template in its footer. A value
+that does not fit the option's shape at all is reported when it is set, and
+capture then refuses and names the option rather than filing through a
+fallback you thought you had stopped using.
+
+##### Without templates
+
+The older single-template pair still works, and it is what runs when
 `capture-templates` is unset:
 
 ```toml
-org.capture-file = "/home/you/org/inbox.org"
-org.capture-template = "* TODO %?\n  %U"
+[org]
+capture-file = "~/org/inbox.org"
+capture-template = "* TODO %?\n  %U"
 ```
 
-With no templates configured, `<leader>oc` still opens the menu — it shows one
+With no templates configured, `<leader>oc` still opens the menu. It shows one
 row, `t Task`, filing into `org.capture-file`. That is emacs's own behaviour:
 `org-capture` substitutes a built-in `("t" "Task" …)` template when
-`org-capture-templates` is nil rather than refusing, and its target is
-`org-default-notes-file`, which is what `org.capture-file` is here.
-
-Capturing through that row says so — *"org: no capture templates; using
-org.capture-file → …"* — so if you meant to be using templates and are not,
-you find out at the moment it matters rather than by discovering notes in the
-wrong file later. A configured set says nothing.
+`org-capture-templates` is nil, and its target is `org-default-notes-file`,
+which is `org.capture-file` here. Capturing through that row says so ("org: no
+capture templates; using org.capture-file → …"). If you meant to be using
+templates and are not, you find out when it matters.
 
 With neither `capture-templates` nor `capture-file` set, capture refuses and
 names both. Emacs would fall back to `~/.notes`; lattice would rather ask than
 put your notes somewhere you never chose.
 
-| | |
-|---|---|
-| `%?` | what you typed. A template without it appends your text on its own line. |
-| `%U` | today, inactive: `[2026-08-26 Wed]` |
-| `%T` | today, active: `<2026-08-26 Wed>` — the agenda sees this one |
-| `%t` | today, active, date only. Same as `%T` for now — `%T` will grow a time of day, `%t` never will |
-| `%^{Question}` | asks for a named value, in a prompt of its own. Several are asked one after another, in template order |
-| `%a` | a link back to where you fired the capture: `[[file:/path/notes.org::42][notes.org]]` |
-| `%%` | a literal `%` |
+##### What capture needs
 
-Anything else is left alone, so a `%d` you meant as text stays a `%d`.
+- **`fs:write`** over the directories capture writes to: your org files, and
+  the drafts directory. This is the same grant archive and refile use, and it
+  also covers the reads a target needs to find its place.
+- **`state:write`**, which is where each capture records its target and the
+  buffer it came from. That record is what lets a draft be filed after a
+  restart.
 
-`%a` is what makes capture-while-reading-code useful: the note remembers the
-file and line you were looking at, and the link is the shape org itself writes
-so following it works in emacs too. A capture fired from a buffer with no file
-— a scratch buffer, or the capture menu — expands it to nothing rather than to
-a link with an empty target, which would look followable and not be.
+```toml
+capabilities = ["fs:write:/home/you/org", "state:write"]
+```
 
-A headline target files the note **after that headline's whole subtree**, not
-directly under the headline. Filing at the top would put each new note in front
-of everything already there, so the subtree would read newest-first while the
-file around it reads oldest-first. The headline is matched ignoring case, extra
-spacing, a leading TODO keyword and trailing `:tags:` — so adding `:drill:` to
-a headline months later does not silently send every future capture to the
-bottom of the file.
-
-Neither option has a default on purpose. A key that quietly created
-`capture.org` in whichever directory the editor happened to start in would
-scatter notes somewhere you would never think to look; unset, `<leader>oc`
-tells you to set it.
-
-Both refile and capture need the same `fs:write` grant archiving does, over
-the directory your org files live in.
+`C-c C-c` saves the file it filed into, as emacs's finalize does. The agenda
+reads files from disk, so an unsaved capture would not show up in `gr`.
 
 ## Tasks
 

@@ -24,12 +24,12 @@ reached the network.
 | `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
 | `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-agenda-mode`, `org-global-mode` |
 | `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, the clock, archive / refile / capture, and org-roam's commands |
-| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory` |
+| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates` |
 | `theme` | one theme element per TODO keyword, so `:colorscheme` recolours your own states |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
 | `scanned-excerpt-source` | dated rows for the agenda — what a row is, when it falls, how it sorts, and which files to scan |
 | `multibuffer-view-source` | the agenda **view** itself: its buffer name, reuse policy and input model |
-| `picker-source` | three pickers — refile targets, `org-roam-find-node`, `org-roam-backlinks` |
+| `picker-source` | refile targets, capture drafts (`<leader>oC`), and org-roam's find-node, insert-node and backlinks pickers |
 | `completion-source` | org-roam nodes, offered inside an `[[…]]` link |
 | `transient-source` | the capture menu, one key per template |
 | `events` | the clock's session, its minute wake and its modeline segment |
@@ -273,7 +273,13 @@ grant at the plugin boundary before the effect reaches the editor. Point it at
 the directory your org files live in. The same grant also covers the *read* a
 `headline` capture target needs to find its insertion point — a write grant
 implies read over the same directory, so there is no second thing to declare. Without it the outliner, tables and the
-agenda all still work and those three chords say they were refused.
+agenda all still work and those three chords say they were refused. The grant
+must also cover capture's drafts directory (`captures/` under `org.directory`
+by default), where an in-progress capture is kept as a file.
+
+`state:write` is the plugin's own store. Each capture records its target and
+the buffer it was started from there, which is what lets a saved draft be filed
+after a restart.
 
 `default_modes` is load-bearing: it is what publishes the enablement request
 for each mode named, and without it a mode registers correctly and simply never

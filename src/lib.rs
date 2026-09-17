@@ -1520,14 +1520,15 @@ impl Guest for Component {
             "capture-templates",
             &DEFAULT_CAPTURE_TEMPLATES.to_vec(),
             "Your capture templates: one `[[org.capture-templates]]` per entry \
-             with `key`, `description`, `target = { file = \"…\", headline = \"…\" }`, \
-             a `body` and an optional `clock-in`. Unset means `<leader>oc` says \
-             so rather than guessing. `:describe-option` shows the full shape.",
+             with a `key`, a `description`, a `target` (`kind` = `file`, \
+             `file+headline`, `file+olp` or `file+datetree`), and a `body` or \
+             `body-file`. `type = \"table-line\"` inserts a table row. Unset \
+             means `<leader>oc` files into `capture-file`. `:describe-option` \
+             shows the full shape.",
         );
-        // OR.11b — roam's own template set. Separate from `capture-templates`
-        // for the reason `roam_templates` opens with: a capture template says
-        // WHERE its text lands, and a roam note's destination is a file that
-        // does not exist yet, named after the node being made.
+        // OR.11b / CT.8 — roam's own template set: the same type as
+        // `capture-templates` in a second option, as emacs keeps
+        // `org-roam-capture-templates` beside `org-capture-templates`.
         //
         // Default EMPTY, and that is the feature rather than an omission:
         // unset means creating a note writes the built-in stub and does not
@@ -1537,11 +1538,12 @@ impl Guest for Component {
             "roam-capture-templates",
             &Vec::new(),
             "What a new org-roam note starts as: one \
-             `[[org.roam-capture-templates]]` per entry with a `key`, an \
-             optional `description`, a `body`, and an optional `file` naming \
-             the note's filename. Both `${title}` / `${slug}` / `${id}` and \
-             the `%` capture placeholders expand. Unset means a new note is \
-             the built-in stub and no menu is shown.",
+             `[[org.roam-capture-templates]]` per entry, the same shape as \
+             `capture-templates` with a required `target`. Its `file` is \
+             relative to `roam-directory`, and `file+head` writes `head` only \
+             into a new file. `${title}` / `${slug}` / `${id}` expand beside \
+             the `%` placeholders. Unset means a new note is the built-in stub \
+             and no menu is shown.",
         );
         let _ = register_option(
             "capture-file",

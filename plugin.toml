@@ -67,7 +67,11 @@ default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 # write to a file other than the one you are in, and the host checks the target
 # against this grant at the plugin boundary. Point it at the directory your org
 # files live in; without it those three chords are refused and say so, and
-# everything else still works.
+# everything else still works. It must also cover capture's drafts directory
+# (`org.directory`/captures by default).
+#
+# `state:write` is the plugin store, where each capture records its target and
+# its caller (CD.4). Without it no capture opens.
 #
 capabilities = ["fs:write:~/src/dhruvasagar/org-files", "state:write"]
 

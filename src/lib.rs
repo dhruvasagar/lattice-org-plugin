@@ -5197,6 +5197,8 @@ fn clock_goto() -> Vec<Effect> {
                 path: Some(path),
                 position: Position { line, byte: 0 },
                 force: false,
+                content: None,
+                activate_minor: None,
             },
         )],
         None => vec![Effect::Echo(EchoPayload {
@@ -8317,6 +8319,8 @@ impl GrammarCallbacks for Component {
                             byte: 0,
                         },
                         force: false,
+                        content: None,
+                        activate_minor: None,
                     },
                 )])
             }
@@ -8973,6 +8977,8 @@ impl GrammarCallbacks for Component {
                         path: Some(path),
                         position: Position { line: 0, byte: 0 },
                         force: false,
+                        content: None,
+                        activate_minor: None,
                     }),
                 ])
             }
@@ -9599,6 +9605,8 @@ fn open_link(ctx: &ActionContext, doc: &Document, on_miss: Effect) -> Vec<Effect
                 path: Some(path),
                 position: Position { line: 0, byte: 0 },
                 force: false,
+                content: None,
+                activate_minor: None,
             },
         )],
         // The host decides what "open" means for a URI — this guest neither
@@ -9965,6 +9973,8 @@ fn follow_id(id: &str) -> Vec<Effect> {
                     byte: 0,
                 },
                 force: false,
+                content: None,
+                activate_minor: None,
             },
         )],
         None if roam_index::is_empty() => warn(format!(

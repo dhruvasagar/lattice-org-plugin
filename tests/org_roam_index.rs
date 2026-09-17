@@ -84,6 +84,7 @@ fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::Disp
                 path,
                 position,
                 force,
+                ..
             } => {
                 editor.do_edit(path, force);
                 editor.set_cursor_clamped(position);
@@ -1154,6 +1155,7 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
                 path,
                 position,
                 force,
+                ..
             } => {
                 editor.do_edit(path, force);
                 editor.land_cursor_at(position);

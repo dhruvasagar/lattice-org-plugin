@@ -205,6 +205,7 @@ fn apply_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutco
                 path,
                 position,
                 force,
+                ..
             } => {
                 editor.do_edit(path.clone(), force);
                 editor.run_tick_pending();

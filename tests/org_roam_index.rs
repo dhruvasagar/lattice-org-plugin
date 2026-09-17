@@ -318,14 +318,11 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
     // does not EXIST until the plugin declaring it has loaded, so `init.rs`
     // sets it from a `plugin-loaded` handler. `:org-roam-sync` is then what
     // makes the index catch up — and it is a real command, not a test hook.
-    editor
-        .config
-        .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
-        .expect("the plugin registered `org.roam-directory`");
     // CD.4: a roam create is a capture DRAFT file. Its directory goes inside the
     // corpus because the corpus is all this harness grants — a draft outside the
-    // grant could not be cleaned up. Nothing here saves a draft, so the scan
-    // never meets one.
+    // grant could not be cleaned up. CD.8: set BEFORE the roam directory,
+    // because setting that starts a scan, and a scan that ran first would not
+    // know to skip the drafts.
     editor
         .config
         .parse_and_set_command(&format!(
@@ -333,6 +330,10 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
             corpus.join("captures").display()
         ))
         .expect("the plugin registered `org.capture-drafts-directory`");
+    editor
+        .config
+        .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
+        .expect("the plugin registered `org.roam-directory`");
 
     // OR.6: the two steps a chord needs before it can dispatch, both of which
     // this harness lacked — which is why `<leader>onf` was once believed
@@ -2036,14 +2037,11 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
     // The documented shape, and the ONLY step: set the option after the load,
     // exactly as an `init.rs` `plugin-loaded` handler does. No `:org-roam-sync`
     // anywhere below — that is the whole point.
-    editor
-        .config
-        .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
-        .expect("the plugin registered `org.roam-directory`");
     // CD.4: a roam create is a capture DRAFT file. Its directory goes inside the
     // corpus because the corpus is all this harness grants — a draft outside the
-    // grant could not be cleaned up. Nothing here saves a draft, so the scan
-    // never meets one.
+    // grant could not be cleaned up. CD.8: set BEFORE the roam directory,
+    // because setting that starts a scan, and a scan that ran first would not
+    // know to skip the drafts.
     editor
         .config
         .parse_and_set_command(&format!(
@@ -2051,6 +2049,10 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
             corpus.join("captures").display()
         ))
         .expect("the plugin registered `org.capture-drafts-directory`");
+    editor
+        .config
+        .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
+        .expect("the plugin registered `org.roam-directory`");
 
     let index = Index { host };
     assert!(
@@ -3332,9 +3334,25 @@ async fn pick(editor: &mut Editor, key: &str) -> lattice_core::BufferId {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    let paths: Vec<String> = editor
+        .buffers
+        .document_ids_sorted()
+        .into_iter()
+        .filter_map(|id| editor.buffers.document_path(id))
+        .map(|p| p.display().to_string())
+        .collect();
     panic!(
-        "a draft opened (last message: {:?})",
-        editor.last_message.as_ref().map(|m| &m.text)
+        "a draft opened (last message: {:?}; picker: {:?}; transient: {:?}; \
+         pending build: {}; prompt: {:?}; buffers: {paths:?})",
+        editor.last_message.as_ref().map(|m| &m.text),
+        editor.picker.as_ref().map(|p| p.title.clone()),
+        editor
+            .picker
+            .as_ref()
+            .and_then(|p| p.transient.as_ref())
+            .map(|t| (t.title.clone(), t.groups.iter().map(|g| g.items.len()).sum::<usize>())),
+        editor.pending_transient_build.is_some(),
+        editor.pending_prompt_submit_action,
     );
 }
 
@@ -3865,4 +3883,118 @@ async fn a_note_created_elsewhere_is_opened_when_filed() {
     let walnut = note(&corpus, "zq_walnut").unwrap();
     assert!(!walnut.contains("Reference:"), "{walnut:?}");
     assert_eq!(buffer_text(&editor, page), "top: \n");
+}
+
+// ── CD.8: drafts and the scans; the outstanding-caller warning ─────────────
+
+/// **A draft is not a node**, from the cold walk or from the watcher, though
+/// the drafts directory sits inside the roam directory and a draft carries an
+/// `:ID:`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drafts_are_not_indexed() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let drafts = corpus.join("captures");
+    std::fs::create_dir_all(&drafts).unwrap();
+    std::fs::write(
+        drafts.join("a3f9c1.org"),
+        ":PROPERTIES:\n:ID: DRAFT-AAAA\n:END:\n#+title: Half Written\n",
+    )
+    .unwrap();
+    let Some(index) = index_corpus(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    // The `nodes` blob is rebuilt once, at the end of the walk.
+    assert!(settle(|| index.nodes().len() >= 4).await);
+    assert!(
+        index.node("DRAFT-AAAA").is_none(),
+        "the cold walk skipped it"
+    );
+
+    // The watcher: a draft saved while running, then a real note after it.
+    std::fs::write(
+        drafts.join("b4e0d2.org"),
+        ":PROPERTIES:\n:ID: DRAFT-BBBB\n:END:\n#+title: Saved Draft\n",
+    )
+    .unwrap();
+    std::fs::write(
+        corpus.join("later.org"),
+        ":PROPERTIES:\n:ID: LATE-GGGG\n:END:\n#+title: Real Note\n",
+    )
+    .unwrap();
+    assert!(
+        settle(|| index.node("LATE-GGGG").is_some()).await,
+        "the watcher ran"
+    );
+    assert!(index.node("DRAFT-BBBB").is_none(), "and skipped the draft");
+    assert!(
+        !index.nodes().iter().any(|n| n.id.starts_with("DRAFT-")),
+        "no draft in find-node"
+    );
+}
+
+fn last_message(editor: &Editor) -> String {
+    editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default()
+}
+
+/// **Filing a capture that others are waiting on** says how many links will
+/// not arrive; the child still files, and says so itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn filing_a_caller_warns_about_its_waiting_children() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, _page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let parent = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Parent").await;
+    let child = create_and_insert(&mut editor, None, "Zq Child").await;
+
+    focus(&mut editor, parent);
+    finalize_roam_capture(&mut editor).await;
+    let message = last_message(&editor);
+    assert!(
+        message.contains("can no longer insert its link"),
+        "the parent's commit warns: {message:?}"
+    );
+    assert!(note(&corpus, "zq_parent").is_some(), "and still files");
+
+    focus(&mut editor, child);
+    finalize_roam_capture(&mut editor).await;
+    assert!(note(&corpus, "zq_child").is_some(), "the child files too");
+    let message = last_message(&editor);
+    assert!(message.contains("is closed"), "{message:?}");
+}
+
+/// **Discarding a caller** warns the same way, and counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discarding_a_caller_warns_about_its_waiting_children() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    let Some((_index, mut editor, _page)) = cd6_setup(base.path(), &corpus, "top: \n", true).await
+    else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    let parent = create_and_insert(&mut editor, Some(pos(0, 5)), "Zq Parent").await;
+    let _first = create_and_insert(&mut editor, None, "Zq First").await;
+    focus(&mut editor, parent);
+    let _second = create_and_insert(&mut editor, None, "Zq Second").await;
+
+    focus(&mut editor, parent);
+    abort_roam_capture(&mut editor).await;
+    let message = last_message(&editor);
+    assert!(
+        message.contains("2 captures started from this one"),
+        "{message:?}"
+    );
 }

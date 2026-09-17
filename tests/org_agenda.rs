@@ -739,6 +739,16 @@ async fn the_agenda_files_option_decides_what_is_scanned() {
     )
     .unwrap();
 
+    // CD.8: a saved capture draft under the directory, where
+    // `{org.directory}/captures` puts one. The walk is one level deep (OA.0d),
+    // so it is not scanned; the two-sources assertion below would catch it.
+    std::fs::create_dir_all(notes.join("captures")).unwrap();
+    std::fs::write(
+        notes.join("captures").join("a3f9c1.org"),
+        format!("* TODO a half-written capture\n  SCHEDULED: {}\n", stamp(1)),
+    )
+    .unwrap();
+
     // …and one that is NOT configured, to prove the option is a decision and
     // not merely an addition to whatever the walk would have found anyway.
     let unlisted = base.path().join("unlisted");
@@ -807,6 +817,10 @@ async fn the_agenda_files_option_decides_what_is_scanned() {
     assert!(
         !files.iter().any(|f| f.contains("unlisted")),
         "an unconfigured directory must not be scanned: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.contains("captures")),
+        "a capture draft is not an agenda entry: {files:?}"
     );
 }
 

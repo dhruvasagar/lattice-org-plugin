@@ -233,7 +233,11 @@ pub fn begin() -> usize {
     let Ok(all) = host_services::walk(&root) else {
         return 0;
     };
-    let files: Vec<String> = all.into_iter().filter(|p| is_org(p)).collect();
+    let drafts = crate::capture_drafts_dir();
+    let files: Vec<String> = all
+        .into_iter()
+        .filter(|p| indexable(p, drafts.as_deref()))
+        .collect();
     let total = files.len();
     // Bump BEFORE the queue is replaced: any chain still draining the old
     // root reads this on its next hop and stops.
@@ -336,8 +340,9 @@ pub fn reindex(paths: &[String]) -> usize {
         return 0;
     }
     let keywords = todo_keywords();
+    let drafts = crate::capture_drafts_dir();
     let mut changed = 0usize;
-    for path in paths.iter().filter(|p| is_org(p)) {
+    for path in paths.iter().filter(|p| indexable(p, drafts.as_deref())) {
         if index_one(path, &keywords) {
             changed += 1;
         }
@@ -346,6 +351,18 @@ pub fn reindex(paths: &[String]) -> usize {
         roam_index::rebuild_nodes_blob();
     }
     changed
+}
+
+/// CD.8: whether roam indexes `path` — an org file that is not a capture
+/// draft.
+///
+/// A saved roam draft carries its `:ID:` from the moment it opens, so a drafts
+/// directory inside the roam directory would put every half-written note in
+/// "find a node", and then delete its file from under the index when it is
+/// filed. A draft becomes a node when it lands in its target. The walk is
+/// recursive (`host-services.walk`), unlike the agenda's, so it needs this.
+pub fn indexable(path: &str, drafts: Option<&str>) -> bool {
+    is_org(path) && !drafts.is_some_and(|dir| crate::capture_drafts::is_under(path, dir))
 }
 
 /// Whether a path is a file roam indexes.
@@ -361,6 +378,22 @@ pub fn is_org(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_draft_is_not_indexed() {
+        let drafts = Some("/roam/captures");
+        assert!(indexable("/roam/note.org", drafts));
+        assert!(!indexable("/roam/captures/a3f9c1.org", drafts));
+        assert!(
+            indexable("/roam/captures-old/note.org", drafts),
+            "a sibling is not the drafts dir"
+        );
+        assert!(
+            indexable("/roam/captures/a3f9c1.org", None),
+            "no drafts dir, nothing skipped"
+        );
+        assert!(!indexable("/roam/README.md", drafts));
+    }
 
     #[test]
     fn only_org_files_are_indexed() {

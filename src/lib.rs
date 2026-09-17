@@ -6590,7 +6590,7 @@ fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
 /// and its store entry intact — emacs's finalize, where a failed `save-buffer`
 /// unwinds the rest. Cleanup is a separate command for the same reason: a host
 /// call made here would run before the write was even attempted.
-fn capture_finalize(doc: &Document) -> Vec<Effect> {
+fn capture_finalize(buffer: u32, doc: &Document) -> Vec<Effect> {
     let Some((id, state)) = capture_state_of(doc) else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
@@ -6599,7 +6599,7 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
     };
     let text = document_text(doc);
     if text.trim().is_empty() {
-        return capture_discard(&id, &state, "org: nothing captured");
+        return capture_discard(buffer, &id, &state, "org: nothing captured");
     }
     let mut effects = capture_effects(&state.dest, text);
     // Every path through `capture_effects` files something; if one ever does
@@ -6626,7 +6626,7 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
     effects.push(Effect::InvokeCommand(
         lattice::plugin_host::types::CommandRef {
             id: "org-capture-cleanup".to_string(),
-            args: Args::String(id),
+            args: Args::String(id.clone()),
         },
     ));
     // CD.7: no caller — show what was filed (org-roam's `find-file`).
@@ -6645,6 +6645,7 @@ fn capture_finalize(doc: &Document) -> Vec<Effect> {
     }
     // Last, so nothing the close or the cleanup says hides it.
     effects.extend(closed);
+    effects.extend(orphaned_links_warning(buffer, &id));
     effects
 }
 
@@ -6945,9 +6946,9 @@ fn roam_create_and_insert(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect>
 ///
 /// Nothing is filed and nothing is written back. A buffer that is not a live
 /// capture declines, so the chord falls through to whatever else binds it.
-fn capture_abort(doc: &Document) -> Vec<Effect> {
+fn capture_abort(buffer: u32, doc: &Document) -> Vec<Effect> {
     match capture_state_of(doc) {
-        Some((id, state)) => capture_discard(&id, &state, "org: capture aborted"),
+        Some((id, state)) => capture_discard(buffer, &id, &state, "org: capture aborted"),
         None => vec![Effect::Declined],
     }
 }
@@ -6956,7 +6957,7 @@ fn capture_abort(doc: &Document) -> Vec<Effect> {
 ///
 /// The host calls run directly here — unlike commit, discard has no write for
 /// them to wait for.
-fn capture_discard(id: &str, state: &CaptureState, message: &str) -> Vec<Effect> {
+fn capture_discard(buffer: u32, id: &str, state: &CaptureState, message: &str) -> Vec<Effect> {
     let mut effects = capture_forget(id, state);
     effects.push(Effect::BufferDelete(true));
     if let Some(caller) = &state.caller {
@@ -6966,7 +6967,44 @@ fn capture_discard(id: &str, state: &CaptureState, message: &str) -> Vec<Effect>
         level: EchoLevel::Info,
         text: message.to_string(),
     }));
+    // After the info line, so the warning is what stays on screen.
+    effects.extend(orphaned_links_warning(buffer, id));
     effects
+}
+
+/// CD.8: the captures still waiting to write a link into `buffer`, which is
+/// about to close.
+///
+/// Read from the store each time rather than kept as a child list on the
+/// parent: a list is bookkeeping that a discard, a crash or a hand-deleted
+/// draft leaves stale, and the store is already the record of what is open.
+/// The children still file their notes; each will say its link had nowhere
+/// to go.
+fn orphaned_links_warning(buffer: u32, own_id: &str) -> Option<Effect> {
+    let waiting = host_services::store_keys(capture_drafts::STATE_PREFIX)
+        .into_iter()
+        .filter(|key| key.strip_prefix(capture_drafts::STATE_PREFIX) != Some(own_id))
+        .filter_map(|key| capture_drafts::decode::<CaptureState>(&host_services::store_get(&key)?))
+        .filter(|child| {
+            child
+                .caller
+                .as_ref()
+                .is_some_and(|c| c.buffer == buffer && c.on_commit.is_some())
+        })
+        .count();
+    (waiting > 0).then(|| {
+        Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: match waiting {
+                1 => {
+                    "org: a capture started from this one can no longer insert its link".to_string()
+                }
+                n => format!(
+                    "org: {n} captures started from this one can no longer insert their links"
+                ),
+            },
+        })
+    })
 }
 
 /// CD.4: delete a capture's state and its draft file. Returns an echo for each
@@ -8807,8 +8845,8 @@ impl GrammarCallbacks for Component {
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
-            CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
-            CAPTURE_ABORT => Ok(capture_abort(doc)),
+            CAPTURE_FINALIZE => Ok(capture_finalize(ctx.buffer_id, doc)),
+            CAPTURE_ABORT => Ok(capture_abort(ctx.buffer_id, doc)),
             CAPTURE_CLEANUP => Ok(capture_cleanup(&ctx)),
             CAPTURE_RESUME => Ok(capture_resume(&ctx)),
             ROAM_INSERT_NODE_REGION => Ok(leaving_visual(&ctx, roam_insert_region(&ctx, doc))),

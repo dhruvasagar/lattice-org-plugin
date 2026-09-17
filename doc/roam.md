@@ -230,6 +230,10 @@ Two things can happen to the caller while a draft is open:
 - **It was closed.** The note is still filed, and the message says the link
   had nowhere to go and shows it, so you can paste it yourself.
 
+That includes filing or discarding the caller first when it is itself a
+draft. Doing so warns how many captures started from it can no longer insert
+their links.
+
 Without templates, `Create and link` stays a single step: the note is written
 from the built-in stub, saved, and linked at once.
 
@@ -426,9 +430,10 @@ A roam draft is an ordinary capture draft, so everything in
 - the target is checked before the draft opens;
 - a write that fails leaves the draft open.
 
-Roam drafts live in the capture drafts directory. **Keep that directory
-outside `org.roam-directory`**: the index does not yet skip drafts, so an
-unfinished note inside the roam directory shows up as a node once it is saved.
+Roam drafts live in the capture drafts directory. The index skips that
+directory even when it is inside `org.roam-directory`, so a saved,
+unfinished note never shows up in find-node. It becomes a node when it is
+filed.
 
 Edit the draft freely first. What gets filed is what is on screen when you
 press `C-c C-c`, not the template you started from.

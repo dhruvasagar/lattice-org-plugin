@@ -137,6 +137,7 @@ mod agenda_match;
 mod agenda_sections;
 mod archive;
 mod capture;
+mod capture_drafts;
 mod capture_flow;
 mod capture_target;
 mod capture_templates;
@@ -562,11 +563,14 @@ const CAPTURE_QUESTION_SUBMIT: u32 = 89;
 const CAPTURE_FINALIZE: u32 = 58;
 /// OC.7b — `C-c C-k`: throw the capture away, writing nothing.
 ///
-/// Emacs's aborted capture creates NOTHING, and that falls out of the buffer
-/// model rather than needing to be undone: the file is written on finalize, so
-/// an abort has nothing to clean up. It is the property OR.6's
-/// `WriteToFile`-on-create does not have.
+/// Nothing is filed. Since CD.4 a capture is a draft FILE, so a draft that was
+/// saved is deleted here; one never saved has nothing on disk to delete.
 const CAPTURE_ABORT: u32 = 59;
+/// CD.4 — the cleanup a commit runs AFTER its write lands: forget the capture's
+/// state and delete its draft file. Fired only through
+/// `effect.invoke-command`, placed after the write, so a write that does not
+/// land never reaches it (the host stops a batch there).
+const CAPTURE_CLEANUP: u32 = 111;
 
 /// OA.12 — the agenda dispatcher. `AGENDA_MENU` opens it; `AGENDA_COMMAND` is
 /// what a row fires, carrying the command's key in its own args.
@@ -1521,6 +1525,25 @@ impl Guest for Component {
             DEFAULT_CAPTURE_FILE,
             "Where `<leader>oc` files a capture when `capture-templates` is unset. \
              Absolute, or relative to the editor's working directory.",
+        );
+        // CD.4: emacs's `org-directory`. Capture drafts hang off it; nothing
+        // else reads it yet. Unset by default, for `capture-file`'s reason.
+        let _ = register_option(
+            "directory",
+            OptionType::String,
+            "",
+            "Your org directory. Capture drafts are kept in its `captures/` \
+             subdirectory unless `capture-drafts-directory` says otherwise.",
+        );
+        let _ = register_option(
+            "capture-drafts-directory",
+            OptionType::String,
+            "",
+            "Where an in-progress capture is kept as a file, so `:w` saves it and \
+             `:org-capture-drafts` can reopen it later. Unset means \
+             `{org.directory}/captures`, else `captures/` beside \
+             `capture-file`. With none of those set a capture still works but \
+             cannot be saved as a draft.",
         );
         let _ = register_option(
             "capture-template",
@@ -3490,6 +3513,13 @@ impl Guest for Component {
             CAPTURE_ABORT,
         );
         register_action(
+            "org-capture-cleanup",
+            "Forget a committed capture's state and draft file (run by C-c C-c \
+             after the entry is filed; not for direct use)",
+            &spec(),
+            CAPTURE_CLEANUP,
+        );
+        register_action(
             "org-capture-submit",
             "File the captured note (dispatched by the prompt on submit)",
             &spec(),
@@ -4264,27 +4294,24 @@ thread_local! {
         const { std::cell::RefCell::new(agenda_args::ViewArgs::new()) };
 }
 
-thread_local! {
-    /// OC.7b: the capture the buffer on screen belongs to.
-    ///
-    /// `C-c C-c` must know WHERE to file what was typed, and the action context
-    /// carries `buffer-id` and `cursor` but no buffer NAME — and
-    /// `document.path()` is `none` for a synthetic buffer, by definition. So
-    /// the target cannot be recovered from the buffer; it is remembered when
-    /// the buffer is opened.
-    ///
-    /// A `thread_local` is the whole synchronisation story for the same reason
-    /// the agenda's `SCAN` is: single-threaded guest, one actor, calls
-    /// serialised by the host's per-plugin channel.
-    ///
-    /// **One capture in flight at a time**, which is a real limit and not an
-    /// oversight. The buffer name is derived from the template key, so two
-    /// captures of the same template would collide on the buffer anyway; and
-    /// emacs's default is likewise one (`org-capture` in progress refuses a
-    /// second). Cleared on finalize and on abort, so an abandoned capture
-    /// cannot mis-file the next one.
-    static PENDING_CAPTURE: std::cell::RefCell<Option<CaptureDestination>> =
-        const { std::cell::RefCell::new(None) };
+/// CD.4: a capture in flight, as recorded under `capture/{id}` in the store.
+///
+/// This replaced `PENDING_CAPTURE`, a guest `thread_local` holding ONE
+/// destination — "one capture in flight at a time". The store is shared by
+/// every seam and survives a restart, so any number of captures can be open,
+/// committed in any order, or saved and resumed tomorrow.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CaptureState {
+    /// Where the finalized text lands.
+    dest: CaptureDestination,
+    /// The template's description, fixed for the capture's life — the drafts
+    /// picker pairs it with the draft's current first line.
+    label: String,
+    /// Where the capture was fired from, and what to write there on commit.
+    caller: Option<capture_drafts::Caller>,
+    /// The draft file. Recorded rather than re-derived, so changing the
+    /// drafts directory mid-capture does not orphan this one.
+    draft: String,
 }
 
 /// OC.7b / OR.11b: what `C-c C-c` needs that the buffer cannot tell it.
@@ -4301,7 +4328,7 @@ thread_local! {
 /// `description` and `clock_in` fields to satisfy this — is a struct built to
 /// fit a consumer rather than to describe anything, and it would leave the
 /// shared state coupled to a type roam has no business constructing.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CaptureDestination {
     /// Where the finalized text lands: a file to append to, or a file and the
     /// headline whose subtree it goes after.
@@ -4419,6 +4446,9 @@ struct QuestionFlow {
     questions: Vec<String>,
     /// Grows by one per submit, in the same order as `questions`.
     answers: Vec<String>,
+    /// CD.4: where the capture was fired from. Recorded at the first hop: by
+    /// the time a question is answered, the prompt is the active buffer.
+    caller: Option<capture_drafts::Caller>,
 }
 
 thread_local! {
@@ -4445,13 +4475,18 @@ thread_local! {
 /// `<Esc>` left behind is replaced the moment a new capture or roam-create
 /// begins asking, rather than relying on the abandoned flow to have cleaned up
 /// after itself.
-fn start_question_flow(kind: QuestionFlowKind, questions: Vec<String>) -> Vec<Effect> {
+fn start_question_flow(
+    kind: QuestionFlowKind,
+    questions: Vec<String>,
+    caller: Option<capture_drafts::Caller>,
+) -> Vec<Effect> {
     let prompt = format!("{}: ", questions[0]);
     PENDING_QUESTIONS.with(|c| {
         *c.borrow_mut() = Some(QuestionFlow {
             kind,
             questions,
             answers: Vec::new(),
+            caller,
         })
     });
     vec![Effect::OpenPrompt(
@@ -4460,7 +4495,7 @@ fn start_question_flow(kind: QuestionFlowKind, questions: Vec<String>) -> Vec<Ef
             initial: String::new(),
             on_submit_action: "org-capture-question-submit".to_string(),
             // No smuggling needed — the flow's identity and progress live in
-            // `PENDING_QUESTIONS`, the [`PENDING_CAPTURE`] precedent. Carrying
+            // `PENDING_QUESTIONS` rather than the prompt. Carrying
             // a growing answer list through `buffer-name` would be exactly the
             // "bespoke codec" this design rejected keeping.
             buffer_name: None,
@@ -4501,7 +4536,13 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
     // dropped the fields menu's extra "body" row along with the menu, so
     // `%?` is typed into the draft buffer itself, the same as a zero-question
     // template — there is no seed to pass.
-    match flow.kind {
+    let QuestionFlow {
+        kind,
+        answers,
+        caller,
+        ..
+    } = flow;
+    match kind {
         QuestionFlowKind::Capture { key } => {
             // `_note` is always empty on this path: it is reached only with
             // a KEY, which only a configured set can supply. Destructured
@@ -4516,16 +4557,22 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
                 Err(effect) => return vec![effect],
             };
             open_capture_buffer(
-                capture_buffer_name(&template.key),
+                DraftSpec {
+                    prefix: "org-capture",
+                    key: template.key.clone(),
+                    title: String::new(),
+                    label: template.description.clone(),
+                    caller,
+                },
                 dest,
                 &template.body,
-                &flow.answers,
+                &answers,
                 "",
                 &capture_origin(),
             )
         }
         QuestionFlowKind::Roam { title, key, id } => {
-            match roam_draft(&title, &key, &id, &flow.answers, "") {
+            match roam_draft(&title, &key, &id, &answers, "") {
                 Err(effect) => effect,
                 Ok(draft) => draft.open(),
             }
@@ -5569,6 +5616,14 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     // the `None` — so an abandoned capture leaves nothing behind for the next.
     let origin = origin_annotation(doc, ctx.cursor.line);
     CAPTURE_ORIGIN.with(|c| *c.borrow_mut() = origin);
+    // CD.4 / OC.7d: and so is the caller — the buffer the capture returns to
+    // when it ends. A plain capture writes nothing back (`on_commit: None`).
+    let caller = Some(capture_drafts::Caller {
+        buffer: ctx.buffer_id,
+        path: doc.path(),
+        at: capture_drafts::Span::at(ctx.cursor.line, ctx.cursor.byte),
+        on_commit: None,
+    });
 
     let key = submitted_text(&ctx.args).filter(|k| !k.is_empty());
     let (template, note) = match selected_template(key.as_deref()) {
@@ -5596,6 +5651,7 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         out.extend(start_question_flow(
             QuestionFlowKind::Capture { key: template.key },
             questions,
+            caller,
         ));
         return out;
     }
@@ -5621,7 +5677,13 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         Err(effect) => return vec![effect],
     };
     let mut out = open_capture_buffer(
-        capture_buffer_name(&template.key),
+        DraftSpec {
+            prefix: "org-capture",
+            key: template.key.clone(),
+            title: String::new(),
+            label: template.description.clone(),
+            caller,
+        },
         dest,
         &template.body,
         &[],
@@ -5661,39 +5723,136 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
 /// `""`, which is what `%a` correctly means for a create that has no origin
 /// buffer.
 fn open_capture_buffer(
-    name: String,
+    draft: DraftSpec,
     dest: CaptureDestination,
     body: &str,
     answers: &[String],
     entered: &str,
     annotation: &str,
 ) -> Vec<Effect> {
+    // CD.3b / design H5: the target FIRST, before anything is typed —
+    // emacs's `org-capture-set-target-location` order. A target that would
+    // refuse the write is reported now, and nothing opens.
+    if let Err(reason) = host_services::can_write_file(&dest.target.resolved_file()) {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: capture template `{}`: {reason}", draft.key),
+        })];
+    }
     let (text, point) = capture::expand_for_buffer(body, entered, answers, now_when(), annotation);
-    // Remembered BEFORE the effect is returned: the action context carries a
-    // buffer id and a cursor but no buffer NAME, and a synthetic buffer's
-    // `document.path()` is `none`, so `C-c C-c` could not otherwise work out
-    // where to file what it is looking at.
-    PENDING_CAPTURE.with(|c| *c.borrow_mut() = Some(dest));
-    vec![Effect::OpenSyntheticBuffer(
-        lattice::plugin_host::types::OpenSyntheticBufferPayload {
-            name,
-            mode_id: "org-mode".to_string(),
+
+    let configured = capture_drafts_dir();
+    let dir = configured
+        .clone()
+        .unwrap_or_else(|| capture_drafts::UNSET_DRAFTS_DIR.to_string());
+    let id = allocate_capture_id(&draft, &dir);
+    let path = capture_drafts::draft_path(&dir, &id);
+    let state = CaptureState {
+        dest,
+        label: draft.label,
+        caller: draft.caller,
+        draft: path.clone(),
+    };
+    // Recorded BEFORE the buffer opens: `C-c C-c` finds its destination here,
+    // by the draft's path, and a buffer with no state behind it could never be
+    // filed.
+    let stored = capture_drafts::encode(&state)
+        .ok_or_else(|| "could not encode the capture's state".to_string())
+        .and_then(|bytes| host_services::store_put(&capture_drafts::state_key(&id), &bytes));
+    if let Err(reason) = stored {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: capture could not record its state ({reason}); nothing was opened"),
+        })];
+    }
+
+    let mut out = vec![Effect::OpenBufferAt(
+        lattice::plugin_host::types::OpenBufferAtPayload {
+            path: Some(path),
+            position: point
+                .map(|(line, byte)| lattice::plugin_host::types::Position { line, byte })
+                .unwrap_or(lattice::plugin_host::types::Position { line: 0, byte: 0 }),
+            force: false,
+            // Seeds only a file that does not exist yet — a fresh id always
+            // names one — so the template never lands on a saved draft.
             content: Some(text),
-            cursor: point.map(|(line, byte)| lattice::plugin_host::types::Position { line, byte }),
             activate_minor: Some("org-capture-mode".to_string()),
         },
-    )]
+    )];
+    if configured.is_none() {
+        // After the open, whose own `[New]` echo would otherwise hide it.
+        out.push(Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: this capture cannot be saved as a draft — set org.directory \
+                   (or org.capture-drafts-directory)"
+                .to_string(),
+        }));
+    }
+    out
 }
 
-/// The capture buffer's name. Keyed by template so two templates do not fight
-/// over one buffer, and stable so re-firing the same template returns to the
-/// note in progress rather than starting a second.
-fn capture_buffer_name(key: &str) -> String {
-    if key.is_empty() {
-        "*org-capture*".to_string()
-    } else {
-        format!("*org-capture:{key}*")
+/// CD.4: what `open_capture_buffer` needs to name and file a capture, beside
+/// its text.
+struct DraftSpec {
+    /// `org-capture` or `org-roam-capture`: one input to the id, so the two
+    /// verbs' captures of the same key never collide.
+    prefix: &'static str,
+    key: String,
+    /// The node title for a roam capture; empty for org-capture.
+    title: String,
+    label: String,
+    caller: Option<capture_drafts::Caller>,
+}
+
+thread_local! {
+    /// CD.4: the id counter. Per seam — a guest `thread_local` is not shared
+    /// between seams — which is why an id is also checked against the store
+    /// and the disk before it is used.
+    static CAPTURE_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A capture id not in use: no store entry and no file under that name.
+///
+/// Bounded, and the bound is not expected to be reached — 24 bits against a
+/// handful of live drafts. If it ever is, the last candidate is used and the
+/// store write simply replaces a stale entry.
+fn allocate_capture_id(draft: &DraftSpec, dir: &str) -> String {
+    let salt = local_now_secs();
+    let mut id = String::new();
+    for _ in 0..64 {
+        let n = CAPTURE_COUNTER.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            n
+        });
+        id = capture_drafts::capture_id(draft.prefix, &draft.key, &draft.title, n, salt);
+        let live = host_services::store_get(&capture_drafts::state_key(&id)).is_some()
+            || host_services::read_file(&capture_drafts::draft_path(dir, &id)).is_ok();
+        if !live {
+            break;
+        }
     }
+    id
+}
+
+/// CD.4: the configured drafts directory, `~` expanded — `None` when no
+/// option names one.
+fn capture_drafts_dir() -> Option<String> {
+    capture_drafts::drafts_dir(
+        &option_or("capture-drafts-directory", ""),
+        &option_or("directory", ""),
+        &option_or("capture-file", DEFAULT_CAPTURE_FILE),
+    )
+    .map(|d| crate::roam_scan::expand_tilde(&d))
+}
+
+/// CD.4: the capture a buffer belongs to — its id, from the draft's path, and
+/// the state recorded for it. `None` for any buffer that is not a live capture.
+fn capture_state_of(doc: &Document) -> Option<(String, CaptureState)> {
+    let path = doc.path()?;
+    let id = capture_drafts::id_from_path(&path)?;
+    let bytes = host_services::store_get(&capture_drafts::state_key(&id))?;
+    capture_drafts::decode(&bytes).map(|state| (id, state))
 }
 
 /// The name the host smuggles back with a prompt submit, minus its wrapping.
@@ -6340,52 +6499,113 @@ fn write_at(path: String, anchor: FileAnchor, text: String) -> Effect {
 /// what a prompt collected: the point of the buffer surface is that the user
 /// may have rewritten any of it, so the only honest source is what is on
 /// screen when they finalize.
+///
+/// CD.4: the action makes **no** host call that changes anything. It returns,
+/// in order: the write, then closing the draft, returning to the caller, and
+/// the cleanup command. The host stops a batch at a write that does not land
+/// (lattice CD.3c), so a failed filing leaves the draft on screen with its file
+/// and its store entry intact — emacs's finalize, where a failed `save-buffer`
+/// unwinds the rest. Cleanup is a separate command for the same reason: a host
+/// call made here would run before the write was even attempted.
 fn capture_finalize(doc: &Document) -> Vec<Effect> {
-    let Some(pending) = PENDING_CAPTURE.with(|c| c.borrow().clone()) else {
+    let Some((id, state)) = capture_state_of(doc) else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org: no capture in progress".to_string(),
         })];
     };
     let text = document_text(doc);
-    // Cleared BEFORE the write is even queued. If the write fails the capture
-    // is still over — leaving it pending would make the next `C-c C-c` in an
-    // unrelated buffer file this one's text.
-    PENDING_CAPTURE.with(|c| *c.borrow_mut() = None);
     if text.trim().is_empty() {
-        return vec![
-            Effect::BufferDelete(true),
-            Effect::Echo(EchoPayload {
-                level: EchoLevel::Info,
-                text: "org: nothing captured".to_string(),
-            }),
-        ];
+        return capture_discard(&id, &state, "org: nothing captured");
     }
-    let mut effects = capture_effects(&pending, text);
-    // AFTER the write, so a failed write leaves the buffer on screen with the
-    // text still in it rather than closing over the top of it.
+    let mut effects = capture_effects(&state.dest, text);
+    // Every path through `capture_effects` files something; if one ever does
+    // not, the draft stays rather than closing over unfiled text.
+    if !effects.iter().any(|e| matches!(e, Effect::WriteToFile(_))) {
+        return effects;
+    }
+    // Close BEFORE focusing: `buffer-delete` closes the active buffer, which
+    // after the focus would be the caller.
     effects.push(Effect::BufferDelete(true));
+    if let Some(caller) = &state.caller {
+        effects.push(Effect::FocusBuffer(caller.buffer));
+    }
+    effects.push(Effect::InvokeCommand(
+        lattice::plugin_host::types::CommandRef {
+            id: "org-capture-cleanup".to_string(),
+            args: Args::String(id),
+        },
+    ));
     effects
 }
 
 /// OC.7b — `C-c C-k`: throw the capture away.
 ///
-/// **Nothing is created, and that falls out rather than being cleaned up.**
-/// The file is written on finalize, so an abort has nothing to undo — the
-/// property OR.6's `WriteToFile`-on-create does not have, and the reason the
-/// buffer surface is worth the ABI it took.
-fn capture_abort() -> Vec<Effect> {
-    let was_pending = PENDING_CAPTURE.with(|c| c.borrow_mut().take()).is_some();
-    if !was_pending {
-        return vec![Effect::Declined];
+/// Nothing is filed and nothing is written back. A buffer that is not a live
+/// capture declines, so the chord falls through to whatever else binds it.
+fn capture_abort(doc: &Document) -> Vec<Effect> {
+    match capture_state_of(doc) {
+        Some((id, state)) => capture_discard(&id, &state, "org: capture aborted"),
+        None => vec![Effect::Declined],
     }
-    vec![
-        Effect::BufferDelete(true),
-        Effect::Echo(EchoPayload {
-            level: EchoLevel::Info,
-            text: "org: capture aborted".to_string(),
-        }),
-    ]
+}
+
+/// Forget a capture and close it, returning to its caller.
+///
+/// The host calls run directly here — unlike commit, discard has no write for
+/// them to wait for.
+fn capture_discard(id: &str, state: &CaptureState, message: &str) -> Vec<Effect> {
+    let mut effects = capture_forget(id, state);
+    effects.push(Effect::BufferDelete(true));
+    if let Some(caller) = &state.caller {
+        effects.push(Effect::FocusBuffer(caller.buffer));
+    }
+    effects.push(Effect::Echo(EchoPayload {
+        level: EchoLevel::Info,
+        text: message.to_string(),
+    }));
+    effects
+}
+
+/// CD.4: delete a capture's state and its draft file. Returns an echo for each
+/// that failed — a draft left behind is worth saying, not worth refusing over.
+///
+/// A draft under [`capture_drafts::UNSET_DRAFTS_DIR`] was never saveable, so it
+/// is not on disk and there is no grant to ask about it.
+fn capture_forget(id: &str, state: &CaptureState) -> Vec<Effect> {
+    let mut problems = Vec::new();
+    if let Err(e) = host_services::store_delete(&capture_drafts::state_key(id)) {
+        problems.push(format!("its state could not be removed ({e})"));
+    }
+    if !capture_drafts::is_under(&state.draft, capture_drafts::UNSET_DRAFTS_DIR) {
+        if let Err(e) = host_services::delete_file(&state.draft) {
+            problems.push(format!("{} could not be deleted ({e})", state.draft));
+        }
+    }
+    problems
+        .into_iter()
+        .map(|p| {
+            Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!("org: capture {id}: {p}"),
+            })
+        })
+        .collect()
+}
+
+/// CD.4 — `org-capture-cleanup <id>`: what a commit runs after its write
+/// landed. Not meant to be typed; only a commit's `invoke-command` reaches it.
+fn capture_cleanup(ctx: &ActionContext) -> Vec<Effect> {
+    let Some(id) = submitted_text(&ctx.args).filter(|id| capture_drafts::is_capture_id(id)) else {
+        return vec![Effect::None];
+    };
+    let Some(state) = host_services::store_get(&capture_drafts::state_key(&id))
+        .and_then(|bytes| capture_drafts::decode::<CaptureState>(&bytes))
+    else {
+        // Already gone — a retried commit, or a discard from elsewhere.
+        return vec![Effect::None];
+    };
+    capture_forget(&id, &state)
 }
 
 /// Every line of `doc`, rejoined, with trailing blank lines trimmed to one
@@ -8093,7 +8313,8 @@ impl GrammarCallbacks for Component {
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
-            CAPTURE_ABORT => Ok(capture_abort()),
+            CAPTURE_ABORT => Ok(capture_abort(doc)),
+            CAPTURE_CLEANUP => Ok(capture_cleanup(&ctx)),
             TOGGLE_CHECKBOX => Ok(leaving_visual(&ctx, toggle_checkbox(&ctx, doc, tree))),
             TOGGLE_CHECKBOX_SUBTREE => {
                 Ok(leaving_visual(&ctx, toggle_checkbox_set(&ctx, doc, tree)))
@@ -10224,20 +10445,6 @@ const fn lattice_clock_report_toggle() -> &'static str {
     "action:scan-view-clockreport-toggle"
 }
 
-/// The capture buffer a roam note is drafted in.
-///
-/// Namespaced apart from `*org-capture:…*` so a roam template and a capture
-/// template that share a key cannot land in the same buffer — they are two
-/// different drafts filing to two different places, and one buffer holding both
-/// would file whichever was typed last into whichever target was remembered.
-fn roam_capture_buffer_name(key: &str) -> String {
-    if key.is_empty() {
-        "*org-roam-capture*".to_string()
-    } else {
-        format!("*org-roam-capture:{key}*")
-    }
-}
-
 /// OR.11a + OR.11b — open the note the chosen template describes, as a draft.
 ///
 /// The second hop of `:org-roam-create-node`, and a THIRD hop when the template
@@ -10297,7 +10504,9 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
             // cannot conjure a question out of user data), so the questions
             // extracted from it are exactly the ones left to ask.
             let questions = capture_flow::questions(&draft.body);
-            start_question_flow(QuestionFlowKind::Roam { title, key, id }, questions)
+            // CD.4: no caller yet — a roam create returning to where it was
+            // fired from is CD.6 / CD.7's.
+            start_question_flow(QuestionFlowKind::Roam { title, key, id }, questions, None)
         }
         Ok(draft) => draft.open(),
     }
@@ -10305,7 +10514,8 @@ fn roam_create_from_template(ctx: &ExCommandContext) -> Vec<Effect> {
 
 /// A roam note resolved far enough to know where it goes and what it says.
 struct RoamDraft {
-    name: String,
+    key: String,
+    title: String,
     dest: CaptureDestination,
     body: String,
     answers: Vec<String>,
@@ -10317,7 +10527,13 @@ struct RoamDraft {
 impl RoamDraft {
     fn open(self) -> Vec<Effect> {
         open_capture_buffer(
-            self.name,
+            DraftSpec {
+                prefix: "org-roam-capture",
+                label: format!("roam: {}", self.title),
+                key: self.key,
+                title: self.title,
+                caller: None,
+            },
             self.dest,
             &self.body,
             &self.answers,
@@ -10416,7 +10632,8 @@ fn roam_draft(
         asks_questions: answers.is_empty()
             && entered.is_empty()
             && !capture_flow::questions(&body).is_empty(),
-        name: roam_capture_buffer_name(key),
+        key: key.to_string(),
+        title: title.to_string(),
         dest: CaptureDestination::roam(template, path, seed.as_deref()),
         body,
         answers: answers.to_vec(),
@@ -10760,7 +10977,7 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
                 // row. The ARGS are `"t"` and the template's own key stays
                 // empty: `selected_template` ignores the key on the unset path
                 // and returns the legacy template, and an empty key is what
-                // `capture_buffer_name` / `capture_key_from_prompt_name` read
+                // `capture_key_from_prompt_name` reads
                 // as "the single-template capture" — a distinction OC.3a
                 // depends on and this must not disturb.
                 vec![TransientItem {

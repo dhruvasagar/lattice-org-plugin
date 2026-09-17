@@ -87,7 +87,11 @@
 use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 /// Where a capture lands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// CD.4: serializable, because a capture's destination is recorded in the
+/// plugin store when it opens and read back when it commits — possibly in a
+/// later session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     /// Append at the end of the file.
     File { file: String },
@@ -180,7 +184,17 @@ pub type TreeTypeAlias = crate::datetree::TreeType;
 /// [`RawTarget::kind`]: these spellings contain no `+`, so the derive's
 /// kebab-casing produces exactly org's own names and the host validates the
 /// closed set for free.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ConfigShapeDerive)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    ConfigShapeDerive,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum EntryType {
     /// An org entry — a headline and its body. Today's behaviour, and the
     /// default, so a template that has never heard of this field is unchanged.

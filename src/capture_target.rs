@@ -308,7 +308,7 @@ pub struct TableInsertion {
 }
 
 /// Where in the table a row lands, when the caller has a preference.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TablePlacement {
     /// After the last row. Org's default.
     #[default]

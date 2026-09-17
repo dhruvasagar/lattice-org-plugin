@@ -39,7 +39,17 @@ use crate::roam_dailies::Date;
 ///
 /// A schema `Enum`: `day` / `week` / `month` carry no `+`, so the derive's
 /// kebab-casing gives org's own spellings and the host validates the set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, lattice_plugin_sdk::ConfigShape)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    lattice_plugin_sdk::ConfigShape,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum TreeType {
     /// `* 2026` / `** 2026-09 September` / `*** 2026-09-16 Wednesday`.
     #[default]

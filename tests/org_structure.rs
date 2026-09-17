@@ -196,6 +196,10 @@ async fn org_editor_with_caps(
         Some(ModeId::new("org-mode")),
         "the buffer is in org-mode before any chord is dispatched"
     );
+    // CD.4: captures are draft FILES under `{org.directory}/captures`. Set for
+    // every test so a capture never falls back to the unsaveable path, whose
+    // warning would otherwise be the last message a capture test reads.
+    set_org_option(&mut editor, "directory", base.to_str().unwrap());
     editor
 }
 
@@ -252,6 +256,23 @@ async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch
                     &mode_id,
                     content.as_deref(),
                     cursor,
+                    activate_minor.as_deref(),
+                );
+            }
+            // CD.4: a capture is a draft FILE, opened seeded and with its minor
+            // — the host body both renderers call.
+            lattice_grammar::Effect::OpenBufferAt {
+                path,
+                position,
+                force,
+                content,
+                activate_minor,
+            } => {
+                let _ = editor.open_buffer_at(
+                    path,
+                    position,
+                    force,
+                    content.as_deref(),
                     activate_minor.as_deref(),
                 );
             }
@@ -2385,7 +2406,13 @@ async fn the_last_row_and_a_separator_refuse_to_be_destroyed() {
 /// The `fs:write` grant an archiving org plugin needs: the directory its files
 /// live in. In production that is the user's org directory; here, the tempdir.
 fn fs_write(dir: &std::path::Path) -> Vec<String> {
-    vec![format!("fs:write:{}", dir.display())]
+    // CD.4: `state:write` too, as the shipped manifest grants it — a capture
+    // records its destination in the plugin store, and without the grant it
+    // refuses to open rather than open something it could never file.
+    vec![
+        format!("fs:write:{}", dir.display()),
+        "state:write".to_string(),
+    ]
 }
 
 fn archive_text(editor: &Editor, base: &std::path::Path) -> String {
@@ -2764,6 +2791,42 @@ fn open_capture(editor: &mut Editor) {
         .expect("the capture action is registered");
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(id), &mut out);
+}
+
+/// CD.4: is `path` a capture draft — `…/captures/<6 hex>.org`?
+fn is_capture_draft(path: &std::path::Path) -> bool {
+    let in_captures = path
+        .parent()
+        .and_then(|d| d.file_name())
+        .is_some_and(|n| n == "captures");
+    let stem_is_id = path.extension().is_some_and(|e| e == "org")
+        && path.file_stem().and_then(|s| s.to_str()).is_some_and(|s| {
+            s.len() == 6
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    in_captures && stem_is_id
+}
+
+/// CD.4: every capture draft open in a buffer, with its path.
+fn capture_drafts_open(editor: &Editor) -> Vec<(lattice_core::BufferId, std::path::PathBuf)> {
+    editor
+        .buffers
+        .document_ids_sorted()
+        .into_iter()
+        .filter_map(|id| {
+            let path = editor.buffers.document_path(id)?;
+            is_capture_draft(&path).then_some((id, path))
+        })
+        .collect()
+}
+
+/// CD.4: the draft the active pane shows, if it shows one.
+fn active_capture(editor: &Editor) -> Option<std::path::PathBuf> {
+    let path = editor
+        .buffers
+        .document_path(editor.active_pane_buffer_id())?;
+    is_capture_draft(&path).then_some(path)
 }
 
 /// OC.7b: type `text` into the open capture buffer and press `C-c C-c`.
@@ -3327,7 +3390,7 @@ async fn the_key_you_press_decides_which_template_captures() {
     // OC.7b: the row fired `org-capture n`, which opens that template's
     // capture BUFFER. Finish it the way the user would — type, then C-c C-c.
     assert!(
-        editor.buffers.by_name("*org-capture:n*").is_some(),
+        active_capture(&editor).is_some(),
         "the buffer is keyed by the template the row chose"
     );
     finalize_capture(&mut editor, "a thought").await;
@@ -3370,7 +3433,7 @@ async fn the_prompt_the_menu_opens_actually_files_the_note() {
     press_menu_key(&mut editor, "t").await;
     // OC.7b: the row opens the capture BUFFER, not a one-line prompt.
     assert!(
-        editor.buffers.by_name("*org-capture:t*").is_some(),
+        active_capture(&editor).is_some(),
         "the row opened the capture buffer"
     );
     finalize_capture(&mut editor, "call the bank").await;
@@ -3385,15 +3448,14 @@ async fn the_prompt_the_menu_opens_actually_files_the_note() {
         .to_string();
     assert_eq!(source_text, "* One\n", "capture MOVES nothing");
 
-    // KNOWN GAP (OC.7d): finalize closes the capture buffer but does not
-    // return the pane to where the capture was fired from — `BufferDelete`
-    // leaves whatever the host falls back to, which is the scratch buffer.
-    // A guest cannot fix this today: `switch-buffer` is a picker-accept
-    // outcome, not an `effect`, so there is nothing for the plugin to emit.
-    // Asserted so the day it changes, this says so rather than going quiet.
-    assert_ne!(
-        editor.document_buffer_id, source,
-        "the pane does not yet return to the origin buffer — see OC.7d"
+    // OC.7d, closed by CD.4: the capture records where it was fired from,
+    // and committing returns there (`focus-buffer`, lattice CD.1). This
+    // assertion used to pin the OPPOSITE, so that the day it changed a test
+    // would say so.
+    assert_eq!(
+        editor.active_pane_buffer_id(),
+        source,
+        "the pane returns to the buffer the capture was fired from"
     );
 }
 
@@ -3479,7 +3541,7 @@ async fn a_template_with_questions_is_asked_them_sequentially() {
     // template does — there is no extra "body" prompt: `%?` is typed into the
     // draft directly.
     assert!(
-        editor.buffers.by_name("*org-capture:v*").is_some(),
+        active_capture(&editor).is_some(),
         "the last answer opened the capture buffer with the answers substituted"
     );
     finalize_capture(&mut editor, "").await;
@@ -3519,7 +3581,7 @@ async fn a_template_without_questions_still_captures_in_one_hop() {
     // OC.7b: no questions ⇒ the capture BUFFER opens directly, rather than a
     // second menu or the one-line prompt this asserted before.
     assert!(
-        editor.buffers.by_name("*org-capture:t*").is_some(),
+        active_capture(&editor).is_some(),
         "the capture buffer opened"
     );
     finalize_capture(&mut editor, "call the bank").await;
@@ -3743,7 +3805,7 @@ async fn the_capture_commit_chord_fires_from_insert_mode() {
 
     press_chord(&mut editor, "<leader>oc").await;
     press_menu_key(&mut editor, "t").await;
-    assert!(editor.buffers.by_name("*org-capture:t*").is_some());
+    assert!(active_capture(&editor).is_some());
 
     // Type the entry, then commit WITHOUT leaving Insert.
     let target = editor.active_pane_buffer_id();
@@ -3804,10 +3866,7 @@ async fn the_capture_abort_chord_fires_from_insert_mode() {
         "an aborted capture creates nothing — and with OC.9 saving the target, \
          this assertion can finally fail if it ever does"
     );
-    assert!(
-        editor.buffers.by_name("*org-capture:t*").is_none(),
-        "the draft is gone"
-    );
+    assert!(capture_drafts_open(&editor).is_empty(), "the draft is gone");
 }
 
 /// OR.17 — `<Esc>` mid-flow abandons the WHOLE capture: no note, no draft, and
@@ -3858,7 +3917,7 @@ async fn abandoning_a_question_flow_leaves_nothing_behind() {
 
     assert!(!vocab.exists(), "no note");
     assert!(
-        editor.buffers.by_name("*org-capture:v*").is_none(),
+        capture_drafts_open(&editor).is_empty(),
         "no draft either — the flow never reached the last question"
     );
 
@@ -4840,38 +4899,19 @@ async fn firing_a_capture_opens_a_buffer_holding_the_expanded_template() {
             .with_args(lattice_grammar::Args::String("t".to_string())),
         &mut out,
     );
-    // `OpenSyntheticBuffer` is RENDERER-applied — the `<leader>o:` wall this
-    // file's capture section already describes — so a headless Editor drops
-    // it. Apply it exactly as `lattice-ui-tui`'s arm does, which is also what
-    // makes this a test of the effect's CONTENT rather than of the renderer.
-    for effect in out.effects.clone() {
-        match effect {
-            lattice_grammar::Effect::OpenSyntheticBuffer {
-                name,
-                mode_id,
-                content,
-                cursor,
-                activate_minor,
-            } => editor.open_synthetic_buffer_seeded(
-                &name,
-                &mode_id,
-                content.as_deref(),
-                cursor,
-                activate_minor.as_deref(),
-            ),
-            other => {
-                editor.handle_effect(other);
-            }
-        }
-    }
+    // `OpenBufferAt` is RENDERER-applied, so a headless Editor drops it.
+    // Apply it the way both renderers do (`Editor::open_buffer_at`), which is
+    // also what makes this a test of the effect's CONTENT.
+    let effects = format!("{:?}", out.effects);
+    apply_renderer_effects(&mut editor, out).await;
     editor.run_tick_pending();
 
-    // A real buffer, named for its template so a second capture of the same
-    // template returns to the note in progress.
-    let buffer = editor
-        .buffers
-        .by_name("*org-capture:t*")
-        .unwrap_or_else(|| panic!("no capture buffer. effects={:?}", out.effects));
+    // CD.4: a real FILE buffer, a draft under `captures/`. Each capture gets
+    // its own, so a second capture of the same template is a second draft.
+    let buffer = capture_drafts_open(&editor)
+        .first()
+        .map(|(id, _)| *id)
+        .unwrap_or_else(|| panic!("no capture buffer. effects={effects}"));
     let text = editor
         .buffers
         .document_handle(buffer)
@@ -6735,4 +6775,264 @@ async fn the_hjkl_peers_work_over_a_visual_region() {
     goto(&mut editor, 1, 0);
     press(&mut editor, "<M-l>");
     assert_eq!(text(&editor), "  - a\n  - b\n- c\n");
+}
+
+// ── CD.4: captures are draft files; any number at once; they return home ──
+
+/// One template writing to `target`, keyed `t`.
+fn one_template(editor: &mut Editor, target: &std::path::Path) {
+    set_org_option(
+        editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            target.to_str().unwrap()
+        ),
+    );
+}
+
+async fn open_t(editor: &mut Editor) -> std::path::PathBuf {
+    press_chord(editor, "<leader>oc").await;
+    press_menu_key(editor, "t").await;
+    active_capture(editor).expect("the capture opened a draft")
+}
+
+/// Type at the caret of the active buffer.
+fn type_text(editor: &mut Editor, text: &str) {
+    let target = editor.active_pane_buffer_id();
+    let at = editor.cursor;
+    editor.apply_edit_effect_inline(
+        target,
+        lattice_protocol::edit::Edit::insert(at, text.to_string()),
+        None,
+    );
+    editor.run_tick_pending();
+}
+
+/// Make the draft at `path` the active buffer.
+fn show(editor: &mut Editor, path: &std::path::Path) {
+    let id = editor
+        .find_document_by_path(path)
+        .expect("the draft is open");
+    let _ = editor.handle_effect(lattice_grammar::Effect::FocusBuffer(id.0));
+}
+
+async fn commit(editor: &mut Editor) {
+    press_chord(editor, "<C-c><C-c>").await;
+    editor.run_tick_pending();
+}
+
+async fn discard(editor: &mut Editor) {
+    press_chord(editor, "<C-c><C-k>").await;
+    editor.run_tick_pending();
+}
+
+/// Two captures of the SAME template are two drafts, and either can be
+/// committed first — the property one global slot could not have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_captures_of_one_template_are_independent() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("captures")).unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let first = open_t(&mut editor).await;
+    type_text(&mut editor, "first thing");
+    editor.do_write(None);
+    let second = open_t(&mut editor).await;
+    type_text(&mut editor, "second thing");
+    editor.do_write(None);
+
+    assert_ne!(first, second, "two drafts, not one buffer reused");
+    assert!(first.exists() && second.exists(), "both saved as files");
+    assert_eq!(capture_drafts_open(&editor).len(), 2);
+
+    // Commit the SECOND first.
+    commit(&mut editor).await;
+    assert_eq!(text_of(&editor, &notes), "* TODO second thing\n");
+    assert!(!second.exists(), "a committed draft's file is deleted");
+    assert!(first.exists(), "the other draft is untouched");
+
+    show(&mut editor, &first);
+    commit(&mut editor).await;
+    assert_eq!(
+        text_of(&editor, &notes),
+        "* TODO second thing\n* TODO first thing\n",
+        "the first is still committable afterwards"
+    );
+    assert!(!first.exists());
+    assert!(
+        capture_drafts_open(&editor).is_empty(),
+        "both buffers closed"
+    );
+}
+
+/// Save, close, reopen, commit: the destination is recovered from the store,
+/// not from anything the closed buffer held — the restart path, without the
+/// restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_and_closed_draft_still_files_when_reopened() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("captures")).unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let draft = open_t(&mut editor).await;
+    type_text(&mut editor, "later");
+    editor.do_write(None);
+    assert!(
+        editor.do_buffer_delete(false),
+        "the saved draft closes cleanly"
+    );
+    assert!(capture_drafts_open(&editor).is_empty());
+    assert!(!notes.exists(), "closing files nothing");
+
+    // Reopened the way the drafts picker will: the file, with the minor.
+    let _ = editor.open_buffer_at(
+        Some(draft.clone()),
+        lattice_protocol::position::Position::ZERO,
+        false,
+        Some("the template again — must be ignored"),
+        Some("org-capture-mode"),
+    );
+    commit(&mut editor).await;
+
+    assert_eq!(text_of(&editor, &notes), "* TODO later\n");
+    assert!(!draft.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discarding_an_unsaved_capture_touches_no_disk() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+    let source = editor.active_pane_buffer_id();
+
+    let draft = open_t(&mut editor).await;
+    type_text(&mut editor, "never mind");
+    discard(&mut editor).await;
+
+    assert!(!notes.exists(), "nothing filed");
+    assert!(!draft.exists(), "nothing saved");
+    assert!(
+        !base.path().join("captures").exists(),
+        "not even the drafts directory was created"
+    );
+    assert!(capture_drafts_open(&editor).is_empty());
+    assert_eq!(
+        editor.active_pane_buffer_id(),
+        source,
+        "OC.7d: discard returns to where the capture was fired from too"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discarding_a_saved_capture_deletes_its_file() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("captures")).unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let draft = open_t(&mut editor).await;
+    type_text(&mut editor, "saved, then dropped");
+    editor.do_write(None);
+    assert!(draft.exists());
+    discard(&mut editor).await;
+
+    assert!(!draft.exists(), "the saved draft is deleted");
+    assert!(!notes.exists());
+}
+
+/// emacs's order: a target the capture could not file into is reported when
+/// the capture OPENS, before anything is typed — and nothing opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwritable_target_is_refused_before_the_capture_opens() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &elsewhere.path().join("outside.org"));
+    let source = editor.active_pane_buffer_id();
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "t").await;
+
+    assert!(capture_drafts_open(&editor).is_empty(), "no draft opened");
+    assert_eq!(editor.active_pane_buffer_id(), source);
+    let msg = editor
+        .last_message
+        .as_ref()
+        .map(|m| m.text.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("capture template `t`") && msg.contains("outside"),
+        "the refusal names the template and the reason: {msg:?}"
+    );
+}
+
+/// The rare case the open-time check cannot cover: the target stops being
+/// writable while the capture is open. Committing then fails — and the draft,
+/// its file and its state all survive, so fixing the cause and committing
+/// again files it. emacs's finalize, where a failed save unwinds the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_commit_keeps_the_draft_and_can_be_retried() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("captures")).unwrap();
+    let dir = base.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let notes = dir.join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let draft = open_t(&mut editor).await;
+    type_text(&mut editor, "precious");
+    editor.do_write(None);
+
+    // The target's directory vanishes while the capture is open.
+    std::fs::remove_dir_all(&dir).unwrap();
+    commit(&mut editor).await;
+
+    assert!(!notes.exists());
+    assert_eq!(
+        active_capture(&editor).as_deref(),
+        Some(draft.as_path()),
+        "the draft is still on screen"
+    );
+    assert!(draft.exists(), "its file survived");
+    assert!(
+        editor.active_text().as_string().contains("precious"),
+        "and so did the text"
+    );
+
+    // Fix the cause, commit again.
+    std::fs::create_dir_all(&dir).unwrap();
+    commit(&mut editor).await;
+    assert_eq!(
+        std::fs::read_to_string(&notes).unwrap(),
+        "* TODO precious\n",
+        "the store entry survived too, so the retry knew where to file"
+    );
+    assert!(!draft.exists());
 }

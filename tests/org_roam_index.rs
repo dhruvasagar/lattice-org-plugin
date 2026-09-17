@@ -310,6 +310,17 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
         .config
         .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
         .expect("the plugin registered `org.roam-directory`");
+    // CD.4: a roam create is a capture DRAFT file. Its directory goes inside the
+    // corpus because the corpus is all this harness grants — a draft outside the
+    // grant could not be cleaned up. Nothing here saves a draft, so the scan
+    // never meets one.
+    editor
+        .config
+        .parse_and_set_command(&format!(
+            "org.capture-drafts-directory={}",
+            corpus.join("captures").display()
+        ))
+        .expect("the plugin registered `org.capture-drafts-directory`");
 
     // OR.6: the two steps a chord needs before it can dispatch, both of which
     // this harness lacked — which is why `<leader>onf` was once believed
@@ -1155,10 +1166,18 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
                 path,
                 position,
                 force,
-                ..
+                content,
+                activate_minor,
             } => {
-                editor.do_edit(path, force);
-                editor.land_cursor_at(position);
+                // CD.2's host body, which both renderers call: seeds a new
+                // file, activates the minor, lands the cursor.
+                let _ = editor.open_buffer_at(
+                    path,
+                    position,
+                    force,
+                    content.as_deref(),
+                    activate_minor.as_deref(),
+                );
             }
             // OR.11b: the roam draft. RENDERER-applied, like `OpenTransient`
             // below — so dropping it here would make a working capture buffer
@@ -1179,12 +1198,13 @@ fn apply_accept_effects(editor: &mut Editor, out: lattice_host::dispatch::Dispat
                     activate_minor.as_deref(),
                 );
             }
-            // Closing the draft is part of both `C-c C-c` and `C-c C-k`.
-            // Applied rather than ignored so "the draft is gone afterwards" is
-            // a thing these tests can assert.
-            lattice_grammar::Effect::BufferDelete { force } => {
-                let _ = editor.do_buffer_delete(force);
-            }
+            // `BufferDelete`, `FocusBuffer` and `InvokeCommand` are HOST-applied
+            // while the action dispatches; applying them again here would close
+            // a second buffer. The renderers treat them as no-ops for the same
+            // reason.
+            lattice_grammar::Effect::BufferDelete { .. }
+            | lattice_grammar::Effect::FocusBuffer(_)
+            | lattice_grammar::Effect::InvokeCommand { .. } => {}
             // OR.11b: the roam template CHOOSER. Reached as a direct effect of
             // the create action rather than through `next_actions`, so it
             // needs its own arm — the caller polls `run_tick_pending`
@@ -1986,6 +2006,17 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
         .config
         .parse_and_set_command(&format!("org.roam-directory={}", corpus.display()))
         .expect("the plugin registered `org.roam-directory`");
+    // CD.4: a roam create is a capture DRAFT file. Its directory goes inside the
+    // corpus because the corpus is all this harness grants — a draft outside the
+    // grant could not be cleaned up. Nothing here saves a draft, so the scan
+    // never meets one.
+    editor
+        .config
+        .parse_and_set_command(&format!(
+            "org.capture-drafts-directory={}",
+            corpus.join("captures").display()
+        ))
+        .expect("the plugin registered `org.capture-drafts-directory`");
 
     let index = Index { host };
     assert!(
@@ -2463,15 +2494,8 @@ async fn an_unreadable_body_file_is_skipped_not_a_trap() {
         "names the template and says why: {message:?}"
     );
 
-    let mut ids = Vec::new();
-    editor
-        .buffers
-        .for_each(|entry| ids.push((entry.id, entry.name.clone())));
     assert!(
-        !ids.iter().any(|(_, name)| name
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with("*org-roam-capture")),
+        roam_drafts_open(&editor).is_empty(),
         "no draft — and so no note — was ever opened from an unreadable template"
     );
 
@@ -2532,27 +2556,35 @@ fn note_buffer(editor: &Editor, corpus: &Path) -> Option<(std::path::PathBuf, St
     })
 }
 
-/// Drain until the roam capture buffer exists, and return its text.
+/// CD.4: the capture drafts open right now — buffers on a `<6 hex>.org` file.
+fn roam_drafts_open(editor: &Editor) -> Vec<lattice_core::BufferId> {
+    editor
+        .buffers
+        .document_ids_sorted()
+        .into_iter()
+        .filter(|id| {
+            editor.buffers.document_path(*id).is_some_and(|p| {
+                p.extension().is_some_and(|e| e == "org")
+                    && p.file_stem().and_then(|s| s.to_str()).is_some_and(|s| {
+                        s.len() == 6
+                            && s.bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
+            })
+        })
+        .collect()
+}
+
+/// Drain until the roam capture draft exists, and return its text.
 ///
-/// Found by NAME rather than by path: a capture buffer is synthetic, so
-/// `document.path()` is `none` — which is the whole reason the destination is
-/// remembered guest-side rather than recovered from the buffer.
+/// CD.4: found by PATH — a draft is a file buffer named by its capture id.
 async fn settle_roam_draft(editor: &mut Editor) -> Option<String> {
     for _ in 0..settle_budget(240) {
         editor.run_tick_pending();
-        let mut found = None;
-        let mut ids = Vec::new();
-        editor
-            .buffers
-            .for_each(|entry| ids.push((entry.id, entry.name.clone())));
-        for (id, name) in ids {
-            if !name.unwrap_or_default().starts_with("*org-roam-capture") {
-                continue;
-            }
-            if let Some(handle) = editor.buffers.document_handle(id) {
-                found = Some(lattice_runtime::Document::text(handle.as_ref()));
-            }
-        }
+        let found = roam_drafts_open(editor).into_iter().find_map(|id| {
+            let handle = editor.buffers.document_handle(id)?;
+            Some(lattice_runtime::Document::text(handle.as_ref()))
+        });
         if found.is_some() {
             return found;
         }
@@ -2718,7 +2750,7 @@ async fn an_aborted_roam_capture_leaves_nothing_behind() {
         "an aborted capture files no note"
     );
     assert!(
-        editor.buffers.by_name("*org-roam-capture:d*").is_none(),
+        roam_drafts_open(&editor).is_empty(),
         "…and the draft buffer is gone with it"
     );
     let after: Vec<_> = std::fs::read_dir(&corpus)

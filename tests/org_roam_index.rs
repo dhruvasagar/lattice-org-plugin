@@ -2157,6 +2157,7 @@ async fn a_templated_note_expands_its_fields() {
         spec: concat!(
             "org.roam-capture-templates=[[template]]\n",
             "key = \"d\"\n",
+            "target = { kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${slug}.org\" }\n",
             "description = \"Default note\"\n",
             "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n",
             "#+title: ${title}\\n\\nfrom ${slug}\\n\"\n",
@@ -2306,6 +2307,7 @@ async fn a_templated_note_reads_its_body_from_a_file() {
             concat!(
                 "org.roam-capture-templates=[[template]]\n",
                 "key = \"s\"\n",
+                "target = {{ kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${{slug}}.org\" }}\n",
                 "description = \"Source\"\n",
                 "body-file = \"{}\"\n",
             ),
@@ -2404,6 +2406,7 @@ async fn an_unreadable_body_file_is_skipped_not_a_trap() {
             concat!(
                 "org.roam-capture-templates=[[template]]\n",
                 "key = \"s\"\n",
+                "target = {{ kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${{slug}}.org\" }}\n",
                 "description = \"Source\"\n",
                 "body-file = \"{}\"\n",
             ),
@@ -2693,6 +2696,7 @@ async fn an_aborted_roam_capture_leaves_nothing_behind() {
         concat!(
             "[[template]]\n",
             "key = \"d\"\n",
+            "target = { kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${slug}.org\" }\n",
             "description = \"Default note\"\n",
             "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n#+title: ${title}\\n\"\n",
         ),
@@ -2761,6 +2765,7 @@ async fn a_roam_template_asks_its_questions() {
         concat!(
             "[[template]]\n",
             "key = \"c\"\n",
+            "target = { kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${slug}.org\" }\n",
             "description = \"Concept\"\n",
             "body = \":PROPERTIES:\\n:ID:       ${id}\\n:END:\\n",
             "#+title: ${title}\\n#+category: %^{Category}\\n\\n* Summary\\n%?\\n\"\n",
@@ -2861,6 +2866,7 @@ async fn a_body_file_templates_questions_are_asked_too() {
             concat!(
                 "[[template]]\n",
                 "key = \"c\"\n",
+                "target = {{ kind = \"file\", file = \"%<%Y%m%d%H%M%S>-${{slug}}.org\" }}\n",
                 "description = \"Concept\"\n",
                 "body-file = \"{}\"\n",
             ),

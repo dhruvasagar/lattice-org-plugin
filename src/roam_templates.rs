@@ -1,244 +1,169 @@
-//! OR.11b — `org.roam-capture-templates`: what a new roam note starts as.
+//! OR.11b / CT.8 — `org.roam-capture-templates`: the SAME template type as
+//! `org.capture-templates`, held in a second option.
 //!
-//! Design: `lattice/docs/dev/architecture/org-roam.md` §6.3.
+//! Design: `lattice/docs/dev/architecture/org-capture-templates.md` §1, §7.
 //!
-//! ## Why this is not `org.capture-templates`
+//! ## One type, two options — as emacs has it
 //!
-//! Emacs keeps `org-roam-capture-templates` separate from
-//! `org-capture-templates`, and the reason is structural rather than
-//! historical: a capture template says WHERE its text lands — a file, a
-//! headline under it — and a roam template cannot, because the destination is
-//! a file that does not exist yet and whose name is derived from the node
-//! being made. `target` is the field the two sets disagree about, and it is
-//! the field capture is organised around.
+//! This file used to declare its own `RawRoamTemplate`, justified by the claim
+//! that the split was org's: "a capture template says WHERE its text lands, and
+//! a roam template cannot". That was wrong. `org-roam-capture-templates`
+//! documents the same `keys / description / type / template` tuple as
+//! `org-capture-templates`, and its `:target` is COMPULSORY
+//! (`org-roam-capture--get-target` raises "Template needs to specify
+//! `:target'"). Roam adds target kinds and a `${…}` pass; it never forked the
+//! type. So a roam template is a [`capture_templates::Template`], declared in
+//! a different option, resolved with [`TemplateList::Roam`].
 //!
-//! So a roam template has no `target`. It has an optional `file`, which names
-//! the note's FILENAME rather than a place inside an existing file, and which
-//! interpolates `${slug}` / `${id}` / `${title}` like the body does.
+//! What stays here is what is genuinely roam's:
 //!
-//! ## Both placeholder syntaxes, in one order
+//! - the `${title}` / `${slug}` / `${id}` pass, which means something only
+//!   because a node is being made;
+//! - resolving a target PATH against `org.roam-directory`, as org-roam's
+//!   `expand-file-name path org-roam-directory` does;
+//! - reporting a set that failed to load, instead of quietly writing the
+//!   built-in stub for a user who configured templates.
 //!
-//! [`crate::roam_capture`] expands `${…}` (the node being made) and
-//! [`crate::capture`] expands `%…` (the capture context). Roam templates get
-//! both, `${}` first — see `roam_capture::expand_fields` for why that ordering
-//! is the safe one.
-//!
-//! ## Unset is not an error
-//!
-//! With nothing configured, creating a note writes the built-in stub it always
-//! wrote (`:PROPERTIES:` / `:ID:` / `#+title:`) and does not prompt. Making
-//! the feature depend on configuration would break note creation for every
-//! user who has never heard of templates, to add a menu with one row in it.
+//! [`capture_templates::Template`]: crate::capture_templates::Template
+//! [`TemplateList::Roam`]: crate::capture_templates::TemplateList::Roam
 
-use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
+use crate::capture_templates::{ParsedSet, Template, TemplateError, TemplateList};
 
-/// One declared roam template.
-#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
-pub struct RawRoamTemplate {
-    /// The keystroke that selects it in the menu.
-    pub key: String,
-    /// What the menu row says. Absent falls back to the key, so a template is
-    /// never an unlabelled row.
-    pub description: Option<String>,
-    /// The note's text, with `${…}` and `%…` placeholders.
-    pub body: Option<String>,
-    /// The note's text, read from a FILE instead of inlined — emacs org-roam's
-    /// `(file "…/template.org")`. `${…}` expands on this PATH the same way it
-    /// does on `file` below, so a per-node template path is possible; the file
-    /// CONTENT gets both placeholder passes, exactly as `body` does. Mutually
-    /// exclusive with `body` — setting both is a configuration error.
-    pub body_file: Option<String>,
-    /// The note's FILENAME, with `${…}` placeholders — org-roam's
-    /// `:target (file+head "${slug}.org" …)` without the head, which is what
-    /// `body` already is. Absent uses the timestamped default, which is what
-    /// org-roam itself defaults to.
-    pub file: Option<String>,
-}
-
-/// The declared shape of `org.roam-capture-templates`.
-pub type Declared = Vec<RawRoamTemplate>;
-
-/// A usable template.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoamTemplate {
-    pub key: String,
-    pub description: String,
-    /// CT.1: inline text or a path to read at draft time — one field rather
-    /// than a `String` plus an `Option<String>` that had to be kept mutually
-    /// exclusive by hand. `from_declared` enforces the exclusion once, here it
-    /// is simply unrepresentable.
-    pub body: crate::template_body::BodySource,
-    pub file: Option<String>,
-}
-
-/// A read set, plus what was dropped getting there.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RoamTemplateSet {
-    pub templates: Vec<RoamTemplate>,
-    /// Named rather than dropped silently — the menu is where a missing row is
-    /// noticeable, and this is what the footer says.
-    pub skipped: Vec<String>,
-}
-
-impl RoamTemplateSet {
-    pub fn is_empty(&self) -> bool {
-        self.templates.is_empty()
-    }
-
-    pub fn get(&self, key: &str) -> Option<&RoamTemplate> {
-        self.templates.iter().find(|t| t.key == key)
-    }
-}
+/// The declared shape of `org.roam-capture-templates` — capture's, exactly.
+pub type Declared = crate::capture_templates::Declared;
 
 /// Read `org.roam-capture-templates`.
 ///
-/// Never an error. Unset, malformed and empty all mean "no templates", and the
-/// caller writes the built-in stub — see the module header. That is the
-/// difference from [`crate::capture_templates::read`], which errors: a capture
-/// with no template has nothing to do, while a roam note without one has a
-/// perfectly good default.
-pub fn read() -> RoamTemplateSet {
-    let raw = match crate::config_shape::read_option::<Declared>("roam-capture-templates") {
-        Some(Ok(raw)) => raw,
-        // The host validated the tree against the schema before storing it, so
-        // an `Err` here means the schema and `from_value` disagree — a bug, not
-        // a user's typo. Degrade to the stub rather than trapping.
-        _ => return RoamTemplateSet::default(),
-    };
-    from_declared(raw)
+/// `Err(TemplateError::Unset)` is the ONE result that means "write the
+/// built-in stub": the user has never configured templates, and note creation
+/// predates this option. Every other error means they HAVE configured some and
+/// none can be used — and writing the stub then is the silent-misplacement
+/// failure CT.2 fixed one layer down, a note created from a template the user
+/// did not choose. The caller warns instead.
+pub fn read() -> Result<ParsedSet, TemplateError> {
+    crate::capture_templates::read_for(TemplateList::Roam, "roam-capture-templates")
 }
 
-/// The rules, split from the read so they are testable without a host.
-pub fn from_declared(raw: Declared) -> RoamTemplateSet {
-    let mut out = RoamTemplateSet::default();
-    for (i, t) in raw.into_iter().enumerate() {
-        let key = t.key.trim().to_string();
-        if key.is_empty() {
-            // Named by position, since there is no key to name it by. A
-            // template with no key is unreachable: the menu is keyed.
-            out.skipped.push(format!("template {} has no `key`", i + 1));
-            continue;
-        }
-        if out.templates.iter().any(|e| e.key == key) {
-            // First wins, and the loser is NAMED. The menu cannot resolve two
-            // rows on one keystroke, and firing whichever came last silently is
-            // worse than saying so.
-            out.skipped
-                .push(format!("`{key}` is defined twice; the first one wins"));
-            continue;
-        }
-        // CT.1: the body/body-file rules are shared with capture now — blank
-        // counts as absent, both set is refused. What stays HERE is the policy
-        // capture does not share: a roam template with no body at all would
-        // make an empty note, indistinguishable from a failed create, so roam
-        // refuses it where capture allows it.
-        let body = match crate::template_body::classify(t.body.as_deref(), t.body_file.as_deref()) {
-            Ok(crate::template_body::BodySource::Empty) => {
-                out.skipped.push(format!("`{key}` has no `body`"));
-                continue;
-            }
-            Ok(source) => source,
-            Err(crate::template_body::BothSet) => {
-                out.skipped
-                    .push(format!("`{key}` sets both `body` and `body_file`"));
-                continue;
-            }
-        };
-        let description = match t.description.as_deref().map(str::trim) {
-            Some(d) if !d.is_empty() => d.to_string(),
-            _ => key.clone(),
-        };
-        let file = t
-            .file
-            .as_deref()
-            .map(str::trim)
-            .filter(|f| !f.is_empty())
-            .map(str::to_string);
-        out.templates.push(RoamTemplate {
-            key,
-            description,
-            body,
-            file,
-        });
-    }
-    out
-}
-
-/// Resolve a template's body text for one node, reading `body_file` off disk
-/// when that is the source instead of `body`.
+/// The template's body, for one node — read from its `body-file` if it has one.
 ///
-/// ## Why the read happens here, not in [`read`]
-///
-/// `body_file`'s PATH may carry `${…}` — the same shape `file` (the note's own
-/// filename) already has, and for the same reason: org-roam interpolates its
-/// target paths, and a per-node template path is nothing more than that
-/// applied to the template instead of the note. The node does not exist until
-/// a create is underway, so there is nothing to expand, and nothing to read,
-/// before then. `roam_draft` calls this once the node — title, slug, minted
-/// id — is known.
-///
-/// ## `read_file` is injected
-///
-/// So this is testable without a host, the same reason [`from_declared`] is
-/// split from [`read`]: production passes a closure around
-/// `host_services::read_file`, tests pass a fixture. `Err(())` rather than a
-/// carried message — the host's error detail is not for the user, only the
-/// PATH is, and this function already has that.
-///
-/// ## A missing or unreadable file is `Err`, never a panic
-///
-/// The caller turns that into a warn — the same channel `roam_draft` already
-/// uses for every other reason a note cannot be made. A template that
-/// silently wrote an empty note would be worse than one that says why it
-/// could not.
+/// Roam's `${…}` pass runs on the path AND the content, before capture's `%`
+/// pass, which `open_capture_buffer` applies to the whole draft.
 pub fn resolve_body(
-    template: &RoamTemplate,
+    template: &Template,
     node: &crate::roam_capture::Node<'_>,
     read_file: impl FnOnce(&str) -> Result<String, ()>,
 ) -> Result<String, String> {
-    // CT.1: the reading, the tilde expansion and the empty-file rule are
-    // shared. What is roam's, and stays here, is WHICH interpolation runs —
-    // `${slug}` / `${title}` / `${id}` mean something only because a node is
-    // being made, which is why the shared resolver takes the pass rather than
-    // the node.
+    let source = match &template.body_file {
+        Some(path) => crate::template_body::BodySource::File(path.clone()),
+        None if template.body.is_empty() => crate::template_body::BodySource::Empty,
+        None => crate::template_body::BodySource::Inline(template.body.clone()),
+    };
     crate::template_body::resolve(
-        &template.body,
+        &source,
         &template.key,
         |s| crate::roam_capture::expand_fields(s, node),
         read_file,
     )
 }
 
+/// Where a roam template's note lives: its target path with every placeholder
+/// filled, made absolute.
+///
+/// org-roam's order: fill the template (`${…}` and `%…`), then
+/// `expand-file-name` against `org-roam-directory`. A relative path lands in
+/// the roam directory; an absolute or `~/…` one is used as written.
+pub fn target_path(
+    pattern: &str,
+    node: &crate::roam_capture::Node<'_>,
+    now: crate::time_format::When,
+    dir: &str,
+) -> String {
+    let filled =
+        crate::time_format::expand_time(&crate::roam_capture::expand_fields(pattern, node), now);
+    let path = crate::roam_scan::expand_tilde(filled.trim());
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("{}/{path}", dir.trim_end_matches('/'))
+    }
+}
+
+/// The text a roam capture writes, given whether its file is new.
+///
+/// org-roam's `file+head` inserts the head only "if the node is a newly
+/// captured one" (`org-roam-capture.el:495-503`), newline-terminated, and
+/// prescribes the file an `:ID:`. A capture into a file that already exists
+/// writes the body alone: the head and the id are already there.
+pub fn draft_text(
+    template: &Template,
+    node: &crate::roam_capture::Node<'_>,
+    body: &str,
+    id: &str,
+    is_new_file: bool,
+) -> String {
+    if !is_new_file {
+        return body.to_string();
+    }
+    let mut text = String::new();
+    if let Some(head) = &template.head {
+        let head = crate::roam_capture::expand_fields(head, node);
+        text.push_str(&head);
+        if !head.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    text.push_str(body);
+    // The `:ID:` is org-roam's to guarantee, not the template's. Applied after
+    // the head, so the drawer opens the file — where `org-id-get-create` at
+    // `point-min` puts it — and after `${…}`, so a template spelling
+    // `:ID: ${id}` itself is seen as already having one.
+    crate::roam_capture::ensure_id(&text, id)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
+    use crate::capture_templates::{from_declared_for, RawTarget, RawTemplate};
 
-    fn t(key: &str, body: &str) -> RawRoamTemplate {
-        RawRoamTemplate {
+    fn raw(key: &str, body: Option<&str>, body_file: Option<&str>) -> RawTemplate {
+        RawTemplate {
             key: key.to_string(),
-            description: None,
-            body: Some(body.to_string()),
-            body_file: None,
-            file: None,
+            body: body.map(str::to_string),
+            body_file: body_file.map(str::to_string),
+            target: RawTarget {
+                kind: Some("file".to_string()),
+                file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
         }
+    }
+
+    fn set(templates: Vec<RawTemplate>) -> ParsedSet {
+        from_declared_for(TemplateList::Roam, templates).expect("a usable roam set")
     }
 
     fn node<'a>(title: &'a str, slug: &'a str, id: &'a str) -> crate::roam_capture::Node<'a> {
         crate::roam_capture::Node { title, slug, id }
     }
 
-    #[test]
-    fn a_template_without_a_description_is_labelled_by_its_key() {
-        let set = from_declared(vec![t("d", "#+title: ${title}")]);
-        assert_eq!(set.templates[0].description, "d");
+    /// 2026-09-16 14:05:09 local.
+    fn at() -> crate::time_format::When {
+        crate::time_format::When {
+            local_secs: 1_789_567_509,
+        }
     }
 
+    /// A roam template is a capture `Template`: the reference config's shape
+    /// resolves, target and all.
     #[test]
-    fn a_keyless_template_is_skipped_and_named_by_position() {
-        let set = from_declared(vec![t("", "body")]);
-        assert!(set.is_empty());
-        assert_eq!(set.skipped, vec!["template 1 has no `key`"]);
+    fn a_roam_template_is_the_shared_type() {
+        let s = set(vec![raw("c", None, Some("~/t/pkos-concept.org"))]);
+        let t = &s.templates[0];
+        assert_eq!(t.key, "c");
+        assert_eq!(t.body_file.as_deref(), Some("~/t/pkos-concept.org"));
+        assert_eq!(t.target.file(), "%<%Y%m%d%H%M%S>-${slug}.org");
     }
 
     /// The menu cannot resolve two rows on one keystroke, so the second is
@@ -246,132 +171,71 @@ mod tests {
     /// the feature being broken.
     #[test]
     fn a_duplicate_key_keeps_the_first_and_says_so() {
-        let set = from_declared(vec![t("d", "first"), t("d", "second")]);
-        assert_eq!(set.templates.len(), 1);
-        assert_eq!(
-            set.templates[0].body,
-            crate::template_body::BodySource::Inline("first".to_string())
-        );
-        assert_eq!(
-            set.skipped,
-            vec!["`d` is defined twice; the first one wins"]
-        );
+        let s = set(vec![
+            raw("d", Some("first"), None),
+            raw("d", Some("second"), None),
+        ]);
+        assert_eq!(s.templates.len(), 1);
+        assert_eq!(s.templates[0].body, "first");
+        assert_eq!(s.skipped.len(), 1);
     }
 
-    /// An empty body would make an empty note, which is indistinguishable from
-    /// a create that failed.
+    /// CT.8: a bodyless roam template is USABLE now, as it is in emacs — an
+    /// empty `plain` template defaults to `%?`. The old refusal argued that an
+    /// empty body makes an empty note, but a new note always gets its `:ID:`
+    /// drawer (and a head, if declared), so it is never empty.
     #[test]
-    fn a_bodyless_template_is_skipped() {
-        let set = from_declared(vec![t("d", "   ")]);
-        assert!(set.is_empty());
-        assert_eq!(set.skipped, vec!["`d` has no `body`"]);
+    fn a_bodyless_roam_template_is_usable() {
+        let s = set(vec![raw("d", None, None)]);
+        assert_eq!(s.templates.len(), 1);
+        assert_eq!(s.templates[0].body, "");
     }
 
-    #[test]
-    fn a_blank_file_is_the_same_as_none() {
-        let mut raw = t("d", "body");
-        raw.file = Some("  ".to_string());
-        assert_eq!(from_declared(vec![raw]).templates[0].file, None);
-    }
-
-    #[test]
-    fn a_file_pattern_survives_verbatim_for_the_caller_to_expand() {
-        let mut raw = t("d", "body");
-        raw.file = Some("${slug}.org".to_string());
-        assert_eq!(
-            from_declared(vec![raw]).templates[0].file.as_deref(),
-            Some("${slug}.org")
-        );
-    }
-
-    /// A template naming a `body_file` instead of an inline `body` is valid —
-    /// `body` stays empty and `body_file` carries the pattern, unread until a
-    /// node exists to read it for.
-    #[test]
-    fn a_body_file_template_is_accepted_with_an_empty_inline_body() {
-        let raw = RawRoamTemplate {
-            key: "s".to_string(),
-            description: None,
-            body: None,
-            body_file: Some("~/templates/source.org".to_string()),
-            file: None,
-        };
-        let set = from_declared(vec![raw]);
-        assert_eq!(set.skipped, Vec::<String>::new());
-        assert_eq!(
-            set.templates[0].body,
-            crate::template_body::BodySource::File("~/templates/source.org".to_string())
-        );
-    }
-
-    /// `body` and `body_file` naming the same template is a configuration
-    /// error, not a coin flip between them — skip it and say so, the same as
-    /// every other config mistake this module catches.
+    /// Both body sources is a configuration error, named.
     #[test]
     fn setting_both_body_and_body_file_is_a_configuration_error() {
-        let mut raw = t("d", "inline text");
-        raw.body_file = Some("~/templates/d.org".to_string());
-        let set = from_declared(vec![raw]);
-        assert!(set.is_empty());
-        assert_eq!(set.skipped, vec!["`d` sets both `body` and `body_file`"]);
-    }
-
-    /// Blank is the same as absent for `body_file` too — a template with a
-    /// blank `body` and a blank `body_file` has no source at all, same
-    /// message as the plain bodyless case.
-    #[test]
-    fn a_blank_body_file_with_no_body_is_the_bodyless_skip() {
-        let raw = RawRoamTemplate {
-            key: "d".to_string(),
-            description: None,
-            body: None,
-            body_file: Some("   ".to_string()),
-            file: None,
-        };
-        let set = from_declared(vec![raw]);
-        assert!(set.is_empty());
-        assert_eq!(set.skipped, vec!["`d` has no `body`"]);
-    }
-
-    /// A blank `body` alongside a real `body_file` is not "both set" — the
-    /// blank one does not count, the same rule `file` already has.
-    #[test]
-    fn a_blank_body_alongside_a_body_file_is_not_a_conflict() {
-        let raw = RawRoamTemplate {
-            key: "d".to_string(),
-            description: None,
-            body: Some("   ".to_string()),
-            body_file: Some("~/templates/d.org".to_string()),
-            file: None,
-        };
-        let set = from_declared(vec![raw]);
-        assert_eq!(set.skipped, Vec::<String>::new());
-        assert_eq!(
-            set.templates[0].body,
-            crate::template_body::BodySource::File("~/templates/d.org".to_string())
+        let result = from_declared_for(
+            TemplateList::Roam,
+            vec![
+                raw("x", Some("inline"), Some("~/t.org")),
+                raw("ok", Some("b"), None),
+            ],
+        )
+        .expect("the survivor keeps the set");
+        assert_eq!(result.templates.len(), 1);
+        assert!(
+            result.skipped[0].contains("sets both"),
+            "{:?}",
+            result.skipped
         );
+    }
+
+    /// CT.8: org-roam's `:target` is COMPULSORY, so a roam template without
+    /// one is refused — by the host, structurally, as a missing required field.
+    /// That is the same rule the capture list has.
+    #[test]
+    fn the_target_is_required_in_the_roam_list_too() {
+        use lattice_plugin_sdk::shape::{ConfigShape, Schema};
+        let Schema::List(inner) = <Declared as ConfigShape>::schema() else {
+            panic!("a list of templates");
+        };
+        let Schema::Record(fields) = inner.as_ref() else {
+            panic!("each template is a record");
+        };
+        let target = fields.iter().find(|f| f.name == "target").expect("target");
+        assert!(target.required, "org-roam requires :target");
     }
 
     #[test]
     fn resolve_body_reads_and_expands_a_file_sourced_template() {
-        let raw = RawRoamTemplate {
-            key: "s".to_string(),
-            description: None,
-            body: None,
-            body_file: Some("~/templates/${slug}.org".to_string()),
-            file: None,
-        };
-        let template = &from_declared(vec![raw]).templates[0];
+        let s = set(vec![raw("s", None, Some("~/templates/${slug}.org"))]);
         let n = node("Rust Async", "rust_async", "ABC-123");
-        let body = resolve_body(template, &n, |path| {
+        let body = resolve_body(&s.templates[0], &n, |path| {
             assert!(
                 path.contains("rust_async.org") && !path.contains("${"),
                 "the path is expanded before it is read: {path}"
             );
-            assert!(
-                !path.starts_with('~'),
-                "the path is tilde-expanded before it is read: {path}"
-            );
+            assert!(!path.starts_with('~'), "tilde-expanded: {path}");
             Ok("#+title: ${title}\n".to_string())
         })
         .expect("a readable file resolves");
@@ -380,30 +244,16 @@ mod tests {
 
     #[test]
     fn resolve_body_reads_inline_text_without_a_reader_call() {
-        let template = &from_declared(vec![t("d", "#+title: ${title}")]).templates[0];
+        let s = set(vec![raw("d", Some("#+title: ${title}"), None)]);
         let n = node("Rust", "rust", "I");
-        let body = resolve_body(template, &n, |_| {
-            panic!("body_file is unset — the reader must not be called")
-        })
-        .expect("an inline body resolves without reading anything");
+        let body = resolve_body(&s.templates[0], &n, |_| panic!("no body-file")).unwrap();
         assert_eq!(body, "#+title: Rust");
     }
 
-    /// A missing or unreadable file is `Err`, never a panic — `roam_draft`
-    /// turns this into a skip (a warn), the same channel every other reason a
-    /// note cannot be made already uses.
     #[test]
     fn resolve_body_reports_an_unreadable_file_by_name_and_path() {
-        let raw = RawRoamTemplate {
-            key: "s".to_string(),
-            description: None,
-            body: None,
-            body_file: Some("~/templates/source.org".to_string()),
-            file: None,
-        };
-        let template = &from_declared(vec![raw]).templates[0];
-        let n = node("T", "t", "I");
-        let err = resolve_body(template, &n, |_| Err(())).unwrap_err();
+        let s = set(vec![raw("s", None, Some("~/templates/source.org"))]);
+        let err = resolve_body(&s.templates[0], &node("T", "t", "I"), |_| Err(())).unwrap_err();
         assert!(err.contains('s'), "names the template: {err:?}");
         assert!(
             err.contains("templates/source.org"),
@@ -411,20 +261,118 @@ mod tests {
         );
     }
 
-    /// An empty file would silently produce an empty note — indistinguishable
-    /// from a failed create, same reasoning as the inline bodyless skip.
     #[test]
     fn resolve_body_reports_an_empty_file() {
-        let raw = RawRoamTemplate {
-            key: "s".to_string(),
-            description: None,
-            body: None,
-            body_file: Some("~/templates/source.org".to_string()),
-            file: None,
-        };
-        let template = &from_declared(vec![raw]).templates[0];
-        let n = node("T", "t", "I");
-        let err = resolve_body(template, &n, |_| Ok("   \n".to_string())).unwrap_err();
+        let s = set(vec![raw("s", None, Some("~/templates/source.org"))]);
+        let err = resolve_body(&s.templates[0], &node("T", "t", "I"), |_| {
+            Ok("   \n".to_string())
+        })
+        .unwrap_err();
         assert!(err.contains("empty"), "{err:?}");
+    }
+
+    /// The reference config's path: `%<…>` and `${slug}` both filled, and the
+    /// result placed under the roam directory — org-roam's
+    /// `expand-file-name path org-roam-directory`.
+    #[test]
+    fn a_relative_target_path_lands_in_the_roam_directory() {
+        let path = target_path(
+            "%<%Y%m%d%H%M%S>-${slug}.org",
+            &node("Rust Async", "rust_async", "I"),
+            at(),
+            "/org/roam/",
+        );
+        assert_eq!(path, "/org/roam/20260916140509-rust_async.org");
+    }
+
+    /// An absolute path is used as written; `~` is expanded.
+    #[test]
+    fn an_absolute_target_path_is_kept() {
+        let n = node("T", "t", "I");
+        assert_eq!(
+            target_path("/abs/${slug}.org", &n, at(), "/org/roam"),
+            "/abs/t.org"
+        );
+        let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(
+            target_path("~/notes/%<%Y-%m-%d>.org", &n, at(), "/org/roam"),
+            format!("{home}/notes/2026-09-16.org")
+        );
+    }
+
+    /// org-roam's `file+head`: a NEW file gets the head, then the body, with
+    /// the `:ID:` drawer opening the file.
+    #[test]
+    fn a_new_file_gets_its_head_and_an_id() {
+        let s = from_declared_for(
+            TemplateList::Roam,
+            vec![RawTemplate {
+                key: "d".to_string(),
+                body: Some("%?".to_string()),
+                target: RawTarget {
+                    kind: Some("file+head".to_string()),
+                    file: "${slug}.org".to_string(),
+                    head: Some("#+title: ${title}".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let n = node("Rust", "rust", "ID-1");
+        let text = draft_text(&s.templates[0], &n, "%?", "ID-1", true);
+        assert_eq!(
+            text, ":PROPERTIES:\n:ID:       ID-1\n:END:\n#+title: Rust\n%?",
+            "drawer, then the head (newline-terminated), then the body"
+        );
+    }
+
+    /// A capture into a file that already exists writes the body alone — the
+    /// head and the id are already there. This is org-roam's "head content
+    /// will be inserted if the node is a newly captured one".
+    #[test]
+    fn an_existing_file_gets_the_body_alone() {
+        let s = from_declared_for(
+            TemplateList::Roam,
+            vec![RawTemplate {
+                key: "d".to_string(),
+                body: Some("* entry".to_string()),
+                target: RawTarget {
+                    kind: Some("file+head".to_string()),
+                    file: "%<%Y-%m-%d>.org".to_string(),
+                    head: Some("#+title: %<%Y-%m-%d>".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let text = draft_text(
+            &s.templates[0],
+            &node("T", "t", "ID"),
+            "* entry",
+            "ID",
+            false,
+        );
+        assert_eq!(text, "* entry");
+    }
+
+    /// No head declared: a new file still gets its id, as org-roam's plain
+    /// `file` target "will be created, and prescribed an ID".
+    #[test]
+    fn a_plain_file_target_still_prescribes_an_id() {
+        let s = set(vec![raw("c", Some("#+title: ${title}"), None)]);
+        let text = draft_text(
+            &s.templates[0],
+            &node("T", "t", "ID-2"),
+            "#+title: T\n",
+            "ID-2",
+            true,
+        );
+        assert!(
+            text.starts_with(":PROPERTIES:\n:ID:       ID-2\n:END:\n"),
+            "{text:?}"
+        );
+        assert!(text.ends_with("#+title: T\n"), "{text:?}");
     }
 }

@@ -136,6 +136,50 @@ pub fn format_time(fmt: &str, when: When) -> String {
     out
 }
 
+/// CT.8: expand only the `%<fmt>` placeholders in `s`, for a target PATH.
+///
+/// A path is not a template body: `%?`, `%U` and `%^{…}` mean nothing in a file
+/// name, so they are left as written rather than run through the body
+/// expander (which would also append a newline). `%%` is still an escaped `%`,
+/// so `%%<` stays a literal `%<`.
+pub fn expand_time(s: &str, when: When) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some('<') => {
+                let mut lookahead = chars.clone();
+                lookahead.next();
+                let mut fmt = String::new();
+                let mut closed = false;
+                for fc in lookahead.by_ref() {
+                    if fc == '>' {
+                        closed = true;
+                        break;
+                    }
+                    fmt.push(fc);
+                }
+                if closed {
+                    chars = lookahead;
+                    out.push_str(&format_time(&fmt, when));
+                } else {
+                    out.push('%');
+                }
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +256,23 @@ mod tests {
         assert_eq!(format_time("100%%", at(WED)), "100%");
         assert_eq!(format_time("trail%", at(WED)), "trail%");
         assert_eq!(format_time("%s %Z", at(WED)), "%s %Z", "no epoch or zone");
+    }
+
+    /// A path gets `%<…>` and `%%` and nothing else — no trailing newline, no
+    /// `%?`/`%U` expansion.
+    #[test]
+    fn a_path_expands_only_time_placeholders() {
+        assert_eq!(
+            expand_time("%<%Y%m%d%H%M%S>-${slug}.org", at(WED)),
+            "20260916140509-${slug}.org"
+        );
+        assert_eq!(
+            expand_time("daily/%<%Y-%m-%d>.org", at(WED)),
+            "daily/2026-09-16.org"
+        );
+        assert_eq!(expand_time("a%%<b>", at(WED)), "a%<b>");
+        assert_eq!(expand_time("keep %U and %?", at(WED)), "keep %U and %?");
+        assert_eq!(expand_time("open %<%Y", at(WED)), "open %<%Y");
     }
 
     #[test]

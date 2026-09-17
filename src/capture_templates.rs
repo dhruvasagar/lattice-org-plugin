@@ -20,6 +20,7 @@
 //!         olp:       list<string>?,
 //!         tree-type: enum?,     // day | week | month
 //!         sub-olp:   list<string>?, // a path BELOW the date node
+//!         head:      string?,  // org-roam `+head` kinds only
 //!     },
 //!     body:           string?,
 //!     body-file:      string?,
@@ -150,6 +151,20 @@ impl Target {
     pub fn resolved_file(&self) -> String {
         crate::roam_scan::expand_tilde(self.file())
     }
+
+    /// CT.8: the same target, writing to `file` instead — roam resolves a
+    /// template's path against the node and the roam directory, and keeps the
+    /// shape (headline, olp, datetree) the template named.
+    pub fn with_file(&self, file: String) -> Target {
+        let mut out = self.clone();
+        match &mut out {
+            Target::File { file: f }
+            | Target::FileHeadline { file: f, .. }
+            | Target::FileOlp { file: f, .. }
+            | Target::FileDatetree { file: f, .. } => *f = file,
+        }
+        out
+    }
 }
 
 /// CT.6: re-exported so consumers name one module for the template shape.
@@ -202,6 +217,9 @@ pub struct Template {
     pub entry_type: EntryType,
     /// CT.4: for `table-line`, where in the table the row goes.
     pub placement: crate::capture_target::TablePlacement,
+    /// CT.8: org-roam's `+head` text, written only when the capture creates
+    /// the file. Always `None` in the capture list.
+    pub head: Option<String>,
     /// OC.11 — org's `:clock-in`: start a clock on the entry this template
     /// captures, as part of capturing it.
     ///
@@ -247,17 +265,22 @@ pub enum TemplateError {
 impl TemplateError {
     /// What the user sees echoed.
     pub fn message(&self) -> String {
+        self.message_for(TemplateList::Capture)
+    }
+
+    /// CT.8: the same message, naming whichever option it came from — the two
+    /// lists share this error, and a message naming the wrong option sends the
+    /// user to the wrong table.
+    pub fn message_for(&self, list: TemplateList) -> String {
+        let (noun, option) = match list {
+            TemplateList::Capture => ("capture templates", "org.capture-templates"),
+            TemplateList::Roam => ("roam templates", "org.roam-capture-templates"),
+        };
         match self {
-            TemplateError::Unset => {
-                "org: no capture templates — set `org.capture-templates`".to_string()
-            }
-            TemplateError::Malformed(e) => format!("org.capture-templates: {e}"),
-            TemplateError::Empty => {
-                "org.capture-templates: no usable templates in the set".to_string()
-            }
-            TemplateError::NotLoaded(why) => {
-                format!("org.capture-templates did not load: {why}")
-            }
+            TemplateError::Unset => format!("org: no {noun} — set `{option}`"),
+            TemplateError::Malformed(e) => format!("{option}: {e}"),
+            TemplateError::Empty => format!("{option}: no usable templates in the set"),
+            TemplateError::NotLoaded(why) => format!("{option} did not load: {why}"),
         }
     }
 }
@@ -316,6 +339,15 @@ pub struct RawTarget {
     /// Two fields rather than one overloaded one so a ported emacs config
     /// cannot silently mean something else: `olp` keeps org's meaning.
     pub sub_olp: Option<Vec<String>>,
+    /// CT.8: org-roam's `file+head` / `file+head+olp` HEAD — text written at the
+    /// top of the file ONLY when the capture creates it, before the body.
+    ///
+    /// org-roam's own semantics (`org-roam-capture.el:495-503`): inserted when
+    /// the target is a new file, filled with the same placeholder passes as the
+    /// body, newline-terminated. A second capture into the same file writes the
+    /// body alone. Roam-list only: `org-capture` has no such target, and a
+    /// capture template naming one is refused.
+    pub head: Option<String>,
 }
 
 /// One `[[org.capture-templates]]` entry, as declared.
@@ -360,6 +392,18 @@ pub struct RawTemplate {
 /// The declared shape of `org.capture-templates`, for the registration call.
 pub type Declared = Vec<RawTemplate>;
 
+/// CT.8: which option a template was declared in.
+///
+/// The two lists hold ONE type, as emacs holds `org-capture-templates` and
+/// `org-roam-capture-templates` as two variables of one shape. What differs is
+/// the handful of rules emacs itself applies differently: only org-roam has
+/// `file+head` targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateList {
+    Capture,
+    Roam,
+}
+
 /// CT.3: resolve a declared target into the shape it names.
 ///
 /// ## `kind` absent is the old inference, deliberately
@@ -384,13 +428,22 @@ pub type Declared = Vec<RawTemplate>;
 /// edit is likelier than a deliberate empty string.
 fn resolve_target(
     key: &str,
+    list: TemplateList,
     file: String,
-    kind: Option<String>,
-    headline: Option<String>,
-    olp: Option<Vec<String>>,
-    tree_type: Option<crate::datetree::TreeType>,
-    sub_olp: Option<Vec<String>>,
-) -> Result<Target, String> {
+    raw: RawTarget,
+) -> Result<(Target, Option<String>), String> {
+    let RawTarget {
+        kind,
+        headline,
+        olp,
+        tree_type,
+        sub_olp,
+        head,
+        ..
+    } = raw;
+    // CT.8: the head is org-roam's. Blank counts as absent, like every other
+    // text field here.
+    let head = head.filter(|h| !h.trim().is_empty());
     let headline = headline
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty());
@@ -423,15 +476,52 @@ fn resolve_target(
              (use `olp` to address a path directly)"
         ));
     }
+    // CT.8: a head belongs to the two `+head` kinds, and those to org-roam.
+    let takes_head = matches!(kind.as_deref(), Some("file+head") | Some("file+head+olp"));
+    if takes_head && list == TemplateList::Capture {
+        return Err(format!(
+            "`{key}`: `kind = \"{}\"` is an org-roam target \
+             (org-capture has no `+head` kinds)",
+            kind.as_deref().unwrap_or_default()
+        ));
+    }
+    if head.is_some() && !takes_head {
+        return Err(format!(
+            "`{key}`: `head` belongs to `kind = \"file+head\"` or \"file+head+olp\""
+        ));
+    }
+
     let Some(kind) = kind else {
         // The pre-CT.3 inference, unchanged.
-        return Ok(match headline {
-            Some(headline) => Target::FileHeadline { file, headline },
-            None => Target::File { file },
-        });
+        return Ok((
+            match headline {
+                Some(headline) => Target::FileHeadline { file, headline },
+                None => Target::File { file },
+            },
+            None,
+        ));
     };
 
-    match kind.as_str() {
+    let target = match kind.as_str() {
+        // CT.8: org-roam's `file+head` is `file` with a head, and
+        // `file+head+olp` is `file+olp` with one. The head is applied when the
+        // draft is built, where it is known whether the file is new, so the
+        // write path sees the plain shapes.
+        "file+head" => match (headline, olp) {
+            (None, None) => Ok(Target::File { file }),
+            _ => Err(format!(
+                "`{key}`: `kind = \"file+head\"` takes neither `headline` nor `olp`"
+            )),
+        },
+        "file+head+olp" => match (headline, olp) {
+            (None, Some(olp)) => Ok(Target::FileOlp { file, olp }),
+            (_, None) => Err(format!(
+                "`{key}`: `kind = \"file+head+olp\"` needs an `olp`"
+            )),
+            (Some(_), Some(_)) => Err(format!(
+                "`{key}`: `kind = \"file+head+olp\"` does not take `headline`"
+            )),
+        },
         "file" => match (headline, olp) {
             (None, None) => Ok(Target::File { file }),
             _ => Err(format!(
@@ -473,10 +563,22 @@ fn resolve_target(
         // to `file` would append every capture to the end of the file while the
         // config plainly says otherwise.
         other => Err(format!(
-            "`{key}`: unknown target `kind = \"{other}\"` \
-             (expected `file`, `file+headline`, `file+olp` or `file+datetree`)"
+            "`{key}`: unknown target `kind = \"{other}\"` (expected `file`, \
+             `file+headline`, `file+olp`, `file+datetree`, or for org-roam \
+             `file+head` / `file+head+olp`)"
         )),
-    }
+    }?;
+    Ok((target, head))
+}
+
+/// The capture list's [`from_declared_for`], for tests.
+///
+/// Test-only since CT.8: production reads through [`read_for`], which names the
+/// list. The capture-list tests predate the second list and read clearer
+/// without spelling it out on every call.
+#[cfg(test)]
+pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
+    from_declared_for(TemplateList::Capture, raw)
 }
 
 /// Read the option's value into the template set.
@@ -491,7 +593,10 @@ fn resolve_target(
 /// and silently firing whichever came last is worse than saying so — but the set
 /// as a whole is still usable, which is what separates this from the structural
 /// failures the host now catches.
-pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
+///
+/// CT.8: for either list — one type in two options, as emacs holds
+/// `org-capture-templates` and `org-roam-capture-templates`.
+pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet, TemplateError> {
     if raw.is_empty() {
         return Err(TemplateError::Unset);
     }
@@ -526,16 +631,8 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             ));
             continue;
         }
-        let target = match resolve_target(
-            &key,
-            file,
-            t.target.kind,
-            t.target.headline,
-            t.target.olp,
-            t.target.tree_type,
-            t.target.sub_olp,
-        ) {
-            Ok(target) => target,
+        let (target, head) = match resolve_target(&key, list, file, t.target) {
+            Ok(resolved) => resolved,
             Err(why) => {
                 skipped.push(why);
                 continue;
@@ -578,6 +675,7 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
             body_file,
             entry_type: t.r#type.unwrap_or_default(),
             placement,
+            head,
             clock_in: t.clock_in.unwrap_or(false),
         });
     }
@@ -593,8 +691,14 @@ pub fn from_declared(raw: Declared) -> Result<ParsedSet, TemplateError> {
 /// The one entry point production code uses; `from_declared` is split out so
 /// the resolution rules are testable without a host.
 pub fn read() -> Result<ParsedSet, TemplateError> {
-    let out = match crate::config_shape::read_option::<Declared>("capture-templates") {
-        Some(Ok(raw)) => from_declared(raw),
+    read_for(TemplateList::Capture, "capture-templates")
+}
+
+/// CT.8: [`read`] for either list. `option` is the plugin-local name, as
+/// `read_option` takes it.
+pub fn read_for(list: TemplateList, option: &str) -> Result<ParsedSet, TemplateError> {
+    let out = match crate::config_shape::read_option::<Declared>(option) {
+        Some(Ok(raw)) => from_declared_for(list, raw),
         // The host validated the write, so this is the residue a schema cannot
         // express. Carry the path it came with rather than flattening it to
         // "malformed" — the location is the whole value of reporting it.
@@ -611,7 +715,7 @@ pub fn read() -> Result<ParsedSet, TemplateError> {
     // nothing to explain, and a stale diagnostic cannot exist anyway (the
     // registry drops it the moment an assignment succeeds).
     if matches!(out, Err(TemplateError::Unset)) {
-        if let Some(why) = crate::config_shape::option_failure("capture-templates") {
+        if let Some(why) = crate::config_shape::option_failure(option) {
             return Err(TemplateError::NotLoaded(why));
         }
     }
@@ -722,6 +826,7 @@ mod tests {
                 olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
                 tree_type: None,
                 sub_olp: None,
+                head: None,
             },
             ..Default::default()
         }]
@@ -880,6 +985,131 @@ mod tests {
             matches!(set.templates[0].target, Target::File { .. }),
             "an all-blank olp is not a declaration"
         );
+    }
+
+    /// CT.8 helper: one template in either list, with a kind and a head.
+    fn in_list(
+        list: TemplateList,
+        kind: &str,
+        head: Option<&str>,
+        olp: Option<Vec<&str>>,
+    ) -> Result<ParsedSet, TemplateError> {
+        from_declared_for(
+            list,
+            vec![RawTemplate {
+                key: "k".to_string(),
+                body: Some("x".to_string()),
+                target: RawTarget {
+                    kind: Some(kind.to_string()),
+                    file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
+                    head: head.map(str::to_string),
+                    olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+        )
+    }
+
+    /// CT.8: org-roam's `file+head` resolves to the plain `file` shape, and the
+    /// head rides alongside for the draft to apply to a new file.
+    #[test]
+    fn a_roam_file_head_target_carries_its_head() {
+        let set = in_list(
+            TemplateList::Roam,
+            "file+head",
+            Some("#+title: ${title}\n"),
+            None,
+        )
+        .expect("a roam file+head template resolves");
+        assert!(matches!(set.templates[0].target, Target::File { .. }));
+        assert_eq!(
+            set.templates[0].head.as_deref(),
+            Some("#+title: ${title}\n")
+        );
+    }
+
+    /// `file+head+olp` is `file+olp` with a head.
+    #[test]
+    fn a_roam_file_head_olp_target_is_an_olp_with_a_head() {
+        let set = in_list(
+            TemplateList::Roam,
+            "file+head+olp",
+            Some("#+title: x\n"),
+            Some(vec!["Notes"]),
+        )
+        .expect("resolves");
+        assert!(matches!(set.templates[0].target, Target::FileOlp { .. }));
+        assert!(set.templates[0].head.is_some());
+    }
+
+    /// org-capture has no `+head` kinds, so the capture list refuses them BY
+    /// NAME rather than filing a head nobody asked for.
+    #[test]
+    fn the_capture_list_refuses_org_roam_head_kinds() {
+        let err = in_list(TemplateList::Capture, "file+head", Some("h"), None)
+            .expect_err("the only template was refused");
+        assert_eq!(err, TemplateError::Empty);
+
+        let mut declared = vec![RawTemplate {
+            key: "k".to_string(),
+            target: RawTarget {
+                kind: Some("file+head".to_string()),
+                file: "~/x.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        declared.push(RawTemplate {
+            key: "ok".to_string(),
+            target: RawTarget {
+                file: "~/x.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let set = from_declared(declared).expect("the survivor keeps the set");
+        assert!(
+            set.skipped[0].contains("is an org-roam target"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    /// A head on a kind that does not take one is named, not dropped.
+    #[test]
+    fn a_head_on_a_headless_kind_is_named() {
+        let mut declared = vec![RawTemplate {
+            key: "k".to_string(),
+            target: RawTarget {
+                kind: Some("file".to_string()),
+                file: "~/x.org".to_string(),
+                head: Some("#+title: x".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        declared.push(RawTemplate {
+            key: "ok".to_string(),
+            target: RawTarget {
+                file: "~/x.org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let set = from_declared_for(TemplateList::Roam, declared).expect("survivor");
+        assert!(
+            set.skipped[0].contains("`head` belongs to"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    /// A blank head counts as absent, like every other text field.
+    #[test]
+    fn a_blank_head_is_absent() {
+        let set = in_list(TemplateList::Roam, "file+head", Some("   "), None).expect("resolves");
+        assert_eq!(set.templates[0].head, None);
     }
 
     /// CT.2: a `~/…` target is expanded for READING, and left alone for
@@ -1097,13 +1327,21 @@ mod tests {
         let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             target_names,
-            vec!["kind", "file", "headline", "olp", "tree-type", "sub-olp"],
+            vec![
+                "kind",
+                "file",
+                "headline",
+                "olp",
+                "tree-type",
+                "sub-olp",
+                "head"
+            ],
             "the target record's shape is as user-visible as the template's"
         );
         let target_required: Vec<bool> = target_fields.iter().map(|f| f.required).collect();
         assert_eq!(
             target_required,
-            vec![false, true, false, false, false, false],
+            vec![false, true, false, false, false, false, false],
             "`file` is the only field every target shape needs — `kind` absent \
              keeps the pre-CT.3 inference, `headline` / `olp` belong to one \
              kind each, CT.6's `tree-type` defaults to `day`, and CT.7's \

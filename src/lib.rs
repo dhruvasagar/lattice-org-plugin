@@ -4326,16 +4326,21 @@ impl CaptureDestination {
         }
     }
 
-    /// Append to one file — roam's whole destination, and the shape of every
-    /// capture target that names no headline.
-    fn appending_to(path: String) -> Self {
+    /// CT.8: where a roam template files — the template's own target shape,
+    /// writing to `path`, the target's pattern resolved against the node and
+    /// the roam directory.
+    ///
+    /// Replaces a fixed `appending_to(path)`: roam used to have one destination
+    /// shape (append to a new file) because its templates could not say
+    /// otherwise. Now they declare a `target` like any capture template, so a
+    /// roam template naming `file+olp` or `file+datetree` files there.
+    fn roam(template: &capture_templates::Template, path: String) -> Self {
         Self {
-            target: capture_templates::Target::File { file: path },
+            target: template.target.with_file(path),
+            // org-roam has no `:clock-in`.
             clock_in: false,
-            // CT.4: roam makes a NOTE, which is an entry by construction —
-            // there is no table in a file that does not exist yet.
-            entry_type: capture_templates::EntryType::Entry,
-            placement: capture_target::TablePlacement::End,
+            entry_type: template.entry_type,
+            placement: template.placement.clone(),
         }
     }
 }
@@ -5395,6 +5400,8 @@ fn selected_template(
                 // A `table-line` here would have nothing to name a table in.
                 entry_type: capture_templates::EntryType::Entry,
                 placement: capture_target::TablePlacement::End,
+                // CT.8: the legacy path is org-capture's, which has no head.
+                head: None,
                 // The bare `org.capture-file` path has no template table to
                 // carry a `clock-in` key, so it never clocks.
                 clock_in: false,
@@ -8706,18 +8713,32 @@ impl GrammarCallbacks for Component {
                 // also the one value here that must be unique per NOTE, and
                 // minting two per note invites the reading that either is the
                 // note's.
-                if !roam_templates::read().is_empty() {
-                    return Ok(vec![Effect::OpenTransient(
-                        lattice::plugin_host::types::OpenTransientPayload {
-                            source: CAPTURE_TRANSIENT.to_string(),
-                            args: Args::List(vec![
-                                lattice::plugin_host::types::ArgValue::String(
-                                    ORG_TRANSIENT_ROAM.to_string(),
-                                ),
-                                lattice::plugin_host::types::ArgValue::String(title),
-                            ]),
-                        },
-                    )]);
+                // CT.8: only `Unset` falls through to the stub. Any other error
+                // means the user DID configure templates and none can be used —
+                // writing the stub then creates a note from a template they did
+                // not choose, with nothing to say why. That was the old
+                // behaviour: every read error looked like "no templates".
+                match roam_templates::read() {
+                    Err(capture_templates::TemplateError::Unset) => {}
+                    Err(e) => {
+                        return Ok(vec![Effect::Echo(EchoPayload {
+                            level: EchoLevel::Warn,
+                            text: e.message_for(capture_templates::TemplateList::Roam),
+                        })]);
+                    }
+                    Ok(_) => {
+                        return Ok(vec![Effect::OpenTransient(
+                            lattice::plugin_host::types::OpenTransientPayload {
+                                source: CAPTURE_TRANSIENT.to_string(),
+                                args: Args::List(vec![
+                                    lattice::plugin_host::types::ArgValue::String(
+                                        ORG_TRANSIENT_ROAM.to_string(),
+                                    ),
+                                    lattice::plugin_host::types::ArgValue::String(title),
+                                ]),
+                            },
+                        )]);
+                    }
                 }
                 let id = match host_services::new_uuid() {
                     Ok(id) => id,
@@ -10022,35 +10043,6 @@ const fn lattice_clock_report_toggle() -> &'static str {
     "action:scan-view-clockreport-toggle"
 }
 
-/// OR.11b — the roam template chooser, opened for one node.
-///
-/// Each row carries the TITLE as well as its key, because the menu is the only
-/// place that knows both and the create action needs both. Carrying the title
-/// through the menu rather than stashing it guest-side is what makes two
-/// concurrent creates impossible to confuse — the same reason TR.3a gave a
-/// transient open its own arguments.
-/// The note's FILENAME for one template and node.
-///
-/// Takes `${…}` and nothing else: `%U` in a FILENAME would put a timestamp with
-/// spaces and brackets into a path, which is a different kind of mistake from
-/// putting one in a note.
-fn roam_note_filename(
-    template: &roam_templates::RoamTemplate,
-    node: &roam_capture::Node<'_>,
-) -> String {
-    match template.file.as_deref() {
-        Some(pattern) => roam_capture::expand_fields(pattern, node),
-        None => {
-            let stamp = roam_file_stamp();
-            if node.slug.is_empty() {
-                format!("{stamp}.org")
-            } else {
-                format!("{stamp}-{}.org", node.slug)
-            }
-        }
-    }
-}
-
 /// The capture buffer a roam note is drafted in.
 ///
 /// Namespaced apart from `*org-capture:…*` so a roam template and a capture
@@ -10185,8 +10177,17 @@ fn roam_draft(
     let Some(dir) = roam_scan::roam_directory() else {
         return Err(roam_warn("org-roam: set `org.roam-directory` first"));
     };
-    let set = roam_templates::read();
-    let Some(template) = set.get(key) else {
+    let set = match roam_templates::read() {
+        Ok(set) => set,
+        // CT.8: the menu was built from this same read, so an error here means
+        // the option changed between the open and the pick. Say which.
+        Err(e) => {
+            return Err(roam_warn(
+                &e.message_for(capture_templates::TemplateList::Roam),
+            ))
+        }
+    };
+    let Some(template) = set.by_key(key) else {
         // The menu built its rows from this same set, so a key that is not in
         // it means the option changed between the open and the pick. Saying so
         // beats writing a note from a template the user is no longer looking at.
@@ -10204,18 +10205,19 @@ fn roam_draft(
         Ok(body) => body,
         Err(message) => return Err(roam_warn(&format!("org-roam: {message}"))),
     };
-    // The `:ID:` is org-roam's to guarantee, not the template's — emacs writes
-    // it in `org-roam-capture--setup-target-location` and its own default
-    // template carries none. Applied AFTER `${…}` expansion so a template that
-    // spells `:ID: ${id}` itself is seen as already having one.
-    let body = roam_capture::ensure_id(&body, id);
-    let name = roam_note_filename(template, &node);
+    // CT.8: the target path, filled and made absolute — org-roam's order.
+    let path = roam_templates::target_path(template.target.file(), &node, now_when(), &dir);
+    // Whether this capture CREATES the file decides whether the head and the
+    // `:ID:` are written — org-roam's `new-file-p`. A read that fails is a file
+    // that does not exist yet, which is the ordinary case for a new note.
+    let is_new_file = host_services::read_file(&path).is_err();
+    let body = roam_templates::draft_text(template, &node, &body, id, is_new_file);
     Ok(RoamDraft {
         asks_questions: answers.is_empty()
             && entered.is_empty()
             && !capture_flow::questions(&body).is_empty(),
         name: roam_capture_buffer_name(key),
-        dest: CaptureDestination::appending_to(format!("{}/{name}", dir.trim_end_matches('/'))),
+        dest: CaptureDestination::roam(template, path),
         body,
         answers: answers.to_vec(),
         entered: entered.to_string(),
@@ -10229,18 +10231,37 @@ fn roam_warn(text: &str) -> Vec<Effect> {
     })]
 }
 
+/// OR.11b — the roam template chooser, opened for one node.
+///
+/// Each row carries the TITLE as well as its key, because the menu is the only
+/// place that knows both and the create action needs both. Carrying the title
+/// through the menu rather than stashing it guest-side is what makes two
+/// concurrent creates impossible to confuse — the same reason TR.3a gave a
+/// transient open its own arguments.
+///
+/// (This paragraph sat, orphaned, above `roam_note_filename` until CT.8
+/// removed that function — rustdoc had been attaching it to the wrong item.)
 fn roam_template_menu(title: &str) -> Result<lattice::plugin_host::types::TransientSpec, String> {
     use lattice::plugin_host::types::{
         ArgValue, Args as WitArgs, TransientAction, TransientGroup, TransientItem,
         TransientItemKind, TransientSpec,
     };
-    let set = roam_templates::read();
+    // CT.8: a set that failed to load is an `err` — the menu stays shut and the
+    // reason is echoed, rather than opening empty.
+    let set =
+        roam_templates::read().map_err(|e| e.message_for(capture_templates::TemplateList::Roam))?;
     let mut items: Vec<TransientItem> = set
         .templates
         .iter()
         .map(|t| TransientItem {
             key: vec![t.key.clone()],
-            label: t.description.clone(),
+            // A row with no description is labelled by its key — the menu is
+            // keyed, and a blank label reads as a broken row.
+            label: if t.description.is_empty() {
+                t.key.clone()
+            } else {
+                t.description.clone()
+            },
             description: String::new(),
             kind: TransientItemKind::Action(TransientAction {
                 command: "org-roam-create-from-template".to_string(),

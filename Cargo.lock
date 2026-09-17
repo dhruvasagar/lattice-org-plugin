@@ -3116,6 +3116,7 @@ name = "lattice-grammar"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "fancy-regex",
  "lattice-core",
  "lattice-protocol",
  "serde",

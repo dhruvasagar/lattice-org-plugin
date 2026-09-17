@@ -4313,17 +4313,50 @@ struct CaptureDestination {
     entry_type: capture_templates::EntryType,
     /// CT.4: for `table-line`, where in the table the row goes.
     placement: capture_target::TablePlacement,
+    /// The template's `seed` body, already expanded, written as today's node
+    /// when the capture finds that node missing. Expanded at OPEN, with the
+    /// seed's own `%^{…}` questions left blank: those answers (a day's overall
+    /// rating, say) are not known at the first capture of the day, and asking
+    /// for them in the middle of another capture is the wrong moment.
+    seed: Option<String>,
 }
 
 impl CaptureDestination {
-    /// Where an org-capture template files.
-    fn of(template: &capture_templates::Template) -> Self {
-        Self {
+    /// Where an org-capture template files, with its `seed` resolved.
+    ///
+    /// Refuses when the seed's body cannot be read — at open, before the user
+    /// has typed anything, rather than at finalize when the capture would have
+    /// to be filed without the day it needs.
+    fn of(template: &capture_templates::Template) -> Result<Self, Effect> {
+        let seed = match template.seed.as_deref() {
+            None => None,
+            Some(key) => {
+                let set = capture_templates::read().map_err(|e| {
+                    Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: e.message(),
+                    })
+                })?;
+                let Some(seed) = set.by_key(key).cloned() else {
+                    return Err(Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: format!(
+                            "org: no capture template keyed `{key}` (the `seed` of `{}`)",
+                            template.key
+                        ),
+                    }));
+                };
+                let seed = resolve_template_body(seed)?;
+                Some(expand_seed(&seed.body))
+            }
+        };
+        Ok(Self {
             target: template.target.clone(),
             clock_in: template.clock_in,
             entry_type: template.entry_type,
             placement: template.placement.clone(),
-        }
+            seed,
+        })
     }
 
     /// CT.8: where a roam template files — the template's own target shape,
@@ -4334,15 +4367,24 @@ impl CaptureDestination {
     /// shape (append to a new file) because its templates could not say
     /// otherwise. Now they declare a `target` like any capture template, so a
     /// roam template naming `file+olp` or `file+datetree` files there.
-    fn roam(template: &capture_templates::Template, path: String) -> Self {
+    ///
+    /// `seed` is the seed template's body with `${…}` already filled.
+    fn roam(template: &capture_templates::Template, path: String, seed: Option<&str>) -> Self {
         Self {
             target: template.target.with_file(path),
             // org-roam has no `:clock-in`.
             clock_in: false,
             entry_type: template.entry_type,
             placement: template.placement.clone(),
+            seed: seed.map(expand_seed),
         }
     }
+}
+
+/// A seed body expanded for filing: `%U`, `%<fmt>` and the rest as usual, its
+/// `%^{…}` questions blank and `%?` empty — nobody is typing into it.
+fn expand_seed(body: &str) -> String {
+    capture::expand_with(body, "", &[], now_when(), "")
 }
 
 /// OR.17 — which draft a finished question flow opens, and what it needs to
@@ -4469,9 +4511,13 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
                 Ok(t) => t,
                 Err(effect) => return vec![effect],
             };
+            let dest = match CaptureDestination::of(&template) {
+                Ok(dest) => dest,
+                Err(effect) => return vec![effect],
+            };
             open_capture_buffer(
                 capture_buffer_name(&template.key),
-                CaptureDestination::of(&template),
+                dest,
                 &template.body,
                 &flow.answers,
                 "",
@@ -5405,6 +5451,7 @@ fn selected_template(
                 // The bare `org.capture-file` path has no template table to
                 // carry a `clock-in` key, so it never clocks.
                 clock_in: false,
+                seed: None,
             },
             vec![note],
         ));
@@ -5567,9 +5614,13 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
     // The rule is the same in both: the last message should be the most
     // important thing that happened. Here that is the note; there it is the
     // failure.
+    let dest = match CaptureDestination::of(&template) {
+        Ok(dest) => dest,
+        Err(effect) => return vec![effect],
+    };
     let mut out = open_capture_buffer(
         capture_buffer_name(&template.key),
-        CaptureDestination::of(&template),
+        dest,
         &template.body,
         &[],
         "",
@@ -5972,25 +6023,36 @@ fn capture_effects_via(
         // A `table-line` aimed at a section inside the day is the shape a
         // tracker needs, and the one org cannot express with any built-in
         // target. With the section found, the row goes into ITS table.
-        // This crate is edition 2021, so no let-chains — genuinely nested.
-        if let Some(section) = sub.as_ref() {
-            if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
-                let placed = capture_target::resolve_table_in(
-                    &lines,
-                    (section.line + 1, section.end_line + 1),
-                    &dest.placement,
-                );
-                let mut row = capture_target::table_row_text(&text);
-                if !placed.create.is_empty() {
-                    row = format!("{}\n{row}", placed.create.join("\n"));
-                }
-                row.push('\n');
-                return vec![write_at(path, FileAnchor::Line(placed.line), row)];
-            }
-            // An `entry` with a `sub-olp` files after that section's subtree.
-            let body = capture_target::relevel(&text, section.level);
-            return vec![write_at(path, FileAnchor::Line(section.end_line + 1), body)];
+        if let Some(section) = sub {
+            let (at, placed) = place_in_section(&lines, section, dest, &text);
+            return vec![write_at(path, FileAnchor::Line(at), placed)];
         }
+
+        // The section is missing. On the day's FIRST capture that is expected,
+        // and a `seed` is what fills it: the seed's body becomes the day, and
+        // the capture goes into the section that body brings with it — one
+        // write, so the file never holds a day without its sheet.
+        if !sub_olp.is_empty() && !spot.create.is_empty() {
+            if let Some(seed) = dest.seed.as_deref() {
+                return seeded_day(&path, &spot, seed, sub_olp, dest, &text);
+            }
+        }
+        // Otherwise the note is kept under the date node, and says so: a row
+        // there sits outside every table and needs finding.
+        let section_note = (!sub_olp.is_empty()).then(|| {
+            Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!(
+                    "org: no `{}` under today's node in {path}; filed under the date{}",
+                    sub_olp.join("/"),
+                    if spot.create.is_empty() {
+                        ""
+                    } else {
+                        " (a `seed` template can create the day first)"
+                    }
+                ),
+            })
+        });
 
         // CT.5: the body becomes a child of the date node, whatever level the
         // tree put it at. Without this a `*`-rooted template terminates the day,
@@ -6012,7 +6074,9 @@ fn capture_effects_via(
         } else {
             out
         };
-        return vec![write_at(path, FileAnchor::Line(at), out)];
+        let mut effects = vec![write_at(path, FileAnchor::Line(at), out)];
+        effects.extend(section_note);
+        return effects;
     }
 
     if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
@@ -6093,6 +6157,109 @@ fn capture_effects_via(
                 text: format!("org: no {} in {path}; appended at the end", seek.describe()),
             }),
         ],
+    }
+}
+
+/// Where a capture goes inside a `sub-olp` section, as (line, text).
+///
+/// A `table-line` joins the section's first table — created if the section
+/// has none — and an `entry` files after the section's subtree as its child.
+fn place_in_section(
+    lines: &[&str],
+    section: &headline::Entry,
+    dest: &CaptureDestination,
+    text: &str,
+) -> (u32, String) {
+    if matches!(dest.entry_type, capture_templates::EntryType::TableLine) {
+        let placed = capture_target::resolve_table_in(
+            lines,
+            (section.line + 1, section.end_line + 1),
+            &dest.placement,
+        );
+        let mut row = capture_target::table_row_text(text);
+        if !placed.create.is_empty() {
+            row = format!("{}\n{row}", placed.create.join("\n"));
+        }
+        row.push('\n');
+        return (placed.line, row);
+    }
+    // An `entry` files after that section's subtree.
+    (
+        section.end_line + 1,
+        capture_target::relevel(text, section.level),
+    )
+}
+
+/// Today's node, created from `seed`, with the capture already placed in the
+/// `sub_olp` section the seed brings — written as one block at `spot.line`.
+///
+/// The placement runs over the block itself, with the same resolvers a
+/// capture into an existing day uses, so a seeded day and a later capture
+/// agree on where a row goes. A seed without the section still files both
+/// — the day and the note under it — and warns, because the seed is the
+/// user's template and the note is what they just typed.
+fn seeded_day(
+    path: &str,
+    spot: &datetree::DatetreeSpot,
+    seed: &str,
+    sub_olp: &[String],
+    dest: &CaptureDestination,
+    text: &str,
+) -> Vec<Effect> {
+    let mut block: Vec<String> = spot.create.clone();
+    let day_line = block.len().saturating_sub(1) as u32;
+    block.extend(
+        capture_target::relevel(seed, spot.level)
+            .lines()
+            .map(str::to_string),
+    );
+    let lines: Vec<&str> = block.iter().map(String::as_str).collect();
+    let outline = headline::outline_text(&lines);
+    let section = capture_target::find_olp_within(
+        &lines,
+        &outline,
+        (day_line + 1, lines.len() as u32),
+        spot.level,
+        sub_olp,
+    );
+    let (at, placed, note) = match section {
+        Some(section) => {
+            let (at, placed) = place_in_section(&lines, section, dest, text);
+            (at, placed, None)
+        }
+        None => (
+            lines.len() as u32,
+            capture_target::relevel(text, spot.level),
+            Some(Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!(
+                    "org: the seed has no `{}`; filed under today's node in {path}",
+                    sub_olp.join("/")
+                ),
+            })),
+        ),
+    };
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i as u32 == at {
+            push_line(&mut out, &placed);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if at as usize >= lines.len() {
+        push_line(&mut out, &placed);
+    }
+    let mut effects = vec![write_at(path.to_string(), FileAnchor::Line(spot.line), out)];
+    effects.extend(note);
+    effects
+}
+
+/// Append `text`, ending it with a newline if it lacks one.
+fn push_line(out: &mut String, text: &str) {
+    out.push_str(text);
+    if !text.ends_with('\n') {
+        out.push('\n');
     }
 }
 
@@ -6265,8 +6432,12 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
     // OC.11b: BEFORE the write, so a failed `WriteToFile`'s message is the one
     // left on screen. An echo after it would overwrite exactly the thing the
     // user needs to see — the trap `:org-roam-create-node` records.
+    let dest = match CaptureDestination::of(&template) {
+        Ok(dest) => dest,
+        Err(effect) => return vec![effect],
+    };
     let mut out = note;
-    out.extend(capture_effects(&CaptureDestination::of(&template), text));
+    out.extend(capture_effects(&dest, text));
     out
 }
 
@@ -10212,12 +10383,31 @@ fn roam_draft(
     // that does not exist yet, which is the ordinary case for a new note.
     let is_new_file = host_services::read_file(&path).is_err();
     let body = roam_templates::draft_text(template, &node, &body, id, is_new_file);
+    // The seed's body, `${…}` filled over the same node. The seed is validated
+    // to exist when the set was read, so a miss here is the option changing
+    // between hops — refused, as a missing `key` is above.
+    let seed = match template.seed.as_deref() {
+        None => None,
+        Some(seed_key) => {
+            let Some(seed) = set.by_key(seed_key) else {
+                return Err(roam_warn(&format!(
+                    "org-roam: no template `{seed_key}` (the `seed` of `{key}`)"
+                )));
+            };
+            match roam_templates::resolve_body(seed, &node, |path| {
+                host_services::read_file(path).map_err(|_| ())
+            }) {
+                Ok(text) => Some(text),
+                Err(message) => return Err(roam_warn(&format!("org-roam: {message}"))),
+            }
+        }
+    };
     Ok(RoamDraft {
         asks_questions: answers.is_empty()
             && entered.is_empty()
             && !capture_flow::questions(&body).is_empty(),
         name: roam_capture_buffer_name(key),
-        dest: CaptureDestination::roam(template, path),
+        dest: CaptureDestination::roam(template, path, seed.as_deref()),
         body,
         answers: answers.to_vec(),
         entered: entered.to_string(),
@@ -10911,6 +11101,7 @@ mod capture_effects_tests {
             clock_in,
             entry_type: capture_templates::EntryType::Entry,
             placement: capture_target::TablePlacement::End,
+            seed: None,
         };
         let owned = on_disk.to_string();
         capture_effects_via(
@@ -11060,6 +11251,7 @@ mod capture_effects_tests {
             clock_in: false,
             entry_type,
             placement,
+            seed: None,
         };
         let owned = on_disk.to_string();
         capture_effects_via(
@@ -11207,6 +11399,19 @@ mod capture_effects_tests {
         text: &str,
         on_disk: &str,
     ) -> Vec<Effect> {
+        seeded_effects(olp, tree_type, sub_olp, entry_type, None, text, on_disk)
+    }
+
+    /// As [`datetree_effects_sub`], with a `seed` body.
+    fn seeded_effects(
+        olp: Vec<String>,
+        tree_type: capture_templates::TreeTypeAlias,
+        sub_olp: Vec<String>,
+        entry_type: capture_templates::EntryType,
+        seed: Option<&str>,
+        text: &str,
+        on_disk: &str,
+    ) -> Vec<Effect> {
         let dest = CaptureDestination {
             target: capture_templates::Target::FileDatetree {
                 file: "/tmp/x.org".to_string(),
@@ -11217,6 +11422,7 @@ mod capture_effects_tests {
             clock_in: false,
             entry_type,
             placement: capture_target::TablePlacement::End,
+            seed: seed.map(str::to_string),
         };
         let owned = on_disk.to_string();
         capture_effects_via(
@@ -11464,6 +11670,128 @@ mod capture_effects_tests {
         // Falls back to the day node itself rather than losing the capture.
         let written = written_text(&out);
         assert!(written.contains("a note"), "the note survives: {written:?}");
+    }
+
+    /// The tracker's day sheet as a seed body, before re-levelling.
+    const SEED: &str = "\
+* Daily Overview
+| Date | Urge |
+|------+------|
+* Urge / Habit Episode Tracker
+| Time | Urge |
+|------+------|
+
+Cue table
+| External | Internal |
+|----------+----------|
+* End of Day Reflection
+";
+
+    fn episode(seed: Option<&str>, on_disk: &str) -> Vec<Effect> {
+        seeded_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["Urge / Habit Episode Tracker".to_string()],
+            capture_templates::EntryType::TableLine,
+            seed,
+            "| 00:40 | 6 |",
+            on_disk,
+        )
+    }
+
+    /// The first episode of a day, with no sheet yet: the seed becomes the day
+    /// and the row lands in the EPISODE table of that new sheet — not the
+    /// Daily Overview above it, and not the cue table below it.
+    #[test]
+    fn a_seeded_capture_creates_the_day_with_the_row_in_its_section() {
+        let out = episode(Some(SEED), "");
+        assert_eq!(warned(&out), None);
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::Line(0)), "{anchor:?}");
+        assert_eq!(
+            written_text(&out),
+            "\
+* 2026
+** 2026-09 September
+*** 2026-09-16 Wednesday
+**** Daily Overview
+| Date | Urge |
+|------+------|
+**** Urge / Habit Episode Tracker
+| Time | Urge |
+|------+------|
+| 00:40 | 6 |
+
+Cue table
+| External | Internal |
+|----------+----------|
+**** End of Day Reflection
+"
+        );
+    }
+
+    /// The seed is only for a MISSING day. Once today's sheet exists the row
+    /// goes into it and nothing is seeded again — a second sheet under the
+    /// same date would be the duplicate the seed exists to avoid.
+    #[test]
+    fn a_seed_is_not_used_when_the_day_exists() {
+        let out = episode(Some(SEED), &tracker_on_disk());
+        assert_eq!(written_text(&out), "| 00:40 | 6 |\n");
+        let (_, anchor) = landed(&out);
+        assert!(matches!(anchor, FileAnchor::Line(11)), "{anchor:?}");
+    }
+
+    /// No seed, no day: the row is kept under the new date node, and the warn
+    /// names the fix.
+    #[test]
+    fn an_unseeded_first_capture_warns_and_points_at_seed() {
+        let out = episode(None, "");
+        let written = written_text(&out);
+        assert!(written.ends_with("| 00:40 | 6 |\n"), "{written:?}");
+        let warn = warned(&out).expect("a row outside any table must say so");
+        assert!(warn.contains("`Urge / Habit Episode Tracker`"), "{warn}");
+        assert!(warn.contains("`seed`"), "{warn}");
+    }
+
+    /// The day exists but the section was renamed: kept, warned, and no hint
+    /// about `seed`, which would not help.
+    #[test]
+    fn a_day_without_the_section_warns_without_the_seed_hint() {
+        let on_disk = "* 2026\n** 2026-09 September\n*** 2026-09-16 Wednesday\n**** Other\n";
+        let out = episode(Some(SEED), on_disk);
+        assert!(written_text(&out).contains("| 00:40 | 6 |"));
+        let warn = warned(&out).expect("warns");
+        assert!(!warn.contains("seed"), "{warn}");
+    }
+
+    /// A seed that lacks the section still files the day and the row, and
+    /// warns — both are the user's text.
+    #[test]
+    fn a_seed_without_the_section_files_both_and_warns() {
+        let out = episode(Some("* Something else\n"), "");
+        let written = written_text(&out);
+        assert!(written.contains("**** Something else\n"), "{written:?}");
+        assert!(written.ends_with("| 00:40 | 6 |\n"), "{written:?}");
+        assert!(warned(&out).expect("warns").contains("the seed has no"));
+    }
+
+    /// An `entry` with a seed files as a child of the seeded section.
+    #[test]
+    fn a_seeded_entry_files_under_the_new_section() {
+        let out = seeded_effects(
+            Vec::new(),
+            capture_templates::TreeTypeAlias::Day,
+            vec!["Daily Overview".to_string()],
+            capture_templates::EntryType::Entry,
+            Some(SEED),
+            "* a note\n",
+            "",
+        );
+        let written = written_text(&out);
+        assert!(
+            written.contains("|------+------|\n***** a note\n**** Urge"),
+            "{written:?}"
+        );
     }
 
     /// A broken outline path quotes the WHOLE path, not the segment that broke

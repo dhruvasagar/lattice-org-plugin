@@ -230,6 +230,10 @@ pub struct Template {
     /// the whole question — one write, and the durable record is correct the
     /// moment it lands (design D4).
     pub clock_in: bool,
+    /// The key of the template that creates today's node when it is missing —
+    /// see [`RawTemplate::seed`]. Validated: it names another template in the
+    /// same set whose target is a datetree in the same file.
+    pub seed: Option<String>,
 }
 
 /// Why a template set could not be read.
@@ -387,6 +391,13 @@ pub struct RawTemplate {
     pub prepend: Option<bool>,
     /// Start a clock on the entry this template captures (org's `:clock-in`).
     pub clock_in: Option<bool>,
+    /// The key of another template in the same list whose body creates
+    /// today's node when this capture finds it missing. Only for a
+    /// `file+datetree` target with a `sub-olp`: the section this template
+    /// files into lives inside the day, so the first capture of a day has
+    /// nothing to descend into until the day's sheet exists. Org has no
+    /// equivalent.
+    pub seed: Option<String>,
 }
 
 /// The declared shape of `org.capture-templates`, for the registration call.
@@ -667,6 +678,20 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             (None, true) => crate::capture_target::TablePlacement::Prepend,
             (None, false) => crate::capture_target::TablePlacement::End,
         };
+        let seed = t
+            .seed
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if seed.is_some()
+            && !matches!(&target, Target::FileDatetree { sub_olp, .. } if !sub_olp.is_empty())
+        {
+            skipped.push(format!(
+                "`{key}` sets `seed`, which needs a `file+datetree` target with a `sub-olp`"
+            ));
+            continue;
+        }
         templates.push(Template {
             key,
             description,
@@ -677,13 +702,55 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             placement,
             head,
             clock_in: t.clock_in.unwrap_or(false),
+            seed,
         });
     }
+    drop_unresolved_seeds(&mut templates, &mut skipped);
 
     if templates.is_empty() {
         return Err(TemplateError::Empty);
     }
     Ok(ParsedSet { templates, skipped })
+}
+
+/// Skip every template whose `seed` does not name a usable template.
+///
+/// Usable means another template in the set, filing to a datetree in the SAME
+/// file: the seed's body is written as today's node of this template's tree,
+/// so a seed aimed elsewhere is a configuration mistake that would create a
+/// day sheet in a file its own template never writes to.
+///
+/// Repeated until nothing changes, because skipping a template can strand one
+/// that named it as its seed.
+fn drop_unresolved_seeds(templates: &mut Vec<Template>, skipped: &mut Vec<String>) {
+    loop {
+        let bad = templates.iter().enumerate().find_map(|(i, t)| {
+            let seed = t.seed.as_deref()?;
+            let why = if seed == t.key {
+                format!("`{}` names itself as its `seed`", t.key)
+            } else {
+                match templates.iter().find(|o| o.key == seed) {
+                    None => format!("`{}` names a `seed` `{seed}` that is not a template", t.key),
+                    Some(o) => match &o.target {
+                        Target::FileDatetree { file, .. } if file == t.target.file() => {
+                            return None;
+                        }
+                        _ => format!(
+                            "`{}`'s `seed` `{seed}` does not file to a datetree in {}",
+                            t.key,
+                            t.target.file()
+                        ),
+                    },
+                }
+            };
+            Some((i, why))
+        });
+        let Some((i, why)) = bad else {
+            return;
+        };
+        templates.remove(i);
+        skipped.push(why);
+    }
 }
 
 /// Read `org.capture-templates` and resolve it into a usable set.
@@ -1272,6 +1339,82 @@ mod tests {
         assert!(body.starts_with("* TODO %?"));
     }
 
+    /// A datetree template — `sub_olp` set when `section` is given.
+    fn dated(key: &str, file: &str, section: Option<&str>, seed: Option<&str>) -> RawTemplate {
+        RawTemplate {
+            key: key.to_string(),
+            target: RawTarget {
+                kind: Some("file+datetree".to_string()),
+                file: file.to_string(),
+                sub_olp: section.map(|s| vec![s.to_string()]),
+                ..Default::default()
+            },
+            seed: seed.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The tracker's pair: a row template seeded by the day template.
+    #[test]
+    fn a_seed_naming_a_datetree_in_the_same_file_is_kept() {
+        let set = from_declared(vec![
+            dated("H", "~/t.org", None, None),
+            dated("u", "~/t.org", Some("Episodes"), Some("H")),
+        ])
+        .expect("both resolve");
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+        assert_eq!(set.by_key("u").and_then(|t| t.seed.as_deref()), Some("H"));
+    }
+
+    /// Every way a seed can be wrong is a named skip of the template that
+    /// declared it — never of the seed, which is a working template on its own.
+    #[test]
+    fn an_unusable_seed_skips_its_template_and_says_why() {
+        let cases = [
+            // Not a datetree with a sub-olp: there is no section to be missing.
+            (
+                RawTemplate {
+                    seed: Some("H".to_string()),
+                    ..t("u", "row", "~/t.org", Some("Inbox"), "x")
+                },
+                "needs a `file+datetree` target with a `sub-olp`",
+            ),
+            (
+                dated("u", "~/t.org", Some("S"), Some("nope")),
+                "`nope` that is not a template",
+            ),
+            (dated("u", "~/t.org", Some("S"), Some("u")), "names itself"),
+            (
+                dated("u", "~/other.org", Some("S"), Some("H")),
+                "does not file to a datetree in ~/other.org",
+            ),
+        ];
+        for (row, why) in cases {
+            let set = from_declared(vec![dated("H", "~/t.org", None, None), row])
+                .expect("the seed template survives");
+            assert!(set.by_key("u").is_none(), "{why}");
+            assert!(set.by_key("H").is_some(), "{why}");
+            assert!(
+                set.skipped.iter().any(|s| s.contains(why)),
+                "{why}: {:?}",
+                set.skipped
+            );
+        }
+    }
+
+    /// A seed that is itself skipped strands the template naming it.
+    #[test]
+    fn a_seed_skipped_for_its_own_seed_strands_its_dependant() {
+        let set = from_declared(vec![
+            dated("a", "~/t.org", Some("S"), Some("missing")),
+            dated("b", "~/t.org", Some("S"), Some("a")),
+            dated("ok", "~/t.org", None, None),
+        ])
+        .expect("`ok` survives");
+        assert!(set.by_key("a").is_none());
+        assert!(set.by_key("b").is_none(), "{:?}", set.skipped);
+    }
+
     #[test]
     fn the_declared_shape_is_what_the_option_promises() {
         // The schema IS the documentation now — `:describe-option` renders it
@@ -1296,7 +1439,8 @@ mod tests {
                 "type",
                 "table-line-pos",
                 "prepend",
-                "clock-in"
+                "clock-in",
+                "seed"
             ],
             "field names cross kebab-cased — `clock-in` and CT.1's `body-file`, \
              matching org's own `:clock-in` rather than a snake-case spelling \
@@ -1305,7 +1449,7 @@ mod tests {
         let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
             required,
-            vec![true, false, true, false, false, false, false, false, false],
+            vec![true, false, true, false, false, false, false, false, false, false],
             "`key` and `target` are the two a template cannot do without — \
              CT.1's `body-file` is optional, and so is `body`, because a \
              template may declare either or neither, and CT.4's three all \

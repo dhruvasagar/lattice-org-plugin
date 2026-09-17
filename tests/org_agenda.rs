@@ -1899,3 +1899,131 @@ fn settle_budget(base: usize) -> usize {
         .unwrap_or(10);
     base.saturating_mul(scale)
 }
+
+/// Poll until the view shows `n` rows — a re-open replaces the rows of a view
+/// that already reached `Complete`, so waiting on the headerline would pass on
+/// the old scan.
+async fn settle_row_count(
+    registry: &MultibufferRegistryHandle,
+    view: lattice_core::BufferId,
+    n: usize,
+) -> usize {
+    let mut seen = usize::MAX;
+    for _ in 0..settle_budget(600) {
+        if let Some(h) = registry.handle(view) {
+            seen = h.excerpts().len();
+            if seen == n {
+                return seen;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    seen
+}
+
+/// **The default agenda is reachable from any other agenda view.**
+///
+/// A re-open that names no command KEEPS the command the view shows, which is
+/// what makes `gr` a refresh. The menu's `a` row and `:org-agenda` used to name
+/// no command either, so from a custom view (`C-c a w`, a refile view, …)
+/// `C-c a a` refreshed that view instead of opening the default one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_default_agenda_replaces_a_custom_view() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(
+        notes.join("work.org"),
+        "* WAITING Blocked on legal                                        :WAITING:\n\
+         * TODO Ordinary task\n\
+         * TODO Another ordinary task\n",
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.todo-keywords=TODO WAITING | DONE".to_string(),
+    });
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!("org.agenda-files={}", notes.display()),
+    });
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.agenda-custom-commands=[[command]]\n\
+               key = \"w\"\n\
+               description = \"Waiting\"\n\
+               \n\
+               [[command.section]]\n\
+               title = \"Blocked\"\n\
+               when = \"any\"\n\
+               match = \"WAITING\"\n"
+            .to_string(),
+    });
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+
+    // `C-c a w`, then `C-c a a`, both through the menu row's own command.
+    let run = |editor: &mut Editor, name: &str, key: &str| {
+        let id = editor
+            .registry
+            .load()
+            .id_by_name(name)
+            .unwrap_or_else(|| panic!("`{name}` is registered"));
+        let mut out = lattice_host::dispatch::DispatchOutcome::default();
+        editor.dispatch_invocation(
+            lattice_grammar::CommandInvocation::of(id)
+                .with_args(lattice_grammar::Args::String(key.to_string())),
+            &mut out,
+        );
+        for effect in out.effects {
+            editor.handle_effect(effect);
+        }
+        editor.run_tick_pending();
+    };
+    let view_of = |editor: &Editor| {
+        editor
+            .buffers
+            .by_name("*agenda*")
+            .expect("the agenda view is open")
+    };
+
+    run(&mut editor, "org-agenda-command", "w");
+    let view = view_of(&editor);
+    assert_eq!(settle_row_count(&mb, view, 1).await, 1, "the custom view");
+
+    run(&mut editor, "org-agenda-command", "");
+    assert_eq!(view_of(&editor), view, "the same view, reused");
+    assert_eq!(
+        settle_row_count(&mb, view, 3).await,
+        3,
+        "`C-c a a` shows the default agenda, not the custom one again"
+    );
+
+    // `:org-agenda` means the default agenda too.
+    run(&mut editor, "org-agenda-command", "w");
+    assert_eq!(settle_row_count(&mb, view, 1).await, 1);
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line("org-agenda", &mut out);
+    for effect in out.effects {
+        editor.handle_effect(effect);
+    }
+    editor.run_tick_pending();
+    assert_eq!(
+        settle_row_count(&mb, view, 3).await,
+        3,
+        "`:org-agenda` shows the default agenda"
+    );
+}

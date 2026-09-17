@@ -9159,15 +9159,13 @@ impl GrammarCallbacks for Component {
                         // is the only place a user has said where their org
                         // lives.
                         argument: None,
-                        // An empty key is the default agenda rather than an
-                        // error — it is what the built-in row sends, and
-                        // `agenda_custom_commands::resolve` already treats a
-                        // blank key as "no command named".
-                        scan_args: if key.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![key]
-                        },
+                        // ALWAYS the key slot, even empty. An empty key is the
+                        // default agenda (`agenda_args`: `[""]`), but an empty
+                        // LIST is "keep what the view shows" — the host's rule
+                        // that makes `gr` a refresh. Sending `[]` for the
+                        // built-in row turned `C-c a a` into a refresh of
+                        // whatever custom view was already open.
+                        scan_args: vec![key],
                     },
                 ))])
             }
@@ -9731,10 +9729,10 @@ impl GrammarCallbacks for Component {
                         _ => None,
                     },
                     // OA.11a: `:org-agenda` runs the DEFAULT agenda, so it
-                    // names no command. The dispatcher (OA.12) is what fills
-                    // this in; keeping the ex-command's meaning unchanged is
-                    // what makes that a separate, revertable slice.
-                    scan_args: Vec::new(),
+                    // names the empty command — explicitly. An empty list
+                    // would mean "keep what the view shows", and `:org-agenda`
+                    // from a custom view would just refresh that view.
+                    scan_args: vec![String::new()],
                 },
             ))]),
             other => Err(format!("org: unknown ex-command callback {other}")),

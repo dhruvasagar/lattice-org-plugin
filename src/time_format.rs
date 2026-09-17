@@ -39,6 +39,9 @@ pub struct When {
 
 impl When {
     /// Midnight of an epoch day — what tests that only care about the date pin.
+    ///
+    /// Test-only: production always has the full local instant.
+    #[cfg(test)]
     pub fn from_epoch_day(day: i64) -> Self {
         Self {
             local_secs: day * 86_400,

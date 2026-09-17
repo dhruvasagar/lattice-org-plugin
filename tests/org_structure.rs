@@ -276,6 +276,11 @@ async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch
                     activate_minor.as_deref(),
                 );
             }
+            // CD.5: a chord that opens a picker. Renderer-applied; the plugin
+            // source's `init` is async, so the caller settles it.
+            lattice_grammar::Effect::OpenPicker { source, args, .. } => {
+                let _ = editor.open_picker(source, args);
+            }
             lattice_grammar::Effect::OpenTransient { source, args } => {
                 editor.open_named_transient(source, args);
                 // A PLUGIN menu builds off-thread — the seam calls the guest's
@@ -6795,7 +6800,24 @@ fn one_template(editor: &mut Editor, target: &std::path::Path) {
 async fn open_t(editor: &mut Editor) -> std::path::PathBuf {
     press_chord(editor, "<leader>oc").await;
     press_menu_key(editor, "t").await;
-    active_capture(editor).expect("the capture opened a draft")
+    let draft = active_capture(editor).expect("the capture opened a draft");
+    // The org defaults (`org-global-mode` among them) attach to a newly
+    // opened org buffer on the tick after its major is entered — the actor
+    // drives that in production. Settle it, or a later `<leader>o…` pressed IN
+    // the draft finds no binding.
+    let id = editor.active_pane_buffer_id();
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if editor
+            .active_modes
+            .get(&id)
+            .is_some_and(|m| m.has_minor(ModeId::new("org-global-mode")))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    draft
 }
 
 /// Type at the caret of the active buffer.
@@ -7035,4 +7057,131 @@ async fn a_failed_commit_keeps_the_draft_and_can_be_retried() {
         "the store entry survived too, so the retry knew where to file"
     );
     assert!(!draft.exists());
+}
+
+// ── CD.5: the drafts picker ──
+
+async fn settle_picker(editor: &mut Editor) {
+    for _ in 0..settle_budget(200) {
+        let _ = editor.drain_pending_picker_init();
+        if editor.picker.is_some() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Nothing to resume: a sentence, not an empty list that looks broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drafts_chord_with_no_drafts_says_so() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+
+    press_chord(&mut editor, "<leader>oC").await;
+
+    assert!(editor.picker.is_none());
+    assert_eq!(
+        editor
+            .last_message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .as_deref(),
+        Some("org: no capture drafts")
+    );
+}
+
+/// The chord is PRESSED, not read off the keymap — and the org major's own
+/// `<leader>o` chords still resolve beside it in an org file. `<leader>od`,
+/// the design's first choice, is the major's deadline, which is why this is
+/// `<leader>oC`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drafts_chord_lives_beside_the_org_majors_chords() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "** Two\n", &fs_write(base.path())).await;
+
+    press_chord(&mut editor, "<leader>oh").await;
+    assert_eq!(text(&editor), "* Two", "the major's promote still fires");
+
+    press_chord(&mut editor, "<leader>oC").await;
+    assert_eq!(
+        editor
+            .last_message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .as_deref(),
+        Some("org: no capture drafts"),
+        "and the drafts chord reaches org-global-mode inside an org file"
+    );
+}
+
+/// A saved-and-closed draft is listed with a legible label, and picking it
+/// reopens it WITH the capture chords, so `C-c C-c` files it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_draft_is_resumed_from_the_picker_and_files() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(base.path().join("captures")).unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let draft = open_t(&mut editor).await;
+    type_text(&mut editor, "call the bank");
+    editor.do_write(None);
+    assert!(editor.do_buffer_delete(false));
+    assert!(capture_drafts_open(&editor).is_empty());
+
+    press_chord(&mut editor, "<leader>oC").await;
+    settle_picker(&mut editor).await;
+    let labels = picker_labels(&editor);
+    assert_eq!(
+        labels,
+        vec!["todo: * TODO call the bank".to_string()],
+        "one row, named by template and first line"
+    );
+
+    let _ = editor.do_picker_accept();
+    settle_accept(&mut editor).await;
+    assert_eq!(active_capture(&editor).as_deref(), Some(draft.as_path()));
+    let id = editor.active_pane_buffer_id();
+    assert!(
+        editor
+            .active_modes
+            .get(&id)
+            .is_some_and(|m| m.has_minor(ModeId::new("org-capture-mode"))),
+        "the draft came back with its capture chords"
+    );
+
+    commit(&mut editor).await;
+    assert_eq!(text_of(&editor, &notes), "* TODO call the bank\n");
+    assert!(!draft.exists());
+}
+
+/// A draft still open but never saved is listed too — it is in the store —
+/// and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsaved_open_draft_is_listed_as_not_saved() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let notes = base.path().join("inbox.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    one_template(&mut editor, &notes);
+
+    let _draft = open_t(&mut editor).await;
+    press_chord(&mut editor, "<leader>oC").await;
+    settle_picker(&mut editor).await;
+    assert_eq!(
+        picker_labels(&editor),
+        vec!["todo: (not saved)".to_string()]
+    );
 }

@@ -27,6 +27,30 @@ pub const STATE_PREFIX: &str = "capture/";
 /// somewhere the user never chose and would never find again.
 pub const UNSET_DRAFTS_DIR: &str = "/set-org.directory-to-save-capture-drafts";
 
+/// CD.5: the drafts picker's source id.
+pub const DRAFTS_PICKER: &str = "org-capture-drafts";
+
+/// CD.5: a drafts-picker row — the template's label and what the draft says.
+///
+/// The draft's first non-empty line, stars and a leading TODO keyword kept (it
+/// is what the user typed), or "(not saved)" when there is no file to read.
+pub fn row_label(label: &str, text: Option<&str>) -> String {
+    let line = match text {
+        None => "(not saved)".to_string(),
+        Some(text) => text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("(empty)")
+            .to_string(),
+    };
+    if label.is_empty() {
+        line
+    } else {
+        format!("{label}: {line}")
+    }
+}
+
 /// The store key for capture `id`.
 pub fn state_key(id: &str) -> String {
     format!("{STATE_PREFIX}{id}")
@@ -156,6 +180,17 @@ pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_names_the_template_and_the_drafts_first_line() {
+        assert_eq!(
+            row_label("todo", Some("\n* TODO call the bank\n  details\n")),
+            "todo: * TODO call the bank"
+        );
+        assert_eq!(row_label("todo", None), "todo: (not saved)");
+        assert_eq!(row_label("todo", Some("\n\n")), "todo: (empty)");
+        assert_eq!(row_label("", Some("x")), "x");
+    }
 
     #[test]
     fn an_id_is_six_lowercase_hex_digits() {

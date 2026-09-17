@@ -571,6 +571,11 @@ const CAPTURE_ABORT: u32 = 59;
 /// `effect.invoke-command`, placed after the write, so a write that does not
 /// land never reaches it (the host stops a batch there).
 const CAPTURE_CLEANUP: u32 = 111;
+/// CD.5 — `:org-capture-drafts` / `<leader>oC`: the drafts picker, the only
+/// door back into a draft that is no longer on screen.
+const CAPTURE_DRAFTS: u32 = 112;
+/// CD.5 — what a drafts-picker row runs: reopen the draft with its minor.
+const CAPTURE_RESUME: u32 = 113;
 
 /// OA.12 — the agenda dispatcher. `AGENDA_MENU` opens it; `AGENDA_COMMAND` is
 /// what a row fires, carrying the command's key in its own args.
@@ -1407,6 +1412,25 @@ impl Guest for Component {
         // here and go read it — and a picker is what navigation wants. The
         // read-in-place view is a separate question; see `roam_backlinks`.
         lattice::plugin_host::picker_registry::register_picker_source(&roam_backlinks::spec());
+        // CD.5: the capture drafts in the store.
+        lattice::plugin_host::picker_registry::register_picker_source(
+            &lattice::plugin_host::types::PickerSourceSpec {
+                id: capture_drafts::DRAFTS_PICKER.to_string(),
+                doc: "Capture drafts — saved or still open — to resume".to_string(),
+                args_schema: Vec::new(),
+                args_hint: String::new(),
+                // Not live: the list is the store, which does not change while
+                // the picker is open.
+                live: false,
+                // Not rooted: drafts are the same list in every project.
+                rooted: false,
+                // PD.1: no delete verb. Discarding a draft deletes its FILE, and
+                // `<C-d>` must never touch disk; `C-c C-k` in the draft is the
+                // verb for that.
+                delete_command: None,
+                create_label: None,
+            },
+        );
     }
 
     fn register_multibuffer_views() {
@@ -2435,6 +2459,11 @@ impl Guest for Component {
                 // the second hop and is NOT bound — the host dispatches it on
                 // submit.
                 bind("<leader>oc", "org-capture-menu"),
+                // CD.5: the drafts picker. Capital C — "the captures" — because
+                // the design's `<leader>od` is org-mode's deadline, and a
+                // universal minor's binding loses to the major inside an org
+                // file, which is exactly where drafts get resumed from.
+                bind("<leader>oC", "org-capture-drafts"),
                 // OR.6 — finding a note belongs on the UNIVERSAL mode with
                 // capture and the agenda, for their reason: the note you want
                 // is rarely the file you are in. A `Majors(["org-mode"])`
@@ -3330,6 +3359,13 @@ impl Guest for Component {
             CLOCK_GOTO,
         );
         lattice::plugin_host::grammar::register_ex_command(
+            "org-capture-drafts",
+            "Resume a capture draft — saved, or still open — from a picker.",
+            &clock_ex(),
+            CLOCK_PARSE,
+            CAPTURE_DRAFTS,
+        );
+        lattice::plugin_host::grammar::register_ex_command(
             "org-roam-find-node",
             "Find an org-roam note by title or alias, and jump to it.",
             &clock_ex(),
@@ -3511,6 +3547,13 @@ impl Guest for Component {
             "Discard the capture, writing nothing (C-c C-k)",
             &spec(),
             CAPTURE_ABORT,
+        );
+        register_action(
+            "org-capture-resume",
+            "Reopen a capture draft with its capture chords (run by the drafts \
+             picker)",
+            &spec(),
+            CAPTURE_RESUME,
         );
         register_action(
             "org-capture-cleanup",
@@ -6593,6 +6636,97 @@ fn capture_forget(id: &str, state: &CaptureState) -> Vec<Effect> {
         .collect()
 }
 
+/// CD.5 — `<leader>oC`: open the drafts picker, or say there is nothing to
+/// resume. An empty picker would look broken; a sentence does not.
+fn capture_drafts_open() -> Vec<Effect> {
+    if host_services::store_keys(capture_drafts::STATE_PREFIX).is_empty() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: "org: no capture drafts".to_string(),
+        })];
+    }
+    vec![Effect::OpenPicker(
+        lattice::plugin_host::types::OpenPickerPayload {
+            source: capture_drafts::DRAFTS_PICKER.to_string(),
+            args: Vec::new(),
+            root: None,
+            fill_action: None,
+        },
+    )]
+}
+
+/// CD.5 — the drafts picker's rows: one per capture in the store, labelled with
+/// the template and the draft's current first line.
+///
+/// The first line is read from the FILE now rather than stored, so the row
+/// says what the draft says today. A draft never saved has no file and reads
+/// "(not saved)" — still resumable while its buffer is open.
+fn capture_draft_rows() -> Vec<(
+    lattice::plugin_host::types::RawCandidate,
+    lattice::plugin_host::types::RoutingPayload,
+)> {
+    host_services::store_keys(capture_drafts::STATE_PREFIX)
+        .into_iter()
+        .filter_map(|key| {
+            let id = key.strip_prefix(capture_drafts::STATE_PREFIX)?.to_string();
+            let state: CaptureState = capture_drafts::decode(&host_services::store_get(&key)?)?;
+            let text = host_services::read_file(&state.draft).ok();
+            let display = capture_drafts::row_label(&state.label, text.as_deref());
+            Some((
+                lattice::plugin_host::types::RawCandidate {
+                    insert_text: None,
+                    text: display.clone(),
+                    display,
+                    source: Some(capture_drafts::DRAFTS_PICKER.to_string()),
+                    kind: lattice::plugin_host::types::CandidateKind::Plain,
+                    data: lattice::plugin_host::types::CandidateData::Plain,
+                    annotations: vec![lattice::plugin_host::types::Annotation::Custom(
+                        lattice::plugin_host::types::AnnotationCustom {
+                            text: id.clone(),
+                            slot: "completion.annotation.kind".to_string(),
+                        },
+                    )],
+                    display_spans: Vec::new(),
+                },
+                lattice::plugin_host::types::RoutingPayload::InvokeCommand(
+                    lattice::plugin_host::types::CommandRef {
+                        id: "org-capture-resume".to_string(),
+                        args: Args::String(id),
+                    },
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// CD.5 — `org-capture-resume <id>`: open the draft with `org-capture-mode`,
+/// so `C-c C-c` files it. Opening the file any other way gives a plain org
+/// buffer with no capture chords (design §7).
+fn capture_resume(ctx: &ActionContext) -> Vec<Effect> {
+    let Some(id) = submitted_text(&ctx.args).filter(|id| capture_drafts::is_capture_id(id)) else {
+        return vec![Effect::None];
+    };
+    let Some(state) = host_services::store_get(&capture_drafts::state_key(&id))
+        .and_then(|bytes| capture_drafts::decode::<CaptureState>(&bytes))
+    else {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: capture {id} is no longer in progress"),
+        })];
+    };
+    vec![Effect::OpenBufferAt(
+        lattice::plugin_host::types::OpenBufferAtPayload {
+            path: Some(state.draft),
+            position: lattice::plugin_host::types::Position { line: 0, byte: 0 },
+            force: false,
+            // Never seed: a saved draft keeps what was typed, and an open one
+            // is simply shown.
+            content: None,
+            activate_minor: Some("org-capture-mode".to_string()),
+        },
+    )]
+}
+
 /// CD.4 — `org-capture-cleanup <id>`: what a commit runs after its write
 /// landed. Not meant to be typed; only a commit's `invoke-command` reaches it.
 fn capture_cleanup(ctx: &ActionContext) -> Vec<Effect> {
@@ -8315,6 +8449,7 @@ impl GrammarCallbacks for Component {
             CAPTURE_FINALIZE => Ok(capture_finalize(doc)),
             CAPTURE_ABORT => Ok(capture_abort(doc)),
             CAPTURE_CLEANUP => Ok(capture_cleanup(&ctx)),
+            CAPTURE_RESUME => Ok(capture_resume(&ctx)),
             TOGGLE_CHECKBOX => Ok(leaving_visual(&ctx, toggle_checkbox(&ctx, doc, tree))),
             TOGGLE_CHECKBOX_SUBTREE => {
                 Ok(leaving_visual(&ctx, toggle_checkbox_set(&ctx, doc, tree)))
@@ -9052,6 +9187,9 @@ impl GrammarCallbacks for Component {
                     insert_at_cursor(&ctx, &link),
                 ])
             }
+            // CD.5: an ex-command, so it is applied here rather than in
+            // `apply_action`.
+            CAPTURE_DRAFTS => Ok(capture_drafts_open()),
             ROAM_FIND_NODE => Ok(vec![Effect::OpenPicker(
                 lattice::plugin_host::types::OpenPickerPayload {
                     source: roam_find::FIND_NODE_PICKER.to_string(),
@@ -9336,6 +9474,17 @@ impl PickerSource for Component {
                 })
                 .collect());
         }
+        if source == capture_drafts::DRAFTS_PICKER {
+            return Ok(capture_draft_rows()
+                .into_iter()
+                .map(|(candidate, routing)| {
+                    exports::lattice::plugin_host::picker_source::CandidatePair {
+                        candidate,
+                        routing,
+                    }
+                })
+                .collect());
+        }
         if source == roam_find::FIND_NODE_PICKER {
             return Ok(roam_find::init()?
                 .into_iter()
@@ -9449,6 +9598,14 @@ impl PickerSource for Component {
         }
         if source == roam_find::FIND_NODE_PICKER {
             return roam_find::accept(routing);
+        }
+        if source == capture_drafts::DRAFTS_PICKER {
+            return match routing {
+                lattice::plugin_host::types::RoutingPayload::InvokeCommand(cmd) => {
+                    Ok(lattice::plugin_host::types::PickerAcceptOutcome::InvokeCommand(cmd))
+                }
+                _ => Err("org: the drafts picker got a routing token it did not emit".to_string()),
+            };
         }
         match routing {
             lattice::plugin_host::types::RoutingPayload::InvokeCommand(cmd) => {

@@ -23,8 +23,13 @@
 use crate::timestamp;
 
 /// Expand `template` with `entered` and today's date, no `%^{}` answers.
-pub fn expand(template: &str, entered: &str, today: i64, annotation: &str) -> String {
-    expand_with(template, entered, &[], today, annotation)
+pub fn expand(
+    template: &str,
+    entered: &str,
+    now: crate::time_format::When,
+    annotation: &str,
+) -> String {
+    expand_with(template, entered, &[], now, annotation)
 }
 
 /// Expand `template`, substituting `%^{…}` from `answers` in template order.
@@ -40,10 +45,10 @@ pub fn expand_with(
     template: &str,
     entered: &str,
     answers: &[String],
-    today: i64,
+    now: crate::time_format::When,
     annotation: &str,
 ) -> String {
-    let (y, m, d) = crate::agenda::civil_from_epoch_day(today);
+    let (y, m, d) = crate::agenda::civil_from_epoch_day(now.epoch_day());
     let stamp = format!(
         "{y:04}-{m:02}-{d:02} {}",
         timestamp::DAY_NAMES[timestamp::weekday(y, m, d)]
@@ -92,6 +97,28 @@ pub fn expand_with(
                 }
                 // Unclosed: verbatim, like any other unknown placeholder.
             }
+        }
+        // CT.8: `%<fmt>` — org's `format-time-string`. Handled in this same
+        // pass rather than a pre-pass so `%%<` stays a literal `%<`: a separate
+        // pass would see the `%<` first and expand text the user escaped.
+        if chars.peek() == Some(&'<') {
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            let mut fmt = String::new();
+            let mut closed = false;
+            for fc in lookahead.by_ref() {
+                if fc == '>' {
+                    closed = true;
+                    break;
+                }
+                fmt.push(fc);
+            }
+            if closed {
+                chars = lookahead;
+                out.push_str(&crate::time_format::format_time(&fmt, now));
+                continue;
+            }
+            // Unclosed: verbatim, like any other unknown placeholder.
         }
         match chars.next() {
             Some('?') => {
@@ -147,8 +174,8 @@ mod tests {
     use super::*;
 
     /// 2026-08-26 is a Wednesday.
-    fn today() -> i64 {
-        timestamp::epoch_day(2026, 8, 26)
+    fn today() -> crate::time_format::When {
+        crate::time_format::When::from_epoch_day(timestamp::epoch_day(2026, 8, 26))
     }
 
     #[test]
@@ -157,6 +184,51 @@ mod tests {
             expand("* TODO %?", "call the bank", today(), ""),
             "* TODO call the bank\n"
         );
+    }
+
+    /// CT.8: `%<fmt>` expands with the time of day, not just the date — the
+    /// roam filename stamp needs hours, minutes and seconds.
+    #[test]
+    fn a_format_time_placeholder_expands_in_a_body() {
+        let at = crate::time_format::When {
+            local_secs: 1_789_567_509, // 2026-09-16 14:05:09
+        };
+        assert_eq!(
+            expand("%<%Y%m%d%H%M%S>-note", "", at, ""),
+            "20260916140509-note\n"
+        );
+        assert_eq!(
+            expand("#+title: %<%Y-%m-%d>", "", at, ""),
+            "#+title: 2026-09-16\n"
+        );
+    }
+
+    /// `%%<` is an escaped percent followed by a literal `<`. This is why
+    /// `%<fmt>` lives in the SAME pass as every other placeholder: a separate
+    /// pre-pass would see `%<…>` first and expand text the user escaped.
+    #[test]
+    fn an_escaped_percent_before_a_bracket_stays_literal() {
+        assert_eq!(expand("100%%<%Y>", "", today(), ""), "100%<%Y>\n");
+    }
+
+    /// An unclosed `%<` is left verbatim, like any unknown placeholder, rather
+    /// than swallowing the rest of the template as a format string.
+    #[test]
+    fn an_unclosed_format_time_is_verbatim() {
+        assert_eq!(expand("a %<%Y rest", "", today(), ""), "a %<%Y rest\n");
+    }
+
+    /// `%<…>` and `%^{…}` together — the positional answers must not shift.
+    #[test]
+    fn format_time_does_not_consume_an_answer() {
+        let out = expand_with(
+            "%<%Y> %^{Word} %^{Other}",
+            "",
+            &["one".to_string(), "two".to_string()],
+            today(),
+            "",
+        );
+        assert_eq!(out, "2026 one two\n");
     }
 
     #[test]
@@ -365,11 +437,11 @@ pub fn expand_for_buffer(
     template: &str,
     entered: &str,
     answers: &[String],
-    today: i64,
+    now: crate::time_format::When,
     annotation: &str,
 ) -> (String, Option<(u32, u32)>) {
     let marked = format!("{entered}{POINT_SENTINEL}");
-    let expanded = expand_with(template, &marked, answers, today, annotation);
+    let expanded = expand_with(template, &marked, answers, now, annotation);
     let Some(at) = expanded.find(POINT_SENTINEL) else {
         return (expanded, None);
     };
@@ -389,8 +461,8 @@ pub fn expand_for_buffer(
 mod buffer_expansion_tests {
     use super::*;
 
-    fn today() -> i64 {
-        crate::timestamp::epoch_day(2026, 8, 26)
+    fn today() -> crate::time_format::When {
+        crate::time_format::When::from_epoch_day(crate::timestamp::epoch_day(2026, 8, 26))
     }
 
     /// `%?` becomes a POSITION, not substituted text — the inversion the

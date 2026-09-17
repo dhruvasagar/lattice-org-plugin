@@ -184,6 +184,7 @@ mod roam_scan;
 mod roam_templates;
 mod roam_tree;
 mod template_body;
+mod time_format;
 mod timestamp;
 mod todo;
 mod tree;
@@ -4535,6 +4536,16 @@ fn origin_annotation(doc: &Document, line: u32) -> Option<String> {
 /// to the wrong day looks correct and is not.
 /// LOCAL, not UTC — see [`local_now_secs`]. This divided the raw UTC seconds
 /// until 2026-09-05, which anchored the agenda to the UTC day.
+/// CT.8: the current local instant, for `%<fmt>` and the date stamps.
+///
+/// Seconds rather than a day, because `%<%Y%m%d%H%M%S>` — the stamp every roam
+/// template names its file with — needs the time of day as well as the date.
+fn now_when() -> time_format::When {
+    time_format::When {
+        local_secs: local_now_secs(),
+    }
+}
+
 fn today_epoch_day() -> i64 {
     epoch_day_from_local_secs(local_now_secs())
 }
@@ -5597,8 +5608,7 @@ fn open_capture_buffer(
     entered: &str,
     annotation: &str,
 ) -> Vec<Effect> {
-    let (text, point) =
-        capture::expand_for_buffer(body, entered, answers, today_epoch_day(), annotation);
+    let (text, point) = capture::expand_for_buffer(body, entered, answers, now_when(), annotation);
     // Remembered BEFORE the effect is returned: the action context carries a
     // buffer id and a cursor but no buffer NAME, and a synthetic buffer's
     // `document.path()` is `none`, so `C-c C-c` could not otherwise work out
@@ -6244,7 +6254,7 @@ fn capture_submit(ctx: &ActionContext) -> Vec<Effect> {
         Ok(t) => t,
         Err(effect) => return vec![effect],
     };
-    let text = capture::expand(&template.body, &entered, today_epoch_day(), &taken_origin());
+    let text = capture::expand(&template.body, &entered, now_when(), &taken_origin());
     // OC.11b: BEFORE the write, so a failed `WriteToFile`'s message is the one
     // left on screen. An echo after it would overwrite exactly the thing the
     // user needs to see — the trap `:org-roam-create-node` records.

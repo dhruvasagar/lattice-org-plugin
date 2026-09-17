@@ -54,7 +54,7 @@ pub enum TreeType {
 /// deliberately abbreviated (`Wed`) because org TIMESTAMPS use `%a`; a datetree
 /// heading uses `%A`, so the full names live here rather than widening a
 /// constant whose other caller wants the short form.
-const MONTH_NAMES: [&str; 12] = [
+pub(crate) const MONTH_NAMES: [&str; 12] = [
     "January",
     "February",
     "March",
@@ -70,7 +70,7 @@ const MONTH_NAMES: [&str; 12] = [
 ];
 
 /// Full weekday names — org's `%A`.
-const DAY_NAMES_FULL: [&str; 7] = [
+pub(crate) const DAY_NAMES_FULL: [&str; 7] = [
     "Sunday",
     "Monday",
     "Tuesday",
@@ -135,7 +135,7 @@ fn week_label(date: Date) -> String {
 }
 
 /// `(ISO year, ISO week)` for a date.
-fn iso_week(date: Date) -> (i32, u32) {
+pub(crate) fn iso_week(date: Date) -> (i32, u32) {
     // Thursday of this date's week decides the ISO year — that is the rule the
     // standard is written in terms of.
     let dow = crate::timestamp::weekday(date.year, date.month, date.day);

@@ -3350,7 +3350,10 @@ async fn pick(editor: &mut Editor, key: &str) -> lattice_core::BufferId {
             .picker
             .as_ref()
             .and_then(|p| p.transient.as_ref())
-            .map(|t| (t.title.clone(), t.groups.iter().map(|g| g.items.len()).sum::<usize>())),
+            .map(|t| (
+                t.title.clone(),
+                t.groups.iter().map(|g| g.items.len()).sum::<usize>()
+            )),
         editor.pending_transient_build.is_some(),
         editor.pending_prompt_submit_action,
     );

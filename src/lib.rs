@@ -6651,6 +6651,7 @@ fn capture_drafts_open() -> Vec<Effect> {
             args: Vec::new(),
             root: None,
             fill_action: None,
+            query: None,
         },
     )]
 }
@@ -8427,6 +8428,7 @@ impl GrammarCallbacks for Component {
                     // accept routes through the source's own outcome. Nothing
                     // here is waiting for a value, which is what `none` says.
                     fill_action: None,
+                    query: None,
                 },
             )]),
             REFILE_TO => Ok(refile_to(&ctx, doc, tree)),
@@ -9104,6 +9106,7 @@ impl GrammarCallbacks for Component {
                     // accept routes through the source's own outcome. Nothing
                     // here is waiting for a value, which is what `none` says.
                     fill_action: None,
+                    query: None,
                 },
             )]),
             // OR.7c: the link the picker resolved, inserted at the cursor.
@@ -9199,6 +9202,7 @@ impl GrammarCallbacks for Component {
                     // accept routes through the source's own outcome. Nothing
                     // here is waiting for a value, which is what `none` says.
                     fill_action: None,
+                    query: None,
                 },
             )]),
             // OR.6: mint an id, write the note, open it.
@@ -10309,6 +10313,7 @@ fn backlinks_at_point(ctx: &ExCommandContext, doc: &Document) -> Vec<Effect> {
             // PC.11: nor is anything waiting for a value — the backlinks
             // picker acts on its accept rather than answering a caller.
             fill_action: None,
+            query: None,
         },
     )]
 }

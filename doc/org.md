@@ -1213,10 +1213,36 @@ second line in a view whose job is to be scannable. Press `<CR>` for the rest.
 | `<Tab>` `<S-Tab>` | collapse or expand the block at the cursor / every block |
 | `gr` | re-scan |
 | `<leader>ot` `<leader>oT` `<leader>o,` | change the TODO state or priority, **from the agenda** |
+| `m` `M` `~` `*` | mark the row for a bulk action / unmark everything / invert / mark all |
+| `x` | act on the marked rows |
 
-The agenda opens **collapsed to its blocks**, so `<Tab>` is how you open one.
-Emacs binds `<Tab>` in the agenda to "go to this entry" instead; that is on
-`g TAB` here, which is where evil-org-agenda also puts it.
+The agenda opens **expanded**, every entry visible, as emacs' does — the rows
+are the content, and a plan you have to unfold to read is a plan you do not
+read. `<Tab>` collapses a block from there. Emacs binds `<Tab>` in the agenda to
+"go to this entry" instead; that is on `g TAB` here, which is where
+evil-org-agenda also puts it.
+
+### Marking rows, and acting on all of them
+
+`m` marks the row under the cursor and steps down one, so marking a run is
+`mmm`. `m` again on a marked row takes it back, `M` unmarks everything, `~`
+inverts every mark and `*` marks the lot. A marked row carries a `>` in the
+gutter.
+
+`x` then acts on the marked set. Today it offers one verb — `t`, a TODO state
+written into every marked entry — and each edit lands in the file that entry
+lives in, not in the view.
+
+**A mark names the entry, not the row.** Refresh with `gr`, change the span,
+add a filter: the marks stay on the entries you put them on, and reappear
+wherever those entries land. Filtering an entry out of sight does not unmark it;
+it just means `x` skips it this time. Marks also survive restarting the editor,
+and `M` is how you clear them.
+
+**`x` with nothing marked does nothing but say so.** Emacs falls back to
+marking the row at point and acting on that; here a key that rewrites entries
+never guesses which ones from where the cursor happens to be. The single-entry
+verbs are all bound already.
 
 ### Which files it scans
 

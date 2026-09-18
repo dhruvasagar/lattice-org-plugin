@@ -23,7 +23,7 @@ reached the network.
 |---|---|
 | `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
 | `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-agenda-mode`, `org-global-mode` |
-| `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, the clock, archive / refile / capture, and org-roam's commands |
+| `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, the clock, archive / refile / capture, the agenda's bulk marks, and org-roam's commands |
 | `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates` |
 | `theme` | one theme element per TODO keyword, so `:colorscheme` recolours your own states |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
@@ -31,7 +31,9 @@ reached the network.
 | `multibuffer-view-source` | the agenda **view** itself: its buffer name, reuse policy and input model |
 | `picker-source` | refile targets, capture drafts (`<leader>oC`), and org-roam's find-node, insert-node and backlinks pickers |
 | `completion-source` | org-roam nodes, offered inside an `[[…]]` link |
-| `transient-source` | the capture menu, one key per template |
+| `transient-source` | the capture menu (one key per template), the TODO-state menu, the agenda's `gD` view menu and its `x` bulk menu |
+| `signs` | the `>` an agenda row wears when it is marked for a bulk action |
+| `decorations` | which agenda rows carry that mark — re-asked through `refresh-decorations`, because a mark changes no text |
 | `events` | the clock's session, its minute wake and its modeline segment |
 | `help` | `doc/org.md` and `doc/roam.md`, shipped inside the component; `:help org`, `:help org.roam`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 

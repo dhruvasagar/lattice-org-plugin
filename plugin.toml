@@ -19,6 +19,13 @@ provides = [
     # MV.3: the agenda is org's view, so org declares it.
     "multibuffer-view-source",
     "picker-source",
+    # OA.30: agenda bulk marks. `signs` declares the `>` once; `decorations`
+    # is asked which rows carry it, and is the seam `refresh-decorations`
+    # exists to re-ask. Without either the marks are still recorded and the
+    # chords still work — they just never appear, which is the honest
+    # degradation but not a useful one.
+    "signs",
+    "decorations",
     # OR.7: org-roam nodes inside an `[[…]]` link.
     "completion-source",
     # OC.3: the capture menu, one key per template.

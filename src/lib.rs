@@ -65,6 +65,18 @@ wit_bindgen::generate!({
             // the same `Guest` trait as `register-languages`.
             import lattice:plugin-host/theme@0.1.0;
             export register-theme-elements: func();
+            // OA.30: the agenda's bulk marks paint into the gutter. Two
+            // seams, both exported BARE for the scar the comments above
+            // record — `decorations-plugin` and `sign-plugin` each import
+            // `logging`, and every import a component declares must be
+            // satisfiable on EVERY linker it is instantiated against,
+            // including the grammar seam's sync one where `logging` is
+            // deliberately absent. `signs` declares what a mark looks like,
+            // once; `decorations` says which lines carry one, on every
+            // refresh.
+            import lattice:plugin-host/signs@0.1.0;
+            export register-signs: func();
+            export lattice:plugin-host/decorations@0.1.0;
             // OR.5b: the registry a picker plugin declares its sources
             // through. NOT `include picker-source-plugin` — that world also
             // imports `logging`, and this component is instantiated against
@@ -133,6 +145,7 @@ mod agenda;
 mod agenda_args;
 mod agenda_custom_commands;
 mod agenda_log;
+mod agenda_marks;
 mod agenda_match;
 mod agenda_sections;
 mod archive;
@@ -381,6 +394,13 @@ const ORG_TRANSIENT_AGENDA: &str = "agenda";
 /// so needs its own discriminator. `agenda` chooses WHICH agenda to open;
 /// `agenda-view` changes how the agenda already open is being shown.
 const ORG_TRANSIENT_AGENDA_VIEW: &str = "agenda-view";
+
+/// OA.30 — `x`'s menu of bulk verbs, on the same one registered transient
+/// source as every menu above it.
+const ORG_TRANSIENT_AGENDA_BULK: &str = "agenda-bulk";
+
+/// OA.30 — `x` then `t`, the keyword rows of the bulk TODO verb.
+const ORG_TRANSIENT_AGENDA_BULK_TODO: &str = "agenda-bulk-todo";
 
 // TB.2: 21..=31 were `org-table-mode`'s eleven generic table callbacks.
 // They are the host's now — `table-mode` in `lattice-mode` owns pipe-table
@@ -735,6 +755,38 @@ const SET_PROPERTY_VALUE: u32 = 87;
 /// it would be a menu entry that does nothing — the class this codebase keeps
 /// paying for.
 const AGENDA_VIEW_MENU: u32 = 84;
+
+/// OA.30 — `m`, evil-org-agenda's spelling of `org-agenda-bulk-toggle`.
+///
+/// Marks the row under the cursor, or unmarks one already marked, and steps
+/// down a line as org's own does — marking a run of rows is `mmm`, not
+/// `mjmjm`.
+const AGENDA_MARK: u32 = 115;
+
+/// OA.30 — `M`, `org-agenda-bulk-unmark-all`.
+const AGENDA_UNMARK_ALL: u32 = 116;
+
+/// OA.30 — `~`, `org-agenda-bulk-toggle-all`. Every row's mark, inverted.
+const AGENDA_TOGGLE_ALL_MARKS: u32 = 117;
+
+/// OA.30 — `*`, `org-agenda-bulk-mark-all`.
+const AGENDA_MARK_ALL: u32 = 118;
+
+/// OA.30 — `x`, `org-agenda-bulk-action`: the menu of verbs to apply to the
+/// marked set.
+const AGENDA_BULK_MENU: u32 = 119;
+
+/// OA.30 — the menu's `t` row, carrying the keyword as its argument: one TODO
+/// state written into every marked entry.
+const AGENDA_BULK_TODO: u32 = 120;
+
+/// OA.30 — `x` then `t`: the keyword rows, as their own menu.
+///
+/// A second hop rather than putting the keywords straight on `x`, because the
+/// keys on `x` are VERBS and the keys inside `t` are keywords the user
+/// configured. Collapsing them would mean a new TODO state could silently take
+/// the key of a bulk verb.
+const AGENDA_BULK_TODO_MENU: u32 = 121;
 
 /// OE.3 — `C-c C-c`, emacs' `org-ctrl-c-ctrl-c`. See [`ctrl_c_ctrl_c`].
 const CTRL_C_CTRL_C: u32 = 88;
@@ -1115,6 +1167,24 @@ mod todo_theme {
                 scale: None,
             },
         );
+        // OA.30: the bulk mark in the gutter. An element of its own so
+        // `:colorscheme` and a user override can both reach it — a sign that
+        // painted in a colour baked into this plugin would be the one gutter
+        // glyph a theme could not touch.
+        let _ = register_element(
+            "agenda-mark",
+            "The `>` on an agenda row marked for a bulk action.",
+            &ThemeStyleSpec {
+                inherit: None,
+                fg: Some(ColorRef::Palette("yellow".to_string())),
+                bg: None,
+                modifiers: ModifierSet {
+                    bold: Some(true),
+                    ..unset()
+                },
+                scale: None,
+            },
+        );
         let _ = register_element(
             "tag",
             "A headline's trailing `:tag:` list.",
@@ -1371,6 +1441,34 @@ impl Guest for Component {
                 .unwrap_or_default(),
         );
         todo_theme::apply_overrides(&styles);
+    }
+
+    /// OA.30 — the one sign this plugin places: a marked agenda row.
+    ///
+    /// Declared once at load rather than carried on each placement, which is
+    /// the split `signs.wit` argues for at length: the glyph and its theme
+    /// element do not change while the editor runs, and re-crossing them for
+    /// every marked line of every refresh would restate at 60Hz something that
+    /// was settled at boot.
+    fn register_signs() {
+        // Priority 10 — vim's default, and the floor. A mark is a selection the
+        // user just made and can undo with the next keystroke; a diagnostic is
+        // a fact about their code. When both land on one row the diagnostic
+        // wins, which is right: the mark is recoverable information and the
+        // error is not.
+        let _ = lattice::plugin_host::signs::define_sign(
+            agenda_marks::MARK_SIGN,
+            &lattice::plugin_host::signs::SignSpec {
+                text: agenda_marks::MARK_GLYPH.to_string(),
+                fallback: agenda_marks::MARK_GLYPH.to_string(),
+                theme_element: agenda_marks::MARK_THEME_ELEMENT.to_string(),
+                priority: 10,
+                // The leftmost column, shared with diagnostics — this IS vim's
+                // `signcolumn`, and a mark belongs there rather than in the
+                // diff gutter it has nothing to do with.
+                column: "mark".to_string(),
+            },
+        );
     }
 
     /// OR.5b: declare org's picker sources. One today (refile); roam's
@@ -2753,6 +2851,23 @@ impl Guest for Component {
                 // OA.15: emacs' `l`. Bare, for `f` / `b`'s reason — the agenda
                 // is read-only, so a letter here shadows nothing that could be
                 // typed, and this mode activates on agenda views alone.
+                // OA.30: the bulk marks, on evil-org-agenda's letters.
+                //
+                // `m` and `*` are vim keys — set-mark and search-word-under-
+                // cursor — and giving them up is the trade evil-org already
+                // made here. It is a narrow one: the agenda is read-only, so a
+                // vim mark in it names a position in a view that the next `gr`
+                // renumbers, and `*` searches for the word under the cursor in
+                // a buffer whose text is assembled rather than written. Both
+                // are still one `gD`-free keystroke away in any real file.
+                //
+                // `~` is toggle-all and `M` unmark-all; neither means anything
+                // else in a read-only buffer.
+                bind("m", "org-agenda-bulk-toggle"),
+                bind("M", "org-agenda-bulk-unmark-all"),
+                bind("~", "org-agenda-bulk-toggle-all"),
+                bind("*", "org-agenda-bulk-mark-all"),
+                bind("x", "org-agenda-bulk-action"),
                 bind("l", "org-agenda-log-mode"),
                 // OA.29: filtering lives under `s`, evil-org-agenda's prefix.
                 //
@@ -3276,6 +3391,44 @@ impl Guest for Component {
                 "org-agenda-log-mode",
                 "Show what was closed, clocked and changed \u{2014} the span's log, not its plan",
                 AGENDA_LOG_MODE,
+            ),
+            // OA.30 — the bulk marks. Every one of them is registered as an
+            // ordinary action, so each is also an ex-command and each shows up
+            // in `:describe-key` — the marks are not a private mode.
+            (
+                "org-agenda-bulk-toggle",
+                "Mark the agenda row under the cursor for a bulk action, or unmark it",
+                AGENDA_MARK,
+            ),
+            (
+                "org-agenda-bulk-unmark-all",
+                "Drop every agenda mark",
+                AGENDA_UNMARK_ALL,
+            ),
+            (
+                "org-agenda-bulk-toggle-all",
+                "Invert every agenda row's mark",
+                AGENDA_TOGGLE_ALL_MARKS,
+            ),
+            (
+                "org-agenda-bulk-mark-all",
+                "Mark every row in the agenda",
+                AGENDA_MARK_ALL,
+            ),
+            (
+                "org-agenda-bulk-action",
+                "Act on every marked agenda row",
+                AGENDA_BULK_MENU,
+            ),
+            (
+                "org-agenda-bulk-todo",
+                "Write the TODO keyword in args into every marked entry",
+                AGENDA_BULK_TODO,
+            ),
+            (
+                "org-agenda-bulk-todo-menu",
+                "Choose the TODO state to write into every marked entry",
+                AGENDA_BULK_TODO_MENU,
             ),
             ("org-agenda-day-view", "Show one day", AGENDA_SPAN_DAY),
             ("org-agenda-week-view", "Show one week", AGENDA_SPAN_WEEK),
@@ -8375,6 +8528,215 @@ fn row_source(ctx: &ActionContext) -> Option<host_services::SourceLocation> {
     host_services::excerpt_source(u64::from(ctx.buffer_id), ctx.cursor.line)
 }
 
+/// OA.30 — every agenda row on screen, paired with the source entry it shows.
+///
+/// A row is a line the view composes from a file; a header, a separator and a
+/// blank line are not, and `excerpt-source` answering `none` is what tells them
+/// apart. Walking the whole view costs one host call per line, which is why
+/// only the three bulk chords do it — `m` asks about ONE line, the one under
+/// the cursor.
+fn agenda_rows(ctx: &ActionContext, doc: &Document) -> Vec<(u32, host_services::SourceLocation)> {
+    (0..doc.line_count())
+        .filter_map(|line| {
+            host_services::excerpt_source(u64::from(ctx.buffer_id), line).map(|loc| (line, loc))
+        })
+        .collect()
+}
+
+/// Whether `loc` is marked.
+fn is_marked(loc: &host_services::SourceLocation) -> bool {
+    host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line)).is_some()
+}
+
+/// Mark or unmark `loc`. `Err` names why the store refused, which is worth
+/// echoing — a mark that did not stick and says nothing looks like a dead key.
+fn set_mark(loc: &host_services::SourceLocation, on: bool) -> Result<(), String> {
+    let key = agenda_marks::mark_key(&loc.path, loc.line);
+    if on {
+        // A one-byte value rather than an empty one: presence is the whole
+        // fact, and an empty value is the shape a corrupt entry also has.
+        host_services::store_put(&key, &[1])
+    } else {
+        host_services::store_delete(&key)
+    }
+}
+
+/// Forget every mark. Returns how many there were, for the echo.
+fn clear_marks() -> usize {
+    let keys = host_services::store_keys(agenda_marks::MARK_PREFIX);
+    for key in &keys {
+        let _ = host_services::store_delete(key);
+    }
+    keys.len()
+}
+
+/// OA.30 — `m`.
+///
+/// Steps down a line afterwards, as `org-agenda-bulk-mark` does: marking a run
+/// of rows is what this key is for, and the cursor move is what makes it `mmm`.
+/// `cursor-move` is clamped host-side, so the last row is simply the last row.
+fn mark_toggle(ctx: &ActionContext) -> Vec<Effect> {
+    let Some(loc) = row_source(ctx) else {
+        // A header or a separator. `none` rather than `declined`: falling
+        // through would run vim's `m`, which in a view whose line numbers the
+        // next refresh invalidates records a mark that quietly means nothing.
+        return vec![Effect::None];
+    };
+    let want = !is_marked(&loc);
+    if let Err(e) = set_mark(&loc, want) {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: format!("org: could not record the mark — {e}"),
+        })];
+    }
+    host_services::refresh_decorations();
+    vec![Effect::CursorMove(Position {
+        line: ctx.cursor.line + 1,
+        byte: 0,
+    })]
+}
+
+/// OA.30 — `*` (`toggle` false) and `~` (`toggle` true).
+///
+/// One walk of the view for both, because they differ only in what each row's
+/// new state is computed from: `*` sets every row, `~` inverts each one.
+fn mark_all(ctx: &ActionContext, doc: &Document, toggle: bool) -> Vec<Effect> {
+    let rows = agenda_rows(ctx, doc);
+    if rows.is_empty() {
+        return vec![Effect::None];
+    }
+    for (_, loc) in &rows {
+        let want = if toggle { !is_marked(loc) } else { true };
+        let _ = set_mark(loc, want);
+    }
+    host_services::refresh_decorations();
+    let n = host_services::store_keys(agenda_marks::MARK_PREFIX).len();
+    vec![Effect::Echo(EchoPayload {
+        level: EchoLevel::Info,
+        text: format!("{} marked", agenda_marks::marked_count_label(n)),
+    })]
+}
+
+/// OA.30 — `M`.
+fn unmark_all() -> Vec<Effect> {
+    let n = clear_marks();
+    if n == 0 {
+        // org says so out loud rather than doing nothing, and it is the right
+        // answer: "no entry to unmark" tells you the marks you thought you had
+        // are already gone.
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: "org: no marked rows".to_string(),
+        })];
+    }
+    host_services::refresh_decorations();
+    vec![Effect::Echo(EchoPayload {
+        level: EchoLevel::Info,
+        text: format!("{} unmarked", agenda_marks::marked_count_label(n)),
+    })]
+}
+
+/// OA.30 — `x`, the bulk menu.
+///
+/// Refuses with nothing marked rather than acting on the row under the cursor.
+/// Org falls back to marking point and proceeding, and that is the one piece of
+/// its behaviour not copied here: `x` on an unmarked agenda would then rewrite
+/// whichever entry the cursor happened to be on, which is a destructive edit
+/// nobody asked for. The single-entry verbs are all bound already.
+fn bulk_menu(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
+    let marked = marked_rows(ctx, doc);
+    if marked.is_empty() {
+        return vec![Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org: nothing marked — `m` marks the row under the cursor".to_string(),
+        })];
+    }
+    vec![Effect::OpenTransient(
+        lattice::plugin_host::types::OpenTransientPayload {
+            source: CAPTURE_TRANSIENT.to_string(),
+            args: Args::String(ORG_TRANSIENT_AGENDA_BULK.to_string()),
+        },
+    )]
+}
+
+/// OA.30 — the marked rows of THIS view, in view order.
+///
+/// Marks are recorded against a source `path:line` and so survive `gr`, a
+/// filter and a span change (that is the point of recording them that way).
+/// What a bulk verb can act on is narrower: an entry the current view does not
+/// show has no buffer to edit through, because `source-location.buffer` — the
+/// document id an edit names — is something only a row on screen carries. So a
+/// filtered-out mark is kept and skipped rather than acted on blind, which also
+/// matches org, where a mark that leaves the view stops existing.
+fn marked_rows(ctx: &ActionContext, doc: &Document) -> Vec<(u32, host_services::SourceLocation)> {
+    agenda_rows(ctx, doc)
+        .into_iter()
+        .filter(|(_, loc)| is_marked(loc))
+        .collect()
+}
+
+/// OA.30 — the menu's `t` row: one keyword, every marked entry.
+///
+/// Each entry is ONE single-line replace of its own headline, in the source
+/// document the row came from. Not one big edit: the marked rows are in
+/// different files as often as not, and even within one file they are not
+/// contiguous. Single-line replaces also mean the line numbers cannot shift
+/// underneath the ones still to come.
+fn bulk_todo(ctx: &ActionContext, doc: &Document, want: &str) -> Vec<Effect> {
+    let keywords = todo_keywords();
+    let marked = marked_rows(ctx, doc);
+    let mut effects = Vec::with_capacity(marked.len() + 2);
+    let mut changed = 0usize;
+    for (_, loc) in &marked {
+        // Through the SOURCE document, not the file: an earlier verb in this
+        // same batch may already have rewritten it, and reading the file would
+        // not see that. See `host-services.source-line`.
+        let Some(head) = host_services::source_line(loc.buffer, loc.line) else {
+            continue;
+        };
+        let Some(new_head) = todo::set_keyword(&head, &keywords, want) else {
+            continue;
+        };
+        if new_head == head {
+            continue;
+        }
+        changed += 1;
+        effects.extend(replace_lines_at(
+            loc.buffer,
+            loc.line,
+            loc.line,
+            head.len() as u32,
+            new_head,
+            // The entry's OWN line, not `ctx.cursor`. The cursor is a position
+            // in the VIEW, and these edits land in source documents the view
+            // composes — carrying it across would park each source buffer's
+            // cursor at whatever row of the agenda happened to be focused.
+            Position {
+                line: loc.line,
+                byte: 0,
+            },
+        ));
+    }
+    // Marks are dropped once the verb has run, which is org's default
+    // (`org-agenda-persistent-marks` is nil). Keeping them would make a second
+    // press of `x` act on the same rows again, and the second press is almost
+    // always meant for a different set.
+    clear_marks();
+    host_services::refresh_decorations();
+    effects.push(Effect::Echo(EchoPayload {
+        level: EchoLevel::Info,
+        text: if want.is_empty() {
+            format!("{} cleared", agenda_marks::marked_count_label(changed))
+        } else {
+            format!(
+                "{} \u{2192} {want}",
+                agenda_marks::marked_count_label(changed)
+            )
+        },
+    }));
+    effects
+}
+
 /// OA.29 — the prompt each filter key asks with.
 ///
 /// Named rather than derived from the action id's registered doc: the doc is a
@@ -9129,6 +9491,30 @@ impl GrammarCallbacks for Component {
             // The same `Effect::ToggleMode` the auto-generated
             // `:org-agenda-log-mode` ex-command returns, so the chord and the
             // command are one switch rather than two paths that can differ.
+            // OA.30 — the bulk marks. Thin arms over `agenda_marks`' helpers,
+            // for the reason every agenda chord above is thin: the state is in
+            // the plugin store and the paint is on another seam, so an arm that
+            // did the work here would be the only place those two are joined.
+            AGENDA_MARK => Ok(mark_toggle(&ctx)),
+            AGENDA_UNMARK_ALL => Ok(unmark_all()),
+            AGENDA_TOGGLE_ALL_MARKS => Ok(mark_all(&ctx, doc, true)),
+            AGENDA_MARK_ALL => Ok(mark_all(&ctx, doc, false)),
+            AGENDA_BULK_MENU => Ok(bulk_menu(&ctx, doc)),
+            AGENDA_BULK_TODO_MENU => Ok(vec![Effect::OpenTransient(
+                lattice::plugin_host::types::OpenTransientPayload {
+                    source: CAPTURE_TRANSIENT.to_string(),
+                    args: Args::String(ORG_TRANSIENT_AGENDA_BULK_TODO.to_string()),
+                },
+            )]),
+            AGENDA_BULK_TODO => {
+                // An empty argument is the menu's "(none)" row, exactly as
+                // `TODO_SET` reads it — clearing a state in bulk is a state.
+                let want = match &ctx.args {
+                    Args::String(s) => s.clone(),
+                    _ => String::new(),
+                };
+                Ok(bulk_todo(&ctx, doc, &want))
+            }
             AGENDA_LOG_MODE => Ok(vec![Effect::ToggleMode(AGENDA_LOG_MODE_ID.to_string())]),
             AGENDA_FILTER_CLEAR => {
                 // OA.28: the filter is dropped and NOTHING else — the span and
@@ -10861,6 +11247,56 @@ fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
 /// own toggle. Not org's to re-declare: the report is generic over any scan
 /// view that reports clock spans (OA.16), and a second org-side toggle would be
 /// a second writer of one switch.
+/// OA.30 — `x`: what to do to the marked rows.
+///
+/// ONE verb today. Org's own prompt offers nine (`$` archive, `A` archive to
+/// sibling, `t` todo, `+`/`-` tag, `s` schedule, `d` deadline, `r` refile,
+/// `S` scatter, `f` function), and the eight not here are not stubs on the
+/// menu: a row that opens nothing is the class of bug this tree keeps paying
+/// for (OA.18's missing time-grid row says the same). They are follow-ups, and
+/// each needs the single-entry verb to be reachable from a row's SOURCE
+/// document first — which `t` is and the rest are not yet.
+///
+/// The footer names how many rows are marked. It reads the count from the
+/// plugin store rather than being told: a transient is built on its own seam,
+/// with its own memory, and the store is the one thing all three seams of this
+/// feature can see.
+fn agenda_bulk_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let marked = host_services::store_keys(agenda_marks::MARK_PREFIX).len();
+    Ok(TransientSpec {
+        title: "Bulk action".to_string(),
+        groups: vec![TransientGroup {
+            label: String::new(),
+            items: vec![
+                TransientItem {
+                    key: vec!["t".to_string()],
+                    label: "todo".to_string(),
+                    description: "set one TODO state on every marked entry".to_string(),
+                    kind: TransientItemKind::Action(TransientAction {
+                        command: "org-agenda-bulk-todo-menu".to_string(),
+                        args: WitArgs::None,
+                    }),
+                },
+                TransientItem {
+                    key: vec!["q".to_string()],
+                    label: "quit".to_string(),
+                    description: String::new(),
+                    kind: TransientItemKind::Dismiss,
+                },
+            ],
+        }],
+        footer: Some(format!(
+            "{} marked",
+            agenda_marks::marked_count_label(marked)
+        )),
+    })
+}
+
 fn agenda_view_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
     use lattice::plugin_host::types::{
         Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
@@ -11251,6 +11687,25 @@ fn roam_template_menu(
 }
 
 fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    todo_keyword_menu("TODO state", "org-todo-set")
+}
+
+/// OA.30 — `x` then `t`: the same keyword rows, aimed at the marked set.
+///
+/// Built by the SAME function as the single-entry menu, which is the point:
+/// the keys are derived from the configured keywords, so two builders would
+/// mean `d` could be DONE in one menu and DELEGATED in the other depending on
+/// which had been written more recently.
+fn agenda_bulk_todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    todo_keyword_menu("Bulk: TODO state", "org-agenda-bulk-todo")
+}
+
+/// One row per configured TODO keyword, each dispatching `command` with the
+/// keyword as its argument.
+fn todo_keyword_menu(
+    title: &str,
+    command: &str,
+) -> Result<lattice::plugin_host::types::TransientSpec, String> {
     use lattice::plugin_host::types::{
         Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
         TransientSpec,
@@ -11289,7 +11744,7 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
                 String::new()
             },
             kind: TransientItemKind::Action(TransientAction {
-                command: "org-todo-set".to_string(),
+                command: command.to_string(),
                 args: WitArgs::String(k.name.clone()),
             }),
         });
@@ -11302,7 +11757,7 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
         label: "(none)".to_string(),
         description: "clear the state".to_string(),
         kind: TransientItemKind::Action(TransientAction {
-            command: "org-todo-set".to_string(),
+            command: command.to_string(),
             args: WitArgs::String(String::new()),
         }),
     });
@@ -11314,7 +11769,7 @@ fn todo_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
     });
 
     Ok(TransientSpec {
-        title: "TODO state".to_string(),
+        title: title.to_string(),
         groups: vec![TransientGroup {
             label: String::new(),
             items,
@@ -11382,6 +11837,54 @@ impl exports::lattice::plugin_host::completion_source::Guest for Component {
     }
 }
 
+/// OA.30 — which rows of a buffer carry a bulk mark.
+///
+/// The producer half of the marks. It runs OFF the render path, on a trigger,
+/// and the host caches what it returns; the renderer only ever reads that
+/// cache. `refresh-decorations` is what re-arms the trigger, and without it
+/// this would answer once per agenda and then be frozen — a mark is guest
+/// state over a read-only buffer whose text never changes, which is exactly
+/// the blind spot that host call exists to cover.
+///
+/// The resolution runs view-ward, not mark-ward: a mark names a source
+/// `path:line`, so for each LINE on screen this asks what it shows and looks
+/// that up. The other direction is not available — nothing maps a source
+/// entry back to the row displaying it — and this direction is also the one
+/// that stays correct across a refresh, since it re-derives from whatever the
+/// view is showing now.
+impl exports::lattice::plugin_host::decorations::Guest for Component {
+    fn gutter_decorations(
+        ctx: lattice::plugin_host::types::DecorationContext,
+    ) -> Result<Vec<lattice::plugin_host::types::GutterDecoration>, String> {
+        // The overwhelmingly common case, and it must not cost a walk: with
+        // nothing marked there is nothing to paint in ANY buffer, and this
+        // producer is asked about every buffer in the editor, on every edit.
+        // One store read answers it.
+        if host_services::store_keys(agenda_marks::MARK_PREFIX).is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok((0..ctx.line_count)
+            .filter_map(|line| {
+                // `none` for a header, a separator, or any buffer that is not a
+                // composed view — which is how this producer stays inert
+                // everywhere but the agenda without asking what kind of buffer
+                // it is in.
+                let loc = host_services::excerpt_source(ctx.buffer_id, line)?;
+                host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line))?;
+                Some(lattice::plugin_host::types::GutterDecoration::Sign(
+                    lattice::plugin_host::types::GutterSign {
+                        line,
+                        // The NAMESPACED name: `define-sign` prefixed it with
+                        // the plugin's id, and a placement naming the bare one
+                        // resolves to nothing and is silently skipped.
+                        name: agenda_marks::MARK_THEME_ELEMENT.to_string(),
+                    },
+                ))
+            })
+            .collect())
+    }
+}
+
 impl exports::lattice::plugin_host::transient_source::Guest for Component {
     fn id() -> String {
         CAPTURE_TRANSIENT.to_string()
@@ -11423,6 +11926,14 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             // names an action this plugin (or the host) already registered.
             if key == ORG_TRANSIENT_AGENDA_VIEW {
                 return agenda_view_menu();
+            }
+            // OA.30: and the bulk verbs, before the same parse and for the
+            // same reason as the three menus above.
+            if key == ORG_TRANSIENT_AGENDA_BULK {
+                return agenda_bulk_menu();
+            }
+            if key == ORG_TRANSIENT_AGENDA_BULK_TODO {
+                return agenda_bulk_todo_menu();
             }
         }
 

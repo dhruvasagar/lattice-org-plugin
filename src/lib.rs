@@ -9692,7 +9692,15 @@ impl GrammarCallbacks for Component {
             linewise: false,
         })
     }
-    fn apply_operator(_c: u32, _ctx: OperatorContext) -> Result<Vec<Effect>, String> {
+    /// CM.1 (lattice 0.10): `apply-operator` receives `borrow<document>`, the
+    /// handle its four sibling callbacks already had. Org contributes no
+    /// operators — its editing verbs are actions and text objects — so this
+    /// stays a stub; the parameter is the trait's, not a need of org's.
+    fn apply_operator(
+        _c: u32,
+        _ctx: OperatorContext,
+        _doc: &Document,
+    ) -> Result<Vec<Effect>, String> {
         Err("org: no operators".into())
     }
     /// The headline / subtree text objects (OM.4b).

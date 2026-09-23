@@ -1,0 +1,193 @@
+# Continuous integration for lattice-org-plugin.
+#
+# What each job gates, and why it exists:
+#
+# 1. **`component` — builds from a bare clone.** The load-bearing job, and the
+#    reason it is first. This repo shipped for months with dependencies pinned
+#    to `/Users/<someone>/src/lattice/...`, so `cargo build --release --target
+#    wasm32-wasip2` — the exact command the plugin manager runs on boot —
+#    worked on exactly one machine. Worse, the breakage came from
+#    `[dev-dependencies]`, which cargo resolves as part of the BUILD graph, so
+#    test-only crates were gating every user's install.
+#
+#    This job **deliberately does not check out lattice**. That absence is the
+#    guard: reintroduce a path dependency into the component's manifest and
+#    this job fails, on the same command a user would run.
+#
+# 2. **The grammar is asserted non-empty.** `build.rs` fetches
+#    `tree-sitter-org` and compiles it to wasm, and on any failure — offline,
+#    clone refused, clang missing — it writes an EMPTY placeholder and lets the
+#    build succeed, so the plugin degrades with a named reason rather than
+#    becoming a build error. Good behaviour at runtime, useless in CI: a green
+#    build would prove nothing about the grammar. So the job checks the artefact
+#    has real bytes in it.
+#
+# 3. **`integration` — the tests, which need a real editor.** They boot one,
+#    load the component through the loader and dispatch chords, so this job
+#    checks out lattice as a SIBLING directory, which is the layout
+#    `integration/Cargo.toml`'s path dependencies expect. Expensive (it compiles
+#    wasmtime and cranelift), and it tests against lattice `main` rather than a
+#    pinned tag — deliberately, because this plugin is the reference
+#    implementation and "org still works against the editor as it is today" is
+#    the signal worth having. When lattice's WIT moves, this job is where you
+#    find out.
+#
+#    The component is built FIRST. Every test skips when the artefact is absent
+#    rather than failing, so running them without that step reports green while
+#    testing nothing.
+#
+# 4. **`fmt` / `clippy`.** Cheap, and clippy runs on the component only —
+#    linting `integration/` would drag the whole editor in for no extra signal.
+#    `rustflags: ""` because `actions-rust-lang/setup-rust-toolchain@v1`
+#    defaults to `-D warnings`, which turns a toolchain bump's new stylistic
+#    lints into a failed build.
+#
+# Known sharp edge, deliberately not papered over here: `build.rs` clones the
+# grammar from the upstream default branch with no pinned ref, so an upstream
+# push can change what this repo builds without a commit here.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  component:
+    name: component (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      # No `lattice` checkout anywhere in this job. See the header.
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release --target wasm32-wasip2
+        run: cargo build --release --target wasm32-wasip2
+
+      - name: The component exists and the grammar is not a placeholder
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=target/wasm32-wasip2/release/lattice_org_plugin.wasm
+          test -f "$component" || { echo "::error::$component was not produced"; exit 1; }
+          echo "component: $(wc -c < "$component") bytes"
+
+          # build.rs writes an empty grammar.wasm rather than failing the build
+          # when the fetch or the wasm compile does not work. A real grammar is
+          # ~340 KB; anything near zero means this build shipped an org plugin
+          # that cannot parse org.
+          found=0
+          while IFS= read -r g; do
+            found=1
+            size=$(wc -c < "$g")
+            echo "grammar: $size bytes ($g)"
+            if [ "$size" -lt 100000 ]; then
+              echo "::error::grammar.wasm is $size bytes — the tree-sitter build fell back to its empty placeholder, so this component cannot parse org. Check the build log for 'could not fetch the grammar' or 'grammar build failed'."
+              exit 1
+            fi
+          done < <(find target/wasm32-wasip2/release/build -name grammar.wasm)
+          [ "$found" -eq 1 ] || { echo "::error::no grammar.wasm was produced at all"; exit 1; }
+
+      - name: The generated wit/ came from the published crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find wit -name '*.wit' | wc -l | tr -d ' ')
+          echo "wit/ contains $count files"
+          # Written by build.rs from the `lattice-wit` dependency. Zero means
+          # the ABI package never landed and the component compiled against
+          # whatever happened to be on disk.
+          [ "$count" -gt 0 ] || { echo "::error::wit/ is empty"; exit 1; }
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: cargo fmt --check (component)
+        run: cargo fmt --check
+      - name: cargo fmt --check (integration)
+        working-directory: integration
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy --target wasm32-wasip2
+        run: cargo clippy --release --target wasm32-wasip2 --all-targets
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    steps:
+      # The sibling layout `integration/Cargo.toml` expects:
+      #
+      #   <workspace>/lattice-org-plugin
+      #   <workspace>/lattice
+      #
+      # so its `../../lattice/crates/...` path dependencies resolve.
+      - uses: actions/checkout@v4
+        with:
+          path: lattice-org-plugin
+
+      - uses: actions/checkout@v4
+        with:
+          repository: dhruvasagar/lattice
+          path: lattice
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            lattice-org-plugin
+            lattice-org-plugin/integration
+
+      - name: Build the component first
+        working-directory: lattice-org-plugin
+        run: cargo build --release --target wasm32-wasip2
+
+      # One run, two assertions. Running the suite twice to check for skips
+      # would double the slowest job in this workflow for no extra signal.
+      - name: cargo test
+        working-directory: lattice-org-plugin/integration
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test -- --test-threads=1 --nocapture 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          [ "$status" -eq 0 ] || exit "$status"
+
+          # Every test returns early with this line when the component is
+          # missing, so a path or layout mistake would leave the suite green
+          # while exercising nothing.
+          if grep -q "skipping: component not built" test.log; then
+            echo "::error::a test skipped because it could not find the component — the suite passed without testing anything"
+            exit 1
+          fi
+          echo "no skips"

@@ -1,7 +1,12 @@
-# Pinned to the same rustc lattice pins. The dev-dependencies below compile a
-# real editor (wasmtime, cranelift), and those crates set `rust-version = 1.94`
-# — on an older default toolchain `cargo test` refuses to resolve at all.
-# Keep in sync with lattice's `rust-toolchain.toml`.
+# Pinned to the same rustc lattice pins, and it applies to `integration/` too —
+# rustup walks up from the working directory, so the test package inherits this
+# without a file of its own.
+#
+# The pin exists for that package: its dependencies compile a real editor
+# (wasmtime, cranelift), and those crates set `rust-version = 1.94`, so an older
+# default toolchain refuses to resolve at all. The component itself is far less
+# demanding, but a second toolchain for it would be two things to keep in step
+# for no gain. Keep in sync with lattice's `rust-toolchain.toml`.
 [toolchain]
 channel = "1.94.0"
 components = ["rustfmt", "clippy"]

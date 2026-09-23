@@ -9,3 +9,5 @@
 # The integration package is its own workspace, so it has its own target/.
 # `/target` above is root-anchored and does not reach it.
 /integration/target
+# Written by the CI test step so one run can be asserted twice.
+/integration/test.log

@@ -56,21 +56,135 @@ pub fn image_link(line: &str, line_no: u32) -> Option<ImageLink> {
         Some(i) => (&inner[..i], Some(inner[i + 2..].to_string())),
         None => (inner, None),
     };
-    // `file:` is org's explicit prefix; a bare relative path is also a file
-    // link. Any other scheme (`http:`, `id:`, `mailto:`) is not ours.
-    let path = match path.strip_prefix("file:") {
-        Some(p) => p,
-        None if !has_scheme(path) => path,
-        None => return None,
-    };
-    if path.trim().is_empty() || !is_image(path) {
+    let path = file_link_path(path)?;
+    if !is_image(&path) {
         return None;
     }
     Some(ImageLink {
         line: line_no,
-        path: path.to_string(),
+        path,
         description: description.filter(|d| !d.trim().is_empty()),
     })
+}
+
+/// A file link's path, resolved the way org resolves one.
+///
+/// This is org's own pipeline (`org-element-link-parser` then
+/// `org-link-preview-file`), in org's order, minus the steps that need
+/// something we do not have:
+///
+/// 1. **percent-decode** (`org-link-unescape`) — `[[file:my%20photo.png]]`
+///    names `my photo.png`. A link with a space in it is written this way
+///    because org's own `org-store-link` writes it this way.
+/// 2. **type**: `file:`, and org's application variants `file+sys:` /
+///    `file+emacs:`, which name *how* to open a file rather than a different
+///    kind of thing. A bare path with no scheme is a file link too, which is
+///    how `[[./img/a.png]]` and `[[img/a.png]]` work. Any other scheme
+///    (`http:`, `id:`, `mailto:`) is not ours.
+/// 3. **search option**: `[[file:notes.org::*Setup]]` points at a place
+///    INSIDE a file; the path is what precedes `::`. We do not jump to the
+///    search target yet — but opening the file is strictly better than the
+///    old behaviour, which looked for a file literally named
+///    `notes.org::*Setup` and reported it missing.
+/// 4. **`file:///` URIs** collapse to a single leading slash, with a Windows
+///    drive letter surviving: org's `\`///*\(.:\)?/` normalisation.
+///
+/// What is deliberately NOT here, and why:
+///
+/// - **`$VAR` expansion** (org's `substitute-in-file-name`). A plugin gets
+///   `HOME` and nothing else — no `PATH`, no `USER`, no ambient environment —
+///   so `$NOTES/a.png` could only ever expand for the one variable and would
+///   silently become a wrong path for every other. Half of this is worse than
+///   none: a path that keeps its `$` is visibly unresolved.
+/// - **`~user`** (which org's `expand-file-name` does handle). Resolving
+///   another user's home has no cross-platform answer, and `<home>user` is a
+///   plausible path to the wrong place — the rule `lattice_core::home`
+///   already states for every other path the user writes.
+/// - **`org-link-abbrev-alist`**. Org expands abbreviations before type
+///   detection; we have no abbreviation table yet, so there is nothing to
+///   expand. It belongs with that option, not here.
+///
+/// `~` and the join against the buffer's directory are the HOST's half of
+/// this — a relative org link is relative to the file it is written in, which
+/// is where the host resolves it (`wit/media.wit`).
+pub fn file_link_path(raw: &str) -> Option<String> {
+    let decoded = unescape(raw.trim());
+    let rest = match strip_file_prefix(&decoded) {
+        Some(rest) => rest,
+        None if !has_scheme(&decoded) => decoded.as_str(),
+        None => return None,
+    };
+    // org strips from the FIRST `::`, so a path containing two of them keeps
+    // only what precedes the first.
+    let path = match rest.find("::") {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    let path = collapse_uri_slashes(path);
+    (!path.trim().is_empty()).then_some(path)
+}
+
+/// `file:`, plus org's application variants `file+sys:` / `file+emacs:`,
+/// which say how to open the file rather than name a different kind of thing.
+fn strip_file_prefix(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("file")?;
+    match rest.strip_prefix(':') {
+        Some(r) => Some(r),
+        // `file+sys:` / `file+emacs:` — any application suffix, as org's
+        // `\`file\(?:\+\(.+\)\)?\'` accepts.
+        None => rest.strip_prefix('+')?.split_once(':').map(|(_, r)| r),
+    }
+}
+
+/// `file:///home/u/a.png` → `/home/u/a.png`; `file:///c:/x.png` → `c:/x.png`.
+/// Org's `\`///*\(.:\)?/` normalisation, which exists because a `file://`
+/// URI and a plain path are both written into org files by different tools.
+fn collapse_uri_slashes(path: &str) -> String {
+    // THREE slashes minimum, matching org's `\`///*…`. Two is a UNC path
+    // (`//host/share/x.png`), which means something else entirely and must
+    // survive untouched.
+    let Some(rest) = path.strip_prefix("///") else {
+        return path.to_string();
+    };
+    let rest = rest.trim_start_matches('/');
+    // A drive letter between the slashes survives; anything else re-gains the
+    // single leading slash that makes it absolute.
+    match rest.split_once('/') {
+        Some((drive, tail)) if drive.len() == 2 && drive.ends_with(':') => {
+            format!("{drive}/{tail}")
+        }
+        _ => format!("/{rest}"),
+    }
+}
+
+/// `org-link-unescape` — decode `%XX` byte escapes.
+///
+/// A run of escapes decodes as UTF-8 together, so `%E2%82%AC` is one `€`
+/// rather than three replacement characters. Anything that is not a valid
+/// escape is kept verbatim, and a run that does not decode as UTF-8 leaves
+/// the whole string alone: a path that still visibly contains `%41` is
+/// better than one silently mangled.
+fn unescape(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// True when `s` starts with a `scheme:` that is not a bare Windows-style
@@ -172,6 +286,89 @@ mod tests {
         );
     }
 
+    /// `org-link-unescape`: org writes a space as `%20` when it stores a
+    /// link, so a path that was never decoded named a file that does not
+    /// exist — and failed silently, because a media block that will not
+    /// decode is logged at `debug!` and simply does not appear.
+    #[test]
+    fn a_percent_escaped_path_is_decoded() {
+        assert_eq!(
+            image_link("[[file:my%20photo.png]]", 0).unwrap().path,
+            "my photo.png"
+        );
+        // A run decodes as UTF-8 together, not byte by byte.
+        assert_eq!(
+            image_link("[[file:caf%C3%A9.png]]", 0).unwrap().path,
+            "café.png"
+        );
+    }
+
+    /// Anything that is not a valid escape is kept verbatim. A path that
+    /// visibly still contains a `%` is better than one silently mangled.
+    #[test]
+    fn a_stray_percent_survives_decoding() {
+        assert_eq!(
+            image_link("[[file:100%25 scale.png]]", 0).unwrap().path,
+            "100% scale.png"
+        );
+        assert_eq!(image_link("[[file:a%zz.png]]", 0).unwrap().path, "a%zz.png");
+    }
+
+    /// `file+sys:` / `file+emacs:` say HOW to open a file, not that it is a
+    /// different kind of thing. Org treats both as file links; we dropped
+    /// them on the floor because `+` looked like part of a scheme name.
+    #[test]
+    fn org_application_prefixes_are_still_file_links() {
+        assert_eq!(image_link("[[file+sys:a.png]]", 0).unwrap().path, "a.png");
+        assert_eq!(image_link("[[file+emacs:a.png]]", 0).unwrap().path, "a.png");
+    }
+
+    /// `::` names a place INSIDE a file. The path is what precedes it — org
+    /// strips from the first occurrence.
+    #[test]
+    fn a_search_option_is_not_part_of_the_path() {
+        assert_eq!(
+            image_link("[[file:diagram.png::12]]", 0).unwrap().path,
+            "diagram.png"
+        );
+    }
+
+    /// A `file://` URI and a plain path are both written into org files by
+    /// different tools; org collapses the URI form to a path.
+    #[test]
+    fn a_file_uri_collapses_to_a_path() {
+        assert_eq!(
+            image_link("[[file:///home/u/a.png]]", 0).unwrap().path,
+            "/home/u/a.png"
+        );
+        assert_eq!(
+            image_link("[[file:///c:/img/a.png]]", 0).unwrap().path,
+            "c:/img/a.png"
+        );
+    }
+
+    /// Two slashes is a UNC path, which means something else entirely. Org's
+    /// normalisation needs three, and so does ours.
+    #[test]
+    fn a_unc_path_keeps_both_its_slashes() {
+        assert_eq!(
+            image_link("[[file://host/share/a.png]]", 0).unwrap().path,
+            "//host/share/a.png"
+        );
+    }
+
+    /// `$VAR` is deliberately NOT expanded: a plugin is given `HOME` and
+    /// nothing else, so expanding would work for one variable and silently
+    /// produce a wrong path for every other. A `$` that is still there is a
+    /// visibly unresolved path.
+    #[test]
+    fn an_environment_variable_is_left_verbatim() {
+        assert_eq!(
+            image_link("[[file:$NOTES/a.png]]", 0).unwrap().path,
+            "$NOTES/a.png"
+        );
+    }
+
     #[test]
     fn malformed_links_are_refused_rather_than_guessed() {
         for bad in ["[[file:]]", "[[]]", "[[file:a.png", "file:a.png]]", ""] {
@@ -250,19 +447,21 @@ fn classify(path: &str) -> Option<Target> {
         let h = h.trim();
         return (!h.is_empty()).then(|| Target::Headline(h.to_string()));
     }
-    if let Some(f) = p.strip_prefix("file:") {
-        return (!f.trim().is_empty()).then(|| Target::File(f.to_string()));
-    }
-    // OL.1: BEFORE `has_scheme`, which would otherwise classify `id:` as
-    // a generic URI and hand it to the platform opener.
+    // OL.1: BEFORE the file branch and before `has_scheme`, which would
+    // otherwise classify `id:` as a generic URI and hand it to the platform
+    // opener.
     if let Some(id) = p.strip_prefix("id:") {
         let id = id.trim();
         return (!id.is_empty()).then(|| Target::Id(id.to_string()));
     }
-    if has_scheme(p) {
+    if has_scheme(p) && strip_file_prefix(p).is_none() {
         return Some(Target::Uri(p.to_string()));
     }
-    Some(Target::File(p.to_string()))
+    // The same org pipeline the image scanner uses, so the two cannot
+    // disagree about what a link points at. Notably `[[file:notes.org::*Setup]]`
+    // now opens `notes.org` instead of reporting a missing file whose name
+    // contains a search string.
+    file_link_path(p).map(Target::File)
 }
 
 /// The 0-based line of the headline whose title matches `title`.
@@ -306,6 +505,31 @@ mod link_tests {
         assert_eq!(
             link_at("[[notes/a.org]]", 4).unwrap().target,
             Target::File("notes/a.org".into())
+        );
+    }
+
+    /// The opener and the image scanner share one pipeline, so they cannot
+    /// disagree about what a link points at. `[[file:notes.org::*Setup]]`
+    /// used to report "no such file: notes.org::*Setup", blaming the
+    /// filesystem for a name org never meant as one.
+    #[test]
+    fn the_opener_uses_orgs_path_rules_too() {
+        assert_eq!(
+            link_at("[[file:notes.org::*Setup]]", 4).unwrap().target,
+            Target::File("notes.org".into())
+        );
+        assert_eq!(
+            link_at("[[file:my%20notes.org]]", 4).unwrap().target,
+            Target::File("my notes.org".into())
+        );
+        assert_eq!(
+            link_at("[[file+emacs:a.org]]", 4).unwrap().target,
+            Target::File("a.org".into())
+        );
+        // …and a non-file scheme is still a URI, not a path.
+        assert_eq!(
+            link_at("[[https://example.com]]", 5).unwrap().target,
+            Target::Uri("https://example.com".into())
         );
     }
 

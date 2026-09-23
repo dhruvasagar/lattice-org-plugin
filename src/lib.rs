@@ -903,8 +903,23 @@ fn string_list(name: &str) -> Vec<String> {
 }
 
 /// AF.3: `org-agenda-files`, one path per element.
+///
+/// `~` expands, as it does for `org.directory`, `org.roam-directory` and a
+/// capture template's `file`. This was the one path option that did not, so a
+/// config portable enough to commit to a dotfiles repo — the whole reason to
+/// write `~` — produced an agenda that scanned a directory literally named
+/// `~` and found nothing, with no error to explain it.
 fn agenda_files() -> Vec<String> {
-    string_list("agenda-files")
+    expand_each(string_list("agenda-files"))
+}
+
+/// `~`-expand every path in a list. Split out from [`agenda_files`] so the
+/// expansion is testable without a host to read the option from.
+fn expand_each(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|p| crate::roam_scan::expand_tilde(&p))
+        .collect()
 }
 
 /// TK.2: `org.todo-keywords`, one SEQUENCE LINE per element.
@@ -12105,6 +12120,31 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
 
 #[cfg(test)]
 mod agenda_files_tests {
+    /// `org.agenda-files` expands `~`, like every other org path option.
+    ///
+    /// Without it a config written to be portable — the reason anyone types
+    /// `~` — scans a directory literally named `~` and reports an empty agenda
+    /// with nothing to say why. Found when a real config moved from an
+    /// absolute home path to `~` and the agenda silently emptied.
+    #[test]
+    fn agenda_file_paths_expand_a_leading_tilde() {
+        let home = std::env::var("HOME").expect("HOME is set when tests run");
+        let expanded = super::expand_each(vec![
+            "~/org".to_string(),
+            "/absolute/org".to_string(),
+            "~someone/org".to_string(),
+        ]);
+        assert_eq!(
+            expanded,
+            vec![
+                format!("{}/org", home.trim_end_matches('/')),
+                "/absolute/org".to_string(),
+                // `~user` is not ours to resolve; expanding it against OUR home
+                // would be a plausible path to the wrong place.
+                "~someone/org".to_string(),
+            ]
+        );
+    }
 
     /// The two shapes one list carries — a directory and a single file — plus
     /// the annotation people add to configuration they will re-read in six

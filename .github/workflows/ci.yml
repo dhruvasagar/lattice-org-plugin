@@ -138,6 +138,13 @@ jobs:
           done < <(find target/wasm32-wasip2/release/build -name grammar.wasm)
           [ "$found" -eq 1 ] || { echo "::error::no grammar.wasm was produced at all"; exit 1; }
 
+      # 762 tests that need no lattice checkout: the component's own units, and
+      # the guards binding README.md to plugin.toml. They compile for the HOST,
+      # not wasm32 — a different target from the build above, which is why they
+      # were never covered by it.
+      - name: cargo test (component, host)
+        run: cargo test
+
       - name: The generated wit/ came from the published crate
         shell: bash
         run: |

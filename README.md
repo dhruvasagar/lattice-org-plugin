@@ -1,10 +1,27 @@
 # org — the reference plugin
 
-The first real consumer of lattice's `language` seam, and by now of twelve
-others. Design: `docs/dev/architecture/org-mode.md` in the lattice tree —
-plus `org-capture.md`, `org-roam.md` and `org-todo-keywords.md`. Sequencing
-lives under `docs/dev/operations/slice-plans/` (finished plans move to
-`slice-plans/archive/`).
+Org-mode for **[lattice](https://github.com/dhruvasagar/lattice)** — a modal,
+GPU-accelerated, plugin-first text editor in Rust. Outline editing, TODO
+workflow, tables, the clock, capture, refile, archive, the agenda and
+org-roam, shipped as a single WebAssembly component.
+
+| | |
+|---|---|
+| The editor | [github.com/dhruvasagar/lattice](https://github.com/dhruvasagar/lattice) · [website](https://dhruvasagar.github.io/lattice/) · [install](https://dhruvasagar.github.io/lattice/install/) |
+| This plugin's page | [dhruvasagar.github.io/lattice/plugins/org/](https://dhruvasagar.github.io/lattice/plugins/org/) |
+| Writing your own | [plugin authoring guide](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/guides/plugin-authoring.md) |
+| The API it builds against | [`lattice-wit`](https://crates.io/crates/lattice-wit) · [`lattice-plugin-sdk`](https://crates.io/crates/lattice-plugin-sdk) |
+
+It is the first real consumer of lattice's `language` seam, and by now of
+fourteen others — see the table below, which `plugin.toml`'s `provides` is the
+source of truth for.
+
+Design lives in the lattice tree:
+[`org-mode.md`](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/architecture/org-mode.md),
+plus `org-capture.md`, `org-roam.md` and `org-todo-keywords.md` beside it.
+Sequencing is under
+[`slice-plans/`](https://github.com/dhruvasagar/lattice/tree/main/docs/dev/operations/slice-plans)
+(finished plans move to `slice-plans/archive/`).
 
 **This lives outside the lattice tree, and that is the point.** It is what a
 user's plugin manager clones and builds on boot, so it has to work as an
@@ -52,10 +69,10 @@ called `agenda-source` until it was pointed out that its record is an excerpt
 plus an ordering plus a group header, with nothing about org, dates or TODOs
 in it.
 
-## Thirteen seams from one component
+## Fifteen seams from one component
 
-A component implements exactly ONE WIT world, so a plugin providing thirteen
-seams needs a world importing all thirteen. Bundled plugins get theirs written
+A component implements exactly ONE WIT world, so a plugin providing fifteen
+seams needs a world importing all fifteen. Bundled plugins get theirs written
 into lattice's own `wit/` — but an external plugin cannot add a world to
 someone else's package.
 
@@ -78,19 +95,29 @@ is instantiated against, including the grammar seam's **synchronous** one where
 WHOLE component, silently — one `logging::log` call once took the entire plugin
 down.
 
-`wit/` here is a **vendored copy** of lattice's, and the two must describe the
-same lattice or the component builds against one ABI and is tested against
-another.
+`wit/` here is **generated, not vendored** — `build.rs` writes it from the
+[`lattice-wit`](https://crates.io/crates/lattice-wit) dependency on every
+build, and it is gitignored. A hand-copied `wit/` is how this repo once drifted
+three ABI changes behind the editor, with the only symptom being that org
+silently stopped loading.
 
-**The dev-dependencies are worse than that, and you will hit it immediately.**
-Fifteen of them are *absolute* paths into the author's home
-(`/Users/dhruva/src/dhruvasagar/lattice/crates/...`), so `cargo test` cannot
-work on any other machine without editing `Cargo.toml`. Building the
-component — `cargo build --release --target wasm32-wasip2` — does **not** touch
-them and works anywhere; it is only the host-side integration tests that need a
-lattice checkout. Switching these to a relative path or a pinned `git =` is the
-outstanding chore, and it is the one thing standing between this repo and being
-genuinely clonable.
+That dependency pin **is** the ABI generation this plugin targets:
+
+```toml
+[dependencies]
+lattice-plugin-sdk = "0.1"   # typed config shapes
+[build-dependencies]
+lattice-wit = "0.1"          # the WIT package -> wit/
+```
+
+Both come from crates.io, so building this component needs no checkout of
+lattice. That was not always true: every lattice dependency here was once an
+*absolute* path into the author's home, and because cargo resolves
+`[dev-dependencies]` as part of the BUILD graph — not just the test graph —
+even `cargo build --release --target wasm32-wasip2` failed on any other
+machine. The host-side tests that need a real editor now live in a separate
+package (see [Tests](#tests)) precisely so they cannot gate anyone's install
+again.
 
 ## Per-level headlines, and why they were the interesting part
 
@@ -237,15 +264,33 @@ the manual for the version you are running.
 
 ## Building it
 
-`build.rs` clones the grammar into `grammar-src/` and builds it with the
-repo's `scripts/build-wasm-grammar.sh` — **clang and a rustup toolchain
-only**, no emscripten, no docker, no tree-sitter CLI. Offline it embeds empty
-bytes; the host then rejects the registration with a named reason rather than
-failing the build.
-
 ```sh
 cargo build --release --target wasm32-wasip2
 ```
+
+Nothing else — no lattice checkout, no emscripten, no docker, no tree-sitter
+CLI. `build.rs` clones the grammar into `grammar-src/` and compiles it with
+`scripts/build-wasm-grammar.sh`, which needs **clang and a rustup toolchain**
+and nothing more.
+
+> **The clang has to be able to target wasm32**, and on macOS the default one
+> cannot. Apple clang ships without the WebAssembly backend:
+>
+> ```
+> error: unable to create target: 'No available targets are compatible
+> with triple "wasm32-unknown-unknown"'
+> ```
+>
+> `brew install llvm`, then build with `CLANG=$(brew --prefix llvm)/bin/clang`.
+> Linux distributions' clang has the backend already.
+
+**A failed grammar build does not fail the build.** `build.rs` embeds empty
+bytes and warns, so the host rejects the registration with a named reason
+instead of a reference plugin becoming a compile error. The cost is that a
+green build is not proof of a working plugin — if org loads but parses
+nothing, check the build log for `grammar build failed`, and check your clang.
+CI asserts the grammar is over 100 KB for exactly this reason; a real one is
+~340 KB.
 
 The component lands at `target/wasm32-wasip2/release/lattice_org_plugin.wasm`.
 Point a plugin directory at it with a `plugin.toml`:
@@ -253,10 +298,10 @@ Point a plugin directory at it with a `plugin.toml`:
 ```toml
 id = "org"
 provides = [
-    "language", "modes", "grammar", "config", "theme", "media",
-    "scanned-excerpt-source", "multibuffer-view-source",
-    "picker-source", "completion-source", "transient-source",
-    "events", "help",
+    "language", "modes", "grammar", "media", "scanned-excerpt-source",
+    "multibuffer-view-source", "picker-source", "signs", "decorations",
+    "completion-source", "transient-source", "help", "config", "theme",
+    "events",
 ]
 default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 capabilities = ["fs:write:/home/you/org", "state:write"]
@@ -315,17 +360,33 @@ In normal use the plugin manager does this for you from the git source
 
 ## Tests
 
-`cargo test` compiles this crate for the HOST and boots a real editor against
-the component — so build the component first or the integration tests skip
-and you have tested nothing:
+Two suites, deliberately in different packages.
+
+**The component's own** — pure functions, no editor:
 
 ```sh
-cargo build --release --target wasm32-wasip2 && cargo test
+cargo test
 ```
 
-The skip is deliberate and silent-ish (it prints `SKIP:`), because the
-component is a *separate* build artefact: `cargo test` alone compiles this
-crate for the host and never produces the `.wasm` the tests load. A green run
-that never built the component has tested the pure functions and nothing else.
+**The integration suite** — boots a real editor, loads this component through
+the loader and dispatches chords. It lives in `integration/`, its own package
+with its own workspace, because its dependencies are lattice's host crates and
+those would otherwise sit in this package's build graph and break everyone's
+install. It needs a lattice checkout **beside this one**:
 
-Requires a lattice checkout, for the reason in the dev-dependency note above.
+```
+<somewhere>/lattice-org-plugin
+<somewhere>/lattice
+```
+
+```sh
+cargo build --release --target wasm32-wasip2   # first, always
+cd integration && cargo test
+```
+
+The component build is not optional. Every test **skips** when the artefact is
+absent — printing `skipping: component not built` — so running them without it
+reports green while testing nothing. CI greps its own run for that line.
+
+(`integration/Cargo.lock` is committed and load-bearing: the tree reaches a
+yanked `bisync`, which stays usable only when a lockfile already names it.)

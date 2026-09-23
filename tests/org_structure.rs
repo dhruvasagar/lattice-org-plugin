@@ -5349,28 +5349,61 @@ async fn the_built_in_row_opens_the_default_agenda_with_no_command() {
     let mut out = lattice_host::dispatch::DispatchOutcome::default();
     editor.do_transient_trigger("a".to_string(), &mut out);
 
-    let args = out
-        .effects
-        .iter()
-        .find_map(|e| match e {
-            lattice_grammar::Effect::AppAction(
-                lattice_grammar::app_effect::AppEffect::OpenProviderView { args, .. },
-            ) => Some(args.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "the row opened a provider view; got effects {:?}",
-                out.effects
-            )
-        });
+    let args = provider_view_args(&out).unwrap_or_else(|| {
+        panic!(
+            "the row opened a provider view; got effects {:?}",
+            out.effects
+        )
+    });
+
+    // The row and the ex-command are compared against each other rather than
+    // against a literal, because the literal is what went stale: this asserted
+    // `Args::None` until the `C-c a a` fix, and kept asserting it afterwards.
+    let ex = editor
+        .registry
+        .load()
+        .id_by_name("org-agenda")
+        .expect("the org-agenda ex-command is registered");
+    let mut ex_out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(lattice_grammar::CommandInvocation::of(ex), &mut ex_out);
+    let ex_args = provider_view_args(&ex_out).unwrap_or_else(|| {
+        panic!(
+            "`:org-agenda` opened a provider view; got {:?}",
+            ex_out.effects
+        )
+    });
 
     assert_eq!(
-        args,
-        lattice_grammar::Args::None,
-        "no root and no command — byte-for-byte what a bare `:org-agenda` \
-         sends, so the built-in row and the ex-command cannot diverge"
+        args, ex_args,
+        "the built-in row and a bare `:org-agenda` cannot diverge"
     );
+
+    // And the shape itself, because the two agreeing on the WRONG one is the
+    // bug this pair exists to catch. Position 0 is the host's root slot (empty
+    // — a command says which agenda, never where); position 1 is the guest's
+    // scan arg (empty — the default agenda). An empty scan-arg LIST would read
+    // as "keep what this view shows", which is what made `C-c a a` refresh a
+    // custom view instead of replacing it.
+    assert_eq!(
+        args,
+        lattice_grammar::Args::List(vec![
+            lattice_grammar::args::ArgValue::String(String::new()),
+            lattice_grammar::args::ArgValue::String(String::new()),
+        ]),
+        "no root, and the key slot present but empty"
+    );
+}
+
+/// The `args` of the first `OpenProviderView` an outcome carries.
+fn provider_view_args(
+    out: &lattice_host::dispatch::DispatchOutcome,
+) -> Option<lattice_grammar::Args> {
+    out.effects.iter().find_map(|e| match e {
+        lattice_grammar::Effect::AppAction(
+            lattice_grammar::app_effect::AppEffect::OpenProviderView { args, .. },
+        ) => Some(args.clone()),
+        _ => None,
+    })
 }
 
 /// Submit a `:` line the way the renderer does — dispatch, then drain the

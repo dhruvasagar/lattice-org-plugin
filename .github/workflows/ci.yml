@@ -75,6 +75,42 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Apple clang has no WebAssembly backend:
+      #
+      #   error: unable to create target: 'No available targets are compatible
+      #   with triple "wasm32-unknown-unknown"'
+      #
+      # and it is what `clang` resolves to on a macOS runner. The grammar build
+      # then fails, `build.rs` writes its empty placeholder, and the component
+      # ships unable to parse org. Homebrew's LLVM has the backend, and
+      # `scripts/build-wasm-grammar.sh` honours $CLANG.
+      #
+      # This is not only a CI concern: a macOS contributor with only the Xcode
+      # command-line tools hits exactly this, and the build SUCCEEDS.
+      - name: A clang that can target wasm32 (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "CLANG=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
+
+      # Fail here, naming the cause, rather than 40 lines later on a byte
+      # count that has to be traced back to this.
+      - name: Preflight — clang can target wasm32
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc="${CLANG:-clang}"
+          echo "using: $cc"
+          "$cc" --version | head -1
+          echo 'int f(void){return 0;}' > /tmp/probe.c
+          if ! "$cc" --target=wasm32-unknown-unknown -nostdlib -c /tmp/probe.c -o /tmp/probe.o 2>/tmp/probe.err; then
+            echo "::error::$cc cannot target wasm32-unknown-unknown, so the tree-sitter grammar cannot be built: $(head -1 /tmp/probe.err)"
+            exit 1
+          fi
+          echo "wasm32 target OK"
+
       - name: cargo build --release --target wasm32-wasip2
         run: cargo build --release --target wasm32-wasip2
 

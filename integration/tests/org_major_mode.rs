@@ -521,8 +521,10 @@ async fn every_auto_activating_minor_is_in_the_shipped_manifests_default_modes()
     };
 
     // The file a user gets, not the harness's copy of it.
-    let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/plugin.toml"))
-        .expect("the shipped plugin.toml is beside Cargo.toml");
+    // `../plugin.toml`: this package sits in `integration/`, and the manifest a
+    // user gets ships from the repo root beside the component's Cargo.toml.
+    let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../plugin.toml"))
+        .expect("the shipped plugin.toml is at the repo root");
     let default_modes = shipped
         .lines()
         .find(|l| l.trim_start().starts_with("default_modes"))

@@ -29,6 +29,11 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=queries");
+    // Which clang builds the grammar is an input to the result. Without this,
+    // a cached EMPTY grammar.wasm — written by the fallback below when the
+    // compiler could not target wasm32 — survives pointing CLANG at one that
+    // can, and the plugin goes on shipping unable to parse org.
+    println!("cargo:rerun-if-env-changed=CLANG");
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let dest = out.join("grammar.wasm");
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammar-src");
@@ -62,7 +67,17 @@ fn main() {
     if ok && built.is_file() {
         std::fs::copy(&built, &dest).expect("copy grammar");
     } else {
-        println!("cargo:warning=lattice-org-plugin: grammar build failed");
+        // Name the likeliest cause. Apple clang has no WebAssembly backend
+        // ("No available targets are compatible with triple
+        // wasm32-unknown-unknown"), and it is what `clang` resolves to on macOS
+        // with only the Xcode command-line tools — so this branch is reached by
+        // an ordinary macOS contributor, not just an offline one.
+        println!(
+            "cargo:warning=lattice-org-plugin: grammar build failed — org will \
+             load but cannot parse. If this is macOS, `clang` is probably \
+             Apple's, which cannot target wasm32; install LLVM (`brew install \
+             llvm`) and set CLANG to it."
+        );
         std::fs::write(&dest, b"").expect("write placeholder");
     }
 }

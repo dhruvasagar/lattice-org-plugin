@@ -6,3 +6,6 @@
 # WT.2: written by build.rs from the `lattice-wit` dependency. Vendoring it is
 # what let it drift behind the editor's ABI.
 /wit
+# The integration package is its own workspace, so it has its own target/.
+# `/target` above is root-anchored and does not reach it.
+/integration/target

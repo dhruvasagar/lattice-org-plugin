@@ -39,7 +39,7 @@ use lattice_syntax::{Lang, Style, Syntax};
 fn org_component() -> Option<Vec<u8>> {
     std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/target/wasm32-wasip2/release/lattice_org_plugin.wasm"
+        "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
     ))
     .ok()
 }

@@ -39,7 +39,10 @@ use lattice_syntax::{plugin_lang, GrammarSpec, Lang, Style, Syntax};
 const ORG_REPO: &str = "https://github.com/nvim-orgmode/tree-sitter-org";
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the integration package sits inside the repo")
+        .to_path_buf()
 }
 
 fn unique(tag: &str) -> (String, String, u64) {

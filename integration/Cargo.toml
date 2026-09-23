@@ -1,0 +1,111 @@
+# The integration tests, as their own package — deliberately NOT part of the
+# component's build.
+#
+# **Why this is a separate package.** Cargo resolves `[dev-dependencies]` as
+# part of the BUILD graph, not just the test graph. While these fifteen host
+# crates sat in the component's manifest, a dev-dependency that could not
+# resolve stopped `cargo build --release --target wasm32-wasip2` — the exact
+# command the plugin manager runs on boot. So test-only dependencies were
+# gating every user's install, and the failure said "failed to load manifest
+# for dependency `lattice-config`", which reads like a broken plugin rather
+# than a test fixture nobody needed.
+#
+# Splitting them out is structural rather than careful: there is now no way for
+# a test dependency to break somebody's install, because the component's
+# manifest cannot see one.
+#
+# **Why path dependencies are right HERE.** These are the editor's own host
+# crates. They will never be on crates.io — publishing them would mean
+# publishing the editor — and only a contributor runs these tests. A sibling
+# `lattice` checkout is a reasonable thing to ask of someone editing org's
+# internals; it is not a reasonable thing to ask of someone installing a plugin.
+#
+# The tests boot a REAL editor, load the component through the loader and
+# dispatch chords, so they need the whole host. They read the artefact from the
+# root package's `target/`, which means the component must be built first:
+#
+#     cargo build --release --target wasm32-wasip2   # in the repo root
+#     cargo test                                     # here
+#
+# Each test SKIPS when the artefact is absent rather than failing, so a run
+# without that first step reports green while testing nothing. Build first.
+[package]
+name = "lattice-org-plugin-integration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# No library and no binary — this package exists only to carry `tests/`.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# TC.6: the production path never parses TOML — the options are declared shapes
+# now — but TOML is still the nicest way to WRITE a fixture, and the alternative
+# is pages of nested `Value::record([...])` in which a test's intent disappears.
+# `config_shape::from_toml` turns a fixture into the tree the code receives.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+lattice-core = { path = "../../lattice/crates/lattice-core" }
+# MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
+# naming the option's declaration type (`FoldMethodOption`) — it lives here.
+lattice-config = { path = "../../lattice/crates/lattice-config" }
+# TK.3: the test asserts the component's TODO elements land in the SAME
+# registry builtins use, and resolve to real colours.
+lattice-theme = { path = "../../lattice/crates/lattice-theme" }
+lattice-grammar = { path = "../../lattice/crates/lattice-grammar" }
+lattice-host = { path = "../../lattice/crates/lattice-host" }
+lattice-keymap = { path = "../../lattice/crates/lattice-keymap" }
+lattice-mode = { path = "../../lattice/crates/lattice-mode" }
+lattice-plugin-host = { path = "../../lattice/crates/lattice-plugin-host" }
+lattice-plugin-loader = { path = "../../lattice/crates/lattice-plugin-loader" }
+lattice-runtime = { path = "../../lattice/crates/lattice-runtime" }
+lattice-protocol = { path = "../../lattice/crates/lattice-protocol" }
+lattice-syntax = { path = "../../lattice/crates/lattice-syntax" }
+lattice-multibuffer = { path = "../../lattice/crates/lattice-multibuffer" }
+# OC.3: the tests reach the editor's transient registry to prove the capture
+# menu registered into it and builds through it.
+lattice-picker = { path = "../../lattice/crates/lattice-picker" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"
+arc-swap = "1"
+# OR.10: the dailies tests need TODAY in local time — the same answer the guest
+# gets, from the same source. `local-utc-offset-seconds` is implemented as
+# `chrono::Local::now().offset()`, so the test asks chrono directly rather than
+# re-deriving an offset from `SystemTime`, which would be a second
+# implementation of the thing under test. Hardcoding a date would instead make
+# the tests fail once a day.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# OC.6: `lattice_plugin_host::Sleeper` returns a `BoxFuture`, so the test's
+# tokio-backed impl of it names the type. The plugin host owns no runtime by
+# design, which is why the timer is the caller's to supply — here, the test's.
+futures = "0.3"
+# OR.4: the roam-index tests decode what the component ENCODED — the store holds
+# opaque bytes and the guest owns the schema, so a test asserting the index is
+# right has to read it back in the guest's own format. Same crate and version
+# the component uses, deliberately: a decoder that disagreed with the encoder
+# would make the test pass or fail for reasons unrelated to the index.
+#
+# It was inherited implicitly while these tests lived in the component's own
+# package, where a test can use the package's regular dependencies. Split out,
+# nothing carries it but this line.
+rmp-serde = "1.3"
+# ...and `serde` with `derive`, because the roam-index test declares its own
+# mirror of the stored record to decode into. Inherited implicitly too, for the
+# same reason: a test in the component's package could use the component's
+# dependencies, and these tests lived there.
+serde = { version = "1", features = ["derive"] }
+
+# **`Cargo.lock` is committed, and that is load-bearing here.** This package
+# reaches the editor's whole dependency tree, which includes `gix` →
+# `gix-protocol` → `bisync 0.3.x` — every published version of which is YANKED.
+# A yanked version stays usable when a lockfile already selects it, so a fresh
+# resolution fails where a locked one succeeds. The lock was seeded from the
+# component package's own, back when these were its dev-dependencies.
+#
+# Delete it and `cargo test` stops resolving, with an error naming `bisync`
+# rather than anything in this repository.
+
+# A workspace of its own, so the root package's resolution never reaches these
+# dependencies. That separation IS the fix; without it this manifest would be
+# read whenever the component is built and we would be back where we started.
+[workspace]

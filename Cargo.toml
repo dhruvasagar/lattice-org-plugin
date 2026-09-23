@@ -33,7 +33,7 @@ wit-bindgen = "0.58"
 # TC.4: `#[derive(ConfigShape)]` — a Rust struct as a config schema and value,
 # plus the arena flattening the WIT config seam takes. WIT-agnostic pure Rust,
 # so it compiles to wasm32-wasip2 like the rest of the component.
-lattice-plugin-sdk = { path = "../lattice/crates/lattice-plugin-sdk" }
+lattice-plugin-sdk = "0.1"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 # OR.4: the roam index's on-store encoding. The store holds opaque bytes and the
 # GUEST owns the schema, so the format is this plugin's choice — MessagePack,
@@ -86,51 +86,16 @@ regex-lite = "0.1"
 # buildable by someone who has never cloned lattice. The crate is prepared for
 # it: independently versioned, `description` set, and `wit/` now lives inside it
 # so the published tarball actually contains the package.
-lattice-wit = { path = "../lattice/crates/lattice-wit" }
-
-[dev-dependencies]
-# TC.6: the production path never parses TOML — the options are declared shapes
-# now — but TOML is still the nicest way to WRITE a fixture, and the alternative
-# is pages of nested `Value::record([...])` in which a test's intent disappears.
-# `config_shape::from_toml` turns a fixture into the tree the code receives.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
-lattice-core = { path = "../lattice/crates/lattice-core" }
-# MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
-# naming the option's declaration type (`FoldMethodOption`) — it lives here.
-lattice-config = { path = "../lattice/crates/lattice-config" }
-# TK.3: the test asserts the component's TODO elements land in the SAME
-# registry builtins use, and resolve to real colours.
-lattice-theme = { path = "../lattice/crates/lattice-theme" }
-lattice-grammar = { path = "../lattice/crates/lattice-grammar" }
-lattice-host = { path = "../lattice/crates/lattice-host" }
-lattice-keymap = { path = "../lattice/crates/lattice-keymap" }
-lattice-mode = { path = "../lattice/crates/lattice-mode" }
-lattice-plugin-host = { path = "../lattice/crates/lattice-plugin-host" }
-lattice-plugin-loader = { path = "../lattice/crates/lattice-plugin-loader" }
-lattice-runtime = { path = "../lattice/crates/lattice-runtime" }
-lattice-protocol = { path = "../lattice/crates/lattice-protocol" }
-lattice-syntax = { path = "../lattice/crates/lattice-syntax" }
-lattice-multibuffer = { path = "../lattice/crates/lattice-multibuffer" }
-# OC.3: the tests reach the editor's transient registry to prove the capture
-# menu registered into it and builds through it.
-lattice-picker = { path = "../lattice/crates/lattice-picker" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-tempfile = "3"
-arc-swap = "1"
-# OR.10: the dailies tests need TODAY in local time — the same answer the guest
-# gets, from the same source. `local-utc-offset-seconds` is implemented as
-# `chrono::Local::now().offset()`, so the test asks chrono directly rather than
-# re-deriving an offset from `SystemTime`, which would be a second
-# implementation of the thing under test. Hardcoding a date would instead make
-# the tests fail once a day.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-# OC.6: `lattice_plugin_host::Sleeper` returns a `BoxFuture`, so the test's
-# tokio-backed impl of it names the type. The plugin host owns no runtime by
-# design, which is why the timer is the caller's to supply — here, the test's.
-futures = "0.3"
+lattice-wit = "0.1"
 
 [profile.release]
 opt-level = "s"
 strip = true
 
 [workspace]
+# `integration/` is its own workspace and its own package: it carries the
+# integration tests and the fifteen host crates they need. Excluded here so the
+# component's resolution never reaches them — a dev-dependency that cannot
+# resolve stops `cargo build`, and that is what made this repo buildable on
+# exactly one machine.
+exclude = ["integration", "grammar-src"]

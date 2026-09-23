@@ -123,9 +123,22 @@ jobs:
           rustflags: ""
       - name: cargo fmt --check (component)
         run: cargo fmt --check
-      - name: cargo fmt --check (integration)
-        working-directory: integration
-        run: cargo fmt --check
+
+      # rustfmt directly, NOT `cargo fmt`, for the integration package.
+      # `cargo fmt` shells out to `cargo metadata` first, which resolves the
+      # whole dependency graph — including this package's `../../lattice/...`
+      # path dependencies, which are not checked out in this job and are not
+      # going to be: pulling the editor in to check whitespace is the wrong
+      # trade. rustfmt needs only the files and an edition.
+      - name: rustfmt --check (integration)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          # -maxdepth 1 skips tests/disabled/, which cargo does not build
+          # either — see the header of the file in there.
+          rustfmt --check --edition 2021 \
+            $(find integration/src integration/tests -maxdepth 1 -name '*.rs')
 
   clippy:
     name: clippy

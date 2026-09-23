@@ -88,6 +88,16 @@ regex-lite = "0.1"
 # so the published tarball actually contains the package.
 lattice-wit = "0.1"
 
+# Crates.io only, deliberately. A path dependency here would land in the BUILD
+# graph and stop `cargo build --release --target wasm32-wasip2` for anyone
+# without a lattice checkout — see `integration/Cargo.toml` for the whole
+# argument. Anything a unit test needs from the editor goes in that package.
+[dev-dependencies]
+# TC.6: the production path never parses TOML — the options are declared shapes
+# now — but TOML is still the nicest way to WRITE a fixture, and the alternative
+# is pages of nested `Value::record([...])` in which a test's intent disappears.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
 [profile.release]
 opt-level = "s"
 strip = true

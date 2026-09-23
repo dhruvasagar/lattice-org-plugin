@@ -58,21 +58,35 @@ regex-lite = "0.1"
 # load this plugin's component through the loader, and dispatch chords. That
 # needs the host crates, so `cargo test` here compiles the editor.
 #
-# PATH deps against a local lattice checkout — portable enough for the author,
-# not for a stranger cloning this repo. Switch to `git = ...` (pinned to the
-# lattice tag whose `wit/` is vendored here) before anyone else needs to run
-# them; the vendored WIT and these deps must describe the SAME lattice, or the
-# component builds against one ABI and is tested against another.
+# These were ABSOLUTE paths into one laptop (`/Users/dhruva/...`), so this repo
+# built on exactly one machine — `cargo build --release --target wasm32-wasip2`
+# failed on Linux with "failed to load manifest for dependency". Note that it
+# was the BUILD that failed, not just `cargo test`: dev-dependencies are part of
+# the resolution graph, so a test-only dep that cannot resolve stops the plugin
+# manager building this plugin on boot.
+#
+# Relative now, so they work for anyone with a sibling `lattice` checkout. That
+# is the permanent answer for these fifteen: they are the editor's own host
+# crates, they will never be on crates.io, and only a contributor runs them.
+#
+# It is NOT the answer for a stranger, who has no sibling checkout — the plugin
+# manager clones into `~/.config/lattice/plugins/org`. Two things close that,
+# and neither is done: the two dependencies this plugin actually needs to BUILD
+# move to published versions (below), and these fifteen move into a separate
+# test package so they stop gating the component's build at all.
 [build-dependencies]
 # WT.2: the lattice plugin API package. Writing it into `wit/` at build time is
 # what stops this repo's copy drifting behind the editor's — which is exactly
 # what happened, three ABI changes in one day, with the only symptom being that
 # org silently stopped loading.
 #
-# A path dep while lattice is unreleased, matching the dev-dependencies below.
-# Once `lattice-wit` is published this becomes a version pin, and a plugin then
-# declares the ABI it targets the way it declares everything else.
-lattice-wit = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-wit" }
+# Becomes `version = "0.1.0"` — with no `path` — the moment `lattice-wit` is on
+# crates.io. That is what lets a plugin declare the ABI it targets the way it
+# declares everything else, and it is the ONE change that makes this repo
+# buildable by someone who has never cloned lattice. The crate is prepared for
+# it: independently versioned, `description` set, and `wit/` now lives inside it
+# so the published tarball actually contains the package.
+lattice-wit = { path = "../lattice/crates/lattice-wit" }
 
 [dev-dependencies]
 # TC.6: the production path never parses TOML — the options are declared shapes
@@ -80,26 +94,26 @@ lattice-wit = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-wit
 # is pages of nested `Value::record([...])` in which a test's intent disappears.
 # `config_shape::from_toml` turns a fixture into the tree the code receives.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
-lattice-core = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-core" }
+lattice-core = { path = "../lattice/crates/lattice-core" }
 # MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
 # naming the option's declaration type (`FoldMethodOption`) — it lives here.
-lattice-config = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-config" }
+lattice-config = { path = "../lattice/crates/lattice-config" }
 # TK.3: the test asserts the component's TODO elements land in the SAME
 # registry builtins use, and resolve to real colours.
-lattice-theme = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-theme" }
-lattice-grammar = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-grammar" }
-lattice-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-host" }
-lattice-keymap = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-keymap" }
-lattice-mode = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-mode" }
-lattice-plugin-host = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-host" }
-lattice-plugin-loader = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-plugin-loader" }
-lattice-runtime = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-runtime" }
-lattice-protocol = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-protocol" }
-lattice-syntax = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-syntax" }
-lattice-multibuffer = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-multibuffer" }
+lattice-theme = { path = "../lattice/crates/lattice-theme" }
+lattice-grammar = { path = "../lattice/crates/lattice-grammar" }
+lattice-host = { path = "../lattice/crates/lattice-host" }
+lattice-keymap = { path = "../lattice/crates/lattice-keymap" }
+lattice-mode = { path = "../lattice/crates/lattice-mode" }
+lattice-plugin-host = { path = "../lattice/crates/lattice-plugin-host" }
+lattice-plugin-loader = { path = "../lattice/crates/lattice-plugin-loader" }
+lattice-runtime = { path = "../lattice/crates/lattice-runtime" }
+lattice-protocol = { path = "../lattice/crates/lattice-protocol" }
+lattice-syntax = { path = "../lattice/crates/lattice-syntax" }
+lattice-multibuffer = { path = "../lattice/crates/lattice-multibuffer" }
 # OC.3: the tests reach the editor's transient registry to prove the capture
 # menu registered into it and builds through it.
-lattice-picker = { path = "/Users/dhruva/src/dhruvasagar/lattice/crates/lattice-picker" }
+lattice-picker = { path = "../lattice/crates/lattice-picker" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tempfile = "3"
 arc-swap = "1"

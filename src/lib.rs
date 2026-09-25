@@ -3909,6 +3909,46 @@ impl Guest for Component {
             // of them and nothing else.
             &["roam".to_string()],
         );
+        // One page per picker source, named `picker-<source id>`. The host
+        // namespaces them to `org.picker-<id>` and `<C-h>` inside the picker
+        // finds them through the source's owning plugin — the same shape the
+        // project plugin uses (PH.4).
+        let _ = register_topic(
+            "picker-org-roam-node",
+            "The org-roam node picker: find or create a note by title or alias.",
+            include_str!("../doc/picker-org-roam-node.md"),
+            &["org-roam-find-node".to_string()],
+        );
+        let _ = register_topic(
+            "picker-org-roam-insert",
+            "The org-roam insert picker: link to a note from the buffer at point.",
+            include_str!("../doc/picker-org-roam-insert.md"),
+            &["org-roam-insert-node".to_string()],
+        );
+        let _ = register_topic(
+            "picker-org-roam-backlinks",
+            "The org-roam backlinks picker: the notes that link to the note at point.",
+            include_str!("../doc/picker-org-roam-backlinks.md"),
+            &["org-roam-backlinks".to_string()],
+        );
+        let _ = register_topic(
+            "picker-org-refile",
+            "The org-refile picker: choose the headline to refile the current subtree under.",
+            include_str!("../doc/picker-org-refile.md"),
+            &["org-refile".to_string()],
+        );
+        let _ = register_topic(
+            "picker-org-capture-drafts",
+            "The org-capture-drafts picker: resume a saved or open capture draft.",
+            include_str!("../doc/picker-org-capture-drafts.md"),
+            &["org-capture-resume".to_string()],
+        );
+        let _ = register_topic(
+            "picker-agenda",
+            "The agenda picker: jump to any dated row across your agenda files.",
+            include_str!("../doc/picker-agenda.md"),
+            &["agenda".to_string()],
+        );
     }
 
     // ── OM.A1 / OM.A2: the agenda seam ──────────────────────────────────

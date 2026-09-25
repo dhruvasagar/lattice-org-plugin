@@ -156,3 +156,32 @@
 
 ; `# a comment line`.
 (comment) @comment
+
+; ── Inline emphasis ─────────────────────────────────────────────────────────
+;
+; Org emphasis is NOT a named node: `*bold*` parses as an `(expr)` whose first
+; and last children are the delimiter tokens (`*`, `/`, `=`, `~`, …) with the
+; text between them — the same shape the upstream `grammar-src/queries/markup.scm`
+; matches. That file captures only the delimiters (`@bold.start`/`@bold.end`),
+; which colours the `*` and leaves the word plain. We capture the WHOLE `expr`
+; so the emphasised WORD is styled, which is what the reader means by emphasis.
+;
+; Capture names are the host vocabulary `name_to_style` resolves:
+;   `text.strong`   → Style::Bold      (`syntax.bold`)
+;   `text.emphasis` → Style::Italic    (`syntax.italic`)
+;   `text.literal`  → Style::MarkupRaw (`syntax.markup_raw`)  — verbatim + code
+; `_underline_` and `+strikethrough+` are intentionally omitted: there is no
+; host `Style` for either yet, so capturing them would name a colour that
+; resolves to nothing. Add them here once the host grows the styles.
+;
+; Two contexts, mirroring markup.scm: `paragraph` (body prose) and `item`
+; (headline title text).
+(paragraph (expr "*" "*") @text.strong)
+(paragraph (expr "/" "/") @text.emphasis)
+(paragraph (expr "=" "=") @text.literal)
+(paragraph (expr "~" "~") @text.literal)
+
+(item (expr "*" "*") @text.strong)
+(item (expr "/" "/") @text.emphasis)
+(item (expr "=" "=") @text.literal)
+(item (expr "~" "~") @text.literal)

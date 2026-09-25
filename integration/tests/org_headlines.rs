@@ -168,6 +168,33 @@ fn stars_select_the_heading_level() {
     plugin_lang::unregister_plugin(plugin);
 }
 
+/// Inline emphasis colours the enclosed WORD, not just the delimiters.
+/// `*bold*` → Bold, `/italic/` → Italic, `=verbatim=` and `~code~` → MarkupRaw.
+///
+/// Regression: the shipped `highlights.scm` had no emphasis patterns at all, so
+/// every inline marker rendered plain. The fix captures the whole `(expr)` span
+/// (see the query's "Inline emphasis" section).
+#[test]
+fn inline_emphasis_styles_the_word() {
+    let Some((lang, plugin)) = register_org("emphasis") else {
+        return skip("inline_emphasis_styles_the_word");
+    };
+
+    let src = "Some *bold*, /italic/, =verbatim= and ~code~ here.\n";
+    let mut syntax = Syntax::for_language(lang).unwrap().unwrap();
+    syntax.parse(src);
+    let lines = syntax.highlight_lines_native(0, 1).expect("highlights");
+    let styles: Vec<Style> = lines[0].iter().map(|s| s.style).collect();
+
+    for want in [Style::Bold, Style::Italic, Style::MarkupRaw] {
+        assert!(
+            styles.contains(&want),
+            "emphasis line should carry {want:?}, got {styles:?}"
+        );
+    }
+    plugin_lang::unregister_plugin(plugin);
+}
+
 /// The stars themselves stay a base-size marker style, which is what lets the
 /// GPUI peer render `[stars][title]` as two pieces on one baseline. Same
 /// style markdown's `#` markers take, so the renderer needs no org case.

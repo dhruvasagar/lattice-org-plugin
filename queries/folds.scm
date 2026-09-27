@@ -35,3 +35,14 @@
   ; `\begin{...}` … `\end{...}`.
   (latex_env)
 ] @fold
+
+; @codeblock marks full-row code-block-background regions for the host's
+; `syntax.code_block` tint (compute_code_block_lines), the same seam markdown's
+; fenced/indented blocks use. Kept separate from @fold so the two concerns
+; don't entangle: these nodes fold via @fold above AND tint via @codeblock
+; here. Scoped to the block-shaped `#+BEGIN…#+END` regions — the org analogue
+; of a fenced code block — not drawers / lists / tables / latex.
+[
+  (block)
+  (dynamic_block)
+] @codeblock

@@ -33,7 +33,7 @@ wit-bindgen = "0.58"
 # TC.4: `#[derive(ConfigShape)]` — a Rust struct as a config schema and value,
 # plus the arena flattening the WIT config seam takes. WIT-agnostic pure Rust,
 # so it compiles to wasm32-wasip2 like the rest of the component.
-lattice-plugin-sdk = "0.1"
+lattice-plugin-sdk = "0.2"
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 # OR.4: the roam index's on-store encoding. The store holds opaque bytes and the
 # GUEST owns the schema, so the format is this plugin's choice — MessagePack,
@@ -86,7 +86,7 @@ regex-lite = "0.1"
 # buildable by someone who has never cloned lattice. The crate is prepared for
 # it: independently versioned, `description` set, and `wit/` now lives inside it
 # so the published tarball actually contains the package.
-lattice-wit = "0.1"
+lattice-wit = "0.2"
 
 # Crates.io only, deliberately. A path dependency here would land in the BUILD
 # graph and stop `cargo build --release --target wasm32-wasip2` for anyone

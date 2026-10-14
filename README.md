@@ -82,12 +82,12 @@ declares its own world locally and gets one `Guest` trait carrying both
 exports. **Nothing in lattice changes to allow it** — see `src/lib.rs`.
 
 Three details, each a build error if missed: `include` needs the version
-(`@0.2.0`); `generate_all` is required or wit-bindgen demands a `with` mapping
+(`@0.3.0`); `generate_all` is required or wit-bindgen demands a `with` mapping
 per reached interface; and the inline package needs a name distinct from
 lattice's.
 
 **And one that is not a build error — it is worse.** Several seams are declared
-BARE (`export lattice:plugin-host/picker-source@0.2.0;`) rather than by
+BARE (`export lattice:plugin-host/picker-source@0.3.0;`) rather than by
 `include`-ing their world, because those worlds import `logging`. A component's
 import set is fixed for the whole artefact and must resolve on EVERY linker it
 is instantiated against, including the grammar seam's **synchronous** one where
@@ -105,9 +105,9 @@ That dependency pin **is** the ABI generation this plugin targets:
 
 ```toml
 [dependencies]
-lattice-plugin-sdk = "0.2"   # typed config shapes
+lattice-plugin-sdk = "0.3"   # typed config shapes
 [build-dependencies]
-lattice-wit = "0.2"          # the WIT package -> wit/
+lattice-wit = "0.3"          # the WIT package -> wit/
 ```
 
 Both come from crates.io, so building this component needs no checkout of

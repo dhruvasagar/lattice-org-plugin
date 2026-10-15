@@ -10776,7 +10776,7 @@ fn open_link(ctx: &ActionContext, doc: &Document, on_miss: Effect) -> Vec<Effect
     match link.target {
         links::Target::File(path) => vec![Effect::OpenBufferAt(
             lattice::plugin_host::types::OpenBufferAtPayload {
-                path: Some(path),
+                path: Some(links::resolve_against_buffer(doc.path().as_deref(), &path)),
                 position: Position { line: 0, byte: 0 },
                 force: false,
                 content: None,

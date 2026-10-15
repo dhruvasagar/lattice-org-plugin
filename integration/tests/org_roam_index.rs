@@ -1389,6 +1389,53 @@ async fn following_an_id_link_opens_the_file_node() {
     assert_eq!(line, 0, "a FILE node lands at the top of its file");
 }
 
+/// `<CR>` on a relative `[[file:…]]` link opens the file BESIDE the note, not
+/// one under the editor's working directory.
+///
+/// The report: `[[file:./About/…_screenshot.png]]` in a roam note did not
+/// open. `open-buffer-at` resolves a relative path against the editor's cwd,
+/// and the guest handed it the link verbatim — so the link only worked when
+/// the editor happened to be launched from the note's own directory, which
+/// this test's process never is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn following_a_relative_file_link_opens_the_file_beside_the_note() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let shot = corpus
+        .join("About")
+        .join("2024-12-04_08-19-13_screenshot.png");
+    std::fs::create_dir_all(shot.parent().unwrap()).unwrap();
+    std::fs::write(&shot, b"not decoded: image-mode presents, it never reads").unwrap();
+    let note = corpus.join("screenshots.org");
+    std::fs::write(
+        &note,
+        "#+title: Screenshots\n\nSee [[file:./About/2024-12-04_08-19-13_screenshot.png]]\n",
+    )
+    .unwrap();
+    let Some((_index, mut editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+    assert_ne!(
+        std::env::current_dir().unwrap(),
+        corpus,
+        "precondition: the cwd is not the note's directory, so a cwd-relative open fails"
+    );
+
+    open_at_link(&mut editor, &note, 2).await;
+    press_chord(&mut editor, "<CR>").await;
+
+    let (path, _) = where_am_i(&editor);
+    let path = path.expect("a file is open");
+    assert_eq!(
+        std::path::Path::new(&path).canonicalize().ok(),
+        shot.canonicalize().ok(),
+        "opened the screenshot beside the note: {path} (msg: {:?})",
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+}
+
 /// `<CR>` on a link to a HEADLINE node lands on the headline, not on line 0.
 ///
 /// 19% of the reference corpus is headline nodes; without the line every one of

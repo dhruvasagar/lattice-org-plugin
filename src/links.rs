@@ -105,8 +105,10 @@ pub fn image_link(line: &str, line_no: u32) -> Option<ImageLink> {
 ///   expand. It belongs with that option, not here.
 ///
 /// `~` and the join against the buffer's directory are the HOST's half of
-/// this — a relative org link is relative to the file it is written in, which
-/// is where the host resolves it (`wit/media.wit`).
+/// this for an inline image — a relative org link is relative to the file it
+/// is written in, which is where the host resolves it (`wit/media.wit`). A
+/// FOLLOWED link is joined guest-side, by [`resolve_against_buffer`], because
+/// `open-buffer-at` resolves relative paths against the editor's cwd.
 pub fn file_link_path(raw: &str) -> Option<String> {
     let decoded = unescape(raw.trim());
     let rest = match strip_file_prefix(&decoded) {
@@ -122,6 +124,62 @@ pub fn file_link_path(raw: &str) -> Option<String> {
     };
     let path = collapse_uri_slashes(path);
     (!path.trim().is_empty()).then_some(path)
+}
+
+/// Where a followed file link points, as a path the HOST can open.
+///
+/// A relative org link is relative to the file it is written in — org's
+/// `expand-file-name` against `default-directory`, and how the host already
+/// resolves the same link for an inline image (`wit/media.wit`). The host's
+/// `open-buffer-at`, though, resolves a relative path against the EDITOR's
+/// working directory (`wit/types.wit`), so following
+/// `[[file:./About/shot.png]]` from a roam note looked for `./About/shot.png`
+/// under wherever the editor was launched, and found nothing. The join
+/// happens here, then, against the buffer's own directory.
+///
+/// Left alone: an absolute path, a `~` path (the host's half, as for images),
+/// a Windows drive path, and any link from a buffer with no path — there is
+/// no directory to be relative to, and guessing the cwd is what the host does
+/// anyway.
+///
+/// `.` and `..` are folded lexically so the opened buffer is named
+/// `notes/About/shot.png` rather than `notes/./About/shot.png` — the same file
+/// under a second name is how one picture becomes two buffers.
+pub fn resolve_against_buffer(buffer_path: Option<&str>, link: &str) -> String {
+    let is_absolute = link.starts_with('/')
+        || link.starts_with('\\')
+        || link.starts_with('~')
+        || link.as_bytes().get(1) == Some(&b':');
+    let dir = buffer_path
+        .and_then(|p| p.rfind('/').map(|i| &p[..i]))
+        .filter(|_| !is_absolute);
+    let Some(dir) = dir else {
+        return link.to_string();
+    };
+    let rooted = dir.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in dir.split('/').chain(link.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                Some(&last) if last != ".." => {
+                    parts.pop();
+                }
+                // Above a relative root, `..` is kept: `../x` from `a.org`
+                // in the cwd still means the cwd's parent.
+                _ if !rooted => parts.push(".."),
+                // Above `/` there is nothing; `/..` is `/`.
+                _ => {}
+            },
+            p => parts.push(p),
+        }
+    }
+    let joined = parts.join("/");
+    if rooted {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// `file:`, plus org's application variants `file+sys:` / `file+emacs:`,
@@ -643,5 +701,41 @@ mod link_tests {
             "case matters"
         );
         assert_eq!(find_headline(get, 4, "Missing", &kw), None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_against_buffer as r;
+
+    /// The report: a roam note's `./About/…png` is beside the note, not
+    /// under the editor's working directory.
+    #[test]
+    fn a_relative_link_is_relative_to_the_file_it_is_written_in() {
+        assert_eq!(
+            r(Some("/home/u/roam/note.org"), "./About/shot.png"),
+            "/home/u/roam/About/shot.png"
+        );
+        assert_eq!(
+            r(Some("/home/u/roam/note.org"), "a.org"),
+            "/home/u/roam/a.org"
+        );
+        assert_eq!(
+            r(Some("/home/u/roam/sub/n.org"), "../a.org"),
+            "/home/u/roam/a.org"
+        );
+        assert_eq!(
+            r(Some("roam/note.org"), "./About/x.png"),
+            "roam/About/x.png"
+        );
+        assert_eq!(r(Some("note.org"), "../x.org"), "../x.org");
+    }
+
+    #[test]
+    fn absolute_home_and_pathless_links_are_left_to_the_host() {
+        assert_eq!(r(Some("/r/n.org"), "/abs/x.png"), "/abs/x.png");
+        assert_eq!(r(Some("/r/n.org"), "~/x.png"), "~/x.png");
+        assert_eq!(r(Some("/r/n.org"), "c:/x.png"), "c:/x.png");
+        assert_eq!(r(None, "./x.png"), "./x.png");
     }
 }

@@ -7,6 +7,7 @@ org-roam, shipped as a single WebAssembly component.
 
 | | |
 |---|---|
+| Version | `v0.1.0` · see [`CHANGELOG.md`](CHANGELOG.md) for what each release changed and the plugin API it builds against |
 | The editor | [github.com/dhruvasagar/lattice](https://github.com/dhruvasagar/lattice) · [website](https://dhruvasagar.github.io/lattice/) · [install](https://dhruvasagar.github.io/lattice/install/) |
 | This plugin's page | [dhruvasagar.github.io/lattice/plugins/org/](https://dhruvasagar.github.io/lattice/plugins/org/) |
 | Writing your own | [plugin authoring guide](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/guides/plugin-authoring.md) |
@@ -189,9 +190,9 @@ impl Guest for Component {
             name: "org".to_string(),
             source: PluginSource::Git(GitSource {
                 url: "https://github.com/dhruvasagar/lattice-org-plugin".to_string(),
-                // `None` tracks the default branch; pin a rev for reproducible
-                // boots.
-                rev: None,
+                // A release tag, so every boot builds the same plugin. `None`
+                // tracks the default branch instead — newer, and unreleased.
+                rev: Some("v0.1.0".to_string()),
             }),
             // Sugar for "enable this mode once the plugin loads". Org declares
             // its own `default_modes`, so this is only for a mode you want on
@@ -357,6 +358,25 @@ turns all three off together and leaves the outliner and highlighting.
 
 In normal use the plugin manager does this for you from the git source
 (PM.5–PM.8) and caches the build under `~/.config/lattice/plugins/`.
+
+## Releasing
+
+A release is a commit and a `vX.Y.Z` tag — nothing is built or uploaded,
+because every install builds from source and a user pins the tag.
+
+```sh
+scripts/release.sh                 # the current version and what each bump gives
+scripts/release.sh minor --dry-run # every step, nothing changed
+scripts/release.sh minor           # bump, promote the changelog, commit, tag
+git push origin main && git push origin vX.Y.Z
+```
+
+Write what changed under `## Unreleased` in `CHANGELOG.md` as it lands; the
+script retitles that section with the version and date, records the plugin API
+the release builds against (`lattice:plugin-host@…`, from the locked
+`lattice-wit`), and uses the section as the tag message. It also bumps `Cargo.toml`, `Cargo.lock` and the
+version in this README — the `| Version |` row and the `rev:` pin above — and
+refuses to tag if either README line is out of shape. It stops before pushing.
 
 ## Tests
 

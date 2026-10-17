@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-10-17
+
+Builds against `lattice:plugin-host@0.3.x` (lattice-wit 0.3.0).
 
 ### Fixed
 - **A relative file link opens the file beside the note.** `<CR>` on

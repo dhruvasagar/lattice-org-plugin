@@ -7,7 +7,7 @@ org-roam, shipped as a single WebAssembly component.
 
 | | |
 |---|---|
-| Version | `v0.1.0` · see [`CHANGELOG.md`](CHANGELOG.md) for what each release changed and the plugin API it builds against |
+| Version | `v0.1.1` · see [`CHANGELOG.md`](CHANGELOG.md) for what each release changed and the plugin API it builds against |
 | The editor | [github.com/dhruvasagar/lattice](https://github.com/dhruvasagar/lattice) · [website](https://dhruvasagar.github.io/lattice/) · [install](https://dhruvasagar.github.io/lattice/install/) |
 | This plugin's page | [dhruvasagar.github.io/lattice/plugins/org/](https://dhruvasagar.github.io/lattice/plugins/org/) |
 | Writing your own | [plugin authoring guide](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/guides/plugin-authoring.md) |
@@ -192,7 +192,7 @@ impl Guest for Component {
                 url: "https://github.com/dhruvasagar/lattice-org-plugin".to_string(),
                 // A release tag, so every boot builds the same plugin. `None`
                 // tracks the default branch instead — newer, and unreleased.
-                rev: Some("v0.1.0".to_string()),
+                rev: Some("v0.1.1".to_string()),
             }),
             // Sugar for "enable this mode once the plugin loads". Org declares
             // its own `default_modes`, so this is only for a mode you want on

@@ -13,6 +13,18 @@ use lattice_host::editor::Editor;
 use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{LoaderServices, PluginLoader};
 
+/// One compiled-component cache for every test in this binary.
+///
+/// The host caches what wasmtime compiles, keyed by the component's bytes, in
+/// the directory it is given. A fresh temp dir per test made every load a
+/// miss: org's ~1.8 MB component was compiled from scratch for each test,
+/// which is most of what made this suite take hours. Shared here, the first
+/// load compiles and the rest load the compiled code. `CARGO_TARGET_TMPDIR` is
+/// cargo's scratch space for integration tests, kept under `target/`.
+fn component_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("component-cache")
+}
+
 fn boot_sealed_editor() -> Editor {
     lattice_plugin_loader::disable_autoload();
     Editor::boot(CoreDocument::from_text("scratch\n"))
@@ -43,9 +55,8 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
 }
 
 fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
-    let host = Arc::new(
-        PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
-    );
+    let host =
+        Arc::new(PluginHost::with_dirs(component_cache(), base.join("data")).expect("host builds"));
     let agenda_registry = editor
         .services
         .get::<lattice_mode::ScannedExcerptSourceRegistryHandle>()

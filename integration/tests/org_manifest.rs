@@ -19,6 +19,18 @@ use std::sync::Arc;
 use lattice_plugin_host::{Capability, PluginHost, PluginManifest, TrustTier};
 use lattice_plugin_loader::{LoaderServices, PluginLoader};
 
+/// One compiled-component cache for every test in this binary.
+///
+/// The host caches what wasmtime compiles, keyed by the component's bytes, in
+/// the directory it is given. A fresh temp dir per test made every load a
+/// miss: org's ~1.8 MB component was compiled from scratch for each test,
+/// which is most of what made this suite take hours. Shared here, the first
+/// load compiles and the rest load the compiled code. `CARGO_TARGET_TMPDIR` is
+/// cargo's scratch space for integration tests, kept under `target/`.
+fn component_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("component-cache")
+}
+
 /// The component exactly as built — manifest and all.
 fn org_component() -> Option<Vec<u8>> {
     std::fs::read(concat!(
@@ -91,9 +103,8 @@ async fn each_grant_default_is_the_default_org_registers() {
     )
     .unwrap();
     let config = Arc::new(lattice_config::ConfigRegistry::new());
-    let host = Arc::new(
-        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data")).unwrap(),
-    );
+    let host =
+        Arc::new(PluginHost::with_dirs(component_cache(), base.path().join("data")).unwrap());
     let loaded = PluginLoader::with_services(
         host,
         LoaderServices {

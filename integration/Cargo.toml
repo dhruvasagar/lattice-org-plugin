@@ -109,3 +109,15 @@ serde = { version = "1", features = ["derive"] }
 # dependencies. That separation IS the fix; without it this manifest would be
 # read whenever the component is built and we would be back where we started.
 [workspace]
+
+# The suite boots a real editor and loads the real component, so the
+# dependencies are the runtime: wasmtime's Cranelift compiles org's ~1.8 MB
+# component on every load, and at the dev default of `opt-level = 0` that took
+# about 18 s a test — 195 tests in `org_structure.rs` alone ran an hour in CI.
+# This is lattice's own dev profile (its `Cargo.toml`, "dev-profile tuning"),
+# which this standalone workspace never inherited: dependencies at
+# `opt-level = 1`, the tests themselves left at 0 so they still build fast.
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+incremental = false

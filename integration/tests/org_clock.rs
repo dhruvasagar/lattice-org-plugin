@@ -29,6 +29,18 @@ use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{LoaderServices, PluginLoader};
 use lattice_protocol::{parse_chord_sequence, KeyChord};
 
+/// One compiled-component cache for every test in this binary.
+///
+/// The host caches what wasmtime compiles, keyed by the component's bytes, in
+/// the directory it is given. A fresh temp dir per test made every load a
+/// miss: org's ~1.8 MB component was compiled from scratch for each test,
+/// which is most of what made this suite take hours. Shared here, the first
+/// load compiles and the rest load the compiled code. `CARGO_TARGET_TMPDIR` is
+/// cargo's scratch space for integration tests, kept under `target/`.
+fn component_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("component-cache")
+}
+
 fn org_plugin_wasm() -> Option<Vec<u8>> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -100,7 +112,7 @@ async fn org_editor_inner(base: &std::path::Path, text: &str, caps: &[String]) -
     )
     .unwrap();
 
-    let host = Arc::new(PluginHost::with_dirs(base.join("cache"), base.join("data")).unwrap());
+    let host = Arc::new(PluginHost::with_dirs(component_cache(), base.join("data")).unwrap());
     host.set_modeline(editor.modeline.clone(), editor.event_bus.clone());
     host.set_sleeper(Arc::new(TokioSleeper));
     let loader = PluginLoader::with_services(

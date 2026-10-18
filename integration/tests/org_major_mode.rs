@@ -35,6 +35,18 @@ use lattice_mode::{ModeId, ModeKind};
 use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{discover, LoaderServices, PluginLoader};
 
+/// One compiled-component cache for every test in this binary.
+///
+/// The host caches what wasmtime compiles, keyed by the component's bytes, in
+/// the directory it is given. A fresh temp dir per test made every load a
+/// miss: org's ~1.8 MB component was compiled from scratch for each test,
+/// which is most of what made this suite take hours. Shared here, the first
+/// load compiles and the rest load the compiled code. `CARGO_TARGET_TMPDIR` is
+/// cargo's scratch space for integration tests, kept under `target/`.
+fn component_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("component-cache")
+}
+
 /// Boot an editor that is sealed off from the developer's real
 /// `~/.config/lattice`.
 ///
@@ -86,9 +98,8 @@ fn write_org_plugin_dir(root: &std::path::Path, wasm: &[u8]) {
 /// A loader wired to the booted editor's LIVE registries, so the plugin's mode
 /// lands in the same `mode_registry` the editor's activation reads.
 fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
-    let host = Arc::new(
-        PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
-    );
+    let host =
+        Arc::new(PluginHost::with_dirs(component_cache(), base.join("data")).expect("host builds"));
     PluginLoader::with_services(
         host,
         LoaderServices {
@@ -513,7 +524,7 @@ async fn an_org_buffer_folds_by_syntax_without_the_user_setting_it() {
 /// actually gets was covered by no test at all, and every table test enabled
 /// the mode by hand first — which passes against the broken version too.
 ///
-/// So this reads the real file from `CARGO_MANIFEST_DIR` and checks it against
+/// So this reads the real manifest out of the built component and checks it against
 /// the modes the component actually registered. `Manual` minors are exempt and
 /// `org-agenda-mode` is the one: the agenda view's major is `multibuffer-mode`,
 /// which no policy on this list could reach, so the provider that builds the
@@ -525,15 +536,19 @@ async fn every_auto_activating_minor_is_in_the_shipped_manifests_default_modes()
         return;
     };
 
-    // The file a user gets, not the harness's copy of it.
-    // `../plugin.toml`: this package sits in `integration/`, and the manifest a
-    // user gets ships from the repo root beside the component's Cargo.toml.
-    let shipped = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../plugin.toml"))
-        .expect("the shipped plugin.toml is at the repo root");
-    let default_modes = shipped
-        .lines()
-        .find(|l| l.trim_start().starts_with("default_modes"))
-        .expect("the shipped manifest declares default_modes");
+    // The manifest a user gets, not the harness's copy of it: the one embedded
+    // in the component as built (PMF.8 — there is no `plugin.toml`). Read from
+    // the raw bytes, since `org_plugin_wasm` hands back a stripped copy.
+    let built = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
+    ))
+    .unwrap();
+    let shipped = lattice_plugin_host::PluginManifest::from_component_bytes(&built)
+        .expect("the embedded manifest parses")
+        .expect("the component carries its manifest");
+    let default_modes = shipped.default_modes.join(", ");
+    let default_modes = default_modes.as_str();
 
     let base = tempfile::tempdir().unwrap();
     let plugins_dir = base.path().join("plugins");

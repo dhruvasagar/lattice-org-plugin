@@ -27,6 +27,18 @@ use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{discover, LoaderServices, PluginLoader};
 use serde::Deserialize;
 
+/// One compiled-component cache for every test in this binary.
+///
+/// The host caches what wasmtime compiles, keyed by the component's bytes, in
+/// the directory it is given. A fresh temp dir per test made every load a
+/// miss: org's ~1.8 MB component was compiled from scratch for each test,
+/// which is most of what made this suite take hours. Shared here, the first
+/// load compiles and the rest load the compiled code. `CARGO_TARGET_TMPDIR` is
+/// cargo's scratch space for integration tests, kept under `target/`.
+fn component_cache() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("component-cache")
+}
+
 /// The node record shape the guest writes. Declared here rather than shared,
 /// because the plugin is a `cdylib` compiled for wasm — a test that imported
 /// the guest's own type would be checking the encoder against itself. This is
@@ -303,9 +315,8 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
     write_org_plugin_dir(&plugins, &wasm, corpus);
 
     let mut editor = boot_sealed_editor();
-    let host = Arc::new(
-        PluginHost::with_dirs(base.join("cache"), base.join("data")).expect("host builds"),
-    );
+    let host =
+        Arc::new(PluginHost::with_dirs(component_cache(), base.join("data")).expect("host builds"));
     // CD.6b: `install` wires this in the editor; a hand-built loader does not,
     // and unwired every caller reads as closed.
     if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
@@ -546,8 +557,7 @@ async fn roam_is_inert_with_no_directory_configured() {
     // Boot WITHOUT setting `org.roam-directory`.
     let editor = boot_sealed_editor();
     let host = Arc::new(
-        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
-            .expect("host builds"),
+        PluginHost::with_dirs(component_cache(), base.path().join("data")).expect("host builds"),
     );
     // CD.6b: `install` wires this in the editor; a hand-built loader does not,
     // and unwired every caller reads as closed.
@@ -939,8 +949,7 @@ async fn find_node_with_no_directory_says_so() {
     // Boot WITHOUT setting `org.roam-directory`.
     let mut editor = boot_sealed_editor();
     let host = Arc::new(
-        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
-            .expect("host builds"),
+        PluginHost::with_dirs(component_cache(), base.path().join("data")).expect("host builds"),
     );
     // CD.6b: `install` wires this in the editor; a hand-built loader does not,
     // and unwired every caller reads as closed.
@@ -2069,8 +2078,7 @@ async fn setting_the_roam_directory_builds_the_index_without_a_manual_sync() {
 
     let editor = boot_sealed_editor();
     let host = Arc::new(
-        PluginHost::with_dirs(base.path().join("cache"), base.path().join("data"))
-            .expect("host builds"),
+        PluginHost::with_dirs(component_cache(), base.path().join("data")).expect("host builds"),
     );
     // CD.6b: `install` wires this in the editor; a hand-built loader does not,
     // and unwired every caller reads as closed.

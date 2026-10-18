@@ -40,12 +40,24 @@ pub fn roam_directory() -> Option<String> {
     let dir = expand_tilde(trimmed);
     // PMF.8: the option now defaults to `~/org-roam`, which most org users
     // never create — so "inert" is decided by the directory existing, not by
-    // the option being set. A directory outside the grant is not mounted, so
-    // it reads as absent too, which is the honest answer: org could not walk it.
-    if !std::path::Path::new(&dir).is_dir() {
+    // the option being set. A directory outside the grant reads as absent too,
+    // which is the honest answer: org could not walk it.
+    if !usable_dir(&dir) {
         return None;
     }
     Some(dir)
+}
+
+/// Does `dir` exist, inside what org may write?
+///
+/// Asked of the HOST, never with `std::fs`: a WASI filesystem call made from
+/// a seam the host drives on its async runtime (the grammar seam, where
+/// capture runs) panics inside wasmtime-wasi's blocking adapter. The host's
+/// `can-write-file` on a path in `dir` makes exactly the two checks wanted —
+/// the directory exists, and it is inside the grant — without touching WASI.
+pub fn usable_dir(dir: &str) -> bool {
+    let probe = format!("{}/.lattice-probe", dir.trim_end_matches('/'));
+    host_services::can_write_file(&probe).is_ok()
 }
 
 /// What to say when [`roam_directory`] is `None`: the option is set to

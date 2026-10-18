@@ -6209,11 +6209,12 @@ fn allocate_capture_id(draft: &DraftSpec, dir: &str) -> String {
 /// option names one.
 fn capture_drafts_dir() -> Option<String> {
     // PMF.8: `org.directory` now has a default (`~/org`) that many users never
-    // create. Drafts follow it only when it exists; otherwise the fallbacks
-    // apply, as they did when it was unset.
+    // create. Drafts follow it only when it exists (and is writable); otherwise
+    // the fallbacks apply, as they did when it was unset. Asked of the host,
+    // not `std::fs` — see `roam_scan::usable_dir`.
     let directory = option_or("directory", "");
     let directory =
-        if std::path::Path::new(&crate::roam_scan::expand_tilde(directory.trim())).is_dir() {
+        if crate::roam_scan::usable_dir(&crate::roam_scan::expand_tilde(directory.trim())) {
             directory
         } else {
             String::new()

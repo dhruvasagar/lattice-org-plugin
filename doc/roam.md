@@ -8,9 +8,10 @@ Nothing here is a separate store. Roam indexes your **files** — the same ones
 emacs indexes — so both tools can read the same corpus without either owning
 it. There is no database to migrate and no cache to share.
 
-**Roam is inert until you configure it.** With `org.roam-directory` unset there
-is no walk, no watcher and no index; an org user who keeps no notes pays
-nothing for this existing.
+**Roam is inert until its directory exists.** `org.roam-directory` defaults to
+`~/org-roam` (org-roam's own default); while that directory does not exist —
+or the option is set to empty — there is no walk, no watcher and no index, and
+an org user who keeps no notes pays nothing for this existing.
 
 ## Turning it on
 
@@ -18,15 +19,16 @@ nothing for this existing.
 org.roam-directory = "~/notes"
 ```
 
-`~` is expanded. That directory must also be inside this plugin's `fs:read`
-grant — the walk reaches nothing without it, and the symptom is an index that
-stays empty rather than an error.
+`~` is expanded. Setting it is also what lets org read and write there: org's
+file access follows this option (and `org.directory`), so there is no separate
+grant to keep in step — `:plugins` shows the path in force.
 
 Setting the option is enough. Roam walks the directory, arms a filesystem
-watcher on it, and builds the index; changing the option later re-walks against
-the new root and stops the old scan. You do not have to restart, and you do not
-have to set it before the plugin loads — an `init.rs` that sets it from a
-`plugin-loaded` handler works, which is the documented pattern.
+watcher on it, and builds the index; changing the option later reloads org
+with access to the new root, which walks it afresh. You do not have to
+restart, and you do not have to set it before the plugin loads — an `init.rs`
+that sets it from a `plugin-loaded` handler works, which is the documented
+pattern.
 
 ### Why there is a watcher
 
@@ -246,7 +248,7 @@ three different places:
 
 | | |
 |---|---|
-| `[[id:…]] needs a note directory — set org.roam-directory` | roam is not configured |
+| `[[id:…]] needs a note directory — set org.roam-directory` | roam is not configured, or its directory does not exist |
 | `the roam index is empty, so [[id:…]] cannot be resolved — run :org-roam-sync` | configured, nothing indexed |
 | `no note with id …` | the link is broken |
 
@@ -492,7 +494,7 @@ mounted after the editor started.
 
 | Option | Default | |
 |---|---|---|
-| `org.roam-directory` | unset | where your notes live. `~` expanded. Unset means roam is inert |
+| `org.roam-directory` | `~/org-roam` | where your notes live, and where org may write them. `~` expanded. A directory that does not exist, or an empty value, means roam is inert |
 | `org.roam-dailies-directory` | `daily` | relative to `org.roam-directory` unless it starts with `/` |
 | `org.roam-capture-templates` | unset | what a new note starts as. Unset means the built-in stub and no menu |
 | `org.roam-capture-reference-origin` | `true` | give a note started inside another capture a link back to it |

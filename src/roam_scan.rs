@@ -37,7 +37,30 @@ pub fn roam_directory() -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(expand_tilde(trimmed))
+    let dir = expand_tilde(trimmed);
+    // PMF.8: the option now defaults to `~/org-roam`, which most org users
+    // never create — so "inert" is decided by the directory existing, not by
+    // the option being set. A directory outside the grant is not mounted, so
+    // it reads as absent too, which is the honest answer: org could not walk it.
+    if !std::path::Path::new(&dir).is_dir() {
+        return None;
+    }
+    Some(dir)
+}
+
+/// What to say when [`roam_directory`] is `None`: the option is set to
+/// nothing, or it names a directory that is not there.
+pub fn not_configured() -> String {
+    let raw = get_option("roam-directory").unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "org-roam: set `org.roam-directory` to the folder your notes live in".to_string()
+    } else {
+        format!(
+            "org-roam: {trimmed} does not exist — create it, or set `org.roam-directory` \
+             to the folder your notes live in"
+        )
+    }
 }
 
 /// `~` expansion.

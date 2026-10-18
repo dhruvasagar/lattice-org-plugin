@@ -61,7 +61,12 @@ fn org_plugin_wasm() -> Option<Vec<u8>> {
         env!("CARGO_MANIFEST_DIR"),
         "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
     );
-    std::fs::read(path).ok()
+    // The component embeds org's real manifest, and an embedded manifest wins
+    // over a `plugin.toml`. These tests load org under manifests of their own
+    // (a subset of seams, a grant on a temp dir), so take it out first.
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| lattice_plugin_host::manifest::without_embedded_manifest(&bytes))
 }
 
 /// Lay the plugin out on disk the way the manager would. Note the `provides`

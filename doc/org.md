@@ -270,13 +270,16 @@ not exist it is created. The subtree leaves the source only once the write has
 landed, so a target that cannot be written leaves your text exactly where it
 was.
 
-The plugin needs `fs:write` over the directory your org files live in; without
-it the chord is refused at the boundary and says so. Add it to the plugin's
-`plugin.toml`:
+Org may write only under `org.directory` (default `~/org`) and
+`org.roam-directory` (default `~/org-roam`); a target anywhere else is refused
+at the boundary, with a message naming the option to change. Point the option
+at where your org files live — that setting *is* the permission:
 
 ```toml
-capabilities = ["fs:write:/home/you/org"]
+org.directory = "~/notes"
 ```
+
+See [Capabilities and your configuration](help:plugins#capabilities-and-your-configuration).
 
 `<Tab>` is the one key here that falls through: on a headline it cycles
 visibility, and anywhere else it means what it usually means. The
@@ -625,16 +628,12 @@ put your notes somewhere you never chose.
 
 ##### What capture needs
 
-- **`fs:write`** over the directories capture writes to: your org files, and
-  the drafts directory. This is the same grant archive and refile use, and it
-  also covers the reads a target needs to find its place.
+- **Its targets under `org.directory` or `org.roam-directory`**, and its
+  drafts directory too. This is the same file access archive and refile use;
+  it also covers the reads a target needs to find its place.
 - **`state:write`**, which is where each capture records its target and the
   buffer it came from. That record is what lets a draft be filed after a
-  restart.
-
-```toml
-capabilities = ["fs:write:/home/you/org", "state:write"]
-```
+  restart. Org's manifest asks for it; there is nothing to set.
 
 `C-c C-c` saves the file it filed into, as emacs's finalize does. The agenda
 reads files from disk, so an unsaved capture would not show up in `gr`.

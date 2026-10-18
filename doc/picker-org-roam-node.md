@@ -34,7 +34,8 @@ beside the row, and aliases are matched as part of the row's text so a
 note findable only under an alias still turns up. The list is the
 org-roam index, read once when the picker opens.
 
-The picker is empty and says so when `org.roam-directory` is unset —
+The picker is empty and says so when `org.roam-directory` is unset or
+names a directory that does not exist —
 which is a different problem from having no notes, and has a different
 fix.
 

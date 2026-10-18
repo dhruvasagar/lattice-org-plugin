@@ -117,9 +117,7 @@ pub fn init() -> Result<Vec<(RawCandidate, RoutingPayload)>, String> {
         // Said rather than shown as an empty list, for `roam_find`'s reason:
         // "no notes" and "roam is not configured" look identical in an empty
         // picker and have entirely different fixes.
-        return Err(
-            "org-roam: set `org.roam-directory` to the folder your notes live in".to_string(),
-        );
+        return Err(roam_scan::not_configured());
     }
     let nodes = roam_index::all_nodes();
     Ok(nodes

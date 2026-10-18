@@ -17,6 +17,61 @@
 //! starts EDITING — the actions read the buffer through the `borrow<document>`
 //! handle `apply-action` receives and return `Effect::ApplyEdit`.
 
+// The manifest the editor reads before it loads this component, embedded as
+// the `lattice-manifest` custom section — the `.wasm` is the whole plugin, and
+// there is no `plugin.toml` to copy or keep in step. Written as the section
+// directly rather than with `lattice_plugin_sdk::manifest!`, which arrives in
+// plugin-API 0.3.1; switch once that is the floor.
+//
+// `provides` — every seam org contributes. Order is cosmetic except at one
+// point: `config` comes BEFORE `theme` on purpose. Both drain at rank 0 and the
+// sort is stable, so this order is what lets `register-theme-elements` read
+// `org.todo-keywords` and `org.todo-keyword-styles` rather than silently
+// falling back to the defaults (TK.3/TK.5). `signs` + `decorations` draw the
+// agenda's bulk marks (OA.30); `completion-source` is org-roam nodes inside
+// `[[…]]` (OR.7); `transient-source` the capture menu (OC.3); `events` the
+// clock's session, minute wake and modeline segment (OC.6).
+//
+// `default_modes` publishes the enablement request for each mode named. A mode
+// not listed registers and never activates — `auto_activatable_minors` filters
+// on enablement BEFORE policy — which is how `org-table-mode` shipped dead
+// until 2026-08-30. `org-agenda-mode` stays off: the agenda's major is
+// `multibuffer-mode`, so the provider that builds the view activates it.
+//
+// `capabilities` — where org may write follows the user's own configuration
+// (PMF.8): `org.directory` (default `~/org`, emacs's `org-directory`) and
+// `org.roam-directory` (default `~/org-roam`, emacs's
+// `org-roam-directory`). Archive, refile and capture write to files other than
+// the one you are in, and the host checks each target against these grants.
+// The defaults here must match the options' registered defaults below — the
+// loader warns if they drift. `state:write` is the plugin store, where each
+// capture records its target and caller (CD.4).
+//
+// `editor_capabilities` — the grammar seam is capability-gated: without
+// `tree-sitter` every motion, text object and action gets a `none` tree handle
+// and org silently falls back to matching `*` at line starts (OT.4).
+//
+// `min_lattice` — embedded manifests and option-bound grants are both 0.9.10.
+const MANIFEST: &[u8] = br#"
+id = "org"
+provides = [
+    "language", "modes", "grammar", "media", "scanned-excerpt-source",
+    "multibuffer-view-source", "picker-source", "signs", "decorations",
+    "completion-source", "transient-source", "help", "config", "theme", "events",
+]
+default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
+capabilities = [
+    "fs:write:{org.directory|~/org}",
+    "fs:write:{org.roam-directory|~/org-roam}",
+    "state:write",
+]
+editor_capabilities = ["tree-sitter"]
+min_lattice = "0.9.10"
+"#;
+#[unsafe(link_section = "lattice-manifest")]
+#[used]
+static LATTICE_MANIFEST: [u8; MANIFEST.len()] = *MANIFEST.first_chunk().unwrap();
+
 // A plugin that provides TWO seams needs a world that imports both, and a
 // component implements exactly one world. Bundled plugins get theirs written
 // into lattice's own `wit/` (`auto-pair-plugin` imports six interfaces) — but
@@ -1686,14 +1741,19 @@ impl Guest for Component {
             "Where `<leader>oc` files a capture when `capture-templates` is unset. \
              Absolute, or relative to the editor's working directory.",
         );
-        // CD.4: emacs's `org-directory`. Capture drafts hang off it; nothing
-        // else reads it yet. Unset by default, for `capture-file`'s reason.
+        // CD.4: emacs's `org-directory`, with emacs's default. PMF.8: it is
+        // also where org may write — the manifest's `fs:write` grant follows
+        // it, so its default here must stay the manifest template's.
         let _ = register_option(
             "directory",
             OptionType::String,
-            "",
-            "Your org directory. Capture drafts are kept in its `captures/` \
-             subdirectory unless `capture-drafts-directory` says otherwise.",
+            "~/org",
+            "Your org directory (default `~/org`). Capture drafts are kept in its \
+             `captures/` subdirectory unless `capture-drafts-directory` says \
+             otherwise. It also decides where org may write: archive, refile and \
+             capture can file text under this directory and `roam-directory`, \
+             and nowhere else. Setting it moves that access; `:plugins` shows \
+             what is in force.",
         );
         let _ = register_option(
             "capture-drafts-directory",
@@ -1800,17 +1860,20 @@ impl Guest for Component {
              your rows. Unset means the default agenda, which is what nearly \
              everyone wants.",
         );
-        // OR.4: the corpus root. UNSET by default, and that default is the
-        // feature's contract — see `roam_scan::roam_directory`.
+        // OR.4: the corpus root, with org-roam's default. PMF.8: org's second
+        // `fs:write` grant follows it, so the default must stay the manifest
+        // template's. A directory that does not exist keeps roam inert — see
+        // `roam_scan::roam_directory`.
         let _ = register_option(
             "roam-directory",
             OptionType::String,
-            "",
-            "Where your org-roam notes live. `~` is expanded. Unset means \
-             roam is inert: no walk, no watcher, no index, and `<CR>` on an \
-             `[[id:\u{2026}]]` link says the directory is not configured rather \
-             than blaming the filesystem. The directory must also be in this \
-             plugin's `fs:read` grant, or the walk reaches nothing.",
+            "~/org-roam",
+            "Where your org-roam notes live (default `~/org-roam`). `~` is \
+             expanded. If the directory does not exist — or the option is set \
+             to empty — roam is inert: no walk, no watcher, no index, and \
+             `<CR>` on an `[[id:\u{2026}]]` link says so rather than blaming the \
+             filesystem. It also decides where org may write, with \
+             `directory`; a change reloads the plugin with the new access.",
         );
         let _ = register_option(
             "roam-dailies-directory",
@@ -6145,9 +6208,19 @@ fn allocate_capture_id(draft: &DraftSpec, dir: &str) -> String {
 /// CD.4: the configured drafts directory, `~` expanded — `None` when no
 /// option names one.
 fn capture_drafts_dir() -> Option<String> {
+    // PMF.8: `org.directory` now has a default (`~/org`) that many users never
+    // create. Drafts follow it only when it exists; otherwise the fallbacks
+    // apply, as they did when it was unset.
+    let directory = option_or("directory", "");
+    let directory =
+        if std::path::Path::new(&crate::roam_scan::expand_tilde(directory.trim())).is_dir() {
+            directory
+        } else {
+            String::new()
+        };
     capture_drafts::drafts_dir(
         &option_or("capture-drafts-directory", ""),
-        &option_or("directory", ""),
+        &directory,
         &option_or("capture-file", DEFAULT_CAPTURE_FILE),
     )
     .map(|d| crate::roam_scan::expand_tilde(&d))
@@ -10943,7 +11016,7 @@ fn open_daily(date: roam_dailies::Date) -> Vec<Effect> {
     let Some(path) = roam_dailies::path(&date) else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
-            text: "org-roam: set `org.roam-directory` to the folder your notes live in".to_string(),
+            text: roam_scan::not_configured(),
         })];
     };
     if host_services::read_file(&path).is_ok() {

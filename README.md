@@ -14,8 +14,8 @@ org-roam, shipped as a single WebAssembly component.
 | The API it builds against | [`lattice-wit`](https://crates.io/crates/lattice-wit) · [`lattice-plugin-sdk`](https://crates.io/crates/lattice-plugin-sdk) |
 
 It is the first real consumer of lattice's `language` seam, and by now of
-fourteen others — see the table below, which `plugin.toml`'s `provides` is the
-source of truth for.
+fourteen others — see the table below, which the manifest's `provides` (at the
+top of `src/lib.rs`) is the source of truth for.
 
 Design lives in the lattice tree:
 [`org-mode.md`](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/architecture/org-mode.md),
@@ -163,7 +163,9 @@ Lattice's config is itself a WASM component (`~/.config/lattice/init/`), and the
 use-package's shape: name a source, optionally name a mode to enable, and the
 editor clones, builds and loads it.
 
-`~/.config/lattice/init/plugin.toml`:
+Your init's manifest must list the `plugin-manager` seam — at the top of
+`src/lib.rs` in a config scaffolded by lattice 0.9.10 or later, in
+`~/.config/lattice/init/plugin.toml` in an older one:
 
 ```toml
 id = "init"
@@ -230,17 +232,16 @@ cargo build --release --target wasm32-wasip2
 mkdir -p ~/.config/lattice/plugins/org
 cp target/wasm32-wasip2/release/lattice_org_plugin.wasm \
    ~/.config/lattice/plugins/org/component.wasm
-cp plugin.toml ~/.config/lattice/plugins/org/
 ```
 
-The `.wasm` filename does not matter — the manifest does not name the
-component, so the contract is **exactly one** `.wasm` in the directory. Two is
-an error, and so is none.
+That one file is the whole plugin: its manifest is embedded in it. The `.wasm`
+filename does not matter; the contract is **exactly one** `.wasm` in the
+directory. Two is an error, and so is none.
 
-Edit the copied `plugin.toml` so `capabilities` points at *your* notes
-directory: the shipped one names the author's, and a grant you do not hold is
-what makes archive, refile and capture refuse. Then start lattice — discovery
-finds the directory, reads the manifest, and drains each seam.
+Then set `org.directory` (and `org.roam-directory`, if you use roam) to where
+your notes live — see [Where org may write](#where-org-may-write) — and start
+lattice. Discovery finds the directory, reads the manifest, and drains each
+seam.
 
 ### Configuring it
 
@@ -250,14 +251,39 @@ Options are ordinary typed settings, so `:set` works live and
 
 ```toml
 [org]
+directory = "~/notes"
+roam-directory = "~/notes/roam"
 todo-keywords = """
 sequence: TODO(t) NEXT(n) | DONE(d)
 type: PROJECT TO-READ READING
 """
-agenda-files = "~/org"
-roam-directory = "~/org/roam"
+agenda-files = "~/notes"
 inline-images = true
 ```
+
+### Where org may write
+
+Archive, refile and capture write to files other than the one you are in, and
+lattice checks every such write against org's file grant. That grant **follows
+two of org's own options**:
+
+| Option | Default | Org may write under |
+|---|---|---|
+| `org.directory` | `~/org` | your org directory |
+| `org.roam-directory` | `~/org-roam` | your org-roam notes |
+
+The defaults are emacs's own (`org-directory`, `org-roam-directory`). Setting
+either option — in `lattice.toml`, your `init.rs`, or with `:set` — is how you
+move the access; there is no separate grant to edit. Org reloads itself when
+the value changes, and `:plugins` shows what is in force
+(`fs:write ~/notes (org.directory)`). A write outside both is refused with a
+message naming the option to change. Org itself cannot change these options:
+only your configuration can.
+
+A directory that does not exist is fine: roam stays off until
+`org.roam-directory` exists, and capture drafts fall back as if `org.directory`
+were unset. This needs lattice **0.9.10** or later; an older editor refuses the
+plugin by name.
 
 `:set org.<Tab>` lists the full catalogue with its docs, and `:help org` opens
 the plugin's own manual — which ships *inside* the component, so it is always
@@ -293,37 +319,22 @@ nothing, check the build log for `grammar build failed`, and check your clang.
 CI asserts the grammar is over 100 KB for exactly this reason; a real one is
 ~340 KB.
 
-The component lands at `target/wasm32-wasip2/release/lattice_org_plugin.wasm`.
-Point a plugin directory at it with a `plugin.toml`:
-
-```toml
-id = "org"
-provides = [
-    "language", "modes", "grammar", "media", "scanned-excerpt-source",
-    "multibuffer-view-source", "picker-source", "signs", "decorations",
-    "completion-source", "transient-source", "help", "config", "theme",
-    "events",
-]
-default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
-capabilities = ["fs:write:/home/you/org", "state:write"]
-editor_capabilities = ["tree-sitter"]
-```
+The component lands at `target/wasm32-wasip2/release/lattice_org_plugin.wasm`,
+with its manifest embedded — the `lattice-manifest` section written at the top
+of `src/lib.rs`, where each of its fields is explained. There is no
+`plugin.toml` to stage beside it.
 
 The order of `provides` is cosmetic — the loader sorts by real registration
 dependency before draining, so a manifest that lists `modes` before `grammar`
 still resolves every keymap binding. That was not always true, and org is the
 plugin it would have bitten.
 
-`capabilities` covers two things. `fs:write` is what archiving, refile and
-capture need: all three write to a
-file other than the one you are in, and the host checks the target against this
-grant at the plugin boundary before the effect reaches the editor. Point it at
-the directory your org files live in. The same grant also covers the *read* a
-`headline` capture target needs to find its insertion point — a write grant
-implies read over the same directory, so there is no second thing to declare. Without it the outliner, tables and the
-agenda all still work and those three chords say they were refused. The grant
-must also cover capture's drafts directory (`captures/` under `org.directory`
-by default), where an in-progress capture is kept as a file.
+`capabilities` covers two things. The two `fs:write` grants follow
+`org.directory` and `org.roam-directory` ([Where org may
+write](#where-org-may-write)); archiving, refile and capture need them, and
+the same grant covers the *read* a `headline` capture target needs to find its
+insertion point. Without them the outliner, tables and the agenda all still
+work and those three chords say they were refused.
 
 `state:write` is the plugin's own store. Each capture records its target and
 the buffer it was started from there, which is what lets a saved draft be filed

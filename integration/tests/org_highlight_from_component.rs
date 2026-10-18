@@ -34,14 +34,18 @@ use lattice_plugin_host::{PluginHost, TrustTier};
 use lattice_plugin_loader::{LoaderServices, PluginLoader};
 use lattice_syntax::{Lang, Style, Syntax};
 
-/// The component as built, i.e. exactly the bytes staged into
-/// `~/.config/lattice/plugins/org/component.wasm`.
+/// The component as built — the bytes staged into
+/// `~/.config/lattice/plugins/org/component.wasm`, less its manifest.
 fn org_component() -> Option<Vec<u8>> {
+    // The component embeds org's real manifest, and an embedded manifest wins
+    // over a `plugin.toml`. These tests load org under manifests of their own
+    // (a subset of seams, a grant on a temp dir), so take it out first.
     std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
     ))
     .ok()
+    .map(|bytes| lattice_plugin_host::manifest::without_embedded_manifest(&bytes))
 }
 
 /// Load the component through the loader with ONLY the `language` seam

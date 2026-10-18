@@ -1,7 +1,7 @@
-//! The README's seam table and its `provides` example match `plugin.toml`.
+//! The README's seam table matches the manifest's `provides`.
 //!
 //! The README claimed **thirteen** seams in its prose and heading while listing
-//! fifteen in its table, and `plugin.toml` — the only thing that decides what
+//! fifteen in its table, and the manifest — the only thing that decides what
 //! this plugin actually registers — said fifteen. The discrepancy was noticed
 //! in lattice's launch plan months before it was fixed, and was deliberately
 //! left uncorrected there because neither number could be trusted from outside
@@ -30,13 +30,25 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
+/// The manifest's TOML: the `MANIFEST` byte string in `src/lib.rs`.
+fn manifest_text() -> String {
+    let lib = read("src/lib.rs");
+    let (_, rest) = lib
+        .split_once("const MANIFEST: &[u8] = br#\"")
+        .expect("src/lib.rs declares the embedded `MANIFEST`");
+    rest.split_once("\"#;")
+        .expect("the manifest literal closes")
+        .0
+        .to_owned()
+}
+
 /// The seams this plugin registers, from the manifest that decides it.
 fn declared_seams() -> BTreeSet<String> {
-    let manifest: toml::Value = toml::from_str(&read("plugin.toml")).expect("plugin.toml parses");
+    let manifest: toml::Value = toml::from_str(&manifest_text()).expect("the manifest parses");
     manifest
         .get("provides")
         .and_then(|v| v.as_array())
-        .expect("plugin.toml has a `provides` array")
+        .expect("the manifest has a `provides` array")
         .iter()
         .map(|v| {
             v.as_str()
@@ -66,27 +78,12 @@ fn readme_table_seams() -> BTreeSet<String> {
         .collect()
 }
 
-/// The `provides = [ ... ]` block the README shows for a hand-staged install.
-fn readme_example_seams() -> BTreeSet<String> {
-    let readme = read("README.md");
-    let (_, rest) = readme
-        .split_once("provides = [\n")
-        .expect("README shows a `provides = [` example");
-    let block = rest.split_once(']').expect("the example array closes").0;
-    block
-        .split(',')
-        .map(|part| part.trim().trim_matches('"').trim())
-        .filter(|part| !part.is_empty() && !part.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
 fn report(what: &str, declared: &BTreeSet<String>, found: &BTreeSet<String>) {
     let missing: Vec<&String> = declared.difference(found).collect();
     let extra: Vec<&String> = found.difference(declared).collect();
     assert!(
         missing.is_empty() && extra.is_empty(),
-        "{what} disagrees with plugin.toml's `provides` ({} seams).\n  \
+        "{what} disagrees with the manifest's `provides` ({} seams).\n  \
          missing from the README: {missing:?}\n  \
          in the README but not declared: {extra:?}",
         declared.len()
@@ -98,17 +95,6 @@ fn the_readme_table_lists_every_declared_seam() {
     let declared = declared_seams();
     assert!(declared.len() >= 10, "parsed `provides` as {declared:?}");
     report("the README's seam table", &declared, &readme_table_seams());
-}
-
-#[test]
-fn the_readme_install_example_lists_every_declared_seam() {
-    // The example is what someone copies when staging the plugin by hand, so a
-    // seam missing here is a seam that silently does not register for them.
-    report(
-        "the README's `provides` example",
-        &declared_seams(),
-        &readme_example_seams(),
-    );
 }
 
 #[test]
@@ -147,11 +133,11 @@ fn the_readme_does_not_state_a_stale_seam_count_in_prose() {
             .to_lowercase()
             .contains(&format!("{correct} seams from one component")),
         "the heading should read `{correct} seams from one component` — \
-         plugin.toml declares {n}"
+         the manifest declares {n}"
     );
     assert!(
         readme.to_lowercase().contains(&format!("{others} others")),
-        "the opening should say `and by now of {others} others` — plugin.toml \
+        "the opening should say `and by now of {others} others` — the manifest \
          declares {n} seams, of which `language` is one"
     );
 }

@@ -83,9 +83,7 @@ pub fn spec() -> PickerSourceSpec {
 /// an empty list there would be indistinguishable from "you have no notes".
 pub fn init(args: &[String]) -> Result<Vec<(RawCandidate, RoutingPayload)>, String> {
     if roam_scan::roam_directory().is_none() {
-        return Err(
-            "org-roam: set `org.roam-directory` to the folder your notes live in".to_string(),
-        );
+        return Err(roam_scan::not_configured());
     }
     let Some(id) = args.first().filter(|s| !s.trim().is_empty()) else {
         // The ex-command resolves the node at point and passes its id. Reaching

@@ -153,101 +153,103 @@ with **zero renderer changes**. Pinned by
 
 ## Installing it
 
-Two ways in. Both end with the component staged under a directory lattice
-discovers at boot; the difference is who does the staging.
+You need **lattice 0.9.10 or later** and an `init.rs` — your lattice config,
+which is itself a plugin (`lattice --scaffold-init` writes one). Org is
+installed from it: ready-built from a release, or built from source.
 
-### Without a Rust toolchain — the released build
+### First: your `init.rs` needs the `plugin-manager` seam
 
-Every release publishes the component ready-built, so you can install org
-without Rust, the `wasm32-wasip2` target or clang. In your `init.rs`
-(lattice 0.9.10 or later):
+A config scaffolded by lattice 0.9.10 or later has it already —
+`register_plugins` is there, with a commented-out example that installs org.
+An older config needs three additions in `~/.config/lattice/init/`:
+
+1. `wit/init.wit`, inside `world init { … }`:
+
+   ```wit
+   import plugin-manager;
+   export register-plugins: func();
+   ```
+
+2. `"plugin-manager"` in the manifest's `provides` — at the top of
+   `src/lib.rs`, or in `plugin.toml` if your config has one;
+3. a `fn register_plugins() { … }` in your `impl Guest`, holding one of the
+   two calls below.
+
+### The released build — no Rust toolchain
+
+Every release publishes org ready-built, so this needs no Rust, no
+`wasm32-wasip2` target and no clang:
 
 ```rust
-use lattice::plugin_host::plugin_manager::{self, ReleaseSpec};
-
 fn register_plugins() {
+    use lattice::plugin_host::plugin_manager::{self, ReleaseSpec};
     plugin_manager::require_release(&ReleaseSpec {
         name: "org".to_string(),
         repo: "dhruvasagar/lattice-org-plugin".to_string(),
         // A release tag. `None` takes the newest release built for your
-        // editor, looked up once and kept until you update.
+        // editor instead, and `:plugin-update org` moves it to a newer one.
         version: Some("v0.1.1".to_string()),
-        // Optionally pin the bytes, not just the tag.
+        // Optionally pin the exact bytes: the first word of the release's
+        // `org-<version>-api<M>.<m>.wasm.sha256`.
         sha256: None,
+        // org-mode turns itself on for `.org` files.
         enable_mode: None,
     });
 }
 ```
 
-lattice downloads the build made for its own plugin API
-(`org-<version>-api<M>.<m>.wasm`), checks it against the release's published
-checksum, and installs it into `~/.config/lattice/plugins/org/`; after that,
-starting the editor makes no network request. A release with no build for
-your editor is refused by name in `:plugins`, saying which it has. `:plugins`
-shows the source as `release dhruvasagar/lattice-org-plugin@v…`.
+Then `:reload-config` (or restart lattice). Lattice downloads the build made
+for its own plugin API (`org-<version>-api<M>.<m>.wasm`), checks it against
+the checksum the release publishes beside it and against the manifest inside
+it, and installs it into `~/.config/lattice/plugins/org/`. From then on,
+starting the editor makes no network request.
 
-### The normal way — `require` it from your `init.rs`
+**Check it worked:** `:plugins` lists `org` with its source,
+`release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
+you in `org-mode`. If it was refused, it is under the failed loads in
+`:plugins` with the reason — a release with no build for your editor says
+which it has, and an editor older than 0.9.10 says the version org needs.
 
-Lattice's config is itself a WASM component (`~/.config/lattice/init/`), and the
-`plugin-manager` seam is how it declares the plugins it wants. `require` is
-use-package's shape: name a source, optionally name a mode to enable, and the
-editor clones, builds and loads it.
+**Updating:** with a tag, change it and `:reload-config`. With `None`,
+`:plugin-update org` (or `u` on its row in `:plugins`) installs a newer
+release when there is one, and keeps what you have when there is not.
 
-Your init's manifest must list the `plugin-manager` seam — at the top of
-`src/lib.rs` in a config scaffolded by lattice 0.9.10 or later, in
-`~/.config/lattice/init/plugin.toml` in an older one:
+Then point org at your notes — see [Where org may write](#where-org-may-write).
 
-```toml
-id = "init"
-provides = ["plugin-manager"]
-doc = "My lattice config."
-```
+### From source — `require` it
 
-`~/.config/lattice/init/src/lib.rs`:
+Builds org on your machine: needs Rust, the `wasm32-wasip2` target and clang
+(org's tree-sitter grammar is C), and network access on a cold first build for
+the grammar clone. The way to run an unreleased `main`, or your own fork.
 
 ```rust
-wit_bindgen::generate!({
-    world: "plugin-manager-plugin",
-    path: "wit",
-});
-
-use lattice::plugin_host::plugin_manager::{self, GitSource, PluginSource, PluginSpec};
-
-struct Component;
-
-impl Guest for Component {
-    fn register_plugins() {
-        plugin_manager::require(&PluginSpec {
-            // The directory it caches under, and how the editor reports it.
-            name: "org".to_string(),
-            source: PluginSource::Git(GitSource {
-                url: "https://github.com/dhruvasagar/lattice-org-plugin".to_string(),
-                // A release tag, so every boot builds the same plugin. `None`
-                // tracks the default branch instead — newer, and unreleased.
-                rev: Some("v0.1.1".to_string()),
-            }),
-            // Sugar for "enable this mode once the plugin loads". Org declares
-            // its own `default_modes`, so this is only for a mode you want on
-            // that the plugin leaves off.
-            enable_mode: None,
-            // `true` = build only if the artifact is missing, never rebuild.
-            pinned: false,
-        });
-    }
+fn register_plugins() {
+    use lattice::plugin_host::plugin_manager::{self, GitSource, PluginSource, PluginSpec};
+    plugin_manager::require(&PluginSpec {
+        name: "org".to_string(),
+        source: PluginSource::Git(GitSource {
+            url: "https://github.com/dhruvasagar/lattice-org-plugin".to_string(),
+            // A release tag, so every boot builds the same plugin. `None`
+            // tracks the default branch instead — newer, and unreleased.
+            rev: Some("v0.1.1".to_string()),
+        }),
+        enable_mode: None,
+        // `true` = build only if the artifact is missing, never rebuild.
+        pinned: false,
+    });
 }
-
-export!(Component);
 ```
 
-`require` **records** the spec and returns; the host resolves, clones, builds
-and loads it after your registration export returns, off-thread. That is
-deliberate — a `require` that resolved inline would put a git clone and a cargo
-build inside a guest call on the boot path. So org's contributions appear a
-frame or two after boot on a cold first run, and instantly thereafter from the
-cache under `~/.config/lattice/plugins/`.
+`require` **records** the spec and returns; the host clones, builds and loads
+org after your config's registration returns, off-thread — a git clone and a
+cargo build never sit inside a guest call on the boot path. So on a cold
+first run org appears once its build finishes, and instantly thereafter from
+`~/.config/lattice/plugins/`. `PluginSource::Local("~/src/lattice-org-plugin".to_string())`
+builds a checkout of yours in place instead, so an edit and `:reload-config`
+picks it up.
 
-Building the component needs the `wasm32-wasip2` target and clang; a cold first
-boot also needs network access for the grammar clone.
+To switch between the two, replace one call with the other (keep
+`name: "org"`) and `:reload-config`.
 
 ### The manual way — stage it yourself
 
@@ -417,8 +419,12 @@ In normal use the plugin manager does this for you from the git source
 
 ## Releasing
 
-A release is a commit and a `vX.Y.Z` tag — nothing is built or uploaded,
-because every install builds from source and a user pins the tag.
+A release is a commit and a `vX.Y.Z` tag. Pushing the tag runs
+`.github/workflows/release.yml`, which calls lattice's reusable
+`plugin-release.yml`: it checks the tag is the crate version, builds org with
+lattice's `scripts/build-plugin.sh`, and publishes a GitHub release — the tag
+message as its notes — carrying `org-<version>-api<M>.<m>.wasm` and its
+`.sha256`. That asset is what `require_release` installs.
 
 ```sh
 scripts/release.sh                 # the current version and what each bump gives
@@ -431,8 +437,9 @@ Write what changed under `## Unreleased` in `CHANGELOG.md` as it lands; the
 script retitles that section with the version and date, records the plugin API
 the release builds against (`lattice:plugin-host@…`, from the locked
 `lattice-wit`), and uses the section as the tag message. It also bumps `Cargo.toml`, `Cargo.lock` and the
-version in this README — the `| Version |` row and the `rev:` pin above — and
-refuses to tag if either README line is out of shape. It stops before pushing.
+version in this README — the `| Version |` row, the `rev:` pin and the
+`version:` pin above — and refuses to tag if any of those lines is out of
+shape. It stops before pushing.
 
 ## Tests
 

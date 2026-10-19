@@ -245,21 +245,27 @@ seam.
 
 ### Configuring it
 
-Options are ordinary typed settings, so `:set` works live and
-`~/.config/lattice/lattice.toml` persists them (a project may override in
-`<workspace>/.lattice/config.toml`):
+Options are ordinary typed settings: `:set org.<name>=…` changes one live,
+and your `init.rs` sets them for every session. Set them from the handler for
+org's `pre-plugin-loaded` event — it fires after org has declared its options
+and before it reads any, and the load waits for it
+([lattice's `init.rs` guide](https://github.com/dhruvasagar/lattice/blob/main/docs/user/init.md#configuring-user-plugins-that-load-after-you)):
 
-```toml
-[org]
-directory = "~/notes"
-roam-directory = "~/notes/roam"
-todo-keywords = """
-sequence: TODO(t) NEXT(n) | DONE(d)
-type: PROJECT TO-READ READING
-"""
-agenda-files = "~/notes"
-inline-images = true
+```rust
+fn on_event(handler: u32, ev: Event) {
+    if let (1, Event::PrePluginLoaded(name)) = (handler, &ev) {
+        if name == "org" {
+            config::set_option("org.directory", "~/notes");
+            config::set_option("org.roam-directory", "~/notes/roam");
+            config::set_option("org.agenda-files", "~/notes");
+            config::set_option("org.inline-images", "true");
+        }
+    }
+}
 ```
+
+Not `lattice.toml`: it is read before any plugin has registered its options,
+so an `[org]` table there is reported as unknown options and ignored.
 
 ### Where org may write
 
@@ -273,7 +279,7 @@ two of org's own options**:
 | `org.roam-directory` | `~/org-roam` | your org-roam notes |
 
 The defaults are emacs's own (`org-directory`, `org-roam-directory`). Setting
-either option — in `lattice.toml`, your `init.rs`, or with `:set` — is how you
+either option — from your `init.rs`, or live with `:set` — is how you
 move the access; there is no separate grant to edit. Org reloads itself when
 the value changes, and `:plugins` shows what is in force
 (`fs:write ~/notes (org.directory)`). A write outside both is refused with a

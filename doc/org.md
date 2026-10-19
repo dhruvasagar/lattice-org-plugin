@@ -275,9 +275,12 @@ Org may write only under `org.directory` (default `~/org`) and
 at the boundary, with a message naming the option to change. Point the option
 at where your org files live — that setting *is* the permission:
 
-```toml
-org.directory = "~/notes"
 ```
+:set org.directory=~/notes
+```
+
+and from your `init.rs`, so it holds in every session — see
+[configuring user plugins](help:init#configuring-user-plugins-that-load-after-you).
 
 See [Capabilities and your configuration](help:plugins#capabilities-and-your-configuration).
 

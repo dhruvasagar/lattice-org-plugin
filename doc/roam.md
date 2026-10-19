@@ -15,9 +15,12 @@ an org user who keeps no notes pays nothing for this existing.
 
 ## Turning it on
 
-```toml
-org.roam-directory = "~/notes"
 ```
+:set org.roam-directory=~/notes
+```
+
+and from your `init.rs`, so it holds in every session — see
+[configuring user plugins](help:init#configuring-user-plugins-that-load-after-you).
 
 `~` is expanded. Setting it is also what lets org read and write there: org's
 file access follows this option (and `org.directory`), so there is no separate

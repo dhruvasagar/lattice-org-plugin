@@ -27,6 +27,14 @@ Needs **lattice 0.9.10** or later; an older editor refuses the plugin by name.
   until `org.roam-directory` exists, and capture drafts fall back as they
   did when `org.directory` was unset.
 
+### Documentation
+- **Configuring org.** The README's "Configuring it" shows the two places
+  org's options go: an `[org]` table in `lattice.toml` — which, from
+  lattice 0.9.10, is held until org loads instead of being reported as
+  unknown options — or `config::set_option` in your `init.rs`'s
+  `register_options`, which wins where both set one. It previously showed
+  an `[org]` table that lattice ignored.
+
 ### Upgrading
 - If your notes are not in `~/org`, set `org.directory` — in `lattice.toml`
   (`[org]` / `directory = "~/notes"`), in your `init.rs`'s

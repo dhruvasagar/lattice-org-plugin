@@ -4,6 +4,13 @@
 
 Needs **lattice 0.9.10** or later; an older editor refuses the plugin by name.
 
+### Added
+- **Install org without building it.** Each release now publishes the
+  component ready-built — `org-<version>-api<M>.<m>.wasm` and its
+  checksum — so `require_release` in your `init.rs` installs it with no
+  Rust toolchain, `wasm32-wasip2` target or clang (see the README).
+  Building from source with `require` still works as before.
+
 ### Changed
 - **Org is one file.** Its manifest is embedded in the component, so a
   release is the `.wasm` alone and there is no `plugin.toml` to copy or

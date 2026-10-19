@@ -1,0 +1,19 @@
+# Publish each release as a ready-built component, for users who install org
+# with `require_release` instead of building it (lattice PRL.8).
+#
+# `scripts/release.sh` tags; pushing the tag runs this. lattice's reusable
+# workflow checks the tag is the crate version, builds with lattice's
+# `scripts/build-plugin.sh`, and attaches `org-<version>-api<M>.<m>.wasm` and
+# its `.sha256` to a GitHub release whose notes are the tag's message — the
+# CHANGELOG section `release.sh` promoted.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: dhruvasagar/lattice/.github/workflows/plugin-release.yml@main
+    permissions:
+      contents: write

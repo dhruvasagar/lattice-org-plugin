@@ -9,11 +9,13 @@
 #   scripts/release.sh 0.3.0            # an explicit version
 #   scripts/release.sh minor --dry-run  # print every step, change nothing
 #
-# A release IS the tag. Every way of installing this plugin builds it from
-# source — `require` with a git source, or a clone and `cargo build` — so
-# there is no artefact to publish: a user pins `rev: Some("vX.Y.Z")` and the
-# plugin manager builds that commit. The tag is the whole contract, which is
-# why this script guards it and nothing else.
+# A release IS the tag. Pushing it is what publishes: a user who builds pins
+# `rev: Some("vX.Y.Z")` and the plugin manager builds that commit, and the
+# `release` workflow (lattice's reusable `plugin-release.yml`) builds the
+# component and attaches it — `org-X.Y.Z-api<M>.<m>.wasm` and its `.sha256` —
+# to a GitHub release, for a user who `require_release`s it without a Rust
+# toolchain. The tag is the whole contract, which is why this script guards
+# it and nothing else.
 #
 # The version lives in four places, and this script owns all of them:
 #
@@ -21,8 +23,9 @@
 #   Cargo.lock   this package's own entry (rewritten in place: no
 #                `cargo update`, so a release never moves a dependency and
 #                never needs the network)
-#   README.md    the `| Version |` row and the `rev:` pin in the `require`
-#                example — so the snippet a user copies installs this release
+#   README.md    the `| Version |` row, the `rev:` pin in the `require`
+#                example and the `version:` pin in the `require_release`
+#                one — so the snippet a user copies installs this release
 #   CHANGELOG.md `## Unreleased` retitled `## X.Y.Z — <date>`
 #
 # Each rewrite is checked afterwards. A README edited so a pattern no longer
@@ -174,6 +177,8 @@ grep -qE '^\| Version \| `v[0-9]+\.[0-9]+\.[0-9]+`' README.md \
     || die "README.md has no '| Version | \`vX.Y.Z\`' row for the bump to rewrite"
 grep -qE 'rev: Some\("v[0-9]+\.[0-9]+\.[0-9]+"\.to_string\(\)\)' README.md \
     || die "README.md has no 'rev: Some(\"vX.Y.Z\".to_string())' pin for the bump to rewrite"
+grep -qE 'version: Some\("v[0-9]+\.[0-9]+\.[0-9]+"\.to_string\(\)\)' README.md \
+    || die "README.md has no 'version: Some(\"vX.Y.Z\".to_string())' pin for the bump to rewrite"
 echo "  builds against $api"
 
 # ---------------------------------------------------------------- changelog
@@ -261,17 +266,18 @@ if [ "$dry_run" -eq 0 ]; then
         /^\| Version \| `v[0-9]+\.[0-9]+\.[0-9]+`/ {
             sub(/`v[0-9]+\.[0-9]+\.[0-9]+`/, "`v" ver "`")
         }
-        /rev: Some\("v[0-9]+\.[0-9]+\.[0-9]+"\.to_string\(\)\)/ {
+        /(rev|version): Some\("v[0-9]+\.[0-9]+\.[0-9]+"\.to_string\(\)\)/ {
             sub(/"v[0-9]+\.[0-9]+\.[0-9]+"/, "\"v" ver "\"")
         }
         { print }
     '
 fi
 if [ "$dry_run" -eq 1 ]; then
-    echo "  would set README.md's '| Version |' row and 'rev:' pin to $tag"
+    echo "  would set README.md's '| Version |' row and 'rev:' / 'version:' pins to $tag"
 else
     grep -qE "^\| Version \| \`v$next\`" README.md \
         && grep -qF "rev: Some(\"v$next\".to_string())" README.md \
+        && grep -qF "version: Some(\"v$next\".to_string())" README.md \
         || die "README.md was not rewritten to $tag — 'git diff README.md'"
     echo "  README.md names $tag"
 fi

@@ -156,6 +156,36 @@ with **zero renderer changes**. Pinned by
 Two ways in. Both end with the component staged under a directory lattice
 discovers at boot; the difference is who does the staging.
 
+### Without a Rust toolchain — the released build
+
+Every release publishes the component ready-built, so you can install org
+without Rust, the `wasm32-wasip2` target or clang. In your `init.rs`
+(lattice 0.9.10 or later):
+
+```rust
+use lattice::plugin_host::plugin_manager::{self, ReleaseSpec};
+
+fn register_plugins() {
+    plugin_manager::require_release(&ReleaseSpec {
+        name: "org".to_string(),
+        repo: "dhruvasagar/lattice-org-plugin".to_string(),
+        // A release tag. `None` takes the newest release built for your
+        // editor, looked up once and kept until you update.
+        version: Some("v0.1.1".to_string()),
+        // Optionally pin the bytes, not just the tag.
+        sha256: None,
+        enable_mode: None,
+    });
+}
+```
+
+lattice downloads the build made for its own plugin API
+(`org-<version>-api<M>.<m>.wasm`), checks it against the release's published
+checksum, and installs it into `~/.config/lattice/plugins/org/`; after that,
+starting the editor makes no network request. A release with no build for
+your editor is refused by name in `:plugins`, saying which it has. `:plugins`
+shows the source as `release dhruvasagar/lattice-org-plugin@v…`.
+
 ### The normal way — `require` it from your `init.rs`
 
 Lattice's config is itself a WASM component (`~/.config/lattice/init/`), and the

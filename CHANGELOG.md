@@ -21,8 +21,9 @@ Needs **lattice 0.9.10** or later; an older editor refuses the plugin by name.
   did when `org.directory` was unset.
 
 ### Upgrading
-- If your notes are not in `~/org`, set `org.directory` in your `init.rs`
-  (`register_options`; lattice holds it until org loads) or live with `:set`. Without it, archive, refile and capture into files
+- If your notes are not in `~/org`, set `org.directory` — in `lattice.toml`
+  (`[org]` / `directory = "~/notes"`), in your `init.rs`'s
+  `register_options`, or live with `:set`. Without it, archive, refile and capture into files
   outside `~/org` and `~/org-roam` are refused, with a message naming the
   option.
 

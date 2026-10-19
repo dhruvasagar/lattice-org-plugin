@@ -264,8 +264,17 @@ Setting `org.directory` and `org.roam-directory` here rather than from a
 `pre-plugin-loaded` handler matters: org's file access follows them, and set
 up front they are in place for org's first load instead of costing a reload.
 
-Not `lattice.toml`: it is read before any plugin has registered its options,
-so an `[org]` table there is reported as unknown options and ignored.
+Values that need no code can go in `~/.config/lattice/lattice.toml` instead —
+lattice holds them the same way until org declares the options:
+
+```toml
+[org]
+directory = "~/notes"
+roam-directory = "~/notes/roam"
+agenda-files = "~/notes"
+```
+
+Where both set an option, `init.rs` wins: it is read after `lattice.toml`.
 
 ### Where org may write
 

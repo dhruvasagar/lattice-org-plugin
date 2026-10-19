@@ -246,23 +246,23 @@ seam.
 ### Configuring it
 
 Options are ordinary typed settings: `:set org.<name>=…` changes one live,
-and your `init.rs` sets them for every session. Set them from the handler for
-org's `pre-plugin-loaded` event — it fires after org has declared its options
-and before it reads any, and the load waits for it
+and your `init.rs` sets them for every session — in `register_options`, even
+though org has not loaded yet: lattice holds each value and applies it when
+org declares the option
 ([lattice's `init.rs` guide](https://github.com/dhruvasagar/lattice/blob/main/docs/user/init.md#configuring-user-plugins-that-load-after-you)):
 
 ```rust
-fn on_event(handler: u32, ev: Event) {
-    if let (1, Event::PrePluginLoaded(name)) = (handler, &ev) {
-        if name == "org" {
-            config::set_option("org.directory", "~/notes");
-            config::set_option("org.roam-directory", "~/notes/roam");
-            config::set_option("org.agenda-files", "~/notes");
-            config::set_option("org.inline-images", "true");
-        }
-    }
+fn register_options() {
+    config::set_option("org.directory", "~/notes");
+    config::set_option("org.roam-directory", "~/notes/roam");
+    config::set_option("org.agenda-files", "~/notes");
+    config::set_option("org.inline-images", "true");
 }
 ```
+
+Setting `org.directory` and `org.roam-directory` here rather than from a
+`pre-plugin-loaded` handler matters: org's file access follows them, and set
+up front they are in place for org's first load instead of costing a reload.
 
 Not `lattice.toml`: it is read before any plugin has registered its options,
 so an `[org]` table there is reported as unknown options and ignored.

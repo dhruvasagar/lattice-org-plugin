@@ -2,7 +2,7 @@
 # Cut a release of the org plugin: bump the version, promote the changelog,
 # commit, tag. Nothing is pushed.
 #
-#   scripts/release.sh                  # current version + what each bump gives
+#   scripts/release.sh                  # last release + what each bump gives
 #   scripts/release.sh patch            # 0.1.0 -> 0.1.1
 #   scripts/release.sh minor            # 0.1.0 -> 0.2.0
 #   scripts/release.sh major            # 0.1.0 -> 1.0.0
@@ -36,6 +36,12 @@
 # against, read from the locked `lattice-wit` — a plugin version means
 # nothing without the editor it runs on, and a line written by hand is a line
 # that goes stale.
+#
+# Bumps count from the LAST RELEASE — the highest `vX.Y.Z` tag — not from
+# `Cargo.toml`. The two differ when `Cargo.toml` was bumped ahead of a
+# release, and counting from `Cargo.toml` then skips a version (lattice went
+# 0.9.9 -> 0.9.11 that way). A `Cargo.toml` already at the bump's result is
+# released as is; one already PAST it is refused rather than lowered.
 #
 # The first release tags the version the crate already carries: with no
 # `vX.Y.Z` tag for it, `scripts/release.sh X.Y.Z` (the current version)
@@ -89,12 +95,29 @@ rewrite() {
 }
 
 current="$(read_version)"
-[[ "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] \
+[[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
     || die "cannot parse version '$current' out of Cargo.toml"
-cur_major="${BASH_REMATCH[1]}"
-cur_minor="${BASH_REMATCH[2]}"
-cur_patch="${BASH_REMATCH[3]}"
 api="$(read_api)"
+
+# The highest released version: the greatest `vX.Y.Z` tag. Empty before the
+# first release, when bumps count from `Cargo.toml` instead.
+last_release() {
+    git tag --list 'v[0-9]*.[0-9]*.[0-9]*' \
+        | sed 's/^v//' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V | tail -1 || true
+}
+# Whether version $1 sorts strictly before $2.
+version_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
+}
+
+released="$(last_release)"
+base="${released:-$current}"
+[[ "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || die "cannot parse version '$base'"
+base_major="${BASH_REMATCH[1]}"
+base_minor="${BASH_REMATCH[2]}"
+base_patch="${BASH_REMATCH[3]}"
 
 if [ "$#" -eq 0 ]; then
     if git rev-parse -q --verify "refs/tags/v$current" >/dev/null; then
@@ -104,12 +127,13 @@ if [ "$#" -eq 0 ]; then
     fi
     cat <<USAGE
 
-  current   v$current ($tagged)
+  released  v${released:-none}
+  Cargo     v$current ($tagged)
   builds    against $api
 
-  patch     v$cur_major.$cur_minor.$((cur_patch + 1))
-  minor     v$cur_major.$((cur_minor + 1)).0
-  major     v$((cur_major + 1)).0.0
+  patch     v$base_major.$base_minor.$((base_patch + 1))
+  minor     v$base_major.$((base_minor + 1)).0
+  major     v$((base_major + 1)).0.0
 
   scripts/release.sh <patch|minor|major|X.Y.Z> [--dry-run]
 
@@ -130,12 +154,23 @@ done
 [ -n "$bump" ] || die "no bump given (patch|minor|major|X.Y.Z)"
 
 case "$bump" in
-    patch) next="$cur_major.$cur_minor.$((cur_patch + 1))" ;;
-    minor) next="$cur_major.$((cur_minor + 1)).0" ;;
-    major) next="$((cur_major + 1)).0.0" ;;
+    patch) next="$base_major.$base_minor.$((base_patch + 1))" ;;
+    minor) next="$base_major.$((base_minor + 1)).0" ;;
+    major) next="$((base_major + 1)).0.0" ;;
     *)     next="$bump" ;;
 esac
 [[ "$next" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "'$next' is not an X.Y.Z version"
+
+# Never backwards, and never a version already released.
+if [ -n "$released" ] && ! version_lt "$released" "$next"; then
+    die "v$next is not newer than the last release, v$released"
+fi
+# `Cargo.toml` already ahead of the bump asked for: releasing would LOWER it.
+if version_lt "$next" "$current"; then
+    die "Cargo.toml is already at $current, ahead of the $bump bump (v$next) from v${released:-$current}.
+  Release it as is:   scripts/release.sh $current
+  or go past it:      scripts/release.sh <X.Y.Z newer than $current>"
+fi
 tag="v$next"
 
 # Tagging the version already in Cargo.toml is allowed exactly once: it is
@@ -168,6 +203,12 @@ if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
 fi
 [ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ] \
     || die "tag $tag already exists on origin"
+# Tags were just fetched: re-check against the newest release anyone has cut,
+# not only the ones this clone knew about when the version was computed.
+released_now="$(last_release)"
+if [ -n "$released_now" ] && ! version_lt "$released_now" "$next"; then
+    die "v$next is not newer than the last release on origin, v$released_now"
+fi
 echo "  on main, in sync with origin/main, $tag is free"
 
 # The README names the release twice, and the bump below finds both by

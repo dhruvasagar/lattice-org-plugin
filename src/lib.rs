@@ -51,7 +51,8 @@
 // `tree-sitter` every motion, text object and action gets a `none` tree handle
 // and org silently falls back to matching `*` at line starts (OT.4).
 //
-// `min_lattice` — embedded manifests and option-bound grants are both 0.9.10.
+// `min_lattice` — embedded manifests and option-bound grants are both 0.9.11
+// (0.9.10 was never released: the tree carried it, the release skipped it).
 const MANIFEST: &[u8] = br#"
 id = "org"
 provides = [
@@ -66,7 +67,7 @@ capabilities = [
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-min_lattice = "0.9.10"
+min_lattice = "0.9.11"
 "#;
 #[unsafe(link_section = "lattice-manifest")]
 #[used]

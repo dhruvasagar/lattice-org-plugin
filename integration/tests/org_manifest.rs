@@ -66,8 +66,8 @@ fn the_component_carries_its_manifest() {
     assert_eq!(manifest.id, "org");
     assert_eq!(
         manifest.min_lattice,
-        Some((0, 9, 10)),
-        "embedded manifests and option-bound grants both need 0.9.10"
+        Some((0, 9, 11)),
+        "embedded manifests and option-bound grants both need 0.9.11"
     );
     let bound: Vec<String> = option_bound(&manifest)
         .into_iter()

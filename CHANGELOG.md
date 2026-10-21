@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Needs **lattice 0.9.10** or later; an older editor refuses the plugin by name.
+Needs **lattice 0.9.11** or later; an older editor refuses the plugin by name.
 
 ### Added
 - **Install org without building it.** Each release now publishes the
@@ -30,7 +30,7 @@ Needs **lattice 0.9.10** or later; an older editor refuses the plugin by name.
 ### Documentation
 - **Configuring org.** The README's "Configuring it" shows the two places
   org's options go: an `[org]` table in `lattice.toml` — which, from
-  lattice 0.9.10, is held until org loads instead of being reported as
+  lattice 0.9.11, is held until org loads instead of being reported as
   unknown options — or `config::set_option` in your `init.rs`'s
   `register_options`, which wins where both set one. It previously showed
   an `[org]` table that lattice ignored.

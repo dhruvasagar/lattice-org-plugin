@@ -11,10 +11,10 @@
 #
 # A release IS the tag. Pushing it is what publishes: a user who builds pins
 # `rev: Some("vX.Y.Z")` and the plugin manager builds that commit, and the
-# `release` workflow (lattice's reusable `plugin-release.yml`) builds the
-# component and attaches it — `org-X.Y.Z-api<M>.<m>.wasm` and its `.sha256` —
-# to a GitHub release, for a user who `require_release`s it without a Rust
-# toolchain. The tag is the whole contract, which is why this script guards
+# `release` workflow runs CI against the tagged commit and, only if it passes,
+# lattice's reusable `plugin-release.yml` builds the component and attaches
+# it — `org-X.Y.Z-api<M>.<m>.wasm` and its `.sha256` — to a GitHub release,
+# for a user who `require_release`s it without a Rust toolchain. The tag is the whole contract, which is why this script guards
 # it and nothing else.
 #
 # The version lives in four places, and this script owns all of them:

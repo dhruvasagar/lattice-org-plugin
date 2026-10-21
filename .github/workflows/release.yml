@@ -13,7 +13,16 @@ on:
     tags: ['v*']
 
 jobs:
+  # A release goes out green or not at all. The tag push starts this and the
+  # push to main starts `ci` separately, with nothing joining them — v0.1.2
+  # was published 54 s in, while its CI was still running. So CI runs here,
+  # against the tagged commit, and the release waits for it.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
   release:
+    needs: ci
     uses: dhruvasagar/lattice/.github/workflows/plugin-release.yml@main
     permissions:
       contents: write

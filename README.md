@@ -7,7 +7,7 @@ org-roam, shipped as a single WebAssembly component.
 
 | | |
 |---|---|
-| Version | `v0.1.1` · see [`CHANGELOG.md`](CHANGELOG.md) for what each release changed and the plugin API it builds against |
+| Version | `v0.1.2` · see [`CHANGELOG.md`](CHANGELOG.md) for what each release changed and the plugin API it builds against |
 | The editor | [github.com/dhruvasagar/lattice](https://github.com/dhruvasagar/lattice) · [website](https://dhruvasagar.github.io/lattice/) · [install](https://dhruvasagar.github.io/lattice/install/) |
 | This plugin's page | [dhruvasagar.github.io/lattice/plugins/org/](https://dhruvasagar.github.io/lattice/plugins/org/) |
 | Writing your own | [plugin authoring guide](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/guides/plugin-authoring.md) |
@@ -188,7 +188,7 @@ fn register_plugins() {
         repo: "dhruvasagar/lattice-org-plugin".to_string(),
         // A release tag. `None` takes the newest release built for your
         // editor instead, and `:plugin-update org` moves it to a newer one.
-        version: Some("v0.1.1".to_string()),
+        version: Some("v0.1.2".to_string()),
         // Optionally pin the exact bytes: the first word of the release's
         // `org-<version>-api<M>.<m>.wasm.sha256`.
         sha256: None,
@@ -231,7 +231,7 @@ fn register_plugins() {
             url: "https://github.com/dhruvasagar/lattice-org-plugin".to_string(),
             // A release tag, so every boot builds the same plugin. `None`
             // tracks the default branch instead — newer, and unreleased.
-            rev: Some("v0.1.1".to_string()),
+            rev: Some("v0.1.2".to_string()),
         }),
         enable_mode: None,
         // `true` = build only if the artifact is missing, never rebuild.

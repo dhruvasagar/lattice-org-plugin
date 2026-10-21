@@ -53,7 +53,12 @@
 //
 // `min_lattice` — embedded manifests and option-bound grants are both 0.9.11
 // (0.9.10 was never released: the tree carried it, the release skipped it).
-const MANIFEST: &[u8] = br#"
+//
+// Embedded with the SDK's `manifest!` (lattice-plugin-sdk 0.3.1), which writes
+// the `lattice-manifest` custom section on wasm targets only — the hand-rolled
+// `unsafe(link_section)` static it replaces was emitted on every target.
+lattice_plugin_sdk::manifest!(
+    r#"
 id = "org"
 provides = [
     "language", "modes", "grammar", "media", "scanned-excerpt-source",
@@ -68,10 +73,8 @@ capabilities = [
 ]
 editor_capabilities = ["tree-sitter"]
 min_lattice = "0.9.11"
-"#;
-#[unsafe(link_section = "lattice-manifest")]
-#[used]
-static LATTICE_MANIFEST: [u8; MANIFEST.len()] = *MANIFEST.first_chunk().unwrap();
+"#
+);
 
 // A plugin that provides TWO seams needs a world that imports both, and a
 // component implements exactly one world. Bundled plugins get theirs written

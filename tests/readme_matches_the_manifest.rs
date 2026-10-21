@@ -30,13 +30,14 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
-/// The manifest's TOML: the `MANIFEST` byte string in `src/lib.rs`.
+/// The manifest's TOML: the raw string `src/lib.rs` hands to
+/// `lattice_plugin_sdk::manifest!`.
 fn manifest_text() -> String {
     let lib = read("src/lib.rs");
     let (_, rest) = lib
-        .split_once("const MANIFEST: &[u8] = br#\"")
-        .expect("src/lib.rs declares the embedded `MANIFEST`");
-    rest.split_once("\"#;")
+        .split_once("lattice_plugin_sdk::manifest!(\n    r#\"")
+        .expect("src/lib.rs embeds its manifest with `lattice_plugin_sdk::manifest!`");
+    rest.split_once("\"#")
         .expect("the manifest literal closes")
         .0
         .to_owned()

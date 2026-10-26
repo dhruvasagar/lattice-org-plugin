@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Needs **lattice 0.9.12** or later: an editor speaking plugin API 0.3
+refuses this build by name.
+
+### Changed
+- **Plugin API 0.4.** org now builds against `lattice-wit` and
+  `lattice-plugin-sdk` 0.4.0, the API generation lattice 0.9.12 speaks.
+  Nothing org does changes. On lattice 0.9.11, pin org 0.1.2.
+
 ## 0.1.2 — 2026-10-21
 
 Builds against `lattice:plugin-host@0.3.x` (lattice-wit 0.3.1).

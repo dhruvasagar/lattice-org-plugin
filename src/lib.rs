@@ -54,7 +54,7 @@
 // `min_lattice` — embedded manifests and option-bound grants are both 0.9.11
 // (0.9.10 was never released: the tree carried it, the release skipped it).
 //
-// Embedded with the SDK's `manifest!` (lattice-plugin-sdk 0.3.1), which writes
+// Embedded with the SDK's `manifest!` (lattice-plugin-sdk 0.4.0), which writes
 // the `lattice-manifest` custom section on wasm targets only — the hand-rolled
 // `unsafe(link_section)` static it replaces was emitted on every target.
 lattice_plugin_sdk::manifest!(
@@ -87,8 +87,8 @@ min_lattice = "0.9.11"
 // both exports. Nothing in lattice changes to allow it.
 //
 // Three details, each of which is a build error if missed:
-//   * `include` needs the VERSION (`@0.3.0`) — the resolver knows
-//     `lattice:plugin-host@0.3.0`, not `lattice:plugin-host`.
+//   * `include` needs the VERSION (`@0.4.0`) — the resolver knows
+//     `lattice:plugin-host@0.4.0`, not `lattice:plugin-host`.
 //   * `generate_all` — without it wit-bindgen demands a `with` mapping for
 //     every interface reached through the include.
 //   * the inline package needs its own name, distinct from lattice's.
@@ -96,17 +96,17 @@ wit_bindgen::generate!({
     inline: r#"
         package lattice:org-plugin@0.1.0;
         world org-plugin {
-            include lattice:plugin-host/language-plugin@0.3.0;
-            include lattice:plugin-host/help-plugin@0.3.0;
-            include lattice:plugin-host/modes-plugin@0.3.0;
-            include lattice:plugin-host/grammar-plugin@0.3.0;
-            include lattice:plugin-host/config-plugin@0.3.0;
-            include lattice:plugin-host/media-plugin@0.3.0;
+            include lattice:plugin-host/language-plugin@0.4.0;
+            include lattice:plugin-host/help-plugin@0.4.0;
+            include lattice:plugin-host/modes-plugin@0.4.0;
+            include lattice:plugin-host/grammar-plugin@0.4.0;
+            include lattice:plugin-host/config-plugin@0.4.0;
+            include lattice:plugin-host/media-plugin@0.4.0;
             // OM.A1: the agenda seam. Its three exports (`extensions` /
             // `begin` / `scan`) sit at WORLD level, so they land on the same
             // `Guest` trait as `register-languages` rather than behind an
             // interface — which is why they read differently below.
-            include lattice:plugin-host/scanned-excerpt-source-plugin@0.3.0;
+            include lattice:plugin-host/scanned-excerpt-source-plugin@0.4.0;
             // OM.11: refile's target list. NOT `include
             // picker-source-plugin` — that world also imports `logging`, and
             // a component's imports must ALL be satisfiable on EVERY seam's
@@ -115,14 +115,14 @@ wit_bindgen::generate!({
             // "no logging reachable from the grammar hot path" invariant is
             // structural rather than a matter of discipline. Declaring only
             // what the source actually uses keeps it that way.
-            import lattice:plugin-host/host-services@0.3.0;
+            import lattice:plugin-host/host-services@0.4.0;
             // TK.3: one theme element per TODO state. NOT `include
             // theme-plugin` — that world imports `logging` too, and this
             // component is instantiated against the grammar seam's sync
             // linker where `logging` is absent. Same scar as the three
             // seams below; the export sits at world level, so it lands on
             // the same `Guest` trait as `register-languages`.
-            import lattice:plugin-host/theme@0.3.0;
+            import lattice:plugin-host/theme@0.4.0;
             export register-theme-elements: func();
             // OA.30: the agenda's bulk marks paint into the gutter. Two
             // seams, both exported BARE for the scar the comments above
@@ -133,16 +133,16 @@ wit_bindgen::generate!({
             // deliberately absent. `signs` declares what a mark looks like,
             // once; `decorations` says which lines carry one, on every
             // refresh.
-            import lattice:plugin-host/signs@0.3.0;
+            import lattice:plugin-host/signs@0.4.0;
             export register-signs: func();
-            export lattice:plugin-host/decorations@0.3.0;
+            export lattice:plugin-host/decorations@0.4.0;
             // OR.5b: the registry a picker plugin declares its sources
             // through. NOT `include picker-source-plugin` — that world also
             // imports `logging`, and this component is instantiated against
             // the grammar seam's sync linker where `logging` is absent. Same
             // scar as the seams below.
-            import lattice:plugin-host/picker-registry@0.3.0;
-            export lattice:plugin-host/picker-source@0.3.0;
+            import lattice:plugin-host/picker-registry@0.4.0;
+            export lattice:plugin-host/picker-source@0.4.0;
             export register-picker-sources: func();
             // MV.3: the agenda is org's view, so org declares it. NOT
             // `include multibuffer-view-plugin` — that world imports
@@ -152,8 +152,8 @@ wit_bindgen::generate!({
             // deliberately absent. Same scar as the seams above: OC.2 added
             // one `logging::log` call and the WHOLE plugin stopped
             // instantiating.
-            import lattice:plugin-host/multibuffer-view-registry@0.3.0;
-            export lattice:plugin-host/multibuffer-view-source@0.3.0;
+            import lattice:plugin-host/multibuffer-view-registry@0.4.0;
+            export lattice:plugin-host/multibuffer-view-source@0.4.0;
             export register-multibuffer-views: func();
             // OR.7: org-roam nodes inside an `[[…]]` link. NOT `include
             // completion-source-plugin` — that world imports `logging` too,
@@ -161,7 +161,7 @@ wit_bindgen::generate!({
             // EVERY linker it is instantiated against, including the grammar
             // seam's sync one where `logging` is deliberately absent. Same
             // scar as `picker-source` and `transient-source` above.
-            export lattice:plugin-host/completion-source@0.3.0;
+            export lattice:plugin-host/completion-source@0.4.0;
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
             // `logging` and `project`, and an import a component declares
@@ -171,7 +171,7 @@ wit_bindgen::generate!({
             // constraint: OC.2 added one `logging::log` call, the component
             // started importing `logging`, and the WHOLE plugin stopped
             // instantiating.
-            export lattice:plugin-host/transient-source@0.3.0;
+            export lattice:plugin-host/transient-source@0.4.0;
             // OC.6: the clock's async side. NOT `include events-plugin` — that
             // world also imports `logging` and `project`, and every import a
             // component declares must be satisfiable on EVERY linker it is
@@ -186,10 +186,10 @@ wit_bindgen::generate!({
             // neither a wake nor a modeline context. That is where "the clock's
             // session is off the keystroke path" (design D6) is actually
             // enforced.
-            import lattice:plugin-host/events@0.3.0;
-            import lattice:plugin-host/ui@0.3.0;
-            use lattice:plugin-host/types@0.3.0.{event};
-            use lattice:plugin-host/events@0.3.0.{wake-id};
+            import lattice:plugin-host/events@0.4.0;
+            import lattice:plugin-host/ui@0.4.0;
+            use lattice:plugin-host/types@0.4.0.{event};
+            use lattice:plugin-host/events@0.4.0.{wake-id};
             export register-events: func();
             export on-event: func(handler: u32, ev: event);
             export on-wake: func(id: wake-id);

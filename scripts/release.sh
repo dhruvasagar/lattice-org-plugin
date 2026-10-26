@@ -226,8 +226,16 @@ echo "  builds against $api"
 
 say "changelog"
 
-if ! extract_section "$next" | grep -q . \
-    && extract_section Unreleased | tail -n +2 | grep -q '[^[:space:]]'; then
+# Sections are captured and tested, never piped into `grep -q`: grep quits at
+# its first match, the writer upstream dies of SIGPIPE, and under pipefail a
+# section long enough to outrun the pipe reads as absent — lattice's 0.9.12
+# had a written `## Unreleased` stubbed over that way. `has_text` and
+# `has_section` keep the capture in one place.
+has_text() { [[ "$1" =~ [^[:space:]] ]]; }
+has_section() { [ -n "$(extract_section "$1")" ]; }
+unreleased_written() { has_text "$(extract_section Unreleased | tail -n +2)"; }
+
+if ! has_section "$next" && unreleased_written; then
     if [ "$dry_run" -eq 1 ]; then
         echo "  would retitle '## Unreleased' as '## $next — $(date +%F)'"
         echo "  would record: Builds against $api."
@@ -246,7 +254,7 @@ if ! extract_section "$next" | grep -q . \
     fi
 fi
 
-if [ "$dry_run" -eq 0 ] && ! extract_section "$next" | grep -q .; then
+if [ "$dry_run" -eq 0 ] && ! has_section "$next"; then
     rewrite CHANGELOG.md -v ver="$next" -v day="$(date +%F)" -v api="$api" -v marker="$STUB_MARKER" '
         { print }
         !inserted && $0 == "# Changelog" {
@@ -270,8 +278,7 @@ if [ "$dry_run" -eq 0 ]; then
         *"$STUB_MARKER"*) die "the '## $next' section of CHANGELOG.md is still the stub — write it first" ;;
     esac
     echo "  '## $next' section present — it becomes the tag message"
-elif ! extract_section "$next" | grep -q . \
-    && ! extract_section Unreleased | tail -n +2 | grep -q '[^[:space:]]'; then
+elif ! has_section "$next" && ! unreleased_written; then
     die "CHANGELOG.md has neither '## $next' nor a written '## Unreleased' section"
 fi
 

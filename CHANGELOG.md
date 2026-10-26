@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-10-26
+
+Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.0).
 
 Needs **lattice 0.9.12** or later: an editor speaking plugin API 0.3
 refuses this build by name.

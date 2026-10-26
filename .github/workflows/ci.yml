@@ -57,6 +57,12 @@ on:
   # it passes. (No concurrency group here; if one is added, key it with a
   # fixed prefix — called from the release, `github.workflow` is the
   # CALLER's name, and a group shared with the caller deadlocks.)
+  #
+  # So the release commit's own push to main runs nothing: `release.sh`'s
+  # push sends it and its tag together, and the tag's run is the one that
+  # gates. Every job carries the `if:` that says so. It tests the ref as
+  # well as the message because a called workflow sees its CALLER's context
+  # — the tag push carries the same head commit, and must still run.
   workflow_call:
 
 env:
@@ -65,6 +71,7 @@ env:
 jobs:
   component:
     name: component (${{ matrix.os }})
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -163,6 +170,7 @@ jobs:
 
   fmt:
     name: fmt
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -190,6 +198,7 @@ jobs:
 
   clippy:
     name: clippy
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -202,6 +211,7 @@ jobs:
 
   integration:
     name: integration tests
+    if: "${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'chore(release): v')) }}"
     runs-on: ubuntu-latest
     steps:
       # The sibling layout `integration/Cargo.toml` expects:

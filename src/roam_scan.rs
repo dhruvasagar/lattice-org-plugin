@@ -24,6 +24,7 @@
 use crate::lattice::plugin_host::config::get_option;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::tree_sitter;
+use crate::lattice::plugin_host::types::{EchoLevel, UiNotification};
 use crate::{roam, roam_index, roam_tree, todo};
 
 /// The corpus root, or `None` when roam is not configured.
@@ -225,6 +226,7 @@ mod scan {
     pub const MIN_PER_CALL: usize = 1;
 
     pub struct Scan {
+        pub root: String,
         pub files: Vec<String>,
         pub at: usize,
         pub changed: usize,
@@ -261,12 +263,19 @@ pub fn begin() -> usize {
     // arming would be observed by neither, and the symptom — a note you know
     // you wrote missing from the picker — reads as data loss.
     let _ = host_services::watch(&root);
-    // A denied or unwalkable root is a silent zero, deliberately. **The guest
-    // must not log**: calling `logging::log` makes the component IMPORT
-    // `logging`, which org's multi-seam linker does not wire on the grammar
-    // seam, and the WHOLE component then fails to instantiate (OC.2).
-    let Ok(all) = host_services::walk(&root) else {
-        return 0;
+    // **The guest must not log**: calling `logging::log` makes the component
+    // IMPORT `logging`, which org's multi-seam linker does not wire on the
+    // grammar seam, and the WHOLE component then fails to instantiate (OC.2).
+    // `ui` is wired on both, so a denied or unwalkable root is reported there.
+    let all = match host_services::walk(&root) {
+        Ok(all) => all,
+        Err(error) => {
+            notify(
+                EchoLevel::Warn,
+                format!("org-roam: could not read {root}: {error}"),
+            );
+            return 0;
+        }
     };
     let drafts = crate::capture_drafts_dir();
     let files: Vec<String> = all
@@ -280,6 +289,7 @@ pub fn begin() -> usize {
     let keywords = todo_keywords();
     scan::SCAN.with(|s| {
         *s.borrow_mut() = Some(scan::Scan {
+            root: root.clone(),
             files,
             at: 0,
             changed: 0,
@@ -288,6 +298,10 @@ pub fn begin() -> usize {
     });
     if total == 0 {
         crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
+        notify(
+            EchoLevel::Info,
+            format!("org-roam: no .org files under {root}"),
+        );
         return 0;
     }
     publish_progress(0, total);
@@ -347,7 +361,8 @@ pub fn step(generation: u64) -> bool {
             // records whose hashes all match over a blob that is missing or
             // stale. Gating this on `changed` made that state permanent: the
             // picker stayed wrong and `:org-roam-sync` could not repair it.
-            roam_index::rebuild_nodes_blob();
+            let nodes = roam_index::rebuild_nodes_blob();
+            report_finished(&sc.root, nodes, total, sc.changed);
             *borrow = None;
             crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
         } else {
@@ -367,6 +382,43 @@ fn publish_progress(at: usize, total: usize) {
         crate::ROAM_SEGMENT,
         &format!("\u{27f3} roam {at}/{total}"),
     );
+}
+
+/// Write one line to `*messages*`.
+fn notify(level: EchoLevel, message: String) {
+    crate::lattice::plugin_host::ui::notify(&UiNotification { level, message });
+}
+
+/// `1 node`, `2 nodes`.
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// How a scan ended, in `*messages*`.
+///
+/// Only a completed scan reports, so a scan replaced by a newer one says nothing
+/// and the watcher's small re-indexes do not fill the buffer. Zero nodes is a
+/// warning because the picker will be empty: files that were found but gave no
+/// node either carry no `:ID:` or could not be parsed.
+fn report_finished(root: &str, nodes: usize, files: usize, changed: usize) {
+    let files = count(files, "file");
+    if nodes == 0 {
+        notify(
+            EchoLevel::Warn,
+            format!(
+                "org-roam: no nodes in {files} under {root}: a note needs an `:ID:`, \
+                 and the org grammar must be able to parse it"
+            ),
+        );
+    } else {
+        notify(
+            EchoLevel::Info,
+            format!(
+                "org-roam: indexed {} from {files} under {root} ({changed} changed)",
+                count(nodes, "node")
+            ),
+        );
+    }
 }
 
 /// Re-index exactly the paths a watcher reported.

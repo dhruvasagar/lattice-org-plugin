@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.1).
+
+Needs **lattice 0.9.14** or later, for `ui.notify`.
+
+### Added
+- **A roam scan reports how it finished in `*messages*`:** the nodes and files
+  it indexed, or that it found no nodes, no `.org` files or an unreadable
+  directory.
+
+### Changed
+- **`:org-roam-sync` says when there is nothing to scan.** With no usable
+  `org.roam-directory`, it now says so instead of echoing "re-scanning…".
+
 ### Fixed
 - **`:org-roam-find-node` could stay empty for good after an interrupted
   scan.** The picker's list is written at the end of a scan, and a later scan

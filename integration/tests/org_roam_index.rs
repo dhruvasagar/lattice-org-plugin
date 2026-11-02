@@ -145,6 +145,9 @@ fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::Disp
 
 fn boot_sealed_editor() -> Editor {
     lattice_plugin_loader::disable_autoload();
+    // Before the boot: it claims the process's one global subscriber for its own
+    // ring, and the first test to get there would leave `messages()` deaf.
+    let _ = messages();
     Editor::boot(CoreDocument::from_text("scratch\n"))
 }
 
@@ -322,6 +325,9 @@ async fn index_corpus_with_editor(base: &Path, corpus: &Path) -> Option<(Index, 
     if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
         host.set_buffer_store((*buffers).clone());
     }
+    // `install` wires this too. The `ui` seam needs it, for the scan's progress
+    // segment and for the line it writes to `*messages*` when it finishes.
+    host.set_modeline(editor.modeline.clone(), editor.event_bus.clone());
     let loader = loader_over_editor(&editor, host.clone());
     for found in discover(&plugins) {
         loader
@@ -2296,6 +2302,118 @@ async fn a_stale_blob_is_replaced_by_a_scan_with_nothing_to_reparse() {
         settle(|| index.nodes().len() >= 4).await,
         "the blob must be rebuilt from the records: {:?}",
         index.nodes().iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+}
+
+/// The records `*messages*` is built from, through the real layer.
+///
+/// Installed once for this test binary, because the scan logs from the event
+/// actor's thread, which a thread-scoped subscriber would not see. Tests run in
+/// parallel, so each picks out its own lines by its corpus path.
+fn messages() -> Arc<std::sync::Mutex<lattice_runtime::messages::MessagesRing>> {
+    static RING: std::sync::OnceLock<
+        Arc<std::sync::Mutex<lattice_runtime::messages::MessagesRing>>,
+    > = std::sync::OnceLock::new();
+    RING.get_or_init(|| {
+        let ring = Arc::new(std::sync::Mutex::new(
+            lattice_runtime::messages::MessagesRing::with_capacity(100_000),
+        ));
+        lattice_runtime::messages_subscriber::install_messages_subscriber(
+            Arc::clone(&ring),
+            Arc::new(lattice_runtime::EventBus::new()),
+            "info",
+            false,
+        );
+        ring
+    })
+    .clone()
+}
+
+/// The `org-roam:` lines naming `corpus`, oldest first.
+fn roam_messages(corpus: &Path) -> Vec<(lattice_grammar::EchoLevel, String)> {
+    let corpus = corpus.display().to_string();
+    let ring = messages();
+    let ring = ring.lock().unwrap();
+    ring.records()
+        .iter()
+        .filter(|r| r.text.starts_with("org-roam:") && r.text.contains(&corpus))
+        .map(|r| (r.level, r.text.clone()))
+        .collect()
+}
+
+/// **A finished scan says so**, including a scan that found nothing to do, which
+/// is the `:org-roam-sync` someone runs to find out what happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_scan_reports_in_messages() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((_index, editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("SKIP: org component not built");
+        return;
+    };
+
+    assert!(
+        settle(|| roam_messages(&corpus)
+            .iter()
+            .any(|(_, text)| text.contains("indexed") && !text.contains("(0 changed)")))
+        .await,
+        "the first scan reports what it indexed: {:?}",
+        roam_messages(&corpus)
+    );
+    let settled = roam_messages(&corpus).len();
+    sync(&editor).await;
+    assert!(
+        settle(|| roam_messages(&corpus).len() > settled).await,
+        "a re-scan with nothing changed reports too: {:?}",
+        roam_messages(&corpus)
+    );
+    let (level, text) = roam_messages(&corpus).pop().unwrap();
+    assert_eq!(level, lattice_grammar::EchoLevel::Info, "{text}");
+    assert!(text.contains("(0 changed)"), "{text}");
+}
+
+/// Files with no node leave the picker empty, so that is a warning that says
+/// what a note needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_that_finds_no_nodes_warns() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    std::fs::create_dir_all(&corpus).unwrap();
+    std::fs::write(corpus.join("plain.org"), "#+title: No id here\n\nbody\n").unwrap();
+    if index_corpus(base.path(), &corpus).await.is_none() {
+        eprintln!("SKIP: org component not built");
+        return;
+    }
+
+    assert!(
+        settle(|| !roam_messages(&corpus).is_empty()).await,
+        "the scan reports"
+    );
+    let (level, text) = roam_messages(&corpus).pop().unwrap();
+    assert_eq!(level, lattice_grammar::EchoLevel::Warn, "{text}");
+    assert!(text.contains("no nodes in 1 file"), "{text}");
+    assert!(text.contains(":ID:"), "says what a note needs: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_with_no_org_files_says_so() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    std::fs::create_dir_all(&corpus).unwrap();
+    std::fs::write(corpus.join("README.md"), "not a note\n").unwrap();
+    if index_corpus(base.path(), &corpus).await.is_none() {
+        eprintln!("SKIP: org component not built");
+        return;
+    }
+
+    assert!(
+        settle(|| roam_messages(&corpus)
+            .iter()
+            .any(|(_, text)| text.contains("no .org files")))
+        .await,
+        "{:?}",
+        roam_messages(&corpus)
     );
 }
 

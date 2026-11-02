@@ -55,6 +55,15 @@ A scan of any size shows its progress in the modeline, on the right:
 Not an echo. A scan outlives the message line, and a long scan and a dead one
 must not look the same.
 
+When it finishes, it says how it went in `*messages*`:
+
+```
+org-roam: indexed 706 nodes from 706 files under /home/you/org-roam (3 changed)
+```
+
+No nodes, no `.org` files or an unreadable directory each get their own line
+there too, so an empty `:org-roam-find-node` has an explanation.
+
 A large corpus is indexed **across many steps** rather than in one pass — each
 step runs for a bounded slice of wall-clock and then rings its own doorbell
 until the queue drains. That is why the count climbs instead of the editor

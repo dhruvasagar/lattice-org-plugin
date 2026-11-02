@@ -72,7 +72,7 @@ capabilities = [
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-min_lattice = "0.9.11"
+min_lattice = "0.9.14"
 "#
 );
 
@@ -10219,6 +10219,12 @@ impl GrammarCallbacks for Component {
             // note.
             ROAM_CREATE_FROM_TEMPLATE => Ok(roam_create_from_template(&ctx)),
             ROAM_SYNC => {
+                if roam_scan::roam_directory().is_none() {
+                    return Ok(vec![Effect::Echo(EchoPayload {
+                        level: EchoLevel::Warn,
+                        text: roam_scan::not_configured(),
+                    })]);
+                }
                 host_services::emit_event(EV_ROAM_SYNC, &[]);
                 Ok(vec![Effect::Echo(EchoPayload {
                     level: EchoLevel::Info,

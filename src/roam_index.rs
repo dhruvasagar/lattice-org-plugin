@@ -262,8 +262,8 @@ pub fn is_empty() -> bool {
 /// Called **once per batch**, not once per file: it is O(nodes) in host calls,
 /// so doing it per file would make a cold index quadratic. That is why
 /// [`index_file`] reports whether it changed anything rather than rebuilding
-/// itself.
-pub fn rebuild_nodes_blob() {
+/// itself. Returns how many nodes the blob now holds.
+pub fn rebuild_nodes_blob() -> usize {
     let keys = host_services::store_keys(NODE_PREFIX);
     let mut nodes: Vec<Node> = Vec::with_capacity(keys.len());
     for key in keys {
@@ -272,6 +272,7 @@ pub fn rebuild_nodes_blob() {
         }
     }
     put_encoded(NODES_KEY, &nodes);
+    nodes.len()
 }
 
 /// What the store last recorded for `path`.

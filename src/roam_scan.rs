@@ -341,9 +341,13 @@ pub fn step(generation: u64) -> bool {
             // The blob is rebuilt ONCE, at the end — rebuilding per batch would
             // make a cold scan quadratic in host calls, which is the cost the
             // whole batching exists to avoid paying twice.
-            if sc.changed > 0 {
-                roam_index::rebuild_nodes_blob();
-            }
+            //
+            // Even when nothing changed. The per-file records and this blob are
+            // written at different times, so a scan that died in between leaves
+            // records whose hashes all match over a blob that is missing or
+            // stale. Gating this on `changed` made that state permanent: the
+            // picker stayed wrong and `:org-roam-sync` could not repair it.
+            roam_index::rebuild_nodes_blob();
             *borrow = None;
             crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
         } else {

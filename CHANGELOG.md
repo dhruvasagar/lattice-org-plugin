@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **`:org-roam-find-node` could stay empty for good after an interrupted
+  scan.** The picker's list is written at the end of a scan, and a later scan
+  only rewrote it if some note had changed. So a first scan that was cut short
+  left every note indexed and no list, and neither a restart nor
+  `:org-roam-sync` brought it back. Every completed scan now rewrites the list.
+
 ## 0.2.0 — 2026-10-26
 
 Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.0).

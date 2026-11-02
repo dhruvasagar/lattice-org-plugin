@@ -2196,6 +2196,109 @@ async fn a_corpus_larger_than_one_batch_indexes_without_trapping() {
     assert_eq!(one.title, "Bulk Note 42");
 }
 
+/// Index `corpus` once, then copy the store it wrote into a second data
+/// directory with `damage` applied to that copy — the state a later boot of the
+/// editor finds on disk. A copy, because the first boot's store is still alive
+/// and flushes when it drops.
+async fn a_store_left_behind(
+    first: &Path,
+    second: &Path,
+    corpus: &Path,
+    damage: impl FnOnce(&mut lattice_plugin_host::plugin_store::PluginStore),
+) -> bool {
+    let Some(index) = index_corpus(first, corpus).await else {
+        return false;
+    };
+    assert!(
+        settle(|| index.nodes().len() >= 4).await,
+        "the first scan builds the index"
+    );
+    lattice_plugin_host::plugin_store::flush_all();
+
+    fn find_store(dir: &Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = find_store(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == "plugin-store.bin") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let written = find_store(&first.join("data")).expect("the first scan wrote a store");
+    let relative = written.strip_prefix(first).unwrap();
+    let copied = second.join(relative);
+    std::fs::create_dir_all(copied.parent().unwrap()).unwrap();
+    std::fs::copy(&written, &copied).unwrap();
+
+    let mut store = lattice_plugin_host::plugin_store::PluginStore::open(copied.parent().unwrap());
+    damage(&mut store);
+    store.flush();
+    true
+}
+
+/// **A scan with nothing to re-parse still rebuilds the picker's list.**
+///
+/// The per-file records and the `nodes` blob are written at different times: a
+/// record per file as the scan goes, the blob once at the end. A scan that dies
+/// in between — the editor closed, the plugin quarantined — leaves records whose
+/// hashes all match and no blob. Every later scan then found every file
+/// unchanged, and the rebuild was gated on something having changed, so the
+/// picker stayed empty for good and `:org-roam-sync` could not repair it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_that_died_before_writing_the_blob_is_repaired_by_the_next() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let (first, second) = (base.path().join("first"), base.path().join("second"));
+    if !a_store_left_behind(&first, &second, &corpus, |store| {
+        store.delete("nodes").unwrap();
+    })
+    .await
+    {
+        eprintln!("SKIP: org component not built");
+        return;
+    }
+
+    let index = index_corpus(&second, &corpus).await.unwrap();
+    assert!(
+        settle(|| index.nodes().len() >= 4).await,
+        "every file's hash matches, and the picker's list must come back anyway: {:?}",
+        index.nodes().iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+}
+
+/// The same gap with a blob present: one written before a scan that indexed some
+/// changes and then died. Testing only for a MISSING blob would leave this one
+/// stale until a note happened to change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_blob_is_replaced_by_a_scan_with_nothing_to_reparse() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let (first, second) = (base.path().join("first"), base.path().join("second"));
+    if !a_store_left_behind(&first, &second, &corpus, |store| {
+        // An empty list encodes the same whatever its element type.
+        let nothing = rmp_serde::to_vec(&Vec::<u8>::new()).unwrap();
+        store.put("nodes", nothing).unwrap();
+    })
+    .await
+    {
+        eprintln!("SKIP: org component not built");
+        return;
+    }
+
+    let index = index_corpus(&second, &corpus).await.unwrap();
+    assert!(
+        settle(|| index.nodes().len() >= 4).await,
+        "the blob must be rebuilt from the records: {:?}",
+        index.nodes().iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+}
+
 /// **The emacs `<C-c>` spellings reach the same commands as the
 /// `<leader>o…` ones.**
 ///

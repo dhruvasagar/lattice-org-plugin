@@ -3087,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-agent"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-config",
  "lattice-core",
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-ai"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "agent-client-protocol",
  "arc-swap",
@@ -3133,14 +3133,14 @@ dependencies = [
 
 [[package]]
 name = "lattice-cells"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-theme",
 ]
 
 [[package]]
 name = "lattice-compilation"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "fancy-regex",
@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-completion"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-cells",
  "lattice-core",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-config"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "dirs",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-config-macros"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-core"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "dirs",
  "fancy-regex",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-dashboard"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "lattice-cells",
@@ -3232,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-diff"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "imara-diff",
@@ -3255,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-format"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-diff",
  "lattice-protocol",
@@ -3266,7 +3266,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-grammar"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "fancy-regex",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-help"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "lattice-completion",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-host"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "dirs",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-keymap"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "internment",
@@ -3358,7 +3358,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-listing"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-cells",
  "lattice-config",
@@ -3371,7 +3371,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-lsp"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "futures",
@@ -3398,7 +3398,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-magit"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "lattice-cells",
@@ -3424,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-media"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "image",
  "lattice-cells",
@@ -3435,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-mode"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "bitflags 2.13.0",
@@ -3448,6 +3448,7 @@ dependencies = [
  "lattice-keymap",
  "lattice-protocol",
  "lattice-runtime",
+ "lattice-theme",
  "linkme",
  "smallvec",
  "thiserror 2.0.18",
@@ -3458,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-multibuffer"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "fancy-regex",
@@ -3480,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-notify"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-config",
  "lattice-core",
@@ -3523,7 +3524,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-picker"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -3541,14 +3542,14 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-api"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "wit-parser",
 ]
 
 [[package]]
 name = "lattice-plugin-host"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3588,7 +3589,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-loader"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "dirs",
  "futures",
@@ -3620,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-manager"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-cells",
  "lattice-compilation",
@@ -3639,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-trace"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "lattice-cells",
  "lattice-config",
@@ -3657,7 +3658,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-protocol"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "linkme",
  "serde",
@@ -3667,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-runtime"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "futures",
@@ -3686,9 +3687,10 @@ dependencies = [
 
 [[package]]
 name = "lattice-snippet"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
+ "chrono",
  "lattice-completion",
  "lattice-config",
  "lattice-core",
@@ -3696,6 +3698,9 @@ dependencies = [
  "lattice-mode",
  "lattice-picker",
  "lattice-protocol",
+ "lattice-runtime",
+ "lattice-theme",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3704,7 +3709,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-syntax"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "lattice-cells",
@@ -3744,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-terminal"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "alacritty_terminal",
  "arc-swap",
@@ -3764,7 +3769,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-theme"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "arc-swap",
  "tracing",
@@ -3772,7 +3777,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-vcs"
-version = "0.9.11"
+version = "0.9.13"
 dependencies = [
  "gix",
  "ropey",
@@ -3782,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-wit"
-version = "0.3.1"
+version = "0.4.1"
 
 [[package]]
 name = "lazy_static"

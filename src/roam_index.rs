@@ -263,7 +263,11 @@ pub fn is_empty() -> bool {
 /// so doing it per file would make a cold index quadratic. That is why
 /// [`index_file`] reports whether it changed anything rather than rebuilding
 /// itself. Returns how many nodes the blob now holds.
-pub fn rebuild_nodes_blob() -> usize {
+///
+/// The count, or why the list could not be saved. A failed write is reported
+/// rather than dropped: "find a node" reads this blob alone, so it would go on
+/// offering the previous list while the scan said it had indexed the new one.
+pub fn rebuild_nodes_blob() -> Result<usize, String> {
     let keys = host_services::store_keys(NODE_PREFIX);
     let mut nodes: Vec<Node> = Vec::with_capacity(keys.len());
     for key in keys {
@@ -271,8 +275,9 @@ pub fn rebuild_nodes_blob() -> usize {
             nodes.push(node);
         }
     }
-    put_encoded(NODES_KEY, &nodes);
-    nodes.len()
+    let bytes = encode(&nodes).ok_or_else(|| "the node list did not serialise".to_string())?;
+    host_services::store_put(NODES_KEY, &bytes)?;
+    Ok(nodes.len())
 }
 
 /// What the store last recorded for `path`.

@@ -262,7 +262,7 @@ pub fn begin() -> usize {
     // BEFORE the walk: a file written between the walk finishing and the watch
     // arming would be observed by neither, and the symptom — a note you know
     // you wrote missing from the picker — reads as data loss.
-    let _ = host_services::watch(&root);
+    let watched = host_services::watch(&root);
     // **The guest must not log**: calling `logging::log` makes the component
     // IMPORT `logging`, which org's multi-seam linker does not wire on the
     // grammar seam, and the WHOLE component then fails to instantiate (OC.2).
@@ -277,6 +277,20 @@ pub fn begin() -> usize {
             return 0;
         }
     };
+    // A watch that could not arm is reported, but only once the walk has
+    // worked: a root that cannot be read fails both, and one line says that.
+    // The walk still indexes what is there now; without this line, a note
+    // written outside lattice afterwards would be missing from the picker
+    // with nothing to say why.
+    if let Err(error) = watched {
+        notify(
+            EchoLevel::Warn,
+            format!(
+                "org-roam: cannot watch {root}, so notes changed outside lattice \
+                 are picked up only by `:org-roam-sync` or a restart: {error}"
+            ),
+        );
+    }
     let drafts = crate::capture_drafts_dir();
     let files: Vec<String> = all
         .into_iter()
@@ -361,8 +375,10 @@ pub fn step(generation: u64) -> bool {
             // records whose hashes all match over a blob that is missing or
             // stale. Gating this on `changed` made that state permanent: the
             // picker stayed wrong and `:org-roam-sync` could not repair it.
-            let nodes = roam_index::rebuild_nodes_blob();
-            report_finished(&sc.root, nodes, total, sc.changed);
+            match roam_index::rebuild_nodes_blob() {
+                Ok(nodes) => report_finished(&sc.root, nodes, total, sc.changed),
+                Err(error) => report_unsaved(&sc.root, &error),
+            }
             *borrow = None;
             crate::lattice::plugin_host::ui::clear_segment(crate::ROAM_SEGMENT);
         } else {
@@ -421,6 +437,18 @@ fn report_finished(root: &str, nodes: usize, files: usize, changed: usize) {
     }
 }
 
+/// The scan read the notes but could not save the list "find a node" reads,
+/// so the picker still offers the previous one.
+fn report_unsaved(root: &str, error: &str) {
+    notify(
+        EchoLevel::Warn,
+        format!(
+            "org-roam: could not save the node list for {root}, so finding a node \
+             shows the previous one: {error}"
+        ),
+    );
+}
+
 /// Re-index exactly the paths a watcher reported.
 ///
 /// The watcher's common case, and the reason the batch shape matters: a `git
@@ -439,7 +467,13 @@ pub fn reindex(paths: &[String]) -> usize {
         }
     }
     if changed > 0 {
-        roam_index::rebuild_nodes_blob();
+        // The watcher's re-index is silent when it works — it would otherwise
+        // write a line per save — and says so only when the picker is now
+        // out of date.
+        if let Err(error) = roam_index::rebuild_nodes_blob() {
+            let root = roam_directory().unwrap_or_default();
+            report_unsaved(&root, &error);
+        }
     }
     changed
 }

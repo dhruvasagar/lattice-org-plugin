@@ -10,6 +10,11 @@ Needs **lattice 0.9.14** or later, for `ui.notify`.
 - **A roam scan reports how it finished in `*messages*`:** the nodes and files
   it indexed, or that it found no nodes, no `.org` files or an unreadable
   directory.
+- **Roam says when the index can fall behind.** If lattice cannot watch the
+  roam directory, a scan says that notes changed outside lattice will be
+  picked up only by `:org-roam-sync` or a restart. If a scan or a re-index
+  cannot save the list "find a node" reads, it says the picker still shows the
+  previous list, where it used to report success.
 
 ### Changed
 - **`:org-roam-sync` says when there is nothing to scan.** With no usable

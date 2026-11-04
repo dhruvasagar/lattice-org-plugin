@@ -21,6 +21,11 @@ Needs **lattice 0.9.14** or later, for `ui.notify`.
   only rewrote it if some note had changed. So a first scan that was cut short
   left every note indexed and no list, and neither a restart nor
   `:org-roam-sync` brought it back. Every completed scan now rewrites the list.
+- **Building org from a local checkout uses the API it pins.** Before each
+  build, lattice rewrites a local plugin's `wit/` with its own API, and the
+  rewrite did not cause org's build script to rerun. An editor older than
+  org's `lattice-wit` pin therefore left its older API in place, and the build
+  failed: lattice 0.9.13 has no `ui.notify`.
 
 ## 0.2.0 — 2026-10-26
 

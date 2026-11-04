@@ -29,6 +29,16 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=queries");
+    // And whenever `wit/` changes under us. lattice rewrites a local plugin's
+    // `wit/` with ITS OWN API before every build it runs (the loader's
+    // `refresh_wit_package`), so an editor older than this pin leaves its
+    // older API here. Cargo did not count that as a reason to rerun this
+    // script, so the pin above never got re-applied and the build failed
+    // against the older API: 0.9.13's `ui` has no `notify`. Watching the
+    // directory keeps the pin the last word. The write above is
+    // content-preserving, so this settles after one extra run rather than
+    // rerunning every build.
+    println!("cargo:rerun-if-changed=wit");
     // Which clang builds the grammar is an input to the result. Without this,
     // a cached EMPTY grammar.wasm — written by the fallback below when the
     // compiler could not target wasm32 — survives pointing CLANG at one that

@@ -297,13 +297,20 @@ Setting `org.directory` and `org.roam-directory` here rather than from a
 up front they are in place for org's first load instead of costing a reload.
 
 Values that need no code can go in `~/.config/lattice/lattice.toml` instead —
-lattice holds them the same way until org declares the options:
+lattice holds them the same way until org declares the options, lists and
+capture templates included:
 
 ```toml
 [org]
 directory = "~/notes"
 roam-directory = "~/notes/roam"
-agenda-files = "~/notes"
+agenda-files = ["~/notes"]
+
+[[org.capture-templates]]
+key = "t"
+description = "todo"
+target = { file = "~/notes/inbox.org" }
+body = "* TODO %?"
 ```
 
 Where both set an option, `init.rs` wins: it is read after `lattice.toml`.

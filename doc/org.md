@@ -279,8 +279,10 @@ at where your org files live — that setting *is* the permission:
 :set org.directory=~/notes
 ```
 
-and from your `init.rs`, so it holds in every session — see
-[configuring user plugins](help:init#configuring-user-plugins-that-load-after-you).
+and in `lattice.toml` (`[org]` / `directory = "~/notes"`) or your `init.rs`, so
+it holds in every session — see [plugin options](help:options#plugin-options)
+and [configuring user
+plugins](help:init#configuring-user-plugins-that-load-after-you).
 
 See [Capabilities and your configuration](help:plugins#capabilities-and-your-configuration).
 
@@ -391,7 +393,9 @@ that landed closes the capture.
 #### Templates
 
 Templates live in `org.capture-templates`, one `[[org.capture-templates]]`
-table per template:
+table per template, in your `~/.config/lattice/lattice.toml`. They wait there
+until org loads, and a template that does not fit is reported in `*messages*`
+with the field that failed:
 
 ```toml
 [[org.capture-templates]]

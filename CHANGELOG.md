@@ -17,6 +17,10 @@ Needs **lattice 0.9.14** or later, for `ui.notify`.
   previous list, where it used to report success.
 
 ### Changed
+- **The docs show capture templates and lists in `lattice.toml`.** lattice
+  0.9.14 keeps a plugin's lists and tables there until the plugin loads, so
+  `[[org.capture-templates]]` and `agenda-files = [...]` no longer need
+  `init.rs`. The capture section now says which file its templates go in.
 - **`:org-roam-sync` says when there is nothing to scan.** With no usable
   `org.roam-directory`, it now says so instead of echoing "re-scanning…".
 

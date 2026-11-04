@@ -3360,6 +3360,7 @@ dependencies = [
 name = "lattice-listing"
 version = "0.9.13"
 dependencies = [
+ "arc-swap",
  "lattice-cells",
  "lattice-config",
  "lattice-core",
@@ -3408,6 +3409,7 @@ dependencies = [
  "lattice-diff",
  "lattice-grammar",
  "lattice-keymap",
+ "lattice-listing",
  "lattice-mode",
  "lattice-multibuffer",
  "lattice-picker",

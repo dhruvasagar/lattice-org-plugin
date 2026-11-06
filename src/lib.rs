@@ -51,8 +51,9 @@
 // `tree-sitter` every motion, text object and action gets a `none` tree handle
 // and org silently falls back to matching `*` at line starts (OT.4).
 //
-// `min_lattice` — embedded manifests and option-bound grants are both 0.9.11
-// (0.9.10 was never released: the tree carried it, the release skipped it).
+// `min_lattice` — `ui.notify`, which the roam scan reports through, is 0.9.14.
+// Embedded manifests and option-bound grants came earlier, in 0.9.11 (0.9.10
+// was never released: the tree carried it, the release skipped it).
 //
 // Embedded with the SDK's `manifest!` (lattice-plugin-sdk 0.4.0), which writes
 // the `lattice-manifest` custom section on wasm targets only — the hand-rolled

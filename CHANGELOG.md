@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — 2026-11-07
+
+Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.1).
 
 Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.1).
 

@@ -58,6 +58,10 @@ lattice-keymap = { path = "../../lattice/crates/lattice-keymap" }
 lattice-mode = { path = "../../lattice/crates/lattice-mode" }
 lattice-plugin-host = { path = "../../lattice/crates/lattice-plugin-host" }
 lattice-plugin-loader = { path = "../../lattice/crates/lattice-plugin-loader" }
+# AT.7b: the assistant's tool broker, which calls org's `llm-tools` the way a
+# chat does, and the JSON its calls take.
+lattice-ai = { path = "../../lattice/crates/lattice-ai" }
+serde_json = "1"
 lattice-runtime = { path = "../../lattice/crates/lattice-runtime" }
 lattice-protocol = { path = "../../lattice/crates/lattice-protocol" }
 lattice-syntax = { path = "../../lattice/crates/lattice-syntax" }

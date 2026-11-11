@@ -65,6 +65,7 @@ provides = [
     "language", "modes", "grammar", "media", "scanned-excerpt-source",
     "multibuffer-view-source", "picker-source", "signs", "decorations",
     "completion-source", "transient-source", "help", "config", "theme", "events",
+    "llm-tools",
 ]
 default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
 capabilities = [
@@ -194,6 +195,11 @@ wit_bindgen::generate!({
             export register-events: func();
             export on-event: func(handler: u32, ev: event);
             export on-wake: func(id: wake-id);
+            // AT.7: org's tools for the assistant. `host-services`, which a
+            // call reads through, is imported above; the host makes this
+            // seam's store read-only whatever the fs grant says, so a tool
+            // proposes edits rather than writing them.
+            export lattice:plugin-host/llm-tools@0.4.0;
         }
     "#,
     path: "wit",
@@ -225,6 +231,7 @@ mod habit_stats;
 mod headline;
 mod history;
 mod links;
+mod llm_tools;
 // OS.3: what a list item IS — bullet shape, nesting, extent, numbering. The
 // model every list verb reads, and the one `checkbox.rs` now sits on.
 mod list;
@@ -11992,6 +11999,98 @@ impl exports::lattice::plugin_host::multibuffer_view_source::Guest for Component
             "org: `{view}` is a scan view; its rows come from the scan seam, not `build`"
         ))
     }
+}
+
+// AT.7: the `llm-tools` seam. The answers are `llm_tools`'s; this side only
+// gathers what they read through the host.
+impl exports::lattice::plugin_host::llm_tools::Guest for Component {
+    fn tools() -> Vec<lattice::plugin_host::types::LlmTool> {
+        llm_tools::tools()
+            .into_iter()
+            .map(|t| lattice::plugin_host::types::LlmTool {
+                name: t.name.to_string(),
+                description: t.description.to_string(),
+                input_schema: t.input_schema,
+                kind: lattice::plugin_host::types::LlmToolKind::Read,
+            })
+            .collect()
+    }
+
+    fn call(
+        name: String,
+        args: String,
+    ) -> Result<lattice::plugin_host::types::LlmToolResult, String> {
+        let text = match name.as_str() {
+            llm_tools::AGENDA => {
+                let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
+                let (files, problems) = org_corpus(&keywords);
+                let mut text = llm_tools::agenda(&files, &keywords, today_epoch_day(), &args)?;
+                for p in problems {
+                    text.push_str(&format!("\nNot read: {p}"));
+                }
+                text
+            }
+            other => return Err(format!("org has no tool `{other}`")),
+        };
+        Ok(lattice::plugin_host::types::LlmToolResult {
+            text,
+            proposals: Vec::new(),
+        })
+    }
+
+    fn profiles() -> Vec<lattice::plugin_host::types::LlmProfile> {
+        Vec::new()
+    }
+}
+
+/// AT.7: the org files the assistant's tools read — `org.agenda-files`, else
+/// `org.directory` — each with its agenda rows, plus a line for each root or
+/// file that could not be read.
+///
+/// The tree path when the host can parse the file (`parse-file` needs the
+/// `tree-sitter` capability and reads under the same grant as `read-file`),
+/// the text path otherwise, exactly as the agenda view chooses.
+fn org_corpus(keywords: &agenda::Keywords) -> (Vec<llm_tools::OrgFile>, Vec<String>) {
+    use lattice::plugin_host::{host_services, tree_sitter};
+    let mut roots = agenda_files();
+    if roots.is_empty() {
+        roots.push(crate::roam_scan::expand_tilde(
+            option_or("directory", "~/org").trim(),
+        ));
+    }
+    let home = crate::roam_scan::expand_tilde("~");
+    let mut problems = Vec::new();
+    let mut paths = std::collections::BTreeSet::new();
+    for root in roots {
+        if crate::roam_scan::is_org(&root) {
+            paths.insert(root);
+            continue;
+        }
+        match host_services::walk(&root) {
+            Ok(found) => paths.extend(found.into_iter().filter(|p| crate::roam_scan::is_org(p))),
+            Err(e) => problems.push(format!("{root}: {e}")),
+        }
+    }
+    let mut files = Vec::new();
+    for path in paths {
+        let text = match host_services::read_file(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                problems.push(format!("{path}: {e}"));
+                continue;
+            }
+        };
+        let rows = match tree_sitter::parse_file(&path) {
+            Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, keywords, false),
+            None => agenda::scan_file(&text, keywords, false),
+        };
+        let shown = match path.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() && home != "~" => format!("~{rest}"),
+            _ => path.clone(),
+        };
+        files.push(llm_tools::OrgFile { shown, text, rows });
+    }
+    (files, problems)
 }
 
 impl exports::lattice::plugin_host::completion_source::Guest for Component {

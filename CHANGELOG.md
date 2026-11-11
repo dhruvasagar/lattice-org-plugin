@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
+`llm-tools`), for the assistant's tools.
+
+### Added
+- **Org answers lattice's LLM chats.** `org.agenda` tells the assistant what
+  is scheduled, due and overdue for a day, a week or a date range, optionally
+  only what matches a tag or TODO expression (`+work`, `-meeting`, `/WAITING`).
+  It reads your `org.agenda-files` (else `org.directory`) the way `:org-agenda`
+  does, repeats included, so the two never disagree. Every answer starts with
+  today's date, and every row carries a ref (`file::line::heading`). The tool
+  only reads: the seam's store is read-only whatever org's grant says. Turn it
+  on in a chat profile with `tools = ["org.*"]`.
+
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A
   `SCHEDULED: <… +1d>` standup appears on each day of a week view, and a
@@ -9,6 +22,10 @@
   the one that turns overdue. `.+` repeaters (counted from when you next do
   the task) have no future days to show, so a habit is shown once, by its
   consistency graph.
+
+### Fixed
+- **A week view no longer includes an eighth day.** The dated block took in
+  rows from the day after its header ended, filed under a header of their own.
 
 ## 0.2.1 — 2026-11-07
 

@@ -14,7 +14,7 @@ org-roam, shipped as a single WebAssembly component.
 | The API it builds against | [`lattice-wit`](https://crates.io/crates/lattice-wit) · [`lattice-plugin-sdk`](https://crates.io/crates/lattice-plugin-sdk) |
 
 It is the first real consumer of lattice's `language` seam, and by now of
-fourteen others — see the table below, which the manifest's `provides` (at the
+fifteen others — see the table below, which the manifest's `provides` (at the
 top of `src/lib.rs`) is the source of truth for.
 
 Design lives in the lattice tree:
@@ -53,6 +53,7 @@ reached the network.
 | `signs` | the `>` an agenda row wears when it is marked for a bulk action |
 | `decorations` | which agenda rows carry that mark — re-asked through `refresh-decorations`, because a mark changes no text |
 | `events` | the clock's session, its minute wake and its modeline segment |
+| `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), read through the agenda's own scan so the assistant and `:org-agenda` agree |
 | `help` | `doc/org.md` and `doc/roam.md`, shipped inside the component; `:help org`, `:help org.roam`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
@@ -70,10 +71,10 @@ called `agenda-source` until it was pointed out that its record is an excerpt
 plus an ordering plus a group header, with nothing about org, dates or TODOs
 in it.
 
-## Fifteen seams from one component
+## Sixteen seams from one component
 
-A component implements exactly ONE WIT world, so a plugin providing fifteen
-seams needs a world importing all fifteen. Bundled plugins get theirs written
+A component implements exactly ONE WIT world, so a plugin providing sixteen
+seams needs a world importing all sixteen. Bundled plugins get theirs written
 into lattice's own `wit/` — but an external plugin cannot add a world to
 someone else's package.
 

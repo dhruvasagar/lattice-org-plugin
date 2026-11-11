@@ -1213,29 +1213,45 @@ pub fn entries_for_row(
     keywords: &Keywords,
     today: i64,
 ) -> Vec<AgendaEntry> {
+    occurrences(row, sections, keywords, today)
+        .into_iter()
+        .map(|(rank, row)| entry_in_section(&row, &sections[rank], rank as i64, today))
+        .collect()
+}
+
+/// Each section a row lands in, with the row as it falls there: its own day,
+/// and for a repeating one each later day inside a date-windowed section's
+/// window (AT.7a). In section order.
+///
+/// The one decision of "what does the agenda show", shared by the view
+/// ([`entries_for_row`]) and the assistant's `org.agenda` (AT.7b), so the two
+/// cannot disagree about a day.
+///
+/// Only `Days` sections take repeats: an `Any` block (Priority A) lists a task
+/// once, and `Overdue` is the stamp's own day, which no repeat precedes.
+pub fn occurrences<'a>(
+    row: &'a Row,
+    sections: &[Section],
+    keywords: &Keywords,
+    today: i64,
+) -> Vec<(usize, std::borrow::Cow<'a, Row>)> {
     let mut out = Vec::new();
     for (rank, section) in sections.iter().enumerate() {
-        let rank = rank as i64;
-        // AT.7a: a date-windowed section also takes the row on each later day
-        // its repeater lands inside the window. Only `Days`: an `Any` block
-        // (Priority A) lists a task once, and `Overdue` is the stamp's own
-        // day, which no repeat precedes.
         let repeats = match (section.filter.when, row.date) {
             (When::Days(n), Some(d)) => repeats_in(&d, today, today + i64::from(n)),
             _ => Vec::new(),
         };
-        let occurrences = repeats.into_iter().map(|day| {
+        let again = repeats.into_iter().map(|day| {
             let mut again = row.clone();
             if let Some(d) = again.date.as_mut() {
                 d.day = day;
             }
             std::borrow::Cow::Owned(again)
         });
-        for row in std::iter::once(std::borrow::Cow::Borrowed(row)).chain(occurrences) {
-            if !section.admits(&row, keywords, today) {
-                continue;
+        for row in std::iter::once(std::borrow::Cow::Borrowed(row)).chain(again) {
+            if section.admits(&row, keywords, today) {
+                out.push((rank, row));
             }
-            out.push(entry_in_section(&row, section, rank, today));
         }
     }
     out

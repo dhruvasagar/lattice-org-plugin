@@ -412,7 +412,7 @@ impl ViewArgs {
     /// view's resolved `span` and the day it is anchored to.
     ///
     /// **Backward, where the plan is forward.** A section's window is
-    /// `anchor ..= anchor + span`; a log has nothing to say about the future,
+    /// `anchor ..= anchor + span - 1`; a log has nothing to say about the future,
     /// so filing log rows into that window would only ever surface today's.
     /// The daily agenda logs today, the week view logs the last seven days,
     /// and `b` walks back through earlier weeks exactly as it walks the plan.

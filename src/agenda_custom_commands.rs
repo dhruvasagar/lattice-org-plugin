@@ -174,7 +174,8 @@ impl CommandError {
 
 /// Parse the option's value into a command set.
 ///
-/// `default_days` is `org.agenda-span`, used by any `when = "days"` section
+/// `default_days` is the `n` of `When::Days(n)` for `org.agenda-span` (the
+/// span less one, since the window counts today), used by any `when = "days"` section
 /// that does not name its own — so the span option stays meaningful inside a
 /// custom command exactly as it is inside `org.agenda-sections`.
 pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands, CommandError> {

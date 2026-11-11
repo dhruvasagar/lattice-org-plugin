@@ -718,6 +718,65 @@ async fn a_deadline_outranks_a_scheduled_written_before_it() {
     assert_eq!(excerpts[1].start_line, 2);
 }
 
+/// AT.7a — a repeating entry shows on every day of the agenda its repeater
+/// lands on, as Org's does: a `+1d` standup written two days ago is one
+/// overdue row (the stamp's own day) and one row per day of the week view.
+/// Before this the week showed it once, and only under Overdue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeating_entry_shows_on_every_day_it_repeats() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    let repeating = stamp(-2).replace('>', " +1d>");
+    std::fs::write(
+        notes.join("plan.org"),
+        format!("* TODO Standup\n  SCHEDULED: {repeating}\n"),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+
+    let view = match open_org_agenda(
+        &mut editor,
+        &lattice_grammar::Args::String(notes.display().to_string()),
+    ) {
+        lattice_mode::ProviderViewOutcome::Opened { view, .. } => view,
+        lattice_mode::ProviderViewOutcome::Declined { message } => {
+            panic!("the agenda declined: {message}")
+        }
+    };
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+    let status = settle_agenda(&mb, view).await;
+    let handle = mb.handle(view).expect("the view is still open");
+    let excerpts = handle.excerpts();
+
+    // Overdue once, then the seven days of the default span.
+    assert_eq!(
+        excerpts.len(),
+        8,
+        "one overdue row and one per day of the week: {status:?}"
+    );
+    assert!(
+        excerpts.iter().all(|e| e.start_line == 0),
+        "every row is the one entry"
+    );
+}
+
 /// AF.3 — `org.agenda-files` decides which files the agenda scans.
 ///
 /// The editor opens with NO argument, so without the option the scan would use

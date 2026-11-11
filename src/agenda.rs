@@ -95,6 +95,7 @@
 //! only what the excerpt spans changed.
 
 use crate::lattice::plugin_host::tree_sitter::Node;
+use crate::repeat::{self, Repeater};
 use crate::timestamp::{self, Stamp};
 use crate::todo;
 use crate::tree;
@@ -146,6 +147,11 @@ pub struct Dated {
     /// zero-length one are different facts and only the option can tell them
     /// apart — a stamp with no range must render `14:00`, never `14:00-14:00`.
     pub end_minute: Option<u32>,
+    /// AT.7a: the stamp's repeater (`+1w`, `++1m`), so a date-windowed section
+    /// shows the row on every occurrence inside its window ([`repeats_in`]),
+    /// as Org's agenda does. Before this a `+1d` standup appeared once, on the
+    /// date written on the line, and a week view showed one day of it.
+    pub repeater: Option<Repeater>,
 }
 
 #[cfg(test)]
@@ -164,8 +170,60 @@ impl Dated {
             kind,
             start_minute: None,
             end_minute: None,
+            repeater: None,
         }
     }
+}
+
+/// AT.7a — the days, inside `from ..= to`, on which a repeating stamp falls
+/// again: its day plus whole repeats, strictly after the day written on the
+/// line (that one is the row itself, and an overdue one stays overdue).
+///
+/// `+` and `++` repeat from the stamp, so their future days are fixed and the
+/// agenda can show them. `.+` repeats from whenever the task is next done,
+/// which has not happened, so it has no future days to show; a habit is
+/// shown by its consistency graph instead, as Org shows it.
+///
+/// Days and weeks are stepped arithmetically, so a daily repeater written
+/// years ago costs nothing; months and years walk, with the same bound
+/// `repeat::next_date` uses.
+pub fn repeats_in(date: &Dated, from: i64, to: i64) -> Vec<i64> {
+    let Some(rep) = date.repeater else {
+        return Vec::new();
+    };
+    if matches!(rep.base, repeat::Base::Completion) || to < from {
+        return Vec::new();
+    }
+    let step = match rep.unit {
+        repeat::Unit::Day => Some(i64::from(rep.count)),
+        repeat::Unit::Week => Some(i64::from(rep.count) * 7),
+        repeat::Unit::Month | repeat::Unit::Year => None,
+    };
+    let mut days = Vec::new();
+    match step {
+        Some(step) => {
+            let ahead = (from - date.day).max(1);
+            let mut day = date.day + step * ((ahead + step - 1) / step);
+            while day <= to {
+                days.push(day);
+                day += step;
+            }
+        }
+        None => {
+            let mut d = repeat::from_days(date.day);
+            for _ in 0..4096 {
+                d = repeat::shift(d, rep.count, rep.unit);
+                let day = repeat::to_days(d);
+                if day > to {
+                    break;
+                }
+                if day >= from {
+                    days.push(day);
+                }
+            }
+        }
+    }
+    days
 }
 
 /// One agenda row, before it becomes one or more WIT `entry` values.
@@ -506,6 +564,7 @@ fn row_for_section(
             kind,
             start_minute: stamp.time.map(minutes_of),
             end_minute: stamp.time_end.map(minutes_of),
+            repeater: stamp.cookies.iter().find_map(|c| repeat::parse(c)),
         }),
         priority: parsed.priority,
         keyword: parsed.keyword.map(str::to_string),
@@ -730,6 +789,7 @@ pub fn scan_file(text: &str, keywords: &Keywords, admit_tag_only: bool) -> Vec<R
                 kind,
                 start_minute: stamp.time.map(minutes_of),
                 end_minute: stamp.time_end.map(minutes_of),
+                repeater: stamp.cookies.iter().find_map(|c| repeat::parse(c)),
             }),
             priority: headline.priority,
             keyword: headline.keyword.map(str::to_string),
@@ -1155,83 +1215,107 @@ pub fn entries_for_row(
 ) -> Vec<AgendaEntry> {
     let mut out = Vec::new();
     for (rank, section) in sections.iter().enumerate() {
-        if !section.admits(row, keywords, today) {
-            continue;
-        }
         let rank = rank as i64;
-        let (key, label, emphasis) = match (section.filter.when.groups_by_date(), row.date) {
-            (true, Some(d)) => {
-                // OA.30: a TIMED row gets a sub-group of its own, keyed under
-                // its day so it still sorts inside it. The day header renders
-                // above the first block of the day; each time block then
-                // renders its own header reading just the clock.
-                //
-                //     2026-09-08 Tue (today)
-                //       * TODO Something all day
-                //     09:00
-                //       * TODO Standup
-                //     14:00-15:00
-                //       * TODO Review the diff
-                //
-                // Which is emacs' time grid arrived at from the other
-                // direction: the grid line and the group header are the same
-                // row, so nothing new had to be rendered to get it. The
-                // alternative — hanging the time under each row as an HB.5
-                // annotation — costs a screen line per appointment and puts
-                // the time BELOW the thing it qualifies.
-                //
-                // The KEY carries the day as well as the time, because two
-                // different days both holding a 09:00 must not merge into one
-                // block when the sort puts them next to each other.
-                match time_label(&d) {
-                    Some(time) => (
-                        format!("{rank}:{}:{time}", group_key(d.day)),
-                        // **The date rides along, and it has to.** A day whose
-                        // rows are ALL timed has no untimed block to render
-                        // the date header, so a bare `09:00` would be the
-                        // first thing the day showed and the user could not
-                        // tell which day it belonged to. The guest cannot
-                        // detect that case — whether an untimed row exists for
-                        // this day is a question about every OTHER file, after
-                        // a sort it has not seen — so the date is unconditional
-                        // rather than conditional-and-sometimes-wrong.
-                        //
-                        // In the TRAILING PARENTHETICAL, which is not
-                        // decoration: OA.7 dims a trailing `(…)` in the header
-                        // renderer, so the clock reads bright and the repeated
-                        // date recedes. That is what keeps a column of time
-                        // blocks from restating the same eleven characters at
-                        // full weight four times.
-                        format!("{time} ({})", day_phrase(d.day, today)),
-                        // The time blocks of today are part of today, so they
-                        // are emphasised too — the band is the whole day, not
-                        // just its first header.
-                        d.day == today,
-                    ),
-                    None => (
-                        format!("{rank}:{}", group_key(d.day)),
-                        format!("{} — {}", section.title, group_label(d.day, today)),
-                        d.day == today,
-                    ),
-                }
-            }
-            // One block under the section's own title. Also the honest answer
-            // for a date-grouping section handed an undated row, which
-            // `When::admits` makes unreachable but which must not silently
-            // produce a header reading the epoch if that ever changes.
-            //
-            // Never emphasised: a section block spans days, so "is this
-            // today" has no answer for it.
-            _ => (format!("{rank}:"), section.title.clone(), false),
+        // AT.7a: a date-windowed section also takes the row on each later day
+        // its repeater lands inside the window. Only `Days`: an `Any` block
+        // (Priority A) lists a task once, and `Overdue` is the stamp's own
+        // day, which no repeat precedes.
+        let repeats = match (section.filter.when, row.date) {
+            (When::Days(n), Some(d)) => repeats_in(&d, today, today + i64::from(n)),
+            _ => Vec::new(),
         };
-        out.push(AgendaEntry {
-            key,
-            label,
-            sort_key: sort_key_in_section(row, rank, today),
-            emphasis,
+        let occurrences = repeats.into_iter().map(|day| {
+            let mut again = row.clone();
+            if let Some(d) = again.date.as_mut() {
+                d.day = day;
+            }
+            std::borrow::Cow::Owned(again)
         });
+        for row in std::iter::once(std::borrow::Cow::Borrowed(row)).chain(occurrences) {
+            if !section.admits(&row, keywords, today) {
+                continue;
+            }
+            out.push(entry_in_section(&row, section, rank, today));
+        }
     }
     out
+}
+
+/// One row's entry in one section that admits it: its group key, label and
+/// sort key. Split from [`entries_for_row`] so a repeating row's occurrences
+/// (AT.7a) go through exactly the path its own day does.
+fn entry_in_section(row: &Row, section: &Section, rank: i64, today: i64) -> AgendaEntry {
+    let (key, label, emphasis) = match (section.filter.when.groups_by_date(), row.date) {
+        (true, Some(d)) => {
+            // OA.30: a TIMED row gets a sub-group of its own, keyed under
+            // its day so it still sorts inside it. The day header renders
+            // above the first block of the day; each time block then
+            // renders its own header reading just the clock.
+            //
+            //     2026-09-08 Tue (today)
+            //       * TODO Something all day
+            //     09:00
+            //       * TODO Standup
+            //     14:00-15:00
+            //       * TODO Review the diff
+            //
+            // Which is emacs' time grid arrived at from the other
+            // direction: the grid line and the group header are the same
+            // row, so nothing new had to be rendered to get it. The
+            // alternative — hanging the time under each row as an HB.5
+            // annotation — costs a screen line per appointment and puts
+            // the time BELOW the thing it qualifies.
+            //
+            // The KEY carries the day as well as the time, because two
+            // different days both holding a 09:00 must not merge into one
+            // block when the sort puts them next to each other.
+            match time_label(&d) {
+                Some(time) => (
+                    format!("{rank}:{}:{time}", group_key(d.day)),
+                    // **The date rides along, and it has to.** A day whose
+                    // rows are ALL timed has no untimed block to render
+                    // the date header, so a bare `09:00` would be the
+                    // first thing the day showed and the user could not
+                    // tell which day it belonged to. The guest cannot
+                    // detect that case — whether an untimed row exists for
+                    // this day is a question about every OTHER file, after
+                    // a sort it has not seen — so the date is unconditional
+                    // rather than conditional-and-sometimes-wrong.
+                    //
+                    // In the TRAILING PARENTHETICAL, which is not
+                    // decoration: OA.7 dims a trailing `(…)` in the header
+                    // renderer, so the clock reads bright and the repeated
+                    // date recedes. That is what keeps a column of time
+                    // blocks from restating the same eleven characters at
+                    // full weight four times.
+                    format!("{time} ({})", day_phrase(d.day, today)),
+                    // The time blocks of today are part of today, so they
+                    // are emphasised too — the band is the whole day, not
+                    // just its first header.
+                    d.day == today,
+                ),
+                None => (
+                    format!("{rank}:{}", group_key(d.day)),
+                    format!("{} — {}", section.title, group_label(d.day, today)),
+                    d.day == today,
+                ),
+            }
+        }
+        // One block under the section's own title. Also the honest answer
+        // for a date-grouping section handed an undated row, which
+        // `When::admits` makes unreachable but which must not silently
+        // produce a header reading the epoch if that ever changes.
+        //
+        // Never emphasised: a section block spans days, so "is this
+        // today" has no answer for it.
+        _ => (format!("{rank}:"), section.title.clone(), false),
+    };
+    AgendaEntry {
+        key,
+        label,
+        sort_key: sort_key_in_section(row, rank, today),
+        emphasis,
+    }
 }
 
 /// OA.29 — whether `line` opens a headline: stars, then a space.
@@ -2049,6 +2133,112 @@ mod tests {
         assert_eq!(d.end_minute, Some(15 * 60 + 30));
     }
 
+    /// AT.7a: a row scheduled on `day` with repeater `cookie`.
+    fn repeating(day: i64, cookie: &str) -> Row {
+        let mut row = r(Some(day), None, Some("TODO"));
+        if let Some(d) = row.date.as_mut() {
+            d.repeater = repeat::parse(cookie);
+        }
+        row
+    }
+
+    /// The days the dated section (rank 1 of the defaults) files a row under.
+    fn agenda_days(row: &Row, today: i64) -> Vec<String> {
+        entries_for_row(row, &default_sections(6), &kw(), today)
+            .into_iter()
+            .filter(|e| e.key.starts_with("1:"))
+            .map(|e| e.key)
+            .collect()
+    }
+
+    /// AT.7a: `+1d` shows on every day of the window; the stamp's own past day
+    /// stays the one overdue row; Priority A lists the task once.
+    #[test]
+    fn a_daily_repeater_fills_the_week_and_is_overdue_once() {
+        let today = timestamp::epoch_day(2026, 11, 12);
+        let mut row = repeating(today - 2, "+1d");
+        row.priority = Some('A');
+        let out = entries_for_row(&row, &default_sections(6), &kw(), today);
+        let in_section = |rank: &str| out.iter().filter(|e| e.key.starts_with(rank)).count();
+        assert_eq!(in_section("0:"), 1, "overdue: the stamp's own day");
+        assert_eq!(in_section("1:"), 7, "today and the six after it");
+        assert_eq!(in_section("3:"), 1, "Priority A: once");
+        assert_eq!(
+            agenda_days(&row, today)[0],
+            format!("1:{}", group_key(today))
+        );
+    }
+
+    /// `+1w` written weeks ago lands once in a week; `++` repeats the same
+    /// days as `+`; `.+` has no future days until it is done.
+    #[test]
+    fn weekly_catch_up_and_completion_repeaters() {
+        let today = timestamp::epoch_day(2026, 11, 12);
+        let row = repeating(today - 22, "+1w");
+        assert_eq!(
+            agenda_days(&row, today),
+            vec![format!("1:{}", group_key(today + 6))]
+        );
+        assert_eq!(
+            agenda_days(&repeating(today - 22, "++1w"), today),
+            agenda_days(&row, today)
+        );
+        assert!(agenda_days(&repeating(today - 1, ".+1d"), today).is_empty());
+        assert!(agenda_days(&repeating(today - 1, ".+1d/3d"), today).is_empty());
+    }
+
+    /// A stamp after the window shows nothing in it, its repeats included;
+    /// one inside it shows on its day and its repeats after.
+    #[test]
+    fn a_repeater_starting_after_the_window_adds_nothing() {
+        let today = timestamp::epoch_day(2026, 11, 12);
+        assert!(agenda_days(&repeating(today + 10, "+1d"), today).is_empty());
+        assert_eq!(agenda_days(&repeating(today + 3, "+2d"), today).len(), 2);
+    }
+
+    /// Months walk the calendar and clamp: the 31st repeats on the last day of
+    /// a shorter month. A daily repeater years old costs no walk.
+    #[test]
+    fn monthly_repeats_clamp_and_old_daily_ones_are_cheap() {
+        let jan31 = timestamp::epoch_day(2026, 1, 31);
+        let date = Dated {
+            repeater: repeat::parse("+1m"),
+            ..Dated::on(jan31, Kind::Deadline)
+        };
+        let feb = timestamp::epoch_day(2026, 2, 1);
+        assert_eq!(
+            repeats_in(&date, feb, timestamp::epoch_day(2026, 3, 31)),
+            vec![
+                timestamp::epoch_day(2026, 2, 28),
+                timestamp::epoch_day(2026, 3, 28)
+            ]
+        );
+        let old = Dated {
+            repeater: repeat::parse("+1d"),
+            ..Dated::on(timestamp::epoch_day(2001, 1, 1), Kind::Scheduled)
+        };
+        let today = timestamp::epoch_day(2026, 11, 12);
+        assert_eq!(
+            repeats_in(&old, today, today + 2),
+            vec![today, today + 1, today + 2]
+        );
+    }
+
+    /// The scan reads the repeater off the line, on the text path as the tree
+    /// path does; a DONE entry is no row, so it never repeats.
+    #[test]
+    fn the_scan_carries_the_repeater_and_done_does_not_repeat() {
+        let text = "* TODO Standup\nSCHEDULED: <2026-11-10 Tue 09:30 +1d>\n\
+                    * DONE Old\nSCHEDULED: <2026-11-10 Tue +1d>\n";
+        let rows = scan_file(text, &kw(), false);
+        assert_eq!(rows.len(), 1);
+        let date = rows[0].date.expect("dated");
+        assert_eq!(date.repeater, repeat::parse("+1d"));
+        assert_eq!(date.start_minute, Some(9 * 60 + 30));
+        let today = timestamp::epoch_day(2026, 11, 12);
+        assert_eq!(agenda_days(&rows[0], today).len(), 7);
+    }
+
     /// A timed row gets its own group, keyed under its day so it still sorts
     /// inside it, and labelled with the clock.
     #[test]
@@ -2061,6 +2251,7 @@ mod tests {
             kind: Kind::Scheduled,
             start_minute: Some(9 * 60),
             end_minute: None,
+            repeater: None,
         });
         let out = entries_for_row(&row, &s, &kw(), today);
         let dated = out
@@ -2090,6 +2281,7 @@ mod tests {
             kind: Kind::Scheduled,
             start_minute: Some(14 * 60),
             end_minute: Some(15 * 60 + 30),
+            repeater: None,
         });
         let out = entries_for_row(&row, &s, &kw(), today);
         let dated = out.iter().find(|e| e.key.starts_with("1:")).unwrap();
@@ -2113,6 +2305,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: Some(9 * 60),
                 end_minute: None,
+                repeater: None,
             });
             entries_for_row(&row, &s, &kw(), today)
                 .into_iter()
@@ -2153,6 +2346,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: minutes,
                 end_minute: None,
+                repeater: None,
             });
             sort_key_in_section(&row, 0, today)
         };
@@ -2177,6 +2371,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: minutes,
                 end_minute: None,
+                repeater: None,
             });
             sort_key_in_section(&row, 0, today)
         };
@@ -2195,6 +2390,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: Some(minutes),
                 end_minute: None,
+                repeater: None,
             });
             sort_key_in_section(&row, 0, today)
         };
@@ -2213,6 +2409,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: Some(23 * 60 + 59),
                 end_minute: None,
+                repeater: None,
             });
             sort_key_in_section(&row, rank, today)
         };
@@ -2235,6 +2432,7 @@ mod tests {
                 kind: Kind::Scheduled,
                 start_minute: minutes,
                 end_minute: None,
+                repeater: None,
             });
             entries_for_row(&row, &s, &kw(), today)
                 .into_iter()

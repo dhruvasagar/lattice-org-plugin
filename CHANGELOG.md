@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **The agenda shows a repeating entry on every day it repeats.** A
+  `SCHEDULED: <… +1d>` standup appears on each day of a week view, and a
+  `+1w` review on its day, as in Org. The day written on the line is still
+  the one that turns overdue. `.+` repeaters (counted from when you next do
+  the task) have no future days to show, so a habit is shown once, by its
+  consistency graph.
+
 ## 0.2.1 — 2026-11-07
 
 Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.1).

@@ -173,7 +173,8 @@ impl SectionError {
 /// - **One section is unusable** (no title, an unknown `when`) ⇒ skipped, named
 ///   in `skipped`, and the rest survive. One typo should not cost the feature.
 ///
-/// `default_days` is `org.agenda-span`, used by any `when = "days"` section
+/// `default_days` is the `n` of `When::Days(n)` for `org.agenda-span` (the
+/// span less one, since the window counts today), used by any `when = "days"` section
 /// that does not name its own.
 pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedSet, SectionError> {
     if raw.is_empty() {

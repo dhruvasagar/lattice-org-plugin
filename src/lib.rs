@@ -4201,7 +4201,15 @@ impl Guest for Component {
         // `capture-templates` precedent — `:set org.agenda-sections=…` must
         // land on the next scan, and a cache would need an `OptionChanged`
         // subscription to stay honest.
-        let sections = agenda_sections::resolve(span);
+        //
+        // AT.7a: a `when = "days"` section's window is `today ..= today + n`,
+        // so the span's `n` is one less than its day count. The header has
+        // always covered `anchor ..= anchor + span - 1` (`agenda_args::window`)
+        // and the sections one day more, so a row dated a week out sat under
+        // a header that ended the day before it; a daily repeater made that
+        // eighth, unlabelled day show up on every week view.
+        let window_days = span.max(1) - 1;
+        let sections = agenda_sections::resolve(window_days);
         // OA.11: …unless the view was opened for a NAMED agenda, in which case
         // that command's sections are the ones this scan runs. `args` is what
         // OA.11a carries from the view; empty is the default agenda, which is
@@ -4213,7 +4221,7 @@ impl Guest for Component {
         // naming nothing — has to land on a WORKING agenda, and threading one
         // fallback through one call is what makes that structural instead of
         // three branches that each have to remember.
-        let sections = agenda_custom_commands::resolve(&view.command_args(), span, sections);
+        let sections = agenda_custom_commands::resolve(&view.command_args(), window_days, sections);
         // Single-threaded guest, one actor, calls serialised by the host's
         // per-plugin channel — so a `thread_local` IS the whole of the
         // synchronisation story, and `begin`-then-`scan` ordering is a host

@@ -327,7 +327,7 @@ impl Keywords {
         Self { all, done }
     }
 
-    fn is_done(&self, keyword: Option<&str>) -> bool {
+    pub fn is_done(&self, keyword: Option<&str>) -> bool {
         keyword.is_some_and(|k| self.done.iter().any(|d| d == k))
     }
 }
@@ -547,9 +547,15 @@ fn row_for_section(
     // the first keeps the default agenda's cost and output exactly as they
     // were, the second stops a corpus of prose headlines from becoming rows
     // that no match can ever take.
+    //
+    // AT.7c: a keyword is one of those somethings. A DONE headline with no
+    // tags was not a row, so `/DONE` — the TODO half of a match — could never
+    // find one, in a view section or in `org.query`.
     let in_agenda = !is_done && (dated.is_some() || parsed.keyword.is_some());
     let properties = own_properties(section, lines);
-    if !in_agenda && !(admit_tag_only && (!tags.is_empty() || !properties.is_empty())) {
+    let matchable = !tags.is_empty() || !properties.is_empty() || parsed.keyword.is_some();
+    let admitted = in_agenda || (admit_tag_only && matchable);
+    if !admitted {
         return None;
     }
 
@@ -773,9 +779,11 @@ pub fn scan_file(text: &str, keywords: &Keywords, admit_tag_only: bool) -> Vec<R
         // host happened to have an org grammar loaded.
         let is_done = keywords.is_done(headline.keyword);
         let in_agenda = !is_done && (dated.is_some() || headline.keyword.is_some());
-        // No properties on this path (see the field below), so tags are the
-        // only thing a match could take.
-        if !in_agenda && !(admit_tag_only && !tags.is_empty()) {
+        // No properties on this path (see the field below), so tags and the
+        // keyword are the only things a match could take.
+        let matchable = !tags.is_empty() || headline.keyword.is_some();
+        let admitted = in_agenda || (admit_tag_only && matchable);
+        if !admitted {
             continue;
         }
         rows.push(Row {

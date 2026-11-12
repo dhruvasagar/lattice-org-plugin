@@ -25,7 +25,7 @@ use std::sync::Arc;
 use lattice_ai::conversation::ToolKind;
 use lattice_ai::llm::chat::LlmChatsHandle;
 use lattice_ai::llm::tools::plugin::PluginToolsHandle;
-use lattice_ai::llm::tools::{CallContext, Permission};
+use lattice_ai::llm::tools::{CallContext, Offer, Permission};
 use lattice_core::Document as CoreDocument;
 use lattice_host::editor::Editor;
 use lattice_plugin_host::{PluginHost, TrustTier};
@@ -133,28 +133,20 @@ fn stamp(offset: i64, rest: &str) -> String {
     format!("<{day} {name}{rest}>")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_assistant_reads_the_agenda_through_org() {
+/// Org loaded over `files` (name, text) in `notes/`, set as the agenda
+/// files, and the offer a chat selecting `org.*` gets. `None` when the
+/// component is not built.
+async fn org_tools(files: &[(&str, String)]) -> Option<(tempfile::TempDir, Editor, Offer)> {
     let Some(wasm) = org_plugin_wasm() else {
         eprintln!("skipping: the org component is not built");
-        return;
+        return None;
     };
     let base = tempfile::tempdir().unwrap();
     let notes = base.path().join("notes");
     std::fs::create_dir_all(&notes).unwrap();
-    std::fs::write(
-        notes.join("plan.org"),
-        format!(
-            "* TODO [#A] Pay the invoice :money:\n  DEADLINE: {}\n\
-             * TODO Standup\n  SCHEDULED: {}\n\
-             * Dentist {}\n\
-             * TODO Write the report\n",
-            stamp(-2, ""),
-            stamp(-1, " 09:30 +1d"),
-            stamp(2, " 15:00"),
-        ),
-    )
-    .unwrap();
+    for (name, text) in files {
+        std::fs::write(notes.join(name), text).unwrap();
+    }
     let plugins = base.path().join("plugins");
     write_org_plugin_dir(&plugins, &wasm, &notes);
 
@@ -163,6 +155,9 @@ async fn the_assistant_reads_the_agenda_through_org() {
         .discover_and_load(&plugins, TrustTier::Bundled)
         .await;
     assert_eq!(loaded, 1, "the org component loads");
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.todo-keywords=TODO WAITING | DONE".to_string(),
+    });
     editor.handle_effect(lattice_grammar::Effect::SetOption {
         spec: format!("org.agenda-files={}", notes.display()),
     });
@@ -173,6 +168,31 @@ async fn the_assistant_reads_the_agenda_through_org() {
         .map(|c| c.tools().clone())
         .expect("the llm layer is installed at boot");
     let offer = broker.offer(&BTreeSet::from(["org.*".to_string()])).await;
+    Some((base, editor, offer))
+}
+
+async fn call(offer: &Offer, tool: &str, args: serde_json::Value) -> Result<String, String> {
+    offer
+        .call(tool, args, CallContext::default())
+        .await
+        .map(|out| out.text)
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_assistant_reads_the_agenda_through_org() {
+    let plan = format!(
+        "* TODO [#A] Pay the invoice :money:\n  DEADLINE: {}\n\
+         * TODO Standup\n  SCHEDULED: {}\n\
+         * Dentist {}\n\
+         * TODO Write the report\n",
+        stamp(-2, ""),
+        stamp(-1, " 09:30 +1d"),
+        stamp(2, " 15:00"),
+    );
+    let Some((_base, _editor, offer)) = org_tools(&[("plan.org", plan)]).await else {
+        return;
+    };
     let rows: Vec<_> = offer
         .tools()
         .iter()
@@ -180,20 +200,17 @@ async fn the_assistant_reads_the_agenda_through_org() {
         .collect();
     assert_eq!(
         rows,
-        vec![("org__agenda", Permission::Run, ToolKind::Read)],
+        vec![
+            ("org__agenda", Permission::Run, ToolKind::Read),
+            ("org__query", Permission::Run, ToolKind::Read),
+            ("org__entry", Permission::Run, ToolKind::Read),
+        ],
         "org reaches no network, so its read tools run unasked"
     );
 
-    let ask = |args: serde_json::Value| {
-        let offer = &offer;
-        async move {
-            offer
-                .call("org__agenda", args, CallContext::default())
-                .await
-        }
-    };
+    let ask = |args: serde_json::Value| call(&offer, "org__agenda", args);
     let (today_iso, today_name) = date(0);
-    let text = ask(json!({})).await.unwrap().text;
+    let text = ask(json!({})).await.unwrap();
     assert!(
         text.starts_with("Today is ") && text.lines().next().unwrap().contains(&today_iso),
         "{text}"
@@ -227,8 +244,7 @@ async fn the_assistant_reads_the_agenda_through_org() {
 
     let week = ask(json!({"range": "week", "match": "-money"}))
         .await
-        .unwrap()
-        .text;
+        .unwrap();
     assert!(week.contains("entries matching -money"), "{week}");
     assert!(!week.contains("Pay the invoice"), "{week}");
     assert!(week.contains("- 15:00 Dentist (event)"), "{week}");
@@ -240,12 +256,88 @@ async fn the_assistant_reads_the_agenda_through_org() {
 
     let err = ask(json!({"from": "next week"})).await.unwrap_err();
     assert!(
-        err.to_string()
-            .contains(r#"from: "next week" is not a YYYY-MM-DD date"#),
+        err.contains(r#"from: "next week" is not a YYYY-MM-DD date"#),
         "{err}"
     );
     assert!(
         ask(json!({})).await.is_ok(),
         "an error is that call's answer; the plugin keeps answering"
     );
+}
+
+/// `org.query` over the tree path: a property match (which the text scan
+/// cannot answer) and an untagged DONE entry, then `org.entry` by the ref the
+/// query listed and by `ID`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_assistant_queries_and_reads_entries_through_org() {
+    let home = "* Projects :proj:\n\
+                ** WAITING Reply from legal\n\
+                :PROPERTIES:\n\
+                :ID: legal-42\n\
+                :OWNER: Sam\n\
+                :END:\n\
+                Sent the draft on Monday.\n\
+                *** TODO Chase them\n\
+                * DONE Untagged finished thing\n"
+        .to_string();
+    let Some((_base, _editor, offer)) = org_tools(&[("home.org", home)]).await else {
+        return;
+    };
+
+    let owned = call(&offer, "org__query", json!({"match": "OWNER=\"Sam\""}))
+        .await
+        .unwrap();
+    assert!(owned.contains("1 entry matches OWNER=\"Sam\":"), "{owned}");
+    let row = owned
+        .lines()
+        .find(|l| l.starts_with("- WAITING Reply from legal :proj: [ref "))
+        .unwrap_or_else(|| panic!("the WAITING entry, with its inherited tag: {owned}"));
+    let reference = row
+        .rsplit_once("[ref ")
+        .map(|(_, r)| r.trim_end_matches(']'))
+        .unwrap();
+    assert!(
+        reference.ends_with("home.org::2::Reply from legal"),
+        "{reference}"
+    );
+
+    let done = call(&offer, "org__query", json!({"match": "/DONE"}))
+        .await
+        .unwrap();
+    assert!(
+        done.contains("- DONE Untagged finished thing [ref "),
+        "a DONE entry with no tags is reachable by its keyword: {done}"
+    );
+
+    let by_ref = call(&offer, "org__entry", json!({"ref": reference}))
+        .await
+        .unwrap();
+    assert!(
+        by_ref.contains(", under Projects:\n\n** WAITING Reply from legal\n"),
+        "{by_ref}"
+    );
+    assert!(
+        by_ref.contains("Sent the draft on Monday.\n*** TODO Chase them"),
+        "{by_ref}"
+    );
+    assert!(
+        !by_ref.contains("Untagged finished thing"),
+        "the subtree ends: {by_ref}"
+    );
+    assert_eq!(
+        call(&offer, "org__entry", json!({"ref": "legal-42"}))
+            .await
+            .unwrap(),
+        by_ref,
+        "an ID names the same entry"
+    );
+
+    let stale = call(
+        &offer,
+        "org__entry",
+        json!({"ref": reference.replace("Reply from legal", "Reply from finance")}),
+    )
+    .await
+    .unwrap_err();
+    assert!(stale.contains("query again"), "{stale}");
 }

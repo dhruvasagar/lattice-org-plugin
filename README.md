@@ -53,7 +53,7 @@ reached the network.
 | `signs` | the `>` an agenda row wears when it is marked for a bulk action |
 | `decorations` | which agenda rows carry that mark — re-asked through `refresh-decorations`, because a mark changes no text |
 | `events` | the clock's session, its minute wake and its modeline segment |
-| `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), read through the agenda's own scan so the assistant and `:org-agenda` agree |
+| `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), `org.query` (entries by tags, properties or TODO state) and `org.entry` (one entry whole, by its ref or `ID`), read through the agenda's own scan so the assistant and `:org-agenda` agree |
 | `help` | `doc/org.md` and `doc/roam.md`, shipped inside the component; `:help org`, `:help org.roam`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),

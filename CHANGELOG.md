@@ -14,6 +14,12 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   today's date, and every row carries a ref (`file::line::heading`). The tool
   only reads: the seam's store is read-only whatever org's grant says. Turn it
   on in a chat profile with `tools = ["org.*"]`.
+- **`org.query` and `org.entry`.** `org.query` finds entries by tags,
+  properties or TODO state whatever their dates (`+proj/WAITING`,
+  `OWNER="Sam"`, `/DONE`); `org.entry` reads one entry whole (its notes,
+  properties, log and subheadings) by the ref another tool listed, or by its
+  `ID`. A ref whose line has moved still finds its heading when one headline
+  carries it, and is refused with "query again" when none or several do.
 
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A
@@ -24,6 +30,9 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   consistency graph.
 
 ### Fixed
+- **A section matching a TODO state finds DONE entries that have no tags.**
+  `match = "/DONE"` used to miss them: an untagged DONE headline was never
+  scanned as a row.
 - **A week view no longer includes an eighth day.** The dated block took in
   rows from the day after its header ended, filed under a header of their own.
 

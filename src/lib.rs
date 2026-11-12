@@ -12020,18 +12020,11 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
         name: String,
         args: String,
     ) -> Result<lattice::plugin_host::types::LlmToolResult, String> {
-        let text = match name.as_str() {
-            llm_tools::AGENDA => {
-                let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
-                let (files, problems) = org_corpus(&keywords);
-                let mut text = llm_tools::agenda(&files, &keywords, today_epoch_day(), &args)?;
-                for p in problems {
-                    text.push_str(&format!("\nNot read: {p}"));
-                }
-                text
-            }
-            other => return Err(format!("org has no tool `{other}`")),
+        let keywords = agenda::Keywords::from_spec(&todo_keyword_lines().join("\n"));
+        let org = HostOrg {
+            keywords: keywords.clone(),
         };
+        let text = llm_tools::call(&org, &keywords, today_epoch_day(), &name, &args)?;
         Ok(lattice::plugin_host::types::LlmToolResult {
             text,
             proposals: Vec::new(),
@@ -12043,6 +12036,24 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
     }
 }
 
+/// AT.7: what the assistant's tools read, through the host.
+struct HostOrg {
+    keywords: agenda::Keywords,
+}
+
+impl llm_tools::Org for HostOrg {
+    fn corpus(&self, tags_search: bool) -> llm_tools::Corpus {
+        let (files, problems) = org_corpus(&self.keywords, tags_search);
+        llm_tools::Corpus { files, problems }
+    }
+
+    /// Under org's grant, made read-only on this seam's store; `~` expanded
+    /// as the option paths are.
+    fn read(&self, path: &str) -> Result<String, String> {
+        lattice::plugin_host::host_services::read_file(&crate::roam_scan::expand_tilde(path))
+    }
+}
+
 /// AT.7: the org files the assistant's tools read — `org.agenda-files`, else
 /// `org.directory` — each with its agenda rows, plus a line for each root or
 /// file that could not be read.
@@ -12050,7 +12061,11 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
 /// The tree path when the host can parse the file (`parse-file` needs the
 /// `tree-sitter` capability and reads under the same grant as `read-file`),
 /// the text path otherwise, exactly as the agenda view chooses.
-fn org_corpus(keywords: &agenda::Keywords) -> (Vec<llm_tools::OrgFile>, Vec<String>) {
+/// `tags_search` is the view's `admit_tag_only`.
+fn org_corpus(
+    keywords: &agenda::Keywords,
+    tags_search: bool,
+) -> (Vec<llm_tools::OrgFile>, Vec<String>) {
     use lattice::plugin_host::{host_services, tree_sitter};
     let mut roots = agenda_files();
     if roots.is_empty() {
@@ -12081,8 +12096,8 @@ fn org_corpus(keywords: &agenda::Keywords) -> (Vec<llm_tools::OrgFile>, Vec<Stri
             }
         };
         let rows = match tree_sitter::parse_file(&path) {
-            Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, keywords, false),
-            None => agenda::scan_file(&text, keywords, false),
+            Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, keywords, tags_search),
+            None => agenda::scan_file(&text, keywords, tags_search),
         };
         let shown = match path.strip_prefix(&home) {
             Some(rest) if !home.is_empty() && home != "~" => format!("~{rest}"),

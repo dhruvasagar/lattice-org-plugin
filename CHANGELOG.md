@@ -23,6 +23,10 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
 - **`org.clock`** totals the time you clocked over a range of days (the last
   week by default), per entry, per file or per tag, largest first. It counts
   what the agenda's clock report counts: a running clock adds nothing.
+- **`org.notes`** finds your org-roam notes by words in their title or
+  aliases, or by tag, and names the notes that link to each. A note's ref is
+  its `ID`, and `org.entry` reads it: a whole-file note whole, a headline
+  note as its subtree.
 
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A

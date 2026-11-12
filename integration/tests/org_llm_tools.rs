@@ -205,6 +205,7 @@ async fn the_assistant_reads_the_agenda_through_org() {
             ("org__query", Permission::Run, ToolKind::Read),
             ("org__entry", Permission::Run, ToolKind::Read),
             ("org__clock", Permission::Run, ToolKind::Read),
+            ("org__notes", Permission::Run, ToolKind::Read),
         ],
         "org reaches no network, so its read tools run unasked"
     );

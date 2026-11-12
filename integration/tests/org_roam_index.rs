@@ -173,7 +173,7 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
         dir.join("plugin.toml"),
         format!(
             "id = \"org\"\n\
-             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\", \"transient-source\"]\n\
+             provides = [\"events\", \"modes\", \"grammar\", \"language\", \"config\", \"picker-source\", \"completion-source\", \"transient-source\", \"llm-tools\"]\n\
              capabilities = [\"fs:write:{}\", \"state:write\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n\
              default_modes = [\"org-todo-mode\", \"org-global-mode\", \"org-table-mode\"]\n",
@@ -218,6 +218,11 @@ fn loader_over_editor(editor: &Editor, host: Arc<PluginHost>) -> PluginLoader {
             multibuffer_registry: editor
                 .services
                 .get::<lattice_multibuffer::registry::MultibufferRegistryHandle>()
+                .map(|h| (*h).clone()),
+            // AT.7e: the assistant reads the index through org's `llm-tools`.
+            plugin_tools: editor
+                .services
+                .get::<lattice_ai::llm::tools::plugin::PluginToolsHandle>()
                 .map(|h| (*h).clone()),
             ..Default::default()
         },
@@ -4280,4 +4285,93 @@ async fn discarding_a_caller_warns_about_its_waiting_children() {
         message.contains("2 captures started from this one"),
         "{message:?}"
     );
+}
+
+/// AT.7e — the assistant finds notes in the index the event store built, and
+/// reads one by its ID through `org.entry`, which falls back to the index
+/// when the agenda files do not hold the ID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_assistant_finds_and_reads_roam_notes() {
+    let base = tempfile::tempdir().unwrap();
+    let corpus = base.path().join("roam");
+    write_corpus(&corpus);
+    let Some((index, editor)) = index_corpus_with_editor(base.path(), &corpus).await else {
+        eprintln!("skipping: the org component is not built");
+        return;
+    };
+    // Agenda files with no notes in them, so an ID can only come from the
+    // index.
+    let agenda = corpus.join("agenda");
+    std::fs::create_dir_all(&agenda).unwrap();
+    editor
+        .config
+        .parse_and_set_command(&format!("org.agenda-files={}", agenda.display()))
+        .expect("the plugin registered `org.agenda-files`");
+    assert!(
+        settle(|| index.nodes().len() >= 4 && !index.backlinks("FILE-BBBB").is_empty()).await,
+        "the index is built"
+    );
+
+    let broker = editor
+        .services
+        .get::<lattice_ai::llm::chat::LlmChatsHandle>()
+        .map(|c| c.tools().clone())
+        .expect("the llm layer is installed at boot");
+    let offer = broker
+        .offer(&std::collections::BTreeSet::from([
+            "org.notes".to_string(),
+            "org.entry".to_string(),
+        ]))
+        .await;
+    let call = |tool: &'static str, args: serde_json::Value| {
+        let offer = &offer;
+        async move {
+            offer
+                .call(tool, args, lattice_ai::llm::tools::CallContext::default())
+                .await
+                .map(|o| o.text)
+                .map_err(|e| e.to_string())
+        }
+    };
+
+    let rust = call("org__notes", serde_json::json!({"query": "rust"}))
+        .await
+        .unwrap();
+    assert!(rust.contains("1 note matches \"rust\":"), "{rust}");
+    assert!(rust.contains("- Rust :lang: [ref FILE-BBBB] in "), "{rust}");
+    assert!(
+        rust.contains("Linked from: Honey Garlic Chicken Breast"),
+        "{rust}"
+    );
+    let food = call("org__notes", serde_json::json!({"tag": "recipe"}))
+        .await
+        .unwrap();
+    assert!(
+        food.contains("- Honey Garlic Chicken Breast (also: "),
+        "aliases and a file tag: {food}"
+    );
+
+    let note = call("org__entry", serde_json::json!({"ref": "FILE-AAAA"}))
+        .await
+        .unwrap();
+    assert!(
+        note.contains("Note \"Honey Garlic Chicken Breast\" [ref FILE-AAAA], the whole of "),
+        "{note}"
+    );
+    assert!(
+        note.contains("Cooked with [[id:FILE-BBBB][the other note]]."),
+        "{note}"
+    );
+    let headline = call("org__entry", serde_json::json!({"ref": "HEAD-CCCC"}))
+        .await
+        .unwrap();
+    assert!(headline.contains("rust.org::7::Async] in "), "{headline}");
+    assert!(
+        headline.contains("Nested note pointing at [[id:FILE-AAAA]]."),
+        "{headline}"
+    );
+    let phantom = call("org__entry", serde_json::json!({"ref": "PHANTOM-EEEE"}))
+        .await
+        .unwrap_err();
+    assert!(phantom.contains("no entry has the ID"), "{phantom}");
 }

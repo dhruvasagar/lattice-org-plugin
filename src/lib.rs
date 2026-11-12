@@ -12052,6 +12052,33 @@ impl llm_tools::Org for HostOrg {
     fn read(&self, path: &str) -> Result<String, String> {
         lattice::plugin_host::host_services::read_file(&crate::roam_scan::expand_tilde(path))
     }
+
+    /// The index the event store writes; this store only reads it (the host
+    /// keys the store by plugin, so every org instance sees the one index).
+    fn roam_nodes(&self) -> Vec<roam::Node> {
+        roam_index::all_nodes()
+    }
+
+    fn roam_node(&self, id: &str) -> Option<roam::Node> {
+        roam_index::node(id)
+    }
+
+    fn roam_backlinks(&self, id: &str) -> Vec<String> {
+        roam_index::backlinks(id)
+    }
+
+    fn shown(&self, path: &str) -> String {
+        shown_path(path)
+    }
+}
+
+/// A path as a ref spells it: `~` for the home directory.
+fn shown_path(path: &str) -> String {
+    let home = crate::roam_scan::expand_tilde("~");
+    match path.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() && home != "~" => format!("~{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 /// AT.7: the org files the assistant's tools read — `org.agenda-files`, else
@@ -12073,7 +12100,6 @@ fn org_corpus(
             option_or("directory", "~/org").trim(),
         ));
     }
-    let home = crate::roam_scan::expand_tilde("~");
     let mut problems = Vec::new();
     let mut paths = std::collections::BTreeSet::new();
     for root in roots {
@@ -12099,11 +12125,11 @@ fn org_corpus(
             Some(snapshot) => agenda::scan_tree(&snapshot.root(), &text, keywords, tags_search),
             None => agenda::scan_file(&text, keywords, tags_search),
         };
-        let shown = match path.strip_prefix(&home) {
-            Some(rest) if !home.is_empty() && home != "~" => format!("~{rest}"),
-            _ => path.clone(),
-        };
-        files.push(llm_tools::OrgFile { shown, text, rows });
+        files.push(llm_tools::OrgFile {
+            shown: shown_path(&path),
+            text,
+            rows,
+        });
     }
     (files, problems)
 }

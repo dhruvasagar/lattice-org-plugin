@@ -27,6 +27,7 @@ use lattice_plugin_sdk::ConfigShape;
 
 use crate::agenda::{self, Filter, Keywords, Kind, Row, Section, When};
 use crate::repeat::{Base, Repeater, Unit};
+use crate::roam::Node;
 use crate::timestamp;
 use crate::todo;
 
@@ -38,11 +39,17 @@ pub const QUERY: &str = "query";
 pub const ENTRY: &str = "entry";
 /// `org.clock`.
 pub const CLOCK: &str = "clock";
+/// `org.notes`.
+pub const NOTES: &str = "notes";
 
 /// The most rows one answer lists; the rest are counted.
 const MAX_ROWS: usize = 150;
 /// What `org.query` lists when the model gives no `limit`.
 const DEFAULT_LIMIT: usize = 50;
+/// What `org.notes` lists when the model gives no `limit`.
+const DEFAULT_NOTES: usize = 20;
+/// The most backlinks named under one note; the rest are counted.
+const MAX_BACKLINKS: usize = 10;
 /// The widest window `from`/`to` may span.
 const MAX_DAYS: i64 = 366;
 /// The most lines of one entry `org.entry` returns.
@@ -88,6 +95,13 @@ pub fn tools() -> Vec<ToolSpec> {
                           time went and for reports of work done.",
             input_schema: input_schema::<ClockArgs>().unwrap_or_default(),
         },
+        ToolSpec {
+            name: NOTES,
+            description: "Find the user's org-roam notes by words in their title or aliases, or \
+                          by tag, with the notes that link to each. Use it for questions about \
+                          what the user has written on a topic; read a note with org.entry.",
+            input_schema: input_schema::<NotesArgs>().unwrap_or_default(),
+        },
     ]
 }
 
@@ -116,6 +130,23 @@ pub trait Org {
     fn corpus(&self, tags_search: bool) -> Corpus;
     /// One file's text, by the path a ref spells (`~` allowed).
     fn read(&self, path: &str) -> Result<String, String>;
+    /// Every node in the roam index; empty when roam is not set up or the
+    /// index is not built.
+    fn roam_nodes(&self) -> Vec<Node> {
+        Vec::new()
+    }
+    /// One roam node by its ID, case-insensitive.
+    fn roam_node(&self, _id: &str) -> Option<Node> {
+        None
+    }
+    /// The IDs of the nodes linking to `id`.
+    fn roam_backlinks(&self, _id: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// A path as a ref spells it (`~` for home).
+    fn shown(&self, path: &str) -> String {
+        path.to_string()
+    }
 }
 
 /// Run one of org's tools: the text of its answer, or the error the model
@@ -132,6 +163,7 @@ pub fn call(
         QUERY => query(org, keywords, today, args),
         ENTRY => entry(org, keywords, today, args),
         CLOCK => clock(org, keywords, today, args),
+        NOTES => notes(org, today, args),
         other => Err(format!("org has no tool `{other}`")),
     }
 }
@@ -193,6 +225,17 @@ pub struct ClockArgs {
     pub to: Option<String>,
     /// `entry` (the default), `file` or `tag`. An entry with several tags counts under each.
     pub by: Option<ClockBy>,
+}
+
+/// `org.notes`' input.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
+pub struct NotesArgs {
+    /// Words that must all appear in a note's title or one of its aliases, in any case.
+    pub query: Option<String>,
+    /// Only notes carrying this tag, their own or inherited.
+    pub tag: Option<String>,
+    /// The most notes to list; 20 when left out, at most 150.
+    pub limit: Option<i64>,
 }
 
 /// `org.agenda`.
@@ -416,12 +459,40 @@ fn entry(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<S
                     break;
                 }
             }
-            hit.ok_or_else(|| {
-                format!(
-                    "ref: no entry has the ID `{wanted}` in the agenda files; a ref from another \
-                     org tool looks like file::line::heading"
-                )
-            })?
+            match hit {
+                Some(hit) => hit,
+                // Not in the agenda files: a roam note, perhaps, which may be
+                // a whole file rather than a headline.
+                None => match org.roam_node(wanted) {
+                    Some(node) => {
+                        let path = org.shown(&node.file);
+                        let text = org
+                            .read(&node.file)
+                            .map_err(|e| format!("ref: {path}: {e}"))?;
+                        if node.level == 0 {
+                            return Ok(whole_note(&path, &text, &node, today));
+                        }
+                        let at = locate(&text, node.line as usize, &node.title, keywords)
+                            .or_else(|| {
+                                let at = node.line as usize;
+                                text.lines().nth(at).and_then(headline_level).map(|_| at)
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "ref: the note `{wanted}` is not where the roam index puts \
+                                     it; :org-roam-sync re-indexes"
+                                )
+                            })?;
+                        (path, text, at)
+                    }
+                    None => {
+                        return Err(format!(
+                            "ref: no entry has the ID `{wanted}` in the agenda files or the roam \
+                             notes; a ref from another org tool looks like file::line::heading"
+                        ))
+                    }
+                },
+            }
         }
     };
 
@@ -450,6 +521,128 @@ fn entry(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<S
         out.push_str(&format!(
             "\n{} more lines not shown; read the file for the rest.\n",
             end - shown_end
+        ));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// A file-level roam note: the whole file, capped.
+fn whole_note(path: &str, text: &str, node: &Node, today: i64) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = format!("Today is {}.\n", day_name(today));
+    out.push_str(&format!(
+        "Note \"{}\" [ref {}], the whole of {path}:\n\n",
+        node.title, node.id
+    ));
+    for line in lines.iter().take(MAX_ENTRY_LINES) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > MAX_ENTRY_LINES {
+        out.push_str(&format!(
+            "\n{} more lines not shown; read the file for the rest.\n",
+            lines.len() - MAX_ENTRY_LINES
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// `org.notes`: roam nodes by title or alias words and by tag, with the
+/// notes linking to each. A note's ref is its `ID`, which survives edits.
+fn notes(org: &dyn Org, today: i64, args: &str) -> Result<String, String> {
+    let args: NotesArgs = parse_args(args).map_err(|e| e.to_string())?;
+    let words: Vec<String> = args
+        .query
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    let tag = args
+        .tag
+        .as_deref()
+        .map(|t| t.trim().trim_matches(':').to_string())
+        .filter(|t| !t.is_empty());
+    if words.is_empty() && tag.is_none() {
+        return Err("query: give words to look for, or a tag".to_string());
+    }
+    let limit = match args.limit {
+        None => DEFAULT_NOTES,
+        Some(n) if (1..=MAX_ROWS as i64).contains(&n) => n as usize,
+        Some(_) => return Err(format!("limit: between 1 and {MAX_ROWS}")),
+    };
+    let nodes = org.roam_nodes();
+    if nodes.is_empty() {
+        return Err(
+            "the roam index is empty: set org.roam-directory, or run :org-roam-sync to build it"
+                .to_string(),
+        );
+    }
+    let names = |n: &Node| {
+        std::iter::once(&n.title)
+            .chain(&n.aliases)
+            .map(|s| s.to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let mut found: Vec<(bool, &Node)> = nodes
+        .iter()
+        .filter(|n| {
+            tag.as_ref()
+                .is_none_or(|t| n.tags.iter().any(|x| x.eq_ignore_ascii_case(t)))
+        })
+        .filter_map(|n| {
+            let names = names(n);
+            let hit = words.iter().all(|w| names.iter().any(|s| s.contains(w)));
+            // A title hit outranks an alias-only one.
+            let title = n.title.to_lowercase();
+            hit.then(|| (words.iter().all(|w| title.contains(w)), n))
+        })
+        .collect();
+    found.sort_by_key(|(in_title, n)| (!*in_title, n.title.to_lowercase()));
+
+    let what = match (words.is_empty(), &tag) {
+        (false, Some(t)) => format!("\"{}\" tagged {t}", words.join(" ")),
+        (false, None) => format!("\"{}\"", words.join(" ")),
+        (true, Some(t)) => format!("tagged {t}"),
+        (true, None) => unreachable!("refused above"),
+    };
+    let mut out = format!("Today is {}.\n", day_name(today));
+    match found.len() {
+        0 => out.push_str(&format!("No note matches {what}.\n")),
+        1 => out.push_str(&format!("1 note matches {what}:\n")),
+        n => out.push_str(&format!("{n} notes match {what}:\n")),
+    }
+    for (_, n) in found.iter().take(limit) {
+        out.push_str(&format!("- {}", n.title));
+        if !n.aliases.is_empty() {
+            out.push_str(&format!(" (also: {})", n.aliases.join(", ")));
+        }
+        if !n.tags.is_empty() {
+            out.push_str(&format!(" :{}:", n.tags.join(":")));
+        }
+        out.push_str(&format!(" [ref {}] in {}\n", n.id, org.shown(&n.file)));
+        let from = org.roam_backlinks(&n.id);
+        if !from.is_empty() {
+            let titles: Vec<String> = from
+                .iter()
+                .take(MAX_BACKLINKS)
+                .map(|id| {
+                    org.roam_node(id)
+                        .map(|b| b.title)
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            out.push_str(&format!("  Linked from: {}", titles.join("; ")));
+            if from.len() > MAX_BACKLINKS {
+                out.push_str(&format!(" and {} more", from.len() - MAX_BACKLINKS));
+            }
+            out.push('\n');
+        }
+    }
+    if found.len() > limit {
+        out.push_str(&format!(
+            "\n{} more not listed; raise limit (at most {MAX_ROWS}) or narrow the query.\n",
+            found.len() - limit
         ));
     }
     Ok(out.trim_end().to_string())
@@ -1126,11 +1319,181 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
         assert!(err.starts_with("by:"), "{err}");
     }
 
+    /// A roam node; `at` is `(line, level)`, `(0, 0)` for a file node.
+    fn node(
+        id: &str,
+        title: &str,
+        aliases: &[&str],
+        tags: &[&str],
+        file: &str,
+        (line, level): (u32, u32),
+    ) -> Node {
+        Node {
+            id: id.into(),
+            title: title.into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            refs: Vec::new(),
+            file: file.into(),
+            line,
+            level,
+        }
+    }
+
+    const ROAM_RUST: &str = "#+title: Rust\n:PROPERTIES:\n:ID: rust\n:END:\nA language.\n";
+    const ROAM_NOTES: &str = "* Ownership\n:PROPERTIES:\n:ID: own\n:END:\nOne owner.\n\
+                              * Lifetimes\n:PROPERTIES:\n:ID: life\n:END:\n";
+
+    /// A roam index over two files beside the agenda's.
+    struct Roam(Fake, Vec<Node>);
+
+    impl Org for Roam {
+        fn corpus(&self, tags_search: bool) -> Corpus {
+            self.0.corpus(tags_search)
+        }
+        fn read(&self, path: &str) -> Result<String, String> {
+            match path {
+                "/home/u/roam/rust.org" => Ok(ROAM_RUST.into()),
+                "/home/u/roam/notes.org" => Ok(ROAM_NOTES.into()),
+                other => self.0.read(other),
+            }
+        }
+        fn roam_nodes(&self) -> Vec<Node> {
+            self.1.clone()
+        }
+        fn roam_node(&self, id: &str) -> Option<Node> {
+            self.1
+                .iter()
+                .find(|n| n.id.eq_ignore_ascii_case(id))
+                .cloned()
+        }
+        fn roam_backlinks(&self, id: &str) -> Vec<String> {
+            match id {
+                "rust" => vec!["own".into(), "life".into()],
+                _ => Vec::new(),
+            }
+        }
+        fn shown(&self, path: &str) -> String {
+            path.replace("/home/u", "~")
+        }
+    }
+
+    fn roam() -> Roam {
+        Roam(
+            both(),
+            vec![
+                node(
+                    "rust",
+                    "Rust",
+                    &["rustlang"],
+                    &["lang"],
+                    "/home/u/roam/rust.org",
+                    (0, 0),
+                ),
+                node(
+                    "own",
+                    "Ownership",
+                    &[],
+                    &["lang", "rust"],
+                    "/home/u/roam/notes.org",
+                    (0, 1),
+                ),
+                node(
+                    "life",
+                    "Lifetimes",
+                    &["borrow regions"],
+                    &["rust"],
+                    "/home/u/roam/notes.org",
+                    (5, 1),
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn notes_are_found_by_title_or_alias_with_their_backlinks() {
+        let out = call(&roam(), &kw(), today(), NOTES, r#"{"query": "RUST"}"#).unwrap();
+        assert_eq!(
+            out,
+            "Today is Thursday 2026-11-12.\n\
+             1 note matches \"rust\":\n\
+             - Rust (also: rustlang) :lang: [ref rust] in ~/roam/rust.org\n  \
+             Linked from: Ownership; Lifetimes"
+        );
+        let alias = call(&roam(), &kw(), today(), NOTES, r#"{"query": "borrow"}"#).unwrap();
+        assert!(
+            alias.contains("- Lifetimes (also: borrow regions) :rust: [ref life]"),
+            "{alias}"
+        );
+        let tagged = call(&roam(), &kw(), today(), NOTES, r#"{"tag": ":rust:"}"#).unwrap();
+        assert!(
+            tagged.contains("2 notes match tagged rust:\n- Lifetimes"),
+            "{tagged}"
+        );
+        let none = call(
+            &roam(),
+            &kw(),
+            today(),
+            NOTES,
+            r#"{"query": "go", "tag": "lang"}"#,
+        )
+        .unwrap();
+        assert!(
+            none.ends_with("No note matches \"go\" tagged lang."),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn notes_refuse_an_empty_question_and_an_empty_index() {
+        let err = call(&roam(), &kw(), today(), NOTES, "{}").unwrap_err();
+        assert_eq!(err, "query: give words to look for, or a tag");
+        let err = run(&both(), NOTES, r#"{"query": "rust"}"#).unwrap_err();
+        assert!(err.starts_with("the roam index is empty"), "{err}");
+    }
+
+    /// A note's ref is its ID; `org.entry` finds it in the roam index when
+    /// the agenda files do not have it, a file node whole and a headline node
+    /// as a subtree.
+    #[test]
+    fn an_entry_reads_a_roam_note_by_its_id() {
+        let read = |id: &str| {
+            call(
+                &roam(),
+                &kw(),
+                today(),
+                ENTRY,
+                &format!(r#"{{"ref": "{id}"}}"#),
+            )
+        };
+        let file = read("rust").unwrap();
+        assert!(
+            file.starts_with(
+                "Today is Thursday 2026-11-12.\n\
+                 Note \"Rust\" [ref rust], the whole of ~/roam/rust.org:\n\n#+title: Rust\n"
+            ),
+            "{file}"
+        );
+        let headline = read("LIFE").unwrap();
+        assert!(
+            headline.contains(
+                "Entry [ref ~/roam/notes.org::6::Lifetimes] in ~/roam/notes.org:\n\n* Lifetimes\n"
+            ),
+            "{headline}"
+        );
+        assert!(!headline.contains("One owner."), "{headline}");
+        let err = read("nowhere").unwrap_err();
+        assert!(
+            err.contains("in the agenda files or the roam notes"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_tool_list_carries_a_schema_from_each_args_struct() {
         let tools = tools();
         let names: Vec<_> = tools.iter().map(|t| t.name).collect();
-        assert_eq!(names, ["agenda", "query", "entry", "clock"]);
+        assert_eq!(names, ["agenda", "query", "entry", "clock", "notes"]);
         assert!(
             tools[0].input_schema.contains(r#""enum":["day","week"]"#),
             "{}",

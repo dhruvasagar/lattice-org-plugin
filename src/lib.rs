@@ -7532,7 +7532,12 @@ fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -
     let Some(token) = submitted_text(&ctx.args) else {
         return vec![Effect::None];
     };
-    let Some((path, before_line)) = refile::decode(&token) else {
+    let Some(refile::Decoded {
+        path,
+        before_line,
+        level,
+    }) = refile::decode(&token)
+    else {
         return vec![Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org: refile target could not be read".to_string(),
@@ -7543,6 +7548,9 @@ fn refile_to(ctx: &ActionContext, doc: &Document, tree: Option<&TreeSnapshot>) -
     let Some((text, (sl, sb, el, eb))) = archive::extract_subtree(&hl, ctx.cursor.line) else {
         return vec![Effect::None];
     };
+    // A child of the target, as org files it: capture's rule, so the two
+    // cannot disagree about where a subtree lands.
+    let text = capture_target::relevel(&text, level);
 
     vec![Effect::WriteToFile(WriteToFilePayload {
         path,

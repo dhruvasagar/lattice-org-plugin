@@ -2709,8 +2709,8 @@ async fn refiling_files_a_subtree_under_a_headline_in_another_file() {
     assert_eq!(text(&editor), "* Two\n", "the subtree left the source");
     assert_eq!(
         text_of(&editor, &targets),
-        "* Work\n** Q3\n* One\nbody\n* Personal\n",
-        "and landed after Work's whole subtree, not in front of its children"
+        "* Work\n** Q3\n** One\nbody\n* Personal\n",
+        "and landed under Work, after its whole subtree rather than in front of its children"
     );
 }
 

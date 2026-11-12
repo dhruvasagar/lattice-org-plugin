@@ -45,6 +45,11 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   consistency graph.
 
 ### Fixed
+- **Refile files a subtree under its target.** `<leader>or` onto `Work` put
+  the entry after Work's subtree at its own level, a sibling of Work; it is
+  now re-levelled to be Work's child, deeper headings shifting with it, as
+  org's refile and org's capture both file. Refiling to a file makes it a
+  top-level entry.
 - **A state-change note sits under its log line's text.** The note an `@`
   state prompts for was written level with the `- State …` bullet; it is now
   two columns further in, as org writes it and reads it back.

@@ -35,6 +35,9 @@ pub struct Target {
     /// failing, which is what makes "after the last headline in the file"
     /// expressible without a special case.
     pub before_line: Option<u32>,
+    /// The target headline's level, `0` for the file itself: the subtree is
+    /// re-levelled to sit one below it, as org's refile makes it a child.
+    pub level: usize,
     /// What the user reads in the picker: `notes.org  Work / Q3`.
     pub label: String,
 }
@@ -79,6 +82,7 @@ pub fn targets_from(
     let mut out = vec![Target {
         file: file.to_string(),
         before_line: None,
+        level: 0,
         label: display_name.to_string(),
     }];
 
@@ -98,6 +102,7 @@ pub fn targets_from(
         out.push(Target {
             file: file.to_string(),
             before_line: Some(entry.end_line + 1),
+            level: entry.level,
             label: format!("{display_name}  {}", stack.join(" / ")),
         });
     }
@@ -113,28 +118,43 @@ fn title_of(line: &str, level: usize) -> String {
 
 /// Encode a target as the opaque token the picker hands back at `accept`.
 ///
-/// `path\tline`, with an empty line meaning "append". A tab because a path may
-/// contain almost anything else, and this round-trips through `args` as one
-/// string rather than needing a typed payload the seam does not have.
+/// `path\tline\tlevel`, with an empty line meaning "append". A tab because a
+/// path may contain almost anything else, and this round-trips through `args`
+/// as one string rather than needing a typed payload the seam does not have.
 pub fn encode(target: &Target) -> String {
-    match target.before_line {
-        Some(line) => format!("{}\t{line}", target.file),
-        None => format!("{}\t", target.file),
-    }
+    let line = target
+        .before_line
+        .map(|l| l.to_string())
+        .unwrap_or_default();
+    format!("{}\t{line}\t{}", target.file, target.level)
+}
+
+/// A decoded [`encode`]: where to insert, and the level to file under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decoded {
+    pub path: String,
+    pub before_line: Option<u32>,
+    pub level: usize,
 }
 
 /// The inverse of [`encode`]. `None` when the token is malformed — which is
 /// untrusted input as far as the action is concerned, since the token crosses
 /// the boundary twice.
-pub fn decode(token: &str) -> Option<(String, Option<u32>)> {
-    let (path, line) = token.split_once('\t')?;
+pub fn decode(token: &str) -> Option<Decoded> {
+    let (path, rest) = token.split_once('\t')?;
+    let (line, level) = rest.split_once('\t')?;
     if path.is_empty() {
         return None;
     }
-    if line.is_empty() {
-        return Some((path.to_string(), None));
-    }
-    Some((path.to_string(), Some(line.parse().ok()?)))
+    Some(Decoded {
+        path: path.to_string(),
+        before_line: if line.is_empty() {
+            None
+        } else {
+            Some(line.parse().ok()?)
+        },
+        level: level.parse().ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -203,7 +223,11 @@ mod tests {
         let t = &targets_in("/org/notes.org", "notes.org", SAMPLE, 3)[1];
         assert_eq!(
             decode(&encode(t)),
-            Some(("/org/notes.org".to_string(), Some(4)))
+            Some(Decoded {
+                path: "/org/notes.org".to_string(),
+                before_line: Some(4),
+                level: 1,
+            })
         );
     }
 
@@ -212,7 +236,11 @@ mod tests {
         let t = &targets_in("/org/notes.org", "notes.org", SAMPLE, 3)[0];
         assert_eq!(
             decode(&encode(t)),
-            Some(("/org/notes.org".to_string(), None))
+            Some(Decoded {
+                path: "/org/notes.org".to_string(),
+                before_line: None,
+                level: 0,
+            })
         );
     }
 
@@ -223,6 +251,8 @@ mod tests {
     fn a_malformed_token_is_refused_rather_than_guessed_at() {
         assert!(decode("no-tab-here").is_none());
         assert!(decode("\t3").is_none(), "an empty path is not a file");
-        assert!(decode("/org/notes.org\tnotanumber").is_none());
+        assert!(decode("/org/notes.org\tnotanumber\t1").is_none());
+        assert!(decode("/org/notes.org\t3").is_none(), "no level");
+        assert!(decode("/org/notes.org\t3\tdeep").is_none());
     }
 }

@@ -184,7 +184,20 @@ fn eval_config() -> String {
     llm.insert("providers".into(), toml::Value::Table(providers));
     let mut root = toml::Table::new();
     root.insert("llm".into(), toml::Value::Table(llm));
-    toml::Value::Table(root).to_string()
+    // A `Table` displays as a document; a `Value` would display as one
+    // inline table, which is not a file.
+    root.to_string()
+}
+
+/// The config the real run writes loads as the user's own would: a file
+/// lattice rejects fails every run before a model is asked anything.
+#[test]
+fn the_eval_config_is_a_config_lattice_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("llm.toml");
+    std::fs::write(&file, eval_config()).unwrap();
+    let loaded = lattice_ai::llm::config::LlmConfig::load(&file);
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
 }
 
 fn env_list(name: &str) -> Vec<String> {

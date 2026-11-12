@@ -39,12 +39,20 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+# AT.10: the eval of org's assistant tools. Its own directory, not `tests/`,
+# because it is a harness with a corpus and graders rather than one test file;
+# its real run is `#[ignore]`d (it needs a model) and is started by hand.
+[[test]]
+name = "eval"
+path = "eval/main.rs"
+
 [dev-dependencies]
 # TC.6: the production path never parses TOML — the options are declared shapes
 # now — but TOML is still the nicest way to WRITE a fixture, and the alternative
 # is pages of nested `Value::record([...])` in which a test's intent disappears.
 # `config_shape::from_toml` turns a fixture into the tree the code receives.
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# AT.10: `display`, for the eval writing the providers it may use back out as a config.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "display"] }
 lattice-core = { path = "../../lattice/crates/lattice-core" }
 # MO.3: the test reads the resolved `foldmethod` for an org buffer, which means
 # naming the option's declaration type (`FoldMethodOption`) — it lives here.
@@ -69,7 +77,8 @@ lattice-multibuffer = { path = "../../lattice/crates/lattice-multibuffer" }
 # OC.3: the tests reach the editor's transient registry to prove the capture
 # menu registered into it and builds through it.
 lattice-picker = { path = "../../lattice/crates/lattice-picker" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# AT.10: `net` and `io-util` for the eval's scripted model server.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tempfile = "3"
 arc-swap = "1"
 # OR.10: the dailies tests need TODAY in local time — the same answer the guest

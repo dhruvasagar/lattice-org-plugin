@@ -20,6 +20,9 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   properties, log and subheadings) by the ref another tool listed, or by its
   `ID`. A ref whose line has moved still finds its heading when one headline
   carries it, and is refused with "query again" when none or several do.
+- **`org.clock`** totals the time you clocked over a range of days (the last
+  week by default), per entry, per file or per tag, largest first. It counts
+  what the agenda's clock report counts: a running clock adds nothing.
 
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A

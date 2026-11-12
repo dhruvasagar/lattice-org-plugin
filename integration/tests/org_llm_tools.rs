@@ -204,6 +204,7 @@ async fn the_assistant_reads_the_agenda_through_org() {
             ("org__agenda", Permission::Run, ToolKind::Read),
             ("org__query", Permission::Run, ToolKind::Read),
             ("org__entry", Permission::Run, ToolKind::Read),
+            ("org__clock", Permission::Run, ToolKind::Read),
         ],
         "org reaches no network, so its read tools run unasked"
     );
@@ -270,16 +271,20 @@ async fn the_assistant_reads_the_agenda_through_org() {
 /// query listed and by `ID`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_assistant_queries_and_reads_entries_through_org() {
-    let home = "* Projects :proj:\n\
-                ** WAITING Reply from legal\n\
-                :PROPERTIES:\n\
-                :ID: legal-42\n\
-                :OWNER: Sam\n\
-                :END:\n\
-                Sent the draft on Monday.\n\
-                *** TODO Chase them\n\
-                * DONE Untagged finished thing\n"
-        .to_string();
+    let (day, name) = date(0);
+    let home = format!(
+        "* Projects :proj:\n\
+         ** WAITING Reply from legal\n\
+         :PROPERTIES:\n\
+         :ID: legal-42\n\
+         :OWNER: Sam\n\
+         :END:\n\
+         Sent the draft on Monday.\n\
+         *** TODO Chase them\n\
+         CLOCK: [{day} {name} 09:00]--[{day} {name} 10:15] =>  1:15\n\
+         * DONE Untagged finished thing\n\
+         CLOCK: [{day} {name} 11:00]--[{day} {name} 11:30] =>  0:30\n"
+    );
     let Some((_base, _editor, offer)) = org_tools(&[("home.org", home)]).await else {
         return;
     };
@@ -340,4 +345,12 @@ async fn the_assistant_queries_and_reads_entries_through_org() {
     .await
     .unwrap_err();
     assert!(stale.contains("query again"), "{stale}");
+
+    let by_tag = call(&offer, "org__clock", json!({"by": "tag"}))
+        .await
+        .unwrap();
+    assert!(
+        by_tag.contains("1:45 in total.") && by_tag.contains("- 1:15 :proj:\n- 0:30 (no tag)"),
+        "the child's time under its parent's tag: {by_tag}"
+    );
 }

@@ -36,6 +36,8 @@ pub const AGENDA: &str = "agenda";
 pub const QUERY: &str = "query";
 /// `org.entry`.
 pub const ENTRY: &str = "entry";
+/// `org.clock`.
+pub const CLOCK: &str = "clock";
 
 /// The most rows one answer lists; the rest are counted.
 const MAX_ROWS: usize = 150;
@@ -78,6 +80,13 @@ pub fn tools() -> Vec<ToolSpec> {
                           Give the ref another org tool listed. Use it before answering about an \
                           entry's details.",
             input_schema: input_schema::<EntryArgs>().unwrap_or_default(),
+        },
+        ToolSpec {
+            name: CLOCK,
+            description: "Total the time the user clocked in their org files over a range of \
+                          days, per entry, per file or per tag. Use it for questions about where \
+                          time went and for reports of work done.",
+            input_schema: input_schema::<ClockArgs>().unwrap_or_default(),
         },
     ]
 }
@@ -122,6 +131,7 @@ pub fn call(
         AGENDA => agenda(org, keywords, today, args),
         QUERY => query(org, keywords, today, args),
         ENTRY => entry(org, keywords, today, args),
+        CLOCK => clock(org, keywords, today, args),
         other => Err(format!("org has no tool `{other}`")),
     }
 }
@@ -164,6 +174,25 @@ pub struct EntryArgs {
     /// The entry's ref as another org tool listed it (`file::line::heading`), or the value of
     /// its `ID` property.
     pub r#ref: String,
+}
+
+/// What `org.clock` totals under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ConfigShape)]
+pub enum ClockBy {
+    Entry,
+    File,
+    Tag,
+}
+
+/// `org.clock`'s input.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
+pub struct ClockArgs {
+    /// The first day, `YYYY-MM-DD`. Six days before `to` when left out, so a week.
+    pub from: Option<String>,
+    /// The last day, `YYYY-MM-DD`. Today when left out.
+    pub to: Option<String>,
+    /// `entry` (the default), `file` or `tag`. An entry with several tags counts under each.
+    pub by: Option<ClockBy>,
 }
 
 /// `org.agenda`.
@@ -424,6 +453,125 @@ fn entry(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<S
         ));
     }
     Ok(out.trim_end().to_string())
+}
+
+/// `org.clock`: minutes from `CLOCK:` lines whose start falls in the range,
+/// totalled per entry, file or tag, largest first.
+///
+/// The spans are `clock_scan`'s, the agenda clock report's: a running clock
+/// counts nothing, and a span is filed on the day it began.
+fn clock(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<String, String> {
+    let args: ClockArgs = parse_args(args).map_err(|e| e.to_string())?;
+    let to = match &args.to {
+        Some(s) => parse_day(s).map_err(|e| format!("to: {e}"))?,
+        None => today,
+    };
+    let from = match &args.from {
+        Some(s) => parse_day(s).map_err(|e| format!("from: {e}"))?,
+        None => to - 6,
+    };
+    if to < from {
+        return Err("to: before from".to_string());
+    }
+    if to - from >= MAX_DAYS {
+        return Err(format!("to: at most {MAX_DAYS} days from from"));
+    }
+    let by = args.by.unwrap_or(ClockBy::Entry);
+
+    // Tags come from the tags-search scan, which has a row for every headline
+    // carrying one (its own or inherited); a clocked headline with none has
+    // no row and no tags.
+    let corpus = org.corpus(by == ClockBy::Tag);
+    let mut totals: Vec<(String, u32)> = Vec::new();
+    let mut add = |key: String, minutes: u32| match totals.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, m)) => *m += minutes,
+        None => totals.push((key, minutes)),
+    };
+    let mut all = 0u32;
+    for file in &corpus.files {
+        let lines: Vec<&str> = file.text.lines().collect();
+        for span in crate::clock_scan::scan(&file.text) {
+            if span.day < from || span.day > to {
+                continue;
+            }
+            all += span.minutes;
+            match by {
+                ClockBy::File => add(file.shown.clone(), span.minutes),
+                ClockBy::Tag => {
+                    let tags = file
+                        .rows
+                        .iter()
+                        .find(|r| r.line == span.line)
+                        .map(|r| r.tags.clone())
+                        .unwrap_or_default();
+                    if tags.is_empty() {
+                        add("(no tag)".to_string(), span.minutes);
+                    }
+                    for tag in tags {
+                        add(format!(":{tag}:"), span.minutes);
+                    }
+                }
+                ClockBy::Entry => {
+                    let at = span.line as usize;
+                    let line = lines.get(at).copied().unwrap_or("");
+                    let title = title_of(line, keywords);
+                    let level = headline_level(line).unwrap_or(1);
+                    let mut path = ancestors(&lines, at, level, keywords);
+                    path.push(title.clone());
+                    add(
+                        format!(
+                            "{} [ref {}]",
+                            path.join(" > "),
+                            reference(&file.shown, span.line, &title)
+                        ),
+                        span.minutes,
+                    );
+                }
+            }
+        }
+    }
+    // Largest first; ties in the order they were met (file, then line).
+    totals.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+
+    let mut out = format!(
+        "Today is {}.
+",
+        day_name(today)
+    );
+    let window = if from == to {
+        day_name(from)
+    } else {
+        format!("{} to {}", day_name(from), day_name(to))
+    };
+    if all == 0 {
+        out.push_str(&format!("No time was clocked from {window}.\n"));
+    } else {
+        let per = match by {
+            ClockBy::Entry => "entry",
+            ClockBy::File => "file",
+            ClockBy::Tag => "tag; an entry with several tags counts under each",
+        };
+        out.push_str(&format!(
+            "Clocked from {window}: {} in total. By {per}:\n",
+            hours(all)
+        ));
+        for (key, minutes) in totals.iter().take(MAX_ROWS) {
+            out.push_str(&format!("- {} {key}\n", hours(*minutes)));
+        }
+        if totals.len() > MAX_ROWS {
+            out.push_str(&format!(
+                "\n{} more not listed; ask for a shorter range or by file or tag.\n",
+                totals.len() - MAX_ROWS
+            ));
+        }
+    }
+    tell_problems(&mut out, &corpus);
+    Ok(out.trim_end().to_string())
+}
+
+/// `90` → `1:30`, as org writes a duration.
+fn hours(minutes: u32) -> String {
+    format!("{}:{:02}", minutes / 60, minutes % 60)
 }
 
 /// The headline a ref names: its own line if that still carries the heading,
@@ -916,11 +1064,73 @@ SCHEDULED: <2026-11-20 Fri>";
         assert!(out.ends_with("Not read: ~/org: permission denied"), "{out}");
     }
 
+    const WORK: &str = "#+FILETAGS: :work:\n\
+* Website :web:\n\
+** DONE Fix the header\n\
+:LOGBOOK:\n\
+CLOCK: [2026-11-10 Tue 09:00]--[2026-11-10 Tue 10:30] =>  1:30\n\
+CLOCK: [2026-11-11 Wed 14:00]--[2026-11-11 Wed 14:45] =>  0:45\n\
+CLOCK: [2026-11-01 Sun 09:00]--[2026-11-01 Sun 12:00] =>  3:00\n\
+:END:\n\
+* Admin\n\
+CLOCK: [2026-11-12 Thu 08:00]--[2026-11-12 Thu 08:20] =>  0:20\n\
+CLOCK: [2026-11-12 Thu 16:00]\n";
+
+    fn work() -> Fake {
+        Fake(vec![("~/org/work.org", WORK)])
+    }
+
+    /// The default range is the week to today: the 1st is outside it, the
+    /// running clock counts nothing, and the largest total comes first.
+    #[test]
+    fn clocked_time_is_totalled_per_entry_over_the_last_week() {
+        assert_eq!(
+            run(&work(), CLOCK, "{}").unwrap(),
+            "Today is Thursday 2026-11-12.\n\
+             Clocked from Friday 2026-11-06 to Thursday 2026-11-12: 2:35 in total. By entry:\n\
+             - 2:15 Website > Fix the header [ref ~/org/work.org::3::Fix the header]\n\
+             - 0:20 Admin [ref ~/org/work.org::9::Admin]"
+        );
+    }
+
+    #[test]
+    fn clocked_time_by_tag_and_by_file() {
+        let tags = run(&work(), CLOCK, r#"{"by": "tag", "from": "2026-11-01"}"#).unwrap();
+        assert!(
+            tags.contains(
+                "5:35 in total. By tag; an entry with several tags counts under each:\n\
+                 - 5:35 :work:\n\
+                 - 5:15 :web:"
+            ),
+            "{tags}"
+        );
+        let files = run(&work(), CLOCK, r#"{"by": "file", "to": "2026-11-11"}"#).unwrap();
+        assert!(
+            files.contains(
+                "Clocked from Thursday 2026-11-05 to Wednesday 2026-11-11: 2:15 in total. \
+                 By file:\n- 2:15 ~/org/work.org"
+            ),
+            "{files}"
+        );
+        let none = run(
+            &work(),
+            CLOCK,
+            r#"{"from": "2026-10-01", "to": "2026-10-07"}"#,
+        )
+        .unwrap();
+        assert!(
+            none.ends_with("No time was clocked from Thursday 2026-10-01 to Wednesday 2026-10-07."),
+            "{none}"
+        );
+        let err = run(&work(), CLOCK, r#"{"by": "week"}"#).unwrap_err();
+        assert!(err.starts_with("by:"), "{err}");
+    }
+
     #[test]
     fn the_tool_list_carries_a_schema_from_each_args_struct() {
         let tools = tools();
         let names: Vec<_> = tools.iter().map(|t| t.name).collect();
-        assert_eq!(names, ["agenda", "query", "entry"]);
+        assert_eq!(names, ["agenda", "query", "entry", "clock"]);
         assert!(
             tools[0].input_schema.contains(r#""enum":["day","week"]"#),
             "{}",

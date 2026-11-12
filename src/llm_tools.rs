@@ -151,7 +151,7 @@ pub fn tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: CHANGE,
             description: "Change one org entry: set its TODO state, schedule it, give it a \
-                          deadline, or add and remove tags. Give the ref another org tool \
+                          deadline, add and remove tags, or add a note to its log. Give the ref another org tool \
                           listed. The user reviews the edit before it is made; org writes the \
                           timestamps and log lines, so describe the change, not the text.",
             input_schema: input_schema::<ChangeArgs>().unwrap_or_default(),
@@ -307,18 +307,20 @@ pub enum ChangeOp {
     Schedule,
     Deadline,
     Tag,
+    AddNote,
 }
 
 /// `org.change`'s input.
 #[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
 pub struct ChangeArgs {
-    /// `set-state`, `schedule`, `deadline` or `tag`.
+    /// `set-state`, `schedule`, `deadline`, `tag` or `add-note`.
     pub op: ChangeOp,
     /// The entry's ref as another org tool listed it (`file::line::heading`), or its `ID`.
     pub r#ref: String,
     /// For `set-state`: the TODO keyword to set, such as `DONE`; empty clears it.
     pub state: Option<String>,
-    /// For `set-state`: a note, for a state that asks for one.
+    /// For `add-note`: the note to add to the entry's log. For `set-state`: a note, for a
+    /// state that asks for one.
     pub note: Option<String>,
     /// For `schedule` and `deadline`: `2026-11-14`, `+3d`, `tomorrow` or `fri`, optionally
     /// followed by a repeater such as `+1w`; `none` removes it.
@@ -1002,6 +1004,19 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
                 None => format!("Removed the {what} date from \"{title}\""),
             };
             (propose(org, &loc, span, &new)?, said)
+        }
+        ChangeOp::AddNote => {
+            let env = org.change_env();
+            let log = args
+                .note
+                .as_deref()
+                .and_then(|n| crate::complete::note_taken_line(&env.now_stamp, n))
+                .ok_or("note: add-note needs the note's text")?;
+            let end = subtree_end(&lines, at);
+            let mut new: Vec<String> = lines[at..end].iter().map(|l| l.to_string()).collect();
+            crate::complete::insert_log(&mut new, &log, env.log_into_drawer);
+            let said = format!("Added a note to \"{title}\"");
+            (propose(org, &loc, (at, end - 1), &new)?, said)
         }
         ChangeOp::Tag => {
             let asked = args.tags.unwrap_or_default();
@@ -1920,7 +1935,7 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             r#"{"op": "set-state", "ref": "~/org/home.org::7::Chase them", "state": "WAITING", "note": "they are out until Monday"}"#,
         );
         assert!(p.new.starts_with("*** WAITING Chase them\n"), "{p:?}");
-        assert!(p.new.contains("\\\\\n  they are out until Monday"), "{p:?}");
+        assert!(p.new.contains("\\\\\n    they are out until Monday"), "{p:?}");
     }
 
     #[test]
@@ -1989,6 +2004,39 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             r#"{"op": "tag", "ref": "~/org/plan.org::2::Pay the invoice", "tags": ["two words"]}"#,
         );
         assert_eq!(err, "tags: `two words` is not one tag");
+    }
+
+    /// Org's `org-add-note`: into the drawer, after the planning line, the
+    /// note's lines under the bullet's text.
+    #[test]
+    fn a_note_goes_into_the_entrys_log() {
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "add-note", "ref": "~/org/plan.org::4::Standup", "note": "Moved to 10:00.\nAsk Sam first."}"#,
+        );
+        assert!(
+            said.starts_with("Added a note to \"Standup\" in ~/org/plan.org"),
+            "{said}"
+        );
+        assert_eq!(
+            p.old,
+            "* TODO Standup\nSCHEDULED: <2026-11-11 Wed 09:30 +1d>"
+        );
+        assert_eq!(
+            p.new,
+            "* TODO Standup\n\
+             SCHEDULED: <2026-11-11 Wed 09:30 +1d>\n\
+             \x20 :LOGBOOK:\n\
+             \x20 - Note taken on [2026-11-12 Thu 10:00] \\\\\n\
+             \x20   Moved to 10:00.\n\
+             \x20   Ask Sam first.\n\
+             \x20 :END:"
+        );
+        let err = change_err(
+            &plan(),
+            r#"{"op": "add-note", "ref": "~/org/plan.org::4::Standup", "note": "  "}"#,
+        );
+        assert_eq!(err, "note: add-note needs the note's text");
     }
 
     /// Two identical headlines: the edit widens until its old text occurs

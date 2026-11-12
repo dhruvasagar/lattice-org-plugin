@@ -30,7 +30,8 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
 - **`org.change`: the assistant changes an entry the way the keys do.** It
   sets a TODO state, schedules an entry, sets or removes its deadline (dates
   as the `s`/`d` prompt reads them: `+2d`, `fri`, `2026-11-14 +1w`, `none`)
-  and adds or removes tags. Org writes the text, not the model: a repeating
+  adds or removes tags, and adds a note to the entry's log (`- Note taken
+  on …`, where org's `org-add-note` puts it). Org writes the text, not the model: a repeating
   task repeats, a state with `!` or `@` gets its log line (with the note the
   assistant gives), exactly as `<leader>ot` writes them. Each change is a
   proposal lattice puts in front of you as a diff before anything is written.
@@ -44,6 +45,9 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   consistency graph.
 
 ### Fixed
+- **A state-change note sits under its log line's text.** The note an `@`
+  state prompts for was written level with the `- State …` bullet; it is now
+  two columns further in, as org writes it and reads it back.
 - **A section matching a TODO state finds DONE entries that have no tags.**
   `match = "/DONE"` used to miss them: an untagged DONE headline was never
   scanned as a row.

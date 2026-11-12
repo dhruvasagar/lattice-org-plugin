@@ -116,13 +116,31 @@ pub(crate) fn state_log_line(to: &str, from: &str, stamp: &str) -> String {
 /// line ends with ` \\` and the note follows, indented under it. An empty
 /// note is the plain line, as org writes when you store an empty note.
 pub(crate) fn noted_log_line(to: &str, from: &str, stamp: &str, note: &str) -> String {
-    let mut log = state_log_line(to, from, stamp);
+    with_note(state_log_line(to, from, stamp), note)
+}
+
+/// What `org-add-note` writes: `- Note taken on [stamp] \\`, the note under
+/// it. `None` for an empty note, which org does not store.
+pub(crate) fn note_taken_line(stamp: &str, note: &str) -> Option<String> {
+    (!note.trim().is_empty()).then(|| with_note(format!("- Note taken on {stamp}"), note))
+}
+
+/// `entry` with `note` continued under it, each of its lines two columns in
+/// so it sits under the bullet's text; blank lines inside it stay blank.
+fn with_note(mut entry: String, note: &str) -> String {
     let note = note.trim();
-    if !note.is_empty() {
-        log.push_str(" \\\\\n  ");
-        log.push_str(note);
+    if note.is_empty() {
+        return entry;
     }
-    log
+    entry.push_str(" \\\\");
+    for line in note.lines() {
+        entry.push('\n');
+        if !line.trim().is_empty() {
+            entry.push_str("  ");
+            entry.push_str(line.trim_end());
+        }
+    }
+    entry
 }
 
 /// A TODO state change, as lines to write back.
@@ -321,15 +339,22 @@ pub(crate) fn insert_log(lines: &mut Vec<String>, log: &str, into_drawer: bool) 
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "  ".to_string());
 
+    // Every line of the entry at the indent, so a note's continuation stays
+    // under its bullet's text rather than level with the bullet.
+    let entry = log
+        .lines()
+        .map(|l| format!("{indent}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     if !into_drawer {
-        lines.insert(after_plan, format!("{indent}{log}"));
+        lines.insert(after_plan, entry);
         return;
     }
     if let Some(start) = lines
         .iter()
         .position(|l| l.trim().eq_ignore_ascii_case(":LOGBOOK:"))
     {
-        lines.insert(start + 1, format!("{indent}{log}"));
+        lines.insert(start + 1, entry);
         return;
     }
     // No drawer yet. It goes after the PROPERTIES drawer when there is one —
@@ -341,7 +366,7 @@ pub(crate) fn insert_log(lines: &mut Vec<String>, log: &str, into_drawer: bool) 
         .map(|i| i + 1)
         .unwrap_or(after_plan);
     lines.insert(at, format!("{indent}:END:"));
-    lines.insert(at, format!("{indent}{log}"));
+    lines.insert(at, entry);
     lines.insert(at, format!("{indent}:LOGBOOK:"));
 }
 
@@ -544,7 +569,7 @@ mod tests {
         let noted = noted.unwrap().lines.join("\n");
         assert!(
             noted.contains(
-                "  - State \"WAIT\" from \"TODO\" [2026-09-03 Thu 10:00] \\\\\n  on legal"
+                "  - State \"WAIT\" from \"TODO\" [2026-09-03 Thu 10:00] \\\\\n    on legal"
             ),
             "{noted}"
         );

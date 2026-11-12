@@ -12014,6 +12014,91 @@ impl llm_tools::Org for HostOrg {
         crate::roam_scan::expand_tilde(path)
     }
 
+    /// The capture keys' own path: the template, its body resolved, its
+    /// questions answered, `capture_effects` deciding where the text lands.
+    /// Only the user's templates: the `org.capture-file` fallback is the keys'
+    /// legacy path, and filing a model's text through it would put notes
+    /// somewhere the user may have stopped looking.
+    fn capture(
+        &self,
+        key: &str,
+        text: &str,
+        answers: &[String],
+    ) -> Result<llm_tools::Captured, String> {
+        let echo = |e: Effect| match e {
+            Effect::Echo(p) => p.text.trim_start_matches("org: ").to_string(),
+            _ => "the template could not be read".to_string(),
+        };
+        let set = capture_templates::read().map_err(|e| match e {
+            capture_templates::TemplateError::Unset => {
+                "capture: the user has no capture templates (org.capture-templates)".to_string()
+            }
+            e => format!("capture: {}", e.message().trim_start_matches("org: ")),
+        })?;
+        let Some(template) = set.by_key(key).cloned() else {
+            let known: Vec<String> = set
+                .templates
+                .iter()
+                .map(|t| format!("`{}` ({})", t.key, t.description))
+                .collect();
+            return Err(format!(
+                "template: no capture template is keyed `{key}`; the templates are {}",
+                known.join(", ")
+            ));
+        };
+        let template =
+            resolve_template_body(template).map_err(|e| format!("capture: {}", echo(e)))?;
+        let asked = capture_flow::questions(&template.body);
+        if answers.len() != asked.len() {
+            return Err(if asked.is_empty() {
+                format!("answers: template `{key}` asks no questions; give none")
+            } else {
+                format!(
+                    "answers: template `{key}` asks {}: {}; give that many answers, in this order",
+                    asked.len(),
+                    asked.join(", ")
+                )
+            });
+        }
+        if text.is_empty() && asked.is_empty() {
+            return Err("text: give the text to capture".to_string());
+        }
+        let mut dest =
+            CaptureDestination::of(&template).map_err(|e| format!("capture: {}", echo(e)))?;
+        let mut notes = Vec::new();
+        if dest.clock_in {
+            // A clock the model starts is the user's time misrecorded.
+            dest.clock_in = false;
+            notes.push(
+                "The template clocks in on capture; the assistant does not start the user's \
+                 clock."
+                    .to_string(),
+            );
+        }
+        let body = capture::expand_with(&template.body, text, answers, now_when(), "");
+        let mut writes = Vec::new();
+        for effect in capture_effects(&dest, body) {
+            match effect {
+                Effect::WriteToFile(w) => writes.push((
+                    w.path,
+                    match w.anchor {
+                        FileAnchor::Start => llm_tools::Anchor::Start,
+                        FileAnchor::End => llm_tools::Anchor::End,
+                        FileAnchor::Line(n) => llm_tools::Anchor::Line(n),
+                    },
+                    w.text,
+                )),
+                Effect::Echo(p) => notes.push(p.text.trim_start_matches("org: ").to_string()),
+                _ => {}
+            }
+        }
+        Ok(llm_tools::Captured {
+            writes,
+            notes,
+            described: template.description,
+        })
+    }
+
     /// The same clock and options the keys write with.
     fn change_env(&self) -> llm_tools::ChangeEnv {
         llm_tools::ChangeEnv {

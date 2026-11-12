@@ -152,7 +152,8 @@ pub fn tools() -> Vec<ToolSpec> {
             name: CHANGE,
             description: "Change one org entry: set its TODO state, schedule it, give it a \
                           deadline, add and remove tags, add a note to its log, or refile it under another \
-                          headline. Give the ref another org tool \
+                          headline; or capture something new through one of the user's capture \
+                          templates. Give the ref another org tool \
                           listed. The user reviews the edit before it is made; org writes the \
                           timestamps and log lines, so describe the change, not the text.",
             input_schema: input_schema::<ChangeArgs>().unwrap_or_default(),
@@ -209,6 +210,36 @@ pub trait Org {
     }
     /// The clock and keywords a change writes with.
     fn change_env(&self) -> ChangeEnv;
+    /// What capturing `text` through the template keyed `template` would
+    /// write, through the capture keys' own expansion and targets.
+    fn capture(
+        &self,
+        _template: &str,
+        _text: &str,
+        _answers: &[String],
+    ) -> Result<Captured, String> {
+        Err("capture: not available here".to_string())
+    }
+}
+
+/// Where a capture's text goes in its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    Start,
+    End,
+    /// Before this 0-based line; past the end is the end.
+    Line(u32),
+}
+
+/// What a capture writes: each file's insertion, and what the capture said
+/// about it (a target headline it could not find, say).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Captured {
+    /// `(path, anchor, text)`, the path as [`Org::read`] takes it.
+    pub writes: Vec<(String, Anchor, String)>,
+    pub notes: Vec<String>,
+    /// The template's description, for the answer.
+    pub described: String,
 }
 
 /// Run one of org's tools: the text of its answer, or the error the model
@@ -310,15 +341,17 @@ pub enum ChangeOp {
     Tag,
     AddNote,
     Refile,
+    Capture,
 }
 
 /// `org.change`'s input.
 #[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
 pub struct ChangeArgs {
-    /// `set-state`, `schedule`, `deadline`, `tag`, `add-note` or `refile`.
+    /// `set-state`, `schedule`, `deadline`, `tag`, `add-note`, `refile` or `capture`.
     pub op: ChangeOp,
     /// The entry's ref as another org tool listed it (`file::line::heading`), or its `ID`.
-    pub r#ref: String,
+    /// Every op but `capture` needs it.
+    pub r#ref: Option<String>,
     /// For `set-state`: the TODO keyword to set, such as `DONE`; empty clears it.
     pub state: Option<String>,
     /// For `add-note`: the note to add to the entry's log. For `set-state`: a note, for a
@@ -332,6 +365,12 @@ pub struct ChangeArgs {
     /// For `refile`: the ref of the headline to file the entry under, or an org file's path
     /// to file it at the top level.
     pub target: Option<String>,
+    /// For `capture`: the key of one of the user's capture templates.
+    pub template: Option<String>,
+    /// For `capture`: the text the template files, where the user would type it.
+    pub text: Option<String>,
+    /// For `capture`: the answers to the template's questions, in its order.
+    pub answers: Option<Vec<String>>,
 }
 
 /// `org.agenda`.
@@ -906,7 +945,14 @@ fn hours(minutes: u32) -> String {
 /// proposal. The model says what; org writes the text.
 fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<Answer, String> {
     let args: ChangeArgs = parse_args(args).map_err(|e| e.to_string())?;
-    let loc = resolve(org, &args.r#ref, keywords)?;
+    if args.op == ChangeOp::Capture {
+        return capture(org, &args);
+    }
+    let r#ref = args
+        .r#ref
+        .as_deref()
+        .ok_or("ref: give the entry's ref, as another org tool listed it")?;
+    let loc = resolve(org, r#ref, keywords)?;
     let at = match &loc.target {
         Target::Headline(at) => *at,
         Target::File(node) => {
@@ -1010,6 +1056,8 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
             };
             (vec![propose(org, &loc, span, &new)?], said)
         }
+        // Taken before a ref is resolved, since a capture has none.
+        ChangeOp::Capture => return capture(org, &args),
         ChangeOp::Refile => refile(org, keywords, &loc, at, args.target.as_deref())?,
         ChangeOp::AddNote => {
             let env = org.change_env();
@@ -1161,6 +1209,75 @@ fn refile(
             dst.shown, src.shown
         ),
     ))
+}
+
+/// `org.change`'s capture: the template's writes as proposals. A target
+/// file that is missing or empty is refused: `lattice.edit_file` cannot
+/// create a file or anchor in an empty one, and creating a file the user's
+/// template names is the one thing a review of a diff cannot show well.
+fn capture(org: &dyn Org, args: &ChangeArgs) -> Result<Answer, String> {
+    let template = args
+        .template
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("template: capture needs a capture template's key")?;
+    let text = args.text.as_deref().unwrap_or("").trim();
+    let answers = args.answers.clone().unwrap_or_default();
+    let captured = org.capture(template, text, &answers)?;
+    let mut files: Vec<(Located, Vec<String>)> = Vec::new();
+    for (path, anchor, inserted) in &captured.writes {
+        let i = match files.iter().position(|(l, _)| &l.file == path) {
+            Some(i) => i,
+            None => {
+                let shown = org.shown(path);
+                let text = org.read(path).map_err(|_| {
+                    format!(
+                        "capture: the template files into {shown}, which does not exist; \
+                         create it first, or capture with the keys"
+                    )
+                })?;
+                let lines = text.lines().map(str::to_string).collect();
+                let loc = Located {
+                    file: path.clone(),
+                    shown,
+                    text,
+                    target: Target::Headline(0),
+                };
+                files.push((loc, lines));
+                files.len() - 1
+            }
+        };
+        let lines = &mut files[i].1;
+        let at = match anchor {
+            Anchor::Start => 0,
+            Anchor::End => lines.len(),
+            Anchor::Line(n) => (*n as usize).min(lines.len()),
+        };
+        lines.splice(at..at, inserted.lines().map(str::to_string));
+    }
+    let mut proposals = Vec::new();
+    for (loc, lines) in &files {
+        proposals.extend(propose_rewrite(org, loc, lines)?);
+    }
+    if proposals.is_empty() {
+        return Err("capture: the template wrote nothing".to_string());
+    }
+    let into: Vec<&str> = files.iter().map(|(l, _)| l.shown.as_str()).collect();
+    let mut said = format!(
+        "Captured with \"{}\" into {}.",
+        captured.described,
+        into.join(" and ")
+    );
+    for note in &captured.notes {
+        said.push(' ');
+        said.push_str(note);
+    }
+    said.push_str(" The user reviews the edit before it is made.");
+    Ok(Answer {
+        text: said,
+        proposals,
+    })
 }
 
 /// The located file rewritten to `new`, as one proposal over the lines that
@@ -2291,6 +2408,117 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             change_err(&org, r#"{"op": "refile", "ref": "~/t.org::1::Work"}"#)
                 .starts_with("target:")
         );
+    }
+
+    /// A capture's writes, as `capture_effects` would give them.
+    struct Capturing(Fake, Captured);
+
+    impl Org for Capturing {
+        fn corpus(&self, tags_search: bool) -> Corpus {
+            self.0.corpus(tags_search)
+        }
+        fn read(&self, path: &str) -> Result<String, String> {
+            self.0.read(path)
+        }
+        fn real_path(&self, path: &str) -> String {
+            self.0.real_path(path)
+        }
+        fn change_env(&self) -> ChangeEnv {
+            env()
+        }
+        fn capture(
+            &self,
+            template: &str,
+            text: &str,
+            answers: &[String],
+        ) -> Result<Captured, String> {
+            assert_eq!((template, text), ("t", "Call the bank"));
+            assert_eq!(answers, ["today"]);
+            Ok(self.1.clone())
+        }
+    }
+
+    #[test]
+    fn a_capture_proposes_what_the_template_writes() {
+        let into = |anchor: Anchor, notes: Vec<String>| {
+            Capturing(
+                Fake(vec![
+                    ("~/org/inbox.org", "* Inbox\n** Old\n"),
+                    ("~/org/empty.org", ""),
+                ]),
+                Captured {
+                    writes: vec![(
+                        "~/org/inbox.org".into(),
+                        anchor,
+                        "** TODO Call the bank\n".into(),
+                    )],
+                    notes,
+                    described: "Todo".into(),
+                },
+            )
+        };
+        let run = |org: &Capturing| {
+            call(
+                org,
+                &kw(),
+                today(),
+                CHANGE,
+                r#"{"op": "capture", "template": "t", "text": "Call the bank", "answers": ["today"]}"#,
+            )
+        };
+        let a = run(&into(Anchor::End, vec![])).unwrap();
+        assert_eq!(
+            a.text,
+            "Captured with \"Todo\" into ~/org/inbox.org. The user reviews the edit before it \
+             is made."
+        );
+        assert_eq!(
+            a.proposals,
+            [Proposal {
+                path: "/home/u/org/inbox.org".into(),
+                old: "** Old".into(),
+                new: "** Old\n** TODO Call the bank".into(),
+            }]
+        );
+        let a = run(&into(
+            Anchor::Line(1),
+            vec!["no Inbox; appended at the end".into()],
+        ))
+        .unwrap();
+        assert_eq!(a.proposals[0].old, "* Inbox");
+        assert_eq!(a.proposals[0].new, "* Inbox\n** TODO Call the bank");
+        assert!(
+            a.text.contains("into ~/org/inbox.org. no Inbox; appended"),
+            "{}",
+            a.text
+        );
+
+        let mut gone = into(Anchor::End, vec![]);
+        gone.1.writes[0].0 = "~/org/gone.org".into();
+        assert!(run(&gone)
+            .unwrap_err()
+            .contains("~/org/gone.org, which does not exist"));
+        let mut empty = into(Anchor::End, vec![]);
+        empty.1.writes[0].0 = "~/org/empty.org".into();
+        assert!(run(&empty).unwrap_err().contains("the file is empty"));
+        let none = call(
+            &plan(),
+            &kw(),
+            today(),
+            CHANGE,
+            r#"{"op": "capture", "template": "t"}"#,
+        );
+        assert_eq!(none.unwrap_err(), "capture: not available here");
+        let keyless = call(&plan(), &kw(), today(), CHANGE, r#"{"op": "capture"}"#);
+        assert!(keyless.unwrap_err().starts_with("template:"));
+        let refless = call(
+            &plan(),
+            &kw(),
+            today(),
+            CHANGE,
+            r#"{"op": "tag", "tags": ["x"]}"#,
+        );
+        assert!(refless.unwrap_err().starts_with("ref:"));
     }
 
     /// Two identical headlines: the edit widens until its old text occurs

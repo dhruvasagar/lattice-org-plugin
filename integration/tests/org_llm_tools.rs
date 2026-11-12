@@ -370,7 +370,7 @@ async fn the_assistant_changes_an_entry_through_review() {
         stamp(-1, " +1d"),
     );
     let work = "* Projects\n** Q3\n".to_string();
-    let Some((base, editor, offer)) = org_tools(&[("plan.org", plan), ("work.org", work)]).await
+    let Some((base, mut editor, offer)) = org_tools(&[("plan.org", plan), ("work.org", work)]).await
     else {
         return;
     };
@@ -500,6 +500,35 @@ async fn the_assistant_changes_an_entry_through_review() {
             .starts_with("* TODO Standup\n"),
         "and left plan.org"
     );
+
+    // Captured through a template: its own expansion and target search.
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!(
+            "org.capture-templates=[[template]]\nkey = \"m\"\ndescription = \"meeting\"\n\
+             target = {{ kind = \"file+headline\", file = \"{}\", headline = \"Projects\" }}\n\
+             body = \"\"\"\n** TODO %? with %^{{Who}}\n\"\"\"\n",
+            work.display()
+        ),
+    });
+    let asked = change(
+        json!({"op": "capture", "template": "m", "text": "Plan Q4"}),
+        trusted(),
+    )
+    .await
+    .unwrap_err();
+    assert!(asked.contains("template `m` asks 1: Who"), "{asked}");
+    let said = change(
+        json!({"op": "capture", "template": "m", "text": "Plan Q4", "answers": ["Sam"]}),
+        trusted(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        said.starts_with("Captured with \"meeting\" into "),
+        "{said}"
+    );
+    let filed = std::fs::read_to_string(&work).unwrap();
+    assert!(filed.contains("\n** TODO Plan Q4 with Sam\n"), "{filed}");
 
     let err = change(
         json!({"op": "tag", "ref": at(9, "Lunch"), "tags": ["x"]}),

@@ -356,3 +356,110 @@ async fn the_assistant_queries_and_reads_entries_through_org() {
         "the child's time under its parent's tag: {by_tag}"
     );
 }
+
+/// AT.8: `org.change` through the real component and lattice's own
+/// `edit_file`. Inside the project a trusted chat applies the change, and
+/// the file holds what the keys would have written; a ref whose line moved
+/// still finds its heading. Outside the project, under org's grant, the same
+/// trusted call is neither refused nor applied: it opens a review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_assistant_changes_an_entry_through_review() {
+    let plan = format!(
+        "* TODO Write the report\n\
+         * TODO Standup\n  SCHEDULED: {}\n",
+        stamp(-1, " +1d"),
+    );
+    let Some((base, editor, offer)) = org_tools(&[("plan.org", plan)]).await else {
+        return;
+    };
+    let file = base.path().join("notes/plan.org");
+    let at = |line: u32, heading: &str| format!("{}::{line}::{heading}", file.display());
+    let chats = editor.services.get::<LlmChatsHandle>().unwrap();
+    let change = |args: serde_json::Value, ctx: CallContext| {
+        let offer = &offer;
+        async move {
+            offer
+                .call("org__change", args, ctx)
+                .await
+                .map(|o| o.text)
+                .map_err(|e| e.to_string())
+        }
+    };
+    let trusted = || CallContext {
+        trusted: true,
+        ..CallContext::default()
+    };
+
+    // Outside the project first: the corpus is not under the cwd.
+    let opened = Arc::new(tokio::sync::Notify::new());
+    let ctx = CallContext {
+        on_review: Some(Arc::new({
+            let opened = opened.clone();
+            move |open| {
+                if open {
+                    opened.notify_one();
+                }
+            }
+        })),
+        ..trusted()
+    };
+    let call = change(
+        json!({"op": "set-state", "ref": at(1, "Write the report"), "state": "DONE"}),
+        ctx,
+    );
+    tokio::select! {
+        done = call => panic!("an edit outside the project ran without a review: {done:?}"),
+        () = opened.notified() => {}
+        () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+            panic!("no review opened for an edit under org's grant")
+        }
+    }
+    assert!(
+        std::fs::read_to_string(&file).unwrap().starts_with("* TODO Write the report"),
+        "nothing is written before the review decides"
+    );
+
+    // Inside the project, a trusted chat applies it.
+    chats.set_project_root(base.path().to_path_buf());
+    let said = change(
+        json!({"op": "set-state", "ref": at(1, "Write the report"), "state": "DONE"}),
+        trusted(),
+    )
+    .await
+    .unwrap();
+    assert!(said.starts_with("Set \"Write the report\" to DONE in "), "{said}");
+    assert!(said.contains("wrote `"), "{said}");
+    let said = change(
+        json!({"op": "schedule", "ref": at(1, "Write the report"), "date": "+2d"}),
+        trusted(),
+    )
+    .await
+    .unwrap();
+    assert!(said.starts_with("Scheduled \"Write the report\" for <"), "{said}");
+
+    // Standup moved down a line; its old ref still finds it.
+    let said = change(
+        json!({"op": "set-state", "ref": at(2, "Standup"), "state": "DONE"}),
+        trusted(),
+    )
+    .await
+    .unwrap();
+    assert!(said.contains("It repeats, so it goes back to TODO"), "{said}");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.starts_with(&format!(
+            "* DONE Write the report\nSCHEDULED: {}\n* TODO Standup\n",
+            stamp(2, "")
+        )),
+        "{text}"
+    );
+    assert!(!text.contains(&stamp(-1, " +1d")), "the repeat moved its stamp: {text}");
+
+    let err = change(
+        json!({"op": "tag", "ref": at(9, "Lunch"), "tags": ["x"]}),
+        trusted(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("query again"), "{err}");
+}

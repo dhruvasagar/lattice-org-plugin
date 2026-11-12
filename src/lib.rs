@@ -855,6 +855,49 @@ const AGENDA_BULK_TODO: u32 = 120;
 /// the key of a bulk verb.
 const AGENDA_BULK_TODO_MENU: u32 = 121;
 
+/// AT.9 — the assistant's workflows as commands: `:org-plan-day`,
+/// `:org-plan-week`, `:org-review`, `:org-report`. Each opens a chat on one of
+/// org's profiles with its first prompt, through `invoke-command` and nothing
+/// else (design §7), so lattice-ai knows nothing of org. See [`WORKFLOWS`].
+const PLAN_DAY: u32 = 122;
+const PLAN_WEEK: u32 = 123;
+const REVIEW: u32 = 124;
+const REPORT: u32 = 125;
+
+/// `(action, command, what it does, profile, first prompt)`.
+const WORKFLOWS: [(u32, &str, &str, &str, &str); 4] = [
+    (
+        PLAN_DAY,
+        "org-plan-day",
+        "Plan today with the assistant, from your agenda (an `:llm` chat on `org-plan`).",
+        "org-plan",
+        "Plan my day.",
+    ),
+    (
+        PLAN_WEEK,
+        "org-plan-week",
+        "Plan this week with the assistant, from your agenda (an `:llm` chat on `org-plan`).",
+        "org-plan",
+        "Plan my week.",
+    ),
+    (
+        REVIEW,
+        "org-review",
+        "Run a weekly review with the assistant: done, slipped, stuck, next (an `:llm` chat \
+         on `org-review`).",
+        "org-review",
+        "Run my weekly review.",
+    ),
+    (
+        REPORT,
+        "org-report",
+        "Report what you worked on this week, from the clock and the log (an `:llm` chat on \
+         `org-report`).",
+        "org-report",
+        "Report what I worked on this week.",
+    ),
+];
+
 /// OE.3 — `C-c C-c`, emacs' `org-ctrl-c-ctrl-c`. See [`ctrl_c_ctrl_c`].
 const CTRL_C_CTRL_C: u32 = 88;
 
@@ -3750,6 +3793,17 @@ impl Guest for Component {
             CLOCK_PARSE,
             ROAM_SYNC,
         );
+        // AT.9 — the assistant's workflows. They take nothing: the prompt is
+        // the workflow's, and the chat is where the user says more.
+        for (action, name, doc, _, _) in WORKFLOWS {
+            lattice::plugin_host::grammar::register_ex_command(
+                name,
+                doc,
+                &clock_ex(),
+                CLOCK_PARSE,
+                action,
+            );
+        }
         // OR.10 — the journal. Three commands that take nothing and one that
         // takes a date optionally.
         lattice::plugin_host::grammar::register_ex_command(
@@ -3975,6 +4029,18 @@ impl Guest for Component {
             // `:describe-command` cross-links from any command whose name
             // contains these.
             &["fold".to_string()],
+        );
+        // AT.9: the assistant's tools, workflows and commands, at
+        // `:help org.assistant`. Cross-linked from the four workflow commands.
+        let _ = register_topic(
+            "assistant",
+            "The org assistant: org's tools in LLM chats, and the plan, review and report workflows.",
+            include_str!("../doc/assistant.md"),
+            &[
+                "org-plan".to_string(),
+                "org-review".to_string(),
+                "org-report".to_string(),
+            ],
         );
         let _ = register_topic(
             "roam",
@@ -10161,6 +10227,18 @@ impl GrammarCallbacks for Component {
             // OR.11a + OR.11b — the second hop: the chosen template becomes a
             // note.
             ROAM_CREATE_FROM_TEMPLATE => Ok(roam_create_from_template(&ctx)),
+            PLAN_DAY | PLAN_WEEK | REVIEW | REPORT => Ok(WORKFLOWS
+                .iter()
+                .find(|w| w.0 == callback)
+                .map(|(_, _, _, profile, prompt)| {
+                    vec![Effect::InvokeCommand(
+                        lattice::plugin_host::types::CommandRef {
+                            id: "llm".to_string(),
+                            args: Args::String(format!("{profile} {prompt}")),
+                        },
+                    )]
+                })
+                .unwrap_or_default()),
             ROAM_SYNC => {
                 if roam_scan::roam_directory().is_none() {
                     return Ok(vec![Effect::Echo(EchoPayload {
@@ -11970,8 +12048,20 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
         })
     }
 
+    // AT.9: the workflows of design §7. The host filters them as it would a
+    // project's profile file, so a key a plugin may not set never lands.
     fn profiles() -> Vec<lattice::plugin_host::types::LlmProfile> {
-        Vec::new()
+        llm_tools::profiles()
+            .into_iter()
+            .map(|p| lattice::plugin_host::types::LlmProfile {
+                name: p.name.to_string(),
+                description: p.description.to_string(),
+                settings: vec![
+                    ("system".to_string(), p.system),
+                    ("tools".to_string(), p.tools.to_string()),
+                ],
+            })
+            .collect()
     }
 }
 

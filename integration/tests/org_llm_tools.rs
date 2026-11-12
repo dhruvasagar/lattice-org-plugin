@@ -63,7 +63,7 @@ fn write_org_plugin_dir(root: &Path, wasm: &[u8], corpus: &Path) {
         dir.join("plugin.toml"),
         format!(
             "id = \"org\"\n\
-             provides = [\"language\", \"config\", \"llm-tools\"]\n\
+             provides = [\"language\", \"config\", \"grammar\", \"help\", \"llm-tools\"]\n\
              capabilities = [\"fs:write:{}\"]\n\
              editor_capabilities = [\"tree-sitter\"]\n",
             corpus.display()
@@ -370,7 +370,8 @@ async fn the_assistant_changes_an_entry_through_review() {
         stamp(-1, " +1d"),
     );
     let work = "* Projects\n** Q3\n".to_string();
-    let Some((base, mut editor, offer)) = org_tools(&[("plan.org", plan), ("work.org", work)]).await
+    let Some((base, mut editor, offer)) =
+        org_tools(&[("plan.org", plan), ("work.org", work)]).await
     else {
         return;
     };
@@ -537,4 +538,77 @@ async fn the_assistant_changes_an_entry_through_review() {
     .await
     .unwrap_err();
     assert!(err.contains("query again"), "{err}");
+}
+
+/// AT.9: org's workflows are profiles, and each command opens a chat on
+/// one with its first prompt. The chat resolves the profile's prompt and
+/// exactly its tools; a report changes nothing, so it is offered no
+/// `org.change`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_workflow_command_opens_a_chat_on_its_profile() {
+    let Some((_base, mut editor, _offer)) = org_tools(&[("plan.org", "* TODO x\n".into())]).await
+    else {
+        return;
+    };
+    let chats = editor.services.get::<LlmChatsHandle>().unwrap().clone();
+    let names = chats.profile_names();
+    for p in [
+        "org",
+        "org-plan",
+        "org-review",
+        "org-report",
+        "org-research",
+    ] {
+        assert!(names.iter().any(|n| n == p), "{p} is offered: {names:?}");
+    }
+    let topics = editor.help_topics.load();
+    let page = topics.lookup("org.assistant").expect(":help org.assistant");
+    assert!(
+        page.body.render().contains(":org-plan-day"),
+        "the page names the commands"
+    );
+    for (command, profile, opens, tools) in [
+        (
+            "org-plan-day",
+            "org-plan",
+            "You help the user plan a day or a week",
+            &["org.agenda", "org.change", "org.entry", "org.query"][..],
+        ),
+        (
+            "org-plan-week",
+            "org-plan",
+            "You help the user plan a day or a week",
+            &["org.agenda", "org.change", "org.entry", "org.query"][..],
+        ),
+        (
+            "org-review",
+            "org-review",
+            "You run the user's weekly review",
+            &["org.agenda", "org.change", "org.clock", "org.query"][..],
+        ),
+        (
+            "org-report",
+            "org-report",
+            "You write a report of the user's work",
+            &["org.clock", "org.entry", "org.query"][..],
+        ),
+    ] {
+        let before = editor.active_pane_buffer_id();
+        let mut out = lattice_host::dispatch::DispatchOutcome::default();
+        editor.execute_ex_line(command, &mut out);
+        for action in out.next_actions {
+            let _ = editor.dispatch(action);
+        }
+        editor.run_tick_pending();
+        let chat = editor.active_pane_buffer_id();
+        assert_ne!(chat, before, ":{command} opens a chat buffer");
+        let resolved = chats.resolve_for(chat).unwrap();
+        let s = &resolved.values;
+        assert_eq!(s.profile.as_deref(), Some(profile), ":{command}");
+        let offered: Vec<&str> = s.tools.iter().map(String::as_str).collect();
+        assert_eq!(offered, tools, ":{command}");
+        let system = s.system.as_deref().unwrap_or_default();
+        assert!(system.starts_with(opens), ":{command}: {system}");
+        assert!(system.contains("never guess the date"), ":{command}");
+    }
 }

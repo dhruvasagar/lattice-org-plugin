@@ -44,6 +44,15 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   assistant gives), exactly as `<leader>ot` writes them. Each change is a
   proposal lattice puts in front of you as a diff before anything is written.
 
+- **Workflows for the assistant: `:org-plan-day`, `:org-plan-week`,
+  `:org-review`, `:org-report`.** Each opens an `:llm` chat on one of five
+  profiles org now contributes (`org`, `org-plan`, `org-review`,
+  `org-report`, `org-research`), with its own instructions and only the tools
+  it needs, and asks the first question for you. Pick a model per workflow
+  in your config, `[llm.profiles.org-plan] model = "…"`; org names none.
+  `:help org.assistant` covers the tools, the workflows and what a change
+  from a chat can and cannot do.
+
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A
   `SCHEDULED: <… +1d>` standup appears on each day of a week view, and a

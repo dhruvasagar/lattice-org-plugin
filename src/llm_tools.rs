@@ -66,6 +66,63 @@ pub struct ToolSpec {
     pub proposes: bool,
 }
 
+/// One workflow org contributes as an LLM profile (AT.9, design §7): a
+/// system prompt and a tool selection, and nothing else. The prompts are text
+/// files under `src/profiles/`, so they read as prose and diff as prose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// The workflow's own prompt, then the rules every org workflow shares.
+    pub system: String,
+    /// As a profile file spells `tools`: comma-separated.
+    pub tools: &'static str,
+}
+
+/// What every org workflow tells the model about org's tools.
+const COMMON: &str = include_str!("profiles/common.txt");
+
+/// The five workflows of design §7.
+pub fn profiles() -> Vec<ProfileSpec> {
+    let with_common = |own: &str| {
+        format!("{}\n{COMMON}", own.trim_end())
+            .trim_end()
+            .to_string()
+    };
+    vec![
+        ProfileSpec {
+            name: "org",
+            description: "Help over your org files: tasks, plans, notes and logs",
+            system: with_common(include_str!("profiles/org.txt")),
+            tools: "org.*, lattice.read",
+        },
+        ProfileSpec {
+            name: "org-plan",
+            description: "Plan a day or a week from your agenda",
+            system: with_common(include_str!("profiles/org-plan.txt")),
+            tools: "org.agenda, org.query, org.entry, org.change",
+        },
+        ProfileSpec {
+            name: "org-review",
+            description: "A weekly review: what got done, what slipped, what is stuck",
+            system: with_common(include_str!("profiles/org-review.txt")),
+            tools: "org.agenda, org.query, org.clock, org.change",
+        },
+        ProfileSpec {
+            name: "org-report",
+            description: "A report of your work over a period, from the clock and the log",
+            system: with_common(include_str!("profiles/org-report.txt")),
+            tools: "org.clock, org.query, org.entry",
+        },
+        ProfileSpec {
+            name: "org-research",
+            description: "Research a topic into your org-roam notes",
+            system: with_common(include_str!("profiles/org-research.txt")),
+            tools: "org.notes, lattice.read, web.*, org.change",
+        },
+    ]
+}
+
 /// One proposed edit, with `lattice.edit_file`'s semantics: `old` occurs in
 /// `path` exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2561,6 +2618,50 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             r#"{"op": "tag", "ref": "~/org/plan.org::8::Write the summary", "tags": ["x"]}"#,
         );
         assert!(stale.contains("query again"), "{stale}");
+    }
+
+    /// Every profile's tools are org's own, `lattice.read` or `web.*` (what
+    /// a plugin profile may select, design §7), name only tools org offers,
+    /// and its prompt carries the shared rules.
+    #[test]
+    fn the_profiles_select_only_what_a_plugin_may() {
+        let ours: Vec<String> = tools().iter().map(|t| format!("org.{}", t.name)).collect();
+        let all = profiles();
+        let names: Vec<_> = all.iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            [
+                "org",
+                "org-plan",
+                "org-review",
+                "org-report",
+                "org-research"
+            ]
+        );
+        for p in &all {
+            for tool in p.tools.split(',').map(str::trim) {
+                assert!(
+                    tool == "org.*"
+                        || tool == "lattice.read"
+                        || tool == "web.*"
+                        || ours.iter().any(|t| t == tool),
+                    "{}: `{tool}`",
+                    p.name
+                );
+            }
+            assert!(
+                p.system.contains("Pass refs back exactly as given"),
+                "{}",
+                p.name
+            );
+            assert!(!p.system.contains("\n\n\n"), "{}", p.name);
+            assert!(p.description.len() < 80, "{}", p.name);
+        }
+        let report = all.iter().find(|p| p.name == "org-report").unwrap();
+        assert!(
+            !report.tools.contains("org.change"),
+            "a report changes nothing"
+        );
     }
 
     #[test]

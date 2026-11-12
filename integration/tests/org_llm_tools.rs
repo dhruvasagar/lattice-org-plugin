@@ -369,10 +369,13 @@ async fn the_assistant_changes_an_entry_through_review() {
          * TODO Standup\n  SCHEDULED: {}\n",
         stamp(-1, " +1d"),
     );
-    let Some((base, editor, offer)) = org_tools(&[("plan.org", plan)]).await else {
+    let work = "* Projects\n** Q3\n".to_string();
+    let Some((base, editor, offer)) = org_tools(&[("plan.org", plan), ("work.org", work)]).await
+    else {
         return;
     };
     let file = base.path().join("notes/plan.org");
+    let work = base.path().join("notes/work.org");
     let at = |line: u32, heading: &str| format!("{}::{line}::{heading}", file.display());
     let chats = editor.services.get::<LlmChatsHandle>().unwrap();
     let change = |args: serde_json::Value, ctx: CallContext| {
@@ -415,7 +418,9 @@ async fn the_assistant_changes_an_entry_through_review() {
         }
     }
     assert!(
-        std::fs::read_to_string(&file).unwrap().starts_with("* TODO Write the report"),
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .starts_with("* TODO Write the report"),
         "nothing is written before the review decides"
     );
 
@@ -427,7 +432,10 @@ async fn the_assistant_changes_an_entry_through_review() {
     )
     .await
     .unwrap();
-    assert!(said.starts_with("Set \"Write the report\" to DONE in "), "{said}");
+    assert!(
+        said.starts_with("Set \"Write the report\" to DONE in "),
+        "{said}"
+    );
     assert!(said.contains("wrote `"), "{said}");
     let said = change(
         json!({"op": "schedule", "ref": at(1, "Write the report"), "date": "+2d"}),
@@ -435,7 +443,10 @@ async fn the_assistant_changes_an_entry_through_review() {
     )
     .await
     .unwrap();
-    assert!(said.starts_with("Scheduled \"Write the report\" for <"), "{said}");
+    assert!(
+        said.starts_with("Scheduled \"Write the report\" for <"),
+        "{said}"
+    );
 
     // Standup moved down a line; its old ref still finds it.
     let said = change(
@@ -444,7 +455,10 @@ async fn the_assistant_changes_an_entry_through_review() {
     )
     .await
     .unwrap();
-    assert!(said.contains("It repeats, so it goes back to TODO"), "{said}");
+    assert!(
+        said.contains("It repeats, so it goes back to TODO"),
+        "{said}"
+    );
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(
         text.starts_with(&format!(
@@ -453,7 +467,39 @@ async fn the_assistant_changes_an_entry_through_review() {
         )),
         "{text}"
     );
-    assert!(!text.contains(&stamp(-1, " +1d")), "the repeat moved its stamp: {text}");
+    assert!(
+        !text.contains(&stamp(-1, " +1d")),
+        "the repeat moved its stamp: {text}"
+    );
+
+    // Refiled across files: both edits apply, copy first.
+    let said = change(
+        json!({
+            "op": "refile",
+            "ref": at(1, "Write the report"),
+            "target": format!("{}::1::Projects", work.display()),
+        }),
+        trusted(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        said.starts_with("Filed \"Write the report\" under \"Projects\", as two edits"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&work).unwrap(),
+        format!(
+            "* Projects\n** Q3\n** DONE Write the report\nSCHEDULED: {}\n",
+            stamp(2, "")
+        )
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .starts_with("* TODO Standup\n"),
+        "and left plan.org"
+    );
 
     let err = change(
         json!({"op": "tag", "ref": at(9, "Lunch"), "tags": ["x"]}),

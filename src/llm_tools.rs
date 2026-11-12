@@ -151,7 +151,8 @@ pub fn tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: CHANGE,
             description: "Change one org entry: set its TODO state, schedule it, give it a \
-                          deadline, add and remove tags, or add a note to its log. Give the ref another org tool \
+                          deadline, add and remove tags, add a note to its log, or refile it under another \
+                          headline. Give the ref another org tool \
                           listed. The user reviews the edit before it is made; org writes the \
                           timestamps and log lines, so describe the change, not the text.",
             input_schema: input_schema::<ChangeArgs>().unwrap_or_default(),
@@ -308,12 +309,13 @@ pub enum ChangeOp {
     Deadline,
     Tag,
     AddNote,
+    Refile,
 }
 
 /// `org.change`'s input.
 #[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
 pub struct ChangeArgs {
-    /// `set-state`, `schedule`, `deadline`, `tag` or `add-note`.
+    /// `set-state`, `schedule`, `deadline`, `tag`, `add-note` or `refile`.
     pub op: ChangeOp,
     /// The entry's ref as another org tool listed it (`file::line::heading`), or its `ID`.
     pub r#ref: String,
@@ -327,6 +329,9 @@ pub struct ChangeArgs {
     pub date: Option<String>,
     /// For `tag`: tags to add, and `-tag` to remove one.
     pub tags: Option<Vec<String>>,
+    /// For `refile`: the ref of the headline to file the entry under, or an org file's path
+    /// to file it at the top level.
+    pub target: Option<String>,
 }
 
 /// `org.agenda`.
@@ -918,7 +923,7 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
     let nothing = |why: String| -> Result<Answer, String> {
         Ok(Answer::from(format!("Nothing to change: {why}.")))
     };
-    let (edit, mut said) = match args.op {
+    let (edits, mut said) = match args.op {
         ChangeOp::SetState => {
             let want = args
                 .state
@@ -963,7 +968,7 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
             } else {
                 (at, end - 1)
             };
-            (propose(org, &loc, span, &changed.lines)?, said)
+            (vec![propose(org, &loc, span, &changed.lines)?], said)
         }
         ChangeOp::Schedule | ChangeOp::Deadline => {
             let (field, what) = match args.op {
@@ -1003,8 +1008,9 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
                 Some(v) => format!("Gave \"{title}\" a deadline of {v}"),
                 None => format!("Removed the {what} date from \"{title}\""),
             };
-            (propose(org, &loc, span, &new)?, said)
+            (vec![propose(org, &loc, span, &new)?], said)
         }
+        ChangeOp::Refile => refile(org, keywords, &loc, at, args.target.as_deref())?,
         ChangeOp::AddNote => {
             let env = org.change_env();
             let log = args
@@ -1016,7 +1022,7 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
             let mut new: Vec<String> = lines[at..end].iter().map(|l| l.to_string()).collect();
             crate::complete::insert_log(&mut new, &log, env.log_into_drawer);
             let said = format!("Added a note to \"{title}\"");
-            (propose(org, &loc, (at, end - 1), &new)?, said)
+            (vec![propose(org, &loc, (at, end - 1), &new)?], said)
         }
         ChangeOp::Tag => {
             let asked = args.tags.unwrap_or_default();
@@ -1053,7 +1059,7 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
             } else {
                 format!("Tagged \"{title}\" :{}:", tags.join(":"))
             };
-            (propose(org, &loc, (at, at), &[new_head])?, said)
+            (vec![propose(org, &loc, (at, at), &[new_head])?], said)
         }
     };
     said.push_str(&format!(
@@ -1063,8 +1069,150 @@ fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<
     ));
     Ok(Answer {
         text: said,
-        proposals: vec![edit],
+        proposals: edits,
     })
+}
+
+/// `org.change`'s refile: the subtree at `at` moved under `target`, a
+/// child of it as `<leader>or` files it (`capture_target::relevel`). In one
+/// file that is one proposal. Across two it is two, the copy first: a user
+/// who accepts the copy and declines the removal has the entry twice, which
+/// is recoverable, where the other order would lose it.
+fn refile(
+    org: &dyn Org,
+    keywords: &Keywords,
+    src: &Located,
+    at: usize,
+    target: Option<&str>,
+) -> Result<(Vec<Proposal>, String), String> {
+    let target = target
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("target: refile needs the ref of a headline, or an org file's path")?;
+    let lines: Vec<&str> = src.text.lines().collect();
+    let end = subtree_end(&lines, at);
+    let title = title_of(lines[at], keywords);
+    let file_target = !target.contains("::") && crate::roam_scan::is_org(target);
+    let (dst, level, before, under) = if file_target {
+        let text = org
+            .read(target)
+            .map_err(|e| format!("target: {target}: {e}"))?;
+        let n = text.lines().count();
+        let shown = org.shown(target);
+        let dst = Located {
+            file: target.to_string(),
+            shown: shown.clone(),
+            text,
+            target: Target::Headline(0),
+        };
+        (dst, 0, n, format!("the top of {shown}"))
+    } else {
+        let dst = resolve(org, target, keywords).map_err(|e| e.replacen("ref:", "target:", 1))?;
+        let t = match &dst.target {
+            Target::Headline(t) => *t,
+            Target::File(node) => {
+                return Err(format!(
+                    "target: `{}` is a whole-file note; give its file's path to file at its top \
+                     level",
+                    node.id
+                ));
+            }
+        };
+        let tlines: Vec<&str> = dst.text.lines().collect();
+        let level = headline_level(tlines[t]).unwrap_or(1);
+        let before = subtree_end(&tlines, t);
+        let under = format!("\"{}\"", title_of(tlines[t], keywords));
+        (dst, level, before, under)
+    };
+    let same = org.real_path(&dst.file) == org.real_path(&src.file);
+    if same && !file_target {
+        if let Target::Headline(t) = dst.target {
+            if (at..end).contains(&t) {
+                return Err(format!("target: \"{title}\" cannot be filed under itself"));
+            }
+        }
+    }
+    let moved = crate::capture_target::relevel(&lines[at..end].join("\n"), level);
+    let moved: Vec<String> = moved.lines().map(str::to_string).collect();
+    let mut kept: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let said = format!("Filed \"{title}\" under {under}");
+    if same {
+        kept.drain(at..end);
+        let before = if before > at {
+            before - (end - at)
+        } else {
+            before
+        };
+        kept.splice(before..before, moved);
+        let edit = propose_rewrite(org, src, &kept)?
+            .ok_or_else(|| format!("Nothing to change: \"{title}\" is already there"))?;
+        return Ok((vec![edit], said));
+    }
+    let mut filed: Vec<String> = dst.text.lines().map(str::to_string).collect();
+    filed.splice(before..before, moved);
+    let copy = propose_rewrite(org, &dst, &filed)?.ok_or("target: nothing would change")?;
+    kept.drain(at..end);
+    let removal = propose_rewrite(org, src, &kept)?.ok_or("ref: nothing would change")?;
+    Ok((
+        vec![copy, removal],
+        format!(
+            "{said}, as two edits: the copy into {} first, then its removal from {}. Declining \
+             the second leaves it in both files, not in neither",
+            dst.shown, src.shown
+        ),
+    ))
+}
+
+/// The located file rewritten to `new`, as one proposal over the lines that
+/// differ. A pure insertion anchors on the line before it (after, at the
+/// top), and a pure deletion on the line after it (before, at the end), so
+/// neither is an empty side and a deletion takes its line break with it.
+/// `None` when nothing differs.
+fn propose_rewrite(
+    org: &dyn Org,
+    loc: &Located,
+    new: &[String],
+) -> Result<Option<Proposal>, String> {
+    let old: Vec<&str> = loc.text.lines().collect();
+    if old.is_empty() {
+        return Err(format!(
+            "{}: the file is empty, and an edit needs text in it to anchor on; add a line to \
+             it first",
+            loc.shown
+        ));
+    }
+    let mut p = old
+        .iter()
+        .zip(new)
+        .take_while(|(a, b)| **a == b.as_str())
+        .count();
+    let room = old.len().min(new.len()) - p;
+    let mut s = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(room)
+        .take_while(|(a, b)| **a == b.as_str())
+        .count();
+    if p + s == old.len() && p + s == new.len() {
+        return Ok(None);
+    }
+    if p + s == old.len() {
+        // A pure insertion: nothing old to replace.
+        if p > 0 {
+            p -= 1;
+        } else {
+            s -= 1;
+        }
+    } else if p + s == new.len() && (s > 0 || p > 0) {
+        // A pure deletion: an empty replacement would leave its line break.
+        if s > 0 {
+            s -= 1;
+        } else {
+            p -= 1;
+        }
+    }
+    propose(org, loc, (p, old.len() - 1 - s), &new[p..new.len() - s]).map(Some)
 }
 
 fn or_none(state: &str) -> &str {
@@ -1935,7 +2083,10 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             r#"{"op": "set-state", "ref": "~/org/home.org::7::Chase them", "state": "WAITING", "note": "they are out until Monday"}"#,
         );
         assert!(p.new.starts_with("*** WAITING Chase them\n"), "{p:?}");
-        assert!(p.new.contains("\\\\\n    they are out until Monday"), "{p:?}");
+        assert!(
+            p.new.contains("\\\\\n    they are out until Monday"),
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -2037,6 +2188,109 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             r#"{"op": "add-note", "ref": "~/org/plan.org::4::Standup", "note": "  "}"#,
         );
         assert_eq!(err, "note: add-note needs the note's text");
+    }
+
+    /// Across files: the copy first, a child of the target, deeper
+    /// headings shifted with it; then the removal, taking its line break.
+    #[test]
+    fn a_refile_across_files_copies_then_removes() {
+        let org = Fake(vec![
+            ("~/org/inbox.org", "* TODO Call Sam\n** Notes\n* Keep\n"),
+            ("~/org/work.org", "* Projects\n** Q3\n* Admin\n"),
+        ]);
+        let a = call(
+            &org,
+            &kw(),
+            today(),
+            CHANGE,
+            r#"{"op": "refile", "ref": "~/org/inbox.org::1::Call Sam", "target": "~/org/work.org::1::Projects"}"#,
+        )
+        .unwrap();
+        assert!(
+            a.text.starts_with(
+                "Filed \"Call Sam\" under \"Projects\", as two edits: the copy into \
+                 ~/org/work.org first, then its removal from ~/org/inbox.org."
+            ),
+            "{}",
+            a.text
+        );
+        assert_eq!(
+            a.proposals,
+            [
+                Proposal {
+                    path: "/home/u/org/work.org".into(),
+                    old: "** Q3".into(),
+                    new: "** Q3\n** TODO Call Sam\n*** Notes".into(),
+                },
+                Proposal {
+                    path: "/home/u/org/inbox.org".into(),
+                    old: "* TODO Call Sam\n** Notes\n* Keep".into(),
+                    new: "* Keep".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refile_in_one_file_is_one_edit() {
+        let org = Fake(vec![(
+            "~/t.org",
+            "* Inbox\n** TODO Call Sam\n* Work\n** Q3\n",
+        )]);
+        let (said, p) = change_of(
+            &org,
+            r#"{"op": "refile", "ref": "~/t.org::2::Call Sam", "target": "~/t.org::3::Work"}"#,
+        );
+        assert!(
+            said.starts_with("Filed \"Call Sam\" under \"Work\" in ~/t.org."),
+            "{said}"
+        );
+        assert_eq!(p.old, "** TODO Call Sam\n* Work\n** Q3");
+        assert_eq!(p.new, "* Work\n** Q3\n** TODO Call Sam");
+
+        // To a file: its end, at the top level.
+        let (_, p) = change_of(
+            &org,
+            r#"{"op": "refile", "ref": "~/t.org::2::Call Sam", "target": "~/t.org"}"#,
+        );
+        assert_eq!(p.new, "* Work\n** Q3\n* TODO Call Sam");
+    }
+
+    #[test]
+    fn a_refile_the_model_got_wrong_is_refused() {
+        let org = Fake(vec![
+            ("~/t.org", "* Work\n** Q3\n* Admin\n"),
+            ("~/empty.org", ""),
+        ]);
+        let err = |target: &str| {
+            change_err(
+                &org,
+                &format!(r#"{{"op": "refile", "ref": "~/t.org::1::Work", "target": "{target}"}}"#),
+            )
+        };
+        assert_eq!(
+            err("~/t.org::2::Q3"),
+            "target: \"Work\" cannot be filed under itself"
+        );
+        assert!(
+            err("~/t.org::9::Lunch").contains("query again"),
+            "{}",
+            err("~/t.org::9::Lunch")
+        );
+        assert!(
+            err("~/gone.org").starts_with("target: ~/gone.org: "),
+            "{}",
+            err("~/gone.org")
+        );
+        assert!(
+            err("~/empty.org").contains("the file is empty"),
+            "{}",
+            err("~/empty.org")
+        );
+        assert!(
+            change_err(&org, r#"{"op": "refile", "ref": "~/t.org::1::Work"}"#)
+                .starts_with("target:")
+        );
     }
 
     /// Two identical headlines: the edit widens until its old text occurs

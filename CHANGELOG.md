@@ -31,7 +31,10 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   sets a TODO state, schedules an entry, sets or removes its deadline (dates
   as the `s`/`d` prompt reads them: `+2d`, `fri`, `2026-11-14 +1w`, `none`)
   adds or removes tags, and adds a note to the entry's log (`- Note taken
-  on …`, where org's `org-add-note` puts it). Org writes the text, not the model: a repeating
+  on …`, where org's `org-add-note` puts it), and refiles it under another
+  headline or to a file, as `<leader>or` does. A refile across two files is
+  two edits, the copy first, so declining the second leaves the entry in both
+  files rather than in neither. Org writes the text, not the model: a repeating
   task repeats, a state with `!` or `@` gets its log line (with the note the
   assistant gives), exactly as `<leader>ot` writes them. Each change is a
   proposal lattice puts in front of you as a diff before anything is written.

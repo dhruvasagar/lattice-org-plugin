@@ -206,8 +206,9 @@ async fn the_assistant_reads_the_agenda_through_org() {
             ("org__entry", Permission::Run, ToolKind::Read),
             ("org__clock", Permission::Run, ToolKind::Read),
             ("org__notes", Permission::Run, ToolKind::Read),
+            ("org__change", Permission::Review, ToolKind::Edit),
         ],
-        "org reaches no network, so its read tools run unasked"
+        "org reaches no network, so its read tools run unasked and its change is reviewed"
     );
 
     let ask = |args: serde_json::Value| call(&offer, "org__agenda", args);

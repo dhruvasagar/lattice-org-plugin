@@ -27,6 +27,13 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   aliases, or by tag, and names the notes that link to each. A note's ref is
   its `ID`, and `org.entry` reads it: a whole-file note whole, a headline
   note as its subtree.
+- **`org.change`: the assistant changes an entry the way the keys do.** It
+  sets a TODO state, schedules an entry, sets or removes its deadline (dates
+  as the `s`/`d` prompt reads them: `+2d`, `fri`, `2026-11-14 +1w`, `none`)
+  and adds or removes tags. Org writes the text, not the model: a repeating
+  task repeats, a state with `!` or `@` gets its log line (with the note the
+  assistant gives), exactly as `<leader>ot` writes them. Each change is a
+  proposal lattice puts in front of you as a diff before anything is written.
 
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A

@@ -112,6 +112,115 @@ pub(crate) fn state_log_line(to: &str, from: &str, stamp: &str) -> String {
     format!("- State \"{to}\" from \"{from}\" {stamp}")
 }
 
+/// [`state_log_line`] with a note, in org's continuation shape: the state
+/// line ends with ` \\` and the note follows, indented under it. An empty
+/// note is the plain line, as org writes when you store an empty note.
+pub(crate) fn noted_log_line(to: &str, from: &str, stamp: &str, note: &str) -> String {
+    let mut log = state_log_line(to, from, stamp);
+    let note = note.trim();
+    if !note.is_empty() {
+        log.push_str(" \\\\\n  ");
+        log.push_str(note);
+    }
+    log
+}
+
+/// A TODO state change, as lines to write back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateChange {
+    /// The replacement for the headline (`headline_only`) or for the whole
+    /// subtree, headline first.
+    pub lines: Vec<String>,
+    /// Only the headline changed. The common case, and kept a one-line edit
+    /// so a keyword change is a one-line undo.
+    pub headline_only: bool,
+    /// The new state asks for a note (`@`) and none was given: the caller
+    /// prompts for it, the state already changed (org's order).
+    pub note_owed: bool,
+    /// The task repeated rather than finishing: the keyword it reset to and
+    /// where its stamp moved.
+    pub repeated: Option<(String, Date)>,
+}
+
+/// Set the headline's keyword to `want` (empty clears it), the way org does:
+/// a done state on a repeating task repeats it (HB.2); otherwise the keyword
+/// changes and the log gets what the keywords' flags ask for (TK.8), with
+/// `note` as the note an `@` state asks for (TK.9).
+///
+/// The one decision of "what a state change writes", shared by the keys and
+/// the assistant's `org.change` (AT.8), so the two cannot write different
+/// things. `subtree` is read only when the change needs more than the
+/// headline. `None` when nothing would change.
+pub fn change_state(
+    head: &str,
+    subtree: impl FnOnce() -> Vec<String>,
+    want: &str,
+    note: Option<&str>,
+    kws: &crate::todo::Keywords,
+    ctx: &Context,
+) -> Option<StateChange> {
+    let from = crate::todo::parse(head, ctx.keywords)
+        .and_then(|h| h.keyword.map(str::to_string))
+        .unwrap_or_default();
+    let mut subtree = Some(subtree);
+    let mut read = || subtree.take().map(|f| f()).unwrap_or_default();
+    // Only a DONE state repeats. Cycling TODO → NEXT must not shift a
+    // timestamp, which is the bug an over-eager gate here would be.
+    let mut lines = None;
+    if ctx.done_keywords.iter().any(|d| d == want) {
+        let all = read();
+        if let Some(done) = complete_repeating(&all, &from, ctx) {
+            return Some(StateChange {
+                lines: done.lines,
+                headline_only: false,
+                note_owed: false,
+                repeated: Some((done.reset_to, done.next)),
+            });
+        }
+        lines = Some(all);
+    }
+    let new_head = crate::todo::set_keyword(head, ctx.keywords, want)?;
+    if new_head == head {
+        return None;
+    }
+    let to = (!want.is_empty()).then_some(want);
+    let logged = |log: String, lines: Option<Vec<String>>| {
+        let mut lines = lines.unwrap_or_default();
+        if lines.is_empty() {
+            lines.push(head.to_string());
+        }
+        lines[0] = new_head.clone();
+        insert_log(&mut lines, &log, ctx.log_into_drawer);
+        StateChange {
+            lines,
+            headline_only: false,
+            note_owed: false,
+            repeated: None,
+        }
+    };
+    let headline = |note_owed: bool| StateChange {
+        lines: vec![new_head.clone()],
+        headline_only: true,
+        note_owed,
+        repeated: None,
+    };
+    let from_kw = (!from.is_empty()).then_some(from.as_str());
+    Some(match crate::todo::log_on_change(kws, from_kw, to) {
+        crate::todo::LogOnChange::Nothing => headline(false),
+        crate::todo::LogOnChange::Timestamp => logged(
+            state_log_line(want, &from, ctx.now_stamp),
+            lines.or_else(|| Some(read())),
+        ),
+        crate::todo::LogOnChange::Note => match note {
+            Some(note) => logged(
+                noted_log_line(want, &from, ctx.now_stamp, note),
+                lines.or_else(|| Some(read())),
+            ),
+            None => headline(true),
+        },
+    })
+}
+
 /// The done keyword to name in the log line — the one the user actually
 /// entered. Falls back to `DONE`, which is the only sensible guess and the
 /// name org uses when a sequence declares no explicit done state.
@@ -369,6 +478,94 @@ mod tests {
 
     fn lines(s: &str) -> Vec<String> {
         s.lines().map(str::to_string).collect()
+    }
+
+    /// AT.8: the shared verb, through the keyword flags it honours.
+    #[test]
+    fn change_state_does_what_the_keywords_ask() {
+        let kws = crate::todo::parse_todo_keywords("TODO WAIT(w@) NEXT(n!) | DONE");
+        let (all, done) = (kws.names(), kws.split().1);
+        let now = "[2026-09-03 Thu 10:00]";
+        let cx = ctx(now, true, &all, &done);
+        let src = lines("* TODO Write it\nSCHEDULED: <2026-09-05 Sat>\nBody.");
+        let change = |want: &str, note: Option<&str>| {
+            let mut read = false;
+            let out = change_state(
+                &src[0],
+                || {
+                    read = true;
+                    src.clone()
+                },
+                want,
+                note,
+                &kws,
+                &cx,
+            );
+            (out, read)
+        };
+
+        // No flags: the headline alone, and the subtree is never read.
+        let (plain, read) = change("DONE", None);
+        assert_eq!(
+            plain.unwrap(),
+            StateChange {
+                lines: vec!["* DONE Write it".into()],
+                headline_only: true,
+                note_owed: false,
+                repeated: None,
+            }
+        );
+        assert!(
+            read,
+            "a done state reads the subtree to see whether it repeats"
+        );
+        let (_, read) = change("", None);
+        assert!(
+            !read,
+            "clearing a keyword with no flags reads only the headline"
+        );
+
+        // `!`: the log line, in the drawer, under the planning line.
+        let (logged, _) = change("NEXT", None);
+        assert_eq!(
+            logged.unwrap().lines,
+            lines(
+                "* NEXT Write it\n\
+                 SCHEDULED: <2026-09-05 Sat>\n\
+                 \x20 :LOGBOOK:\n\
+                 \x20 - State \"NEXT\" from \"TODO\" [2026-09-03 Thu 10:00]\n\
+                 \x20 :END:\n\
+                 Body."
+            )
+        );
+
+        // `@` with a note writes it; without one, the caller is told to ask.
+        let (noted, _) = change("WAIT", Some("on legal"));
+        let noted = noted.unwrap().lines.join("\n");
+        assert!(
+            noted.contains(
+                "  - State \"WAIT\" from \"TODO\" [2026-09-03 Thu 10:00] \\\\\n  on legal"
+            ),
+            "{noted}"
+        );
+        let (owed, _) = change("WAIT", None);
+        let owed = owed.unwrap();
+        assert!(owed.headline_only && owed.note_owed, "{owed:?}");
+
+        // Nothing to change is no change.
+        assert_eq!(change("TODO", None).0, None);
+    }
+
+    #[test]
+    fn change_state_repeats_a_repeating_task() {
+        let kws = crate::todo::parse_todo_keywords("TODO | DONE");
+        let (all, done) = (kws.names(), kws.split().1);
+        let cx = ctx("[2026-09-03 Thu 10:00]", true, &all, &done);
+        let src = lines("* TODO Water plants\nSCHEDULED: <2026-09-03 Thu +1w>");
+        let change = change_state(&src[0], || src.clone(), "DONE", None, &kws, &cx).unwrap();
+        assert_eq!(change.repeated, Some(("TODO".to_string(), d(2026, 9, 10))));
+        assert_eq!(change.lines[0], "* TODO Water plants");
+        assert_eq!(change.lines[1], "SCHEDULED: <2026-09-10 Thu +1w>");
     }
 
     /// The user's own habit, end to end.

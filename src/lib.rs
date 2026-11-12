@@ -8343,37 +8343,29 @@ fn set_keyword_repeating(
     want: &str,
 ) -> Vec<Effect> {
     let keywords = todo_keywords();
-    let (_, done) = todo::parse_todo_keywords(&todo_keyword_lines().join("\n")).split();
-    // Only a DONE state repeats. Cycling TODO → NEXT must not shift a
-    // timestamp, which is the bug an over-eager gate here would be.
-    if !done.iter().any(|d| d == want) {
-        return set_keyword_logged(ctx, doc, tree, want);
-    }
+    let kws = todo::parse_todo_keywords(&todo_keyword_lines().join("\n"));
+    let (_, done) = kws.split();
     // HB.2b: through the target, not through `doc`.
     //
     // An agenda excerpt is ONE line — the headline — so reading the subtree
     // from the active buffer there yields a single line with no planning line
     // under it, `complete_repeating` correctly finds nothing to repeat, and
-    // the fallback below writes a plain `DONE`. That is not a failure to
-    // repeat: it *destroys the habit*, because the headline stops being
-    // scheduled and the completion is never recorded. The whole subtree has
-    // to be read from, and written back to, the document that actually holds
-    // it — which for an agenda row is a multibuffer source the view owns and
-    // no buffer store holds.
+    // the fallback writes a plain `DONE`. That is not a failure to repeat: it
+    // *destroys the habit*, because the headline stops being scheduled and
+    // the completion is never recorded. The whole subtree has to be read
+    // from, and written back to, the document that actually holds it — which
+    // for an agenda row is a multibuffer source the view owns and no buffer
+    // store holds.
     let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
         return vec![Effect::None];
     };
     let Some(head) = target.line(target.headline, doc) else {
         return vec![Effect::None];
     };
-    let from_keyword = todo::parse(&head, &keywords)
+    let from = todo::parse(&head, &keywords)
         .and_then(|h| h.keyword.map(|k| k.to_string()))
         .unwrap_or_default();
     let end = target.subtree_end(doc, tree);
-    let lines: Vec<String> = (target.headline..=end)
-        .filter_map(|n| target.line(n, doc))
-        .collect();
-
     let now = clock_now();
     let cx = complete::Context {
         today: today_local(),
@@ -8382,49 +8374,81 @@ fn set_keyword_repeating(
         done_keywords: &done,
         log_into_drawer: option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
     };
-    let Some(done_with) = complete::complete_repeating(&lines, &from_keyword, &cx) else {
-        // Not a repeating task: the ordinary completion, which still logs what
-        // the keyword's flags ask for (TK.8).
-        return set_keyword_logged(ctx, doc, tree, want);
+    let subtree = || {
+        (target.headline..=end)
+            .filter_map(|n| target.line(n, doc))
+            .collect::<Vec<_>>()
+    };
+    let Some(change) = complete::change_state(&head, subtree, want, None, &kws, &cx) else {
+        return vec![Effect::None];
     };
 
-    let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
-    let cursor = if target.from_source {
-        // The edit lands in the source; the caret is in the VIEW and stays
-        // where it is. Naming a source line here would move the caret to a
-        // composed row that happens to share the number — the two coordinate
-        // spaces are unrelated, which is the whole reason `from_source`
-        // exists. (`plan_submit` passes `ctx.cursor` for the same reason.)
-        ctx.cursor
-    } else {
-        Position {
+    let mut effects = if change.headline_only {
+        // The overwhelmingly common case, and it must stay a single-line
+        // edit: most keywords declare no flags at all, and rewriting a whole
+        // subtree to change one word would make every `<leader>ot` a bigger
+        // undo step than it is.
+        let new_head = &change.lines[0];
+        let cursor = Position {
             line: target.headline,
-            byte: ctx
-                .cursor
-                .byte
-                .min(done_with.lines.first().map(|l| l.len()).unwrap_or(0) as u32),
-        }
+            byte: ctx.cursor.byte.min(new_head.len() as u32),
+        };
+        replace_lines_at(
+            target.buffer,
+            target.headline,
+            target.headline,
+            head.len() as u32,
+            new_head.clone(),
+            cursor,
+        )
+    } else {
+        // **One edit over the whole subtree**, headline and log together, so
+        // `u` takes the transition back in one step.
+        let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
+        let cursor = if target.from_source || change.repeated.is_none() {
+            // The edit lands in the source; the caret is in the VIEW and stays
+            // where it is. Naming a source line here would move the caret to
+            // a composed row that happens to share the number — the two
+            // coordinate spaces are unrelated, which is the whole reason
+            // `from_source` exists. (`plan_submit` passes `ctx.cursor` for the
+            // same reason.)
+            ctx.cursor
+        } else {
+            Position {
+                line: target.headline,
+                byte: ctx
+                    .cursor
+                    .byte
+                    .min(change.lines.first().map(|l| l.len()).unwrap_or(0) as u32),
+            }
+        };
+        replace_lines_at(
+            target.buffer,
+            target.headline,
+            end,
+            last_len,
+            change.lines.join("\n"),
+            cursor,
+        )
     };
-    let mut effects = replace_lines_at(
-        target.buffer,
-        target.headline,
-        end,
-        last_len,
-        done_with.lines.join("\n"),
-        cursor,
-    );
-    // Say what happened. A keyword that goes back to NEXT after you pressed
-    // DONE looks like the key failed; without this line the correct behaviour
-    // is indistinguishable from a bug, which is how org's own newcomers meet
-    // repeaters.
-    let d = done_with.next;
-    effects.push(Effect::Echo(EchoPayload {
-        level: EchoLevel::Info,
-        text: format!(
-            "org: repeated — {} again, next {:04}-{:02}-{:02}",
-            done_with.reset_to, d.year, d.month, d.day
-        ),
-    }));
+    if let Some((reset_to, d)) = &change.repeated {
+        // Say what happened. A keyword that goes back to NEXT after you
+        // pressed DONE looks like the key failed; without this line the
+        // correct behaviour is indistinguishable from a bug, which is how
+        // org's own newcomers meet repeaters.
+        effects.push(Effect::Echo(EchoPayload {
+            level: EchoLevel::Info,
+            text: format!(
+                "org: repeated — {reset_to} again, next {:04}-{:02}-{:02}",
+                d.year, d.month, d.day
+            ),
+        }));
+    }
+    // TK.9: the state change lands NOW and the note follows, which is org's
+    // order — escaping the prompt leaves the state changed and unnoted.
+    if change.note_owed {
+        effects.extend(note_prompt_for(&from, want));
+    }
     effects
 }
 
@@ -8489,14 +8513,7 @@ fn todo_note_submit(
         return vec![Effect::None];
     }
     let stamp = clock_now().stamp();
-    let mut log = complete::state_log_line(&to, &from, &stamp);
-    let note = text.trim();
-    if !note.is_empty() {
-        // Org's continuation shape: the state line ends with ` \\` and the note
-        // follows on the next line, indented under it.
-        log.push_str(" \\\\\n  ");
-        log.push_str(note);
-    }
+    let log = complete::noted_log_line(&to, &from, &stamp, &text);
     complete::insert_log(
         &mut lines,
         &log,
@@ -8511,104 +8528,6 @@ fn todo_note_submit(
         lines.join("\n"),
         ctx.cursor,
     )
-}
-
-/// TK.8 — set the headline's keyword, recording what the keyword flags ask for.
-///
-/// `org-todo-keywords` lets a state declare `(@)`, `(!)` or `(@/!)`, and until
-/// this those were parsed and inert — the design said so in as many words, and
-/// deferred acting on them to "its own slice with its own tests". This is that
-/// slice's not-a-note half.
-///
-/// **One edit**, headline and log line together, so `u` takes the transition
-/// back in one step. The note case cannot do that — it needs an answer from the
-/// user first — and takes two; see [`note_prompt_for`].
-fn set_keyword_logged(
-    ctx: &ActionContext,
-    doc: &Document,
-    tree: Option<&TreeSnapshot>,
-    want: &str,
-) -> Vec<Effect> {
-    let keywords = todo_keywords();
-    let kws = todo::parse_todo_keywords(&todo_keyword_lines().join("\n"));
-    let Some(target) = PlanTarget::resolve(ctx, doc, tree) else {
-        return vec![Effect::None];
-    };
-    let Some(head) = target.line(target.headline, doc) else {
-        return vec![Effect::None];
-    };
-    let from = todo::parse(&head, &keywords)
-        .and_then(|h| h.keyword.map(|k| k.to_string()))
-        .unwrap_or_default();
-    let to = (!want.is_empty()).then_some(want);
-    let action = todo::log_on_change(&kws, (!from.is_empty()).then_some(from.as_str()), to);
-
-    let Some(new_head) = todo::set_keyword(&head, &keywords, want) else {
-        return vec![Effect::None];
-    };
-    if new_head == head {
-        return vec![Effect::None];
-    }
-    match action {
-        // The overwhelmingly common case, and it must stay a single-line edit:
-        // most keywords declare no flags at all, and rewriting a whole subtree
-        // to change one word would make every `<leader>ot` a bigger undo step
-        // than it is.
-        todo::LogOnChange::Nothing => {
-            let cursor = Position {
-                line: target.headline,
-                byte: ctx.cursor.byte.min(new_head.len() as u32),
-            };
-            replace_lines_at(
-                target.buffer,
-                target.headline,
-                target.headline,
-                head.len() as u32,
-                new_head,
-                cursor,
-            )
-        }
-        todo::LogOnChange::Timestamp => {
-            let end = target.subtree_end(doc, tree);
-            let mut lines: Vec<String> = (target.headline..=end)
-                .filter_map(|n| target.line(n, doc))
-                .collect();
-            lines[0] = new_head;
-            let stamp = clock_now().stamp();
-            complete::insert_log(
-                &mut lines,
-                &complete::state_log_line(want, &from, &stamp),
-                option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
-            );
-            let last_len = target.line(end, doc).map(|l| l.len()).unwrap_or(0) as u32;
-            replace_lines_at(
-                target.buffer,
-                target.headline,
-                end,
-                last_len,
-                lines.join("\n"),
-                ctx.cursor,
-            )
-        }
-        // TK.9: the state change lands NOW and the note follows, which is org's
-        // order — escaping the prompt leaves the state changed and unnoted.
-        todo::LogOnChange::Note => {
-            let cursor = Position {
-                line: target.headline,
-                byte: ctx.cursor.byte.min(new_head.len() as u32),
-            };
-            let mut effects = replace_lines_at(
-                target.buffer,
-                target.headline,
-                target.headline,
-                head.len() as u32,
-                new_head,
-                cursor,
-            );
-            effects.extend(note_prompt_for(&from, want));
-            effects
-        }
-    }
 }
 
 fn rewrite_headline(
@@ -12011,7 +11930,11 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
                 name: t.name.to_string(),
                 description: t.description.to_string(),
                 input_schema: t.input_schema,
-                kind: lattice::plugin_host::types::LlmToolKind::Read,
+                kind: if t.proposes {
+                    lattice::plugin_host::types::LlmToolKind::Propose
+                } else {
+                    lattice::plugin_host::types::LlmToolKind::Read
+                },
             })
             .collect()
     }
@@ -12024,10 +11947,18 @@ impl exports::lattice::plugin_host::llm_tools::Guest for Component {
         let org = HostOrg {
             keywords: keywords.clone(),
         };
-        let text = llm_tools::call(&org, &keywords, today_epoch_day(), &name, &args)?;
+        let answer = llm_tools::call(&org, &keywords, today_epoch_day(), &name, &args)?;
         Ok(lattice::plugin_host::types::LlmToolResult {
-            text,
-            proposals: Vec::new(),
+            text: answer.text,
+            proposals: answer
+                .proposals
+                .into_iter()
+                .map(|p| lattice::plugin_host::types::ProposedEdit {
+                    path: p.path,
+                    old_string: p.old,
+                    new_string: p.new,
+                })
+                .collect(),
         })
     }
 
@@ -12069,6 +12000,19 @@ impl llm_tools::Org for HostOrg {
 
     fn shown(&self, path: &str) -> String {
         shown_path(path)
+    }
+
+    fn real_path(&self, path: &str) -> String {
+        crate::roam_scan::expand_tilde(path)
+    }
+
+    /// The same clock and options the keys write with.
+    fn change_env(&self) -> llm_tools::ChangeEnv {
+        llm_tools::ChangeEnv {
+            now_stamp: clock_now().stamp(),
+            log_into_drawer: option_or("log-into-drawer", "true").eq_ignore_ascii_case("true"),
+            todo: todo::parse_todo_keywords(&todo_keyword_lines().join("\n")),
+        }
     }
 }
 

@@ -41,6 +41,8 @@ pub const ENTRY: &str = "entry";
 pub const CLOCK: &str = "clock";
 /// `org.notes`.
 pub const NOTES: &str = "notes";
+/// `org.change`, the one tool that proposes edits.
+pub const CHANGE: &str = "change";
 
 /// The most rows one answer lists; the rest are counted.
 const MAX_ROWS: usize = 150;
@@ -60,6 +62,45 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: String,
+    /// Whether the tool proposes edits; every other tool only reads.
+    pub proposes: bool,
+}
+
+/// One proposed edit, with `lattice.edit_file`'s semantics: `old` occurs in
+/// `path` exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub path: String,
+    pub old: String,
+    pub new: String,
+}
+
+/// A tool's answer: text for the model and the edits it proposes. The host
+/// reviews and applies each proposal, and tells the model what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Answer {
+    pub text: String,
+    pub proposals: Vec<Proposal>,
+}
+
+impl From<String> for Answer {
+    fn from(text: String) -> Self {
+        Answer {
+            text,
+            proposals: Vec::new(),
+        }
+    }
+}
+
+/// What a change needs from the host besides the files: the clock and the
+/// TODO keywords with their logging flags.
+pub struct ChangeEnv {
+    /// `[2026-11-12 Thu 10:00]`, for a log line.
+    pub now_stamp: String,
+    /// `org.log-into-drawer`.
+    pub log_into_drawer: bool,
+    /// `org.todo-keywords`, with each state's logging flags.
+    pub todo: crate::todo::Keywords,
 }
 
 /// The tools org offers, all `read`.
@@ -72,6 +113,7 @@ pub fn tools() -> Vec<ToolSpec> {
                           a TODO state. Use it for questions about plans, deadlines and what is \
                           on a given day.",
             input_schema: input_schema::<AgendaArgs>().unwrap_or_default(),
+            proposes: false,
         },
         ToolSpec {
             name: QUERY,
@@ -80,6 +122,7 @@ pub fn tools() -> Vec<ToolSpec> {
                           someone, what is tagged for a project, or which tasks have no date; for \
                           what falls on a day, use org.agenda.",
             input_schema: input_schema::<QueryArgs>().unwrap_or_default(),
+            proposes: false,
         },
         ToolSpec {
             name: ENTRY,
@@ -87,6 +130,7 @@ pub fn tools() -> Vec<ToolSpec> {
                           Give the ref another org tool listed. Use it before answering about an \
                           entry's details.",
             input_schema: input_schema::<EntryArgs>().unwrap_or_default(),
+            proposes: false,
         },
         ToolSpec {
             name: CLOCK,
@@ -94,6 +138,7 @@ pub fn tools() -> Vec<ToolSpec> {
                           days, per entry, per file or per tag. Use it for questions about where \
                           time went and for reports of work done.",
             input_schema: input_schema::<ClockArgs>().unwrap_or_default(),
+            proposes: false,
         },
         ToolSpec {
             name: NOTES,
@@ -101,6 +146,16 @@ pub fn tools() -> Vec<ToolSpec> {
                           by tag, with the notes that link to each. Use it for questions about \
                           what the user has written on a topic; read a note with org.entry.",
             input_schema: input_schema::<NotesArgs>().unwrap_or_default(),
+            proposes: false,
+        },
+        ToolSpec {
+            name: CHANGE,
+            description: "Change one org entry: set its TODO state, schedule it, give it a \
+                          deadline, or add and remove tags. Give the ref another org tool \
+                          listed. The user reviews the edit before it is made; org writes the \
+                          timestamps and log lines, so describe the change, not the text.",
+            input_schema: input_schema::<ChangeArgs>().unwrap_or_default(),
+            proposes: true,
         },
     ]
 }
@@ -147,6 +202,12 @@ pub trait Org {
     fn shown(&self, path: &str) -> String {
         path.to_string()
     }
+    /// A path as a proposal names it: what `lattice.edit_file` opens.
+    fn real_path(&self, path: &str) -> String {
+        path.to_string()
+    }
+    /// The clock and keywords a change writes with.
+    fn change_env(&self) -> ChangeEnv;
 }
 
 /// Run one of org's tools: the text of its answer, or the error the model
@@ -157,13 +218,14 @@ pub fn call(
     today: i64,
     name: &str,
     args: &str,
-) -> Result<String, String> {
+) -> Result<Answer, String> {
     match name {
-        AGENDA => agenda(org, keywords, today, args),
-        QUERY => query(org, keywords, today, args),
-        ENTRY => entry(org, keywords, today, args),
-        CLOCK => clock(org, keywords, today, args),
-        NOTES => notes(org, today, args),
+        AGENDA => agenda(org, keywords, today, args).map(Answer::from),
+        QUERY => query(org, keywords, today, args).map(Answer::from),
+        ENTRY => entry(org, keywords, today, args).map(Answer::from),
+        CLOCK => clock(org, keywords, today, args).map(Answer::from),
+        NOTES => notes(org, today, args).map(Answer::from),
+        CHANGE => change(org, keywords, today, args),
         other => Err(format!("org has no tool `{other}`")),
     }
 }
@@ -236,6 +298,33 @@ pub struct NotesArgs {
     pub tag: Option<String>,
     /// The most notes to list; 20 when left out, at most 150.
     pub limit: Option<i64>,
+}
+
+/// What `org.change` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ConfigShape)]
+pub enum ChangeOp {
+    SetState,
+    Schedule,
+    Deadline,
+    Tag,
+}
+
+/// `org.change`'s input.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShape)]
+pub struct ChangeArgs {
+    /// `set-state`, `schedule`, `deadline` or `tag`.
+    pub op: ChangeOp,
+    /// The entry's ref as another org tool listed it (`file::line::heading`), or its `ID`.
+    pub r#ref: String,
+    /// For `set-state`: the TODO keyword to set, such as `DONE`; empty clears it.
+    pub state: Option<String>,
+    /// For `set-state`: a note, for a state that asks for one.
+    pub note: Option<String>,
+    /// For `schedule` and `deadline`: `2026-11-14`, `+3d`, `tomorrow` or `fri`, optionally
+    /// followed by a repeater such as `+1w`; `none` removes it.
+    pub date: Option<String>,
+    /// For `tag`: tags to add, and `-tag` to remove one.
+    pub tags: Option<Vec<String>>,
 }
 
 /// `org.agenda`.
@@ -415,92 +504,131 @@ fn query(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<S
 }
 
 /// `org.entry`: one entry, headline to the end of its subtree.
-fn entry(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<String, String> {
-    let args: EntryArgs = parse_args(args).map_err(|e| e.to_string())?;
+/// Where a ref leads.
+struct Located {
+    /// As refs and answers spell the file (`~` for home).
+    shown: String,
+    /// As [`Org::read`] takes it; a proposal names [`Org::real_path`] of it.
+    file: String,
+    text: String,
+    target: Target,
+}
+
+enum Target {
+    /// A headline, by its 0-based line.
+    Headline(usize),
+    /// A roam note that is the whole file.
+    File(Node),
+}
+
+/// The entry a ref names: `file::line::heading` (a moved line found by its
+/// heading when only one headline carries it), else an `ID` in the agenda
+/// files, else an `ID` in the roam index.
+fn resolve(org: &dyn Org, raw: &str, keywords: &Keywords) -> Result<Located, String> {
     // Small models echo the row's wrapping (`[ref …]`) along with the ref.
-    let wanted = args
-        .r#ref
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+    let wanted = raw.trim().trim_start_matches('[').trim_end_matches(']');
     let wanted = wanted.strip_prefix("ref ").unwrap_or(wanted).trim();
     if wanted.is_empty() {
         return Err("ref: empty".to_string());
     }
-    let (path, text, at) = match wanted.split_once("::") {
-        Some((path, rest)) => {
-            let (line, heading) = rest
-                .split_once("::")
-                .ok_or_else(|| format!("ref: `{wanted}` is not file::line::heading"))?;
-            let line: usize = line
-                .trim()
-                .parse()
-                .ok()
-                .filter(|&n| n > 0)
-                .ok_or_else(|| format!("ref: `{line}` is not a line number"))?;
-            if !crate::roam_scan::is_org(path) {
-                return Err(format!("ref: `{path}` is not an org file"));
-            }
-            let text = org.read(path).map_err(|e| format!("ref: {path}: {e}"))?;
-            let at = locate(&text, line - 1, heading.trim(), keywords).ok_or_else(|| {
+    if let Some((path, rest)) = wanted.split_once("::") {
+        let (line, heading) = rest
+            .split_once("::")
+            .ok_or_else(|| format!("ref: `{wanted}` is not file::line::heading"))?;
+        let line: usize = line
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| format!("ref: `{line}` is not a line number"))?;
+        if !crate::roam_scan::is_org(path) {
+            return Err(format!("ref: `{path}` is not an org file"));
+        }
+        let text = org.read(path).map_err(|e| format!("ref: {path}: {e}"))?;
+        let at = locate(&text, line - 1, heading.trim(), keywords).ok_or_else(|| {
+            format!(
+                "ref: `{wanted}` no longer names one entry (the file changed since it was \
+                 listed); query again for a fresh ref"
+            )
+        })?;
+        return Ok(Located {
+            shown: path.to_string(),
+            file: path.to_string(),
+            text,
+            target: Target::Headline(at),
+        });
+    }
+    for file in org.corpus(false).files {
+        if let Some(at) = by_id(&file.text, wanted) {
+            return Ok(Located {
+                file: file.shown.clone(),
+                shown: file.shown,
+                text: file.text,
+                target: Target::Headline(at),
+            });
+        }
+    }
+    // Not in the agenda files: a roam note, perhaps, which may be a whole
+    // file rather than a headline.
+    let node = org.roam_node(wanted).ok_or_else(|| {
+        format!(
+            "ref: no entry has the ID `{wanted}` in the agenda files or the roam notes; a ref \
+             from another org tool looks like file::line::heading"
+        )
+    })?;
+    let shown = org.shown(&node.file);
+    let text = org
+        .read(&node.file)
+        .map_err(|e| format!("ref: {shown}: {e}"))?;
+    let target = if node.level == 0 {
+        Target::File(node.clone())
+    } else {
+        let at = locate(&text, node.line as usize, &node.title, keywords)
+            .or_else(|| {
+                let at = node.line as usize;
+                text.lines().nth(at).and_then(headline_level).map(|_| at)
+            })
+            .ok_or_else(|| {
                 format!(
-                    "ref: `{wanted}` no longer names one entry (the file changed since it was \
-                     listed); query again for a fresh ref"
+                    "ref: the note `{wanted}` is not where the roam index puts it; \
+                     :org-roam-sync re-indexes"
                 )
             })?;
-            (path.to_string(), text, at)
-        }
-        None => {
-            let corpus = org.corpus(false);
-            let mut hit = None;
-            for file in corpus.files {
-                if let Some(at) = by_id(&file.text, wanted) {
-                    hit = Some((file.shown, file.text, at));
-                    break;
-                }
-            }
-            match hit {
-                Some(hit) => hit,
-                // Not in the agenda files: a roam note, perhaps, which may be
-                // a whole file rather than a headline.
-                None => match org.roam_node(wanted) {
-                    Some(node) => {
-                        let path = org.shown(&node.file);
-                        let text = org
-                            .read(&node.file)
-                            .map_err(|e| format!("ref: {path}: {e}"))?;
-                        if node.level == 0 {
-                            return Ok(whole_note(&path, &text, &node, today));
-                        }
-                        let at = locate(&text, node.line as usize, &node.title, keywords)
-                            .or_else(|| {
-                                let at = node.line as usize;
-                                text.lines().nth(at).and_then(headline_level).map(|_| at)
-                            })
-                            .ok_or_else(|| {
-                                format!(
-                                    "ref: the note `{wanted}` is not where the roam index puts \
-                                     it; :org-roam-sync re-indexes"
-                                )
-                            })?;
-                        (path, text, at)
-                    }
-                    None => {
-                        return Err(format!(
-                            "ref: no entry has the ID `{wanted}` in the agenda files or the roam \
-                             notes; a ref from another org tool looks like file::line::heading"
-                        ))
-                    }
-                },
-            }
-        }
+        Target::Headline(at)
+    };
+    Ok(Located {
+        shown,
+        file: node.file,
+        text,
+        target,
+    })
+}
+
+/// The 0-based line after the subtree at `at`: the next headline at its
+/// level or above, or the end of the file.
+fn subtree_end(lines: &[&str], at: usize) -> usize {
+    let level = headline_level(lines[at]).unwrap_or(1);
+    (at + 1..lines.len())
+        .find(|&j| headline_level(lines[j]).is_some_and(|l| l <= level))
+        .unwrap_or(lines.len())
+}
+
+fn entry(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<String, String> {
+    let args: EntryArgs = parse_args(args).map_err(|e| e.to_string())?;
+    let Located {
+        shown: path,
+        text,
+        target,
+        ..
+    } = resolve(org, &args.r#ref, keywords)?;
+    let at = match target {
+        Target::Headline(at) => at,
+        Target::File(node) => return Ok(whole_note(&path, &text, &node, today)),
     };
 
     let lines: Vec<&str> = text.lines().collect();
     let level = headline_level(lines[at]).unwrap_or(1);
-    let end = (at + 1..lines.len())
-        .find(|&j| headline_level(lines[j]).is_some_and(|l| l <= level))
-        .unwrap_or(lines.len());
+    let end = subtree_end(&lines, at);
     let title = title_of(lines[at], keywords);
     let mut out = format!("Today is {}.\n", day_name(today));
     out.push_str(&format!(
@@ -767,6 +895,209 @@ fn hours(minutes: u32) -> String {
     format!("{}:{:02}", minutes / 60, minutes % 60)
 }
 
+/// `org.change`: one entry changed through the verbs the keys use, as a
+/// proposal. The model says what; org writes the text.
+fn change(org: &dyn Org, keywords: &Keywords, today: i64, args: &str) -> Result<Answer, String> {
+    let args: ChangeArgs = parse_args(args).map_err(|e| e.to_string())?;
+    let loc = resolve(org, &args.r#ref, keywords)?;
+    let at = match &loc.target {
+        Target::Headline(at) => *at,
+        Target::File(node) => {
+            return Err(format!(
+                "ref: `{}` is a whole-file note, with no headline to change",
+                node.id
+            ))
+        }
+    };
+    let lines: Vec<&str> = loc.text.lines().collect();
+    let head = lines[at];
+    let title = title_of(head, keywords);
+    let names = keywords.all.clone();
+    let nothing = |why: String| -> Result<Answer, String> {
+        Ok(Answer::from(format!("Nothing to change: {why}.")))
+    };
+    let (edit, mut said) = match args.op {
+        ChangeOp::SetState => {
+            let want = args
+                .state
+                .as_deref()
+                .map(str::trim)
+                .ok_or("state: set-state needs the keyword to set")?;
+            if !want.is_empty() && !names.iter().any(|k| k == want) {
+                return Err(format!(
+                    "state: `{want}` is not one of the TODO keywords ({})",
+                    names.join(", ")
+                ));
+            }
+            let env = org.change_env();
+            let (_, done) = env.todo.split();
+            let cx = crate::complete::Context {
+                today: crate::repeat::from_days(today),
+                now_stamp: &env.now_stamp,
+                keywords: &names,
+                done_keywords: &done,
+                log_into_drawer: env.log_into_drawer,
+            };
+            let end = subtree_end(&lines, at);
+            let subtree = || lines[at..end].iter().map(|l| l.to_string()).collect();
+            // An `@` state asked for a note the model did not give gets the
+            // plain log line, as org writes when the note is left empty.
+            let note = Some(args.note.as_deref().unwrap_or(""));
+            let Some(changed) =
+                crate::complete::change_state(head, subtree, want, note, &env.todo, &cx)
+            else {
+                return nothing(format!("\"{title}\" is already {}", or_none(want)));
+            };
+            let mut said = format!("Set \"{title}\" to {}", or_none(want));
+            if let Some((reset_to, d)) = &changed.repeated {
+                said = format!(
+                    "Marked \"{title}\" {want}. It repeats, so it goes back to {reset_to}, next \
+                     on {:04}-{:02}-{:02}",
+                    d.year, d.month, d.day
+                );
+            }
+            let span = if changed.headline_only {
+                (at, at)
+            } else {
+                (at, end - 1)
+            };
+            (propose(org, &loc, span, &changed.lines)?, said)
+        }
+        ChangeOp::Schedule | ChangeOp::Deadline => {
+            let (field, what) = match args.op {
+                ChangeOp::Schedule => (crate::planning::Field::Scheduled, "scheduled"),
+                _ => (crate::planning::Field::Deadline, "deadline"),
+            };
+            let date = args
+                .date
+                .as_deref()
+                .map(str::trim)
+                .ok_or("date: give a date, or `none` to remove it")?;
+            let value = if date.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(
+                    crate::org_date::parse(date, crate::repeat::from_days(today))
+                        .map_err(|e| format!("date: {e}"))?
+                        .render(),
+                )
+            };
+            let next = lines.get(at + 1).copied();
+            use crate::planning::PlanEdit;
+            let (span, new) =
+                match crate::planning::plan_edit(at as u32, next, field, value.clone()) {
+                    PlanEdit::Nothing => {
+                        return nothing(match &value {
+                            Some(v) => format!("\"{title}\" is already {what} {v}"),
+                            None => format!("\"{title}\" has no {what} date"),
+                        })
+                    }
+                    PlanEdit::Replace { text, .. } => ((at, at + 1), vec![head.to_string(), text]),
+                    PlanEdit::Insert { text, .. } => ((at, at), vec![head.to_string(), text]),
+                    PlanEdit::Delete { .. } => ((at, at + 1), vec![head.to_string()]),
+                };
+            let said = match &value {
+                Some(v) if what == "scheduled" => format!("Scheduled \"{title}\" for {v}"),
+                Some(v) => format!("Gave \"{title}\" a deadline of {v}"),
+                None => format!("Removed the {what} date from \"{title}\""),
+            };
+            (propose(org, &loc, span, &new)?, said)
+        }
+        ChangeOp::Tag => {
+            let asked = args.tags.unwrap_or_default();
+            if asked
+                .iter()
+                .all(|t| t.trim().trim_matches(['-', '+', ':']).is_empty())
+            {
+                return Err("tags: give tags to add, and `-tag` to remove one".to_string());
+            }
+            let h = crate::todo::parse(head, &names).ok_or("ref: not a headline")?;
+            let mut tags: Vec<String> = h.tags.iter().map(|t| t.to_string()).collect();
+            for t in &asked {
+                let t = t.trim();
+                match t.strip_prefix('-') {
+                    Some(gone) => tags.retain(|x| x != gone.trim_matches(':')),
+                    None => {
+                        let t = t.trim_start_matches('+').trim_matches(':');
+                        if t.contains(|c: char| c.is_whitespace() || c == ':') {
+                            return Err(format!("tags: `{t}` is not one tag"));
+                        }
+                        if !t.is_empty() && !tags.iter().any(|x| x == t) {
+                            tags.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            let new_head = crate::todo::set_tags(head, &names, &tags.join(":"))
+                .ok_or("ref: not a headline")?;
+            if new_head == head {
+                return nothing(format!("\"{title}\" already has those tags"));
+            }
+            let said = if tags.is_empty() {
+                format!("Removed every tag from \"{title}\"")
+            } else {
+                format!("Tagged \"{title}\" :{}:", tags.join(":"))
+            };
+            (propose(org, &loc, (at, at), &[new_head])?, said)
+        }
+    };
+    said.push_str(&format!(
+        " in {}. The user reviews the edit before it is made. Lines in this file may move: \
+         use the ref this tool or a query gives for a further change.",
+        loc.shown
+    ));
+    Ok(Answer {
+        text: said,
+        proposals: vec![edit],
+    })
+}
+
+fn or_none(state: &str) -> &str {
+    if state.is_empty() {
+        "no state"
+    } else {
+        state
+    }
+}
+
+/// Lines `start..=end` of the located file replaced by `new`, as an edit
+/// whose old text occurs once in the file: widened by whole lines around it
+/// until it is unique, so a duplicate headline elsewhere cannot take the edit.
+fn propose(
+    org: &dyn Org,
+    loc: &Located,
+    (start, end): (usize, usize),
+    new: &[String],
+) -> Result<Proposal, String> {
+    let text = &loc.text;
+    let lines: Vec<&str> = text.lines().collect();
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let (mut before, mut after) = (start, end);
+    loop {
+        let old = lines[before..=after].join(nl);
+        if text.matches(old.as_str()).count() == 1 {
+            let mut replaced: Vec<&str> = lines[before..start].to_vec();
+            replaced.extend(new.iter().map(String::as_str));
+            replaced.extend(&lines[end + 1..=after]);
+            return Ok(Proposal {
+                path: org.real_path(&loc.file),
+                old,
+                new: replaced.join(nl),
+            });
+        }
+        if before > 0 {
+            before -= 1;
+        } else if after + 1 < lines.len() {
+            after += 1;
+        } else {
+            return Err(format!(
+                "{}: the entry is repeated word for word, so no edit names it alone",
+                loc.shown
+            ));
+        }
+    }
+}
+
 /// The headline a ref names: its own line if that still carries the heading,
 /// else the one headline in the file that does. `None` when none or several
 /// do — refusing is safer than choosing.
@@ -1025,6 +1356,22 @@ SCHEDULED: <2026-11-20 Fri>\n\
                 .map(|(_, text)| text.to_string())
                 .ok_or_else(|| "no such file".to_string())
         }
+
+        fn real_path(&self, path: &str) -> String {
+            path.replace('~', "/home/u")
+        }
+
+        fn change_env(&self) -> ChangeEnv {
+            env()
+        }
+    }
+
+    fn env() -> ChangeEnv {
+        ChangeEnv {
+            now_stamp: "[2026-11-12 Thu 10:00]".to_string(),
+            log_into_drawer: true,
+            todo: crate::todo::parse_todo_keywords("TODO WAITING(w@) | DONE(d!)"),
+        }
     }
 
     fn plan() -> Fake {
@@ -1036,7 +1383,14 @@ SCHEDULED: <2026-11-20 Fri>\n\
     }
 
     fn run(org: &Fake, name: &str, args: &str) -> Result<String, String> {
-        call(org, &kw(), today(), name, args)
+        text(call(org, &kw(), today(), name, args))
+    }
+
+    fn text(answer: Result<Answer, String>) -> Result<String, String> {
+        answer.map(|a| {
+            assert!(a.proposals.is_empty(), "a read tool proposes nothing");
+            a.text
+        })
     }
 
     fn ask(args: &str) -> String {
@@ -1252,8 +1606,11 @@ SCHEDULED: <2026-11-20 Fri>";
             fn read(&self, _: &str) -> Result<String, String> {
                 Err("unused".to_string())
             }
+            fn change_env(&self) -> ChangeEnv {
+                env()
+            }
         }
-        let out = call(&Partly, &kw(), today(), QUERY, r#"{"match": "+a"}"#).unwrap();
+        let out = text(call(&Partly, &kw(), today(), QUERY, r#"{"match": "+a"}"#)).unwrap();
         assert!(out.ends_with("Not read: ~/org: permission denied"), "{out}");
     }
 
@@ -1376,6 +1733,9 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
         fn shown(&self, path: &str) -> String {
             path.replace("/home/u", "~")
         }
+        fn change_env(&self) -> ChangeEnv {
+            env()
+        }
     }
 
     fn roam() -> Roam {
@@ -1412,7 +1772,7 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
 
     #[test]
     fn notes_are_found_by_title_or_alias_with_their_backlinks() {
-        let out = call(&roam(), &kw(), today(), NOTES, r#"{"query": "RUST"}"#).unwrap();
+        let out = text(call(&roam(), &kw(), today(), NOTES, r#"{"query": "RUST"}"#)).unwrap();
         assert_eq!(
             out,
             "Today is Thursday 2026-11-12.\n\
@@ -1420,23 +1780,30 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
              - Rust (also: rustlang) :lang: [ref rust] in ~/roam/rust.org\n  \
              Linked from: Ownership; Lifetimes"
         );
-        let alias = call(&roam(), &kw(), today(), NOTES, r#"{"query": "borrow"}"#).unwrap();
+        let alias = text(call(
+            &roam(),
+            &kw(),
+            today(),
+            NOTES,
+            r#"{"query": "borrow"}"#,
+        ))
+        .unwrap();
         assert!(
             alias.contains("- Lifetimes (also: borrow regions) :rust: [ref life]"),
             "{alias}"
         );
-        let tagged = call(&roam(), &kw(), today(), NOTES, r#"{"tag": ":rust:"}"#).unwrap();
+        let tagged = text(call(&roam(), &kw(), today(), NOTES, r#"{"tag": ":rust:"}"#)).unwrap();
         assert!(
             tagged.contains("2 notes match tagged rust:\n- Lifetimes"),
             "{tagged}"
         );
-        let none = call(
+        let none = text(call(
             &roam(),
             &kw(),
             today(),
             NOTES,
             r#"{"query": "go", "tag": "lang"}"#,
-        )
+        ))
         .unwrap();
         assert!(
             none.ends_with("No note matches \"go\" tagged lang."),
@@ -1446,7 +1813,7 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
 
     #[test]
     fn notes_refuse_an_empty_question_and_an_empty_index() {
-        let err = call(&roam(), &kw(), today(), NOTES, "{}").unwrap_err();
+        let err = text(call(&roam(), &kw(), today(), NOTES, "{}")).unwrap_err();
         assert_eq!(err, "query: give words to look for, or a tag");
         let err = run(&both(), NOTES, r#"{"query": "rust"}"#).unwrap_err();
         assert!(err.starts_with("the roam index is empty"), "{err}");
@@ -1458,13 +1825,13 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
     #[test]
     fn an_entry_reads_a_roam_note_by_its_id() {
         let read = |id: &str| {
-            call(
+            text(call(
                 &roam(),
                 &kw(),
                 today(),
                 ENTRY,
                 &format!(r#"{{"ref": "{id}"}}"#),
-            )
+            ))
         };
         let file = read("rust").unwrap();
         assert!(
@@ -1489,11 +1856,197 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
         );
     }
 
+    /// One `org.change` call: its answer text and its one proposal.
+    fn change_of(org: &Fake, args: &str) -> (String, Proposal) {
+        let a = call(org, &kw(), today(), CHANGE, args).unwrap();
+        assert_eq!(a.proposals.len(), 1, "{a:?}");
+        (a.text, a.proposals.into_iter().next().unwrap())
+    }
+
+    fn change_err(org: &Fake, args: &str) -> String {
+        call(org, &kw(), today(), CHANGE, args).unwrap_err()
+    }
+
+    /// `DONE(d!)` logs the change, as the key does: the whole subtree is the
+    /// edit, the drawer under the headline.
+    #[test]
+    fn set_state_proposes_what_the_key_writes() {
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "set-state", "ref": "~/org/plan.org::8::Write the report", "state": "DONE"}"#,
+        );
+        assert_eq!(
+            p,
+            Proposal {
+                path: "/home/u/org/plan.org".into(),
+                old: "* TODO Write the report".into(),
+                new: "* DONE Write the report\n  \
+                      :LOGBOOK:\n  \
+                      - State \"DONE\" from \"TODO\" [2026-11-12 Thu 10:00]\n  \
+                      :END:"
+                    .into(),
+            }
+        );
+        assert!(
+            said.starts_with(
+                "Set \"Write the report\" to DONE in ~/org/plan.org. The user reviews"
+            ),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn set_state_repeats_a_repeating_task_and_takes_a_note() {
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "set-state", "ref": "~/org/plan.org::4::Standup", "state": "DONE"}"#,
+        );
+        assert!(
+            said.contains("It repeats, so it goes back to TODO, next on"),
+            "{said}"
+        );
+        assert!(
+            p.old
+                .starts_with("* TODO Standup\nSCHEDULED: <2026-11-11 Wed 09:30 +1d>"),
+            "{p:?}"
+        );
+        assert!(
+            p.new.starts_with("* TODO Standup\nSCHEDULED: <2026-11-12"),
+            "{p:?}"
+        );
+
+        let (_, p) = change_of(
+            &both(),
+            r#"{"op": "set-state", "ref": "~/org/home.org::7::Chase them", "state": "WAITING", "note": "they are out until Monday"}"#,
+        );
+        assert!(p.new.starts_with("*** WAITING Chase them\n"), "{p:?}");
+        assert!(p.new.contains("\\\\\n  they are out until Monday"), "{p:?}");
+    }
+
+    #[test]
+    fn schedule_and_deadline_go_through_the_date_prompt() {
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "schedule", "ref": "~/org/plan.org::8::Write the report", "date": "+2d"}"#,
+        );
+        assert_eq!(p.old, "* TODO Write the report");
+        assert_eq!(
+            p.new,
+            "* TODO Write the report\nSCHEDULED: <2026-11-14 Sat>"
+        );
+        assert!(
+            said.starts_with("Scheduled \"Write the report\" for <2026-11-14 Sat>"),
+            "{said}"
+        );
+
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "deadline", "ref": "~/org/plan.org::2::Pay the invoice", "date": "none"}"#,
+        );
+        assert_eq!(
+            p.old,
+            "* TODO [#A] Pay the invoice :money:\nDEADLINE: <2026-11-10 Tue>"
+        );
+        assert_eq!(p.new, "* TODO [#A] Pay the invoice :money:");
+        assert!(said.starts_with("Removed the deadline date"), "{said}");
+
+        let same = call(
+            &plan(),
+            &kw(),
+            today(),
+            CHANGE,
+            r#"{"op": "deadline", "ref": "~/org/plan.org::2::Pay the invoice", "date": "2026-11-10"}"#,
+        )
+        .unwrap();
+        assert!(
+            same.proposals.is_empty() && same.text.starts_with("Nothing to change"),
+            "{same:?}"
+        );
+        let err = change_err(
+            &plan(),
+            r#"{"op": "schedule", "ref": "~/org/plan.org::8::Write the report", "date": "someday"}"#,
+        );
+        assert!(err.starts_with("date: "), "{err}");
+    }
+
+    #[test]
+    fn tags_are_added_and_removed() {
+        let (said, p) = change_of(
+            &plan(),
+            r#"{"op": "tag", "ref": "~/org/plan.org::2::Pay the invoice", "tags": ["urgent", "-money"]}"#,
+        );
+        assert_eq!(p.old, "* TODO [#A] Pay the invoice :money:");
+        assert!(
+            p.new.starts_with("* TODO [#A] Pay the invoice") && p.new.ends_with(":urgent:"),
+            "{p:?}"
+        );
+        assert!(
+            said.starts_with("Tagged \"Pay the invoice\" :urgent:"),
+            "{said}"
+        );
+        let err = change_err(
+            &plan(),
+            r#"{"op": "tag", "ref": "~/org/plan.org::2::Pay the invoice", "tags": ["two words"]}"#,
+        );
+        assert_eq!(err, "tags: `two words` is not one tag");
+    }
+
+    /// Two identical headlines: the edit widens until its old text occurs
+    /// once, so it cannot land on the other one.
+    #[test]
+    fn a_proposal_is_unique_in_its_file() {
+        let twins = Fake(vec![("~/t.org", "* TODO Same\n* TODO Same\n")]);
+        let (_, p) = change_of(
+            &twins,
+            r#"{"op": "tag", "ref": "~/t.org::2::Same", "tags": ["b"]}"#,
+        );
+        assert_eq!(p.old, "* TODO Same\n* TODO Same");
+        assert!(
+            p.new.starts_with("* TODO Same\n* TODO Same") && p.new.ends_with(":b:"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn a_change_the_model_got_wrong_is_refused() {
+        let at = |op: &str, extra: &str| {
+            let sep = if extra.is_empty() { "" } else { ", " };
+            change_err(
+                &plan(),
+                &format!(
+                    r#"{{"op": "{op}", "ref": "~/org/plan.org::8::Write the report"{sep}{extra}}}"#
+                ),
+            )
+        };
+        assert_eq!(
+            at("set-state", r#""state": "FINISHED""#),
+            "state: `FINISHED` is not one of the TODO keywords (TODO, WAITING, DONE)"
+        );
+        assert!(at("set-state", "").starts_with("state:"));
+        assert!(at("schedule", "").starts_with("date:"));
+        assert!(at("tag", r#""tags": []"#).starts_with("tags:"));
+        assert!(at("delete", "").starts_with("op:"));
+        let stale = change_err(
+            &plan(),
+            r#"{"op": "tag", "ref": "~/org/plan.org::8::Write the summary", "tags": ["x"]}"#,
+        );
+        assert!(stale.contains("query again"), "{stale}");
+    }
+
     #[test]
     fn the_tool_list_carries_a_schema_from_each_args_struct() {
         let tools = tools();
         let names: Vec<_> = tools.iter().map(|t| t.name).collect();
-        assert_eq!(names, ["agenda", "query", "entry", "clock", "notes"]);
+        assert_eq!(
+            names,
+            ["agenda", "query", "entry", "clock", "notes", "change"]
+        );
+        let proposing: Vec<_> = tools
+            .iter()
+            .filter(|t| t.proposes)
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(proposing, ["change"], "only org.change proposes edits");
         assert!(
             tools[0].input_schema.contains(r#""enum":["day","week"]"#),
             "{}",

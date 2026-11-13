@@ -107,7 +107,7 @@ October?`.
 | `org-plan` | planning a day or a week | `org.agenda`, `org.query`, `org.entry`, `org.change` |
 | `org-review` | a weekly review | `org.agenda`, `org.query`, `org.clock`, `org.change` |
 | `org-report` | a report of work over a period | `org.clock`, `org.query`, `org.entry` |
-| `org-research` | researching a topic into your roam notes | `org.notes`, `org.change`, `lattice.read`, `web.*` |
+| `org-research` | researching a topic into your roam notes | `org.notes`, `org.entry`, `org.change`, `lattice.read`, `web.*` |
 
 ### Planning a day or a week
 
@@ -150,7 +150,7 @@ Name another period in the question: `:llm org-report last month`,
 ### Researching into your notes
 
 `:llm org-research <topic>` starts from what you already know: your roam notes
-on the topic. Then it looks outward with `web.search` and `web.fetch`, and reads
+on the topic, read in full. Then it looks outward with `web.search` and `web.fetch`, and reads
 local files you point it at with `lattice.read`. Every claim it brings in
 carries its URL. It adds what it found to a note you already have, or captures
 a new one through one of your capture templates, and says what it is adding and

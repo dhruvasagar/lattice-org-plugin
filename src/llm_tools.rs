@@ -118,7 +118,10 @@ pub fn profiles() -> Vec<ProfileSpec> {
             name: "org-research",
             description: "Research a topic into your org-roam notes",
             system: with_common(include_str!("profiles/org-research.txt")),
-            tools: "org.notes, lattice.read, web.*, org.change",
+            // `org.entry` reads the notes `org.notes` finds, which is the
+            // prompt's first step; without it the model can name a note but
+            // not open it.
+            tools: "org.notes, org.entry, lattice.read, web.*, org.change",
         },
     ]
 }
@@ -2694,5 +2697,60 @@ CLOCK: [2026-11-12 Thu 16:00]\n";
             "{}",
             tools[2].input_schema
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    /// The tools a prompt names (`org.entry`, `web.fetch`), from its own
+    /// text: the shared rules are general and every workflow carries them.
+    fn named_tools(prompt: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for source in ["org.", "lattice.", "web."] {
+            let mut rest = prompt;
+            while let Some(at) = rest.find(source) {
+                let tail = &rest[at + source.len()..];
+                let name: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push(format!("{source}{name}"));
+                }
+                rest = tail;
+            }
+        }
+        out
+    }
+
+    fn selects(tools: &str, tool: &str) -> bool {
+        tools.split(',').map(str::trim).any(|t| {
+            t == tool
+                || t.strip_suffix('*')
+                    .is_some_and(|prefix| tool.starts_with(prefix))
+        })
+    }
+
+    /// A workflow's instructions name only tools it is given. `org-research`
+    /// told the model to read notes with `org.entry` and did not select it,
+    /// so the model could find a note and never open it.
+    #[test]
+    fn each_workflow_selects_every_tool_its_prompt_names() {
+        for p in profiles() {
+            let own = p
+                .system
+                .strip_suffix(COMMON.trim_end())
+                .unwrap_or(&p.system);
+            for tool in named_tools(own) {
+                assert!(
+                    selects(p.tools, &tool),
+                    "{}'s prompt names {tool}, which its tools ({}) leave out",
+                    p.name,
+                    p.tools
+                );
+            }
+        }
     }
 }

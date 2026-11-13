@@ -52,6 +52,14 @@ Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
   in your config, `[llm.profiles.org-plan] model = "…"`; org names none.
   `:help org.assistant` covers the tools, the workflows and what a change
   from a chat can and cannot do.
+- **Org's tools in Claude Code and other agents.** With a lattice that serves
+  plugin tools (`:set llm.serve_tools`), `claude mcp add lattice -- lattice
+  --mcp` gives Claude Code `org__agenda`, `org__change` and the rest, and an
+  ACP agent lattice starts gets them with no setup. A change an agent proposes
+  always opens a diff in lattice and waits for you. `:help org.assistant` now
+  walks through setup, each workflow, choosing a model, what leaves your
+  machine, every tool's inputs, using the tools from other agents, and
+  troubleshooting.
 
 ### Changed
 - **The agenda shows a repeating entry on every day it repeats.** A

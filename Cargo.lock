@@ -86,20 +86,21 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-sdk"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcf43b14190fe0cb78645746b7cb2e1609a16665a466b9835ef85107aa358f12"
+checksum = "ca23d3e3a94e9b071c37d7b7c3afafc5a797dca49d818ed485f190a6faf18502"
 dependencies = [
  "lattice-plugin-sdk-derive",
  "rmp-serde",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "lattice-plugin-sdk-derive"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76209a463ab89024a4a1f91f40314499349d8165d0dbbf6c2713c18b690f5a98"
+checksum = "bf7a8cd6269b9cd5cfa92f99eb395c7c07a405f5c43befac22810f973d328576"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -108,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "lattice-wit"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d41bfc818eb892aa37ac8a5c849e3a2ab8a5418e40135487d68d40586ed4a07"
+checksum = "ca79b0fd9a62dd5ff670cc91f151046ad6bf3fb5bbd0f677e8aa65202e9e92a8"
 
 [[package]]
 name = "leb128fmt"

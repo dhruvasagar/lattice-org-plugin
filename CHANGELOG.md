@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-Needs a lattice that has the `llm-tools` seam (`lattice:plugin-host` with
-`llm-tools`), for the assistant's tools.
+Needs lattice 0.10.1 or later, the first with the `llm-tools` seam the
+assistant's tools are offered through; an older editor refuses org by name.
 
 ### Added
 - **Org answers lattice's LLM chats.** `org.agenda` tells the assistant what

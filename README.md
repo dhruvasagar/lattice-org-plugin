@@ -154,7 +154,7 @@ with **zero renderer changes**. Pinned by
 
 ## Installing it
 
-You need **lattice 0.9.14 or later** and an `init.rs` — your lattice config,
+You need **lattice 0.10.1 or later** and an `init.rs` — your lattice config,
 which is itself a plugin (`lattice --scaffold-init` writes one). Org is
 installed from it: ready-built from a release, or built from source.
 
@@ -209,7 +209,7 @@ starting the editor makes no network request.
 `release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
 you in `org-mode`. If it was refused, it is under the failed loads in
 `:plugins` with the reason — a release with no build for your editor says
-which it has, and an editor older than 0.9.14 says the version org needs.
+which it has, and an editor older than 0.10.1 says the version org needs.
 
 **Updating:** with a tag, change it and `:reload-config`. With `None`,
 `:plugin-update org` (or `u` on its row in `:plugins`) installs a newer
@@ -337,7 +337,7 @@ only your configuration can.
 
 A directory that does not exist is fine: roam stays off until
 `org.roam-directory` exists, and capture drafts fall back as if `org.directory`
-were unset. This needs lattice **0.9.14** or later; an older editor refuses the
+were unset. This needs lattice **0.10.1** or later; an older editor refuses the
 plugin by name.
 
 `:set org.<Tab>` lists the full catalogue with its docs, and `:help org` opens

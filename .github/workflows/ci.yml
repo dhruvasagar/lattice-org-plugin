@@ -243,6 +243,16 @@ jobs:
         working-directory: lattice-org-plugin
         run: cargo build --release --target wasm32-wasip2
 
+      # The integration package's lock is not committed: its graph is
+      # lattice's, through the path dependencies. Seeding it from the lattice
+      # checkout builds the editor's crates at the versions lattice itself
+      # pins, and keeps the yanked `bisync` that tree reaches resolvable
+      # (cargo takes a yanked version only when a lock already names it).
+      # Cargo then adds this package's own entries on top.
+      - name: Seed the integration lock from lattice's
+        working-directory: lattice-org-plugin/integration
+        run: cp ../../lattice/Cargo.lock Cargo.lock
+
       # One run, two assertions. Running the suite twice to check for skips
       # would double the slowest job in this workflow for no extra signal.
       - name: cargo test

@@ -472,12 +472,19 @@ install. It needs a lattice checkout **beside this one**:
 
 ```sh
 cargo build --release --target wasm32-wasip2   # first, always
-cd integration && cargo test
+cd integration
+cp ../../lattice/Cargo.lock .                  # once, on a fresh clone
+cargo test
 ```
 
 The component build is not optional. Every test **skips** when the artefact is
 absent — printing `skipping: component not built` — so running them without it
 reports green while testing nothing. CI greps its own run for that line.
 
-(`integration/Cargo.lock` is committed and load-bearing: the tree reaches a
-yanked `bisync`, which stays usable only when a lockfile already names it.)
+`integration/Cargo.lock` is not committed. Its dependency graph is lattice's,
+through the path dependencies, so a committed copy went stale every time
+lattice gained a dependency. Seed it from lattice's lock instead, which CI does
+on every run. Without a seed, resolution fails: the tree reaches a yanked
+`bisync`, which cargo accepts only when a lockfile already names it. After
+that, cargo keeps the file up to date itself; copy lattice's again whenever you
+want the editor's exact pins back.

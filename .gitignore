@@ -11,3 +11,9 @@
 /integration/target
 # Written by the CI test step so one run can be asserted twice.
 /integration/test.log
+# The integration package's lock pins LATTICE's dependency graph (its path
+# dependencies are the editor's own crates), so committed it went stale on
+# every lattice dependency change and sat in `git status` as churn org does
+# not own. It is seeded from lattice's own lock instead: in CI by the test
+# job, on a fresh clone by hand (README, "The integration suite").
+/integration/Cargo.lock

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-17
+
+Builds against `lattice:plugin-host@0.5.x` (lattice-wit 0.5.0).
 
 Needs lattice 0.10.1 or later. Lattice 0.10.1 speaks plugin API 0.5 only,
 so org 0.3.0, built against 0.4, loads in no released editor: use this

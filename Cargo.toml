@@ -13,7 +13,7 @@
 # SKIP when it is absent. Build the component first or they test nothing.
 [package]
 name = "lattice-org-plugin"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
 

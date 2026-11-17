@@ -133,7 +133,7 @@ fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch::Disp
             } => {
                 let _ = editor.dispatch(lattice_host::action::Action::ApplyEdit {
                     target,
-                    edit,
+                    edits: vec![edit],
                     cursor,
                 });
             }

@@ -328,9 +328,11 @@ async fn apply_renderer_effects(editor: &mut Editor, out: lattice_host::dispatch
                 edit,
                 cursor,
             } => {
+                // The action carries every edit of one command (one undo
+                // step, lattice RF.2a); the effect still carries one.
                 let out = editor.dispatch(lattice_host::action::Action::ApplyEdit {
                     target,
-                    edit,
+                    edits: vec![edit],
                     cursor,
                 });
                 let _ = out;

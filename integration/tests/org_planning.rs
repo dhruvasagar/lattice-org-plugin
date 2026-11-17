@@ -234,7 +234,7 @@ fn apply_effects(editor: &mut Editor, out: lattice_host::dispatch::DispatchOutco
             } => {
                 let _ = editor.dispatch(lattice_host::action::Action::ApplyEdit {
                     target,
-                    edit,
+                    edits: vec![edit],
                     cursor,
                 });
             }
@@ -1562,7 +1562,7 @@ fn invoke_once(editor: &mut Editor, name: &str) -> String {
             } => {
                 let _ = editor.dispatch(lattice_host::action::Action::ApplyEdit {
                     target,
-                    edit,
+                    edits: vec![edit],
                     cursor,
                 });
             }

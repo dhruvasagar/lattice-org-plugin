@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-11-17
+
+Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.2).
 
 Needs lattice 0.10.1 or later, the first with the `llm-tools` seam the
 assistant's tools are offered through; an older editor refuses org by name.

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Needs lattice 0.10.1 or later. Lattice 0.10.1 speaks plugin API 0.5 only,
+so org 0.3.0, built against 0.4, loads in no released editor: use this
+release instead.
+
+### Changed
+- **Plugin API 0.5.** org now builds against `lattice-wit` and
+  `lattice-plugin-sdk` 0.5.0. Its `apply-operator` takes the new parse-tree
+  argument and, as before, contributes no operators; nothing org does
+  changes.
+
 ## 0.3.0 — 2026-11-17
 
 Builds against `lattice:plugin-host@0.4.x` (lattice-wit 0.4.2).

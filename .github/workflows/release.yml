@@ -26,3 +26,6 @@ jobs:
     uses: dhruvasagar/lattice/.github/workflows/plugin-release.yml@main
     permissions:
       contents: write
+    # DISCORD_ANNOUNCE_WEBHOOK: the release is announced in the lattice
+    # Discord's announcement channel once it is published.
+    secrets: inherit

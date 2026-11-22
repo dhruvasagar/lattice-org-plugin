@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
+Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
 
 ### Added
 - **Babel: `org-babel-mode`**, on in every org buffer and off with `:set

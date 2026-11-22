@@ -20,6 +20,11 @@ Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
   `*org-babel*` instead of the file. Header arguments merge from
   `#+PROPERTY:`, headline drawers, `#+HEADER:` and the block line, as in
   emacs.
+- **Babel asks, runs many, and stops.** `C-c C-c` asks before it runs
+  (`org.babel.confirm`), and `y` runs the block it asked about even after an
+  edit. `C-c C-v b` / `C-c C-v s` run a buffer's or subtree's blocks in order,
+  asking once. `:org-babel-cancel` stops them, and `C-c C-v k` removes a
+  result.
 
 ## 0.4.0 — 2026-11-17
 

@@ -32,6 +32,8 @@ const SCRIPT_DIR: &str = "/data/babel";
 
 struct Job {
     request: RunRequest,
+    /// The rest of its batch, started when this one finishes.
+    rest: Vec<RunRequest>,
     /// The guest path of the script, removed at finish.
     script: String,
     output: Vec<String>,
@@ -68,14 +70,32 @@ pub(crate) fn sweep() {
     }
 }
 
-/// A run request from `C-c C-c`: write the script and spawn it.
+/// A run request from the grammar seam: a batch, run in order.
 pub(crate) fn on_run(payload: &[u8]) {
-    let Ok(request) = rmp_serde::from_slice::<RunRequest>(payload) else {
+    let Ok(batch) = rmp_serde::from_slice::<Vec<RunRequest>>(payload) else {
         return;
     };
-    let claim = claim_key(request.buffer, &request.key);
+    start_next(batch);
+}
+
+/// Forget the claims of runs that will not start now.
+fn release(runs: &[RunRequest]) {
+    for r in runs {
+        let _ = host_services::store_delete(&claim_key(r.buffer, &r.key));
+    }
+}
+
+/// Start the first of `runs`; the others wait for it to finish. A run that
+/// cannot start stops the batch — what follows it was meant to follow it.
+fn start_next(mut runs: Vec<RunRequest>) {
+    if runs.is_empty() {
+        return;
+    }
+    let request = runs.remove(0);
+    let rest = runs;
     let fail = |text: String| {
-        let _ = host_services::store_delete(&claim);
+        release(std::slice::from_ref(&request));
+        release(&rest);
         host_services::refresh_decorations();
         post(vec![echo(EchoLevel::Error, text)]);
     };
@@ -109,6 +129,7 @@ pub(crate) fn on_run(payload: &[u8]) {
                 id,
                 Job {
                     request,
+                    rest,
                     script,
                     output: Vec::new(),
                     dropped: 0,
@@ -120,6 +141,30 @@ pub(crate) fn on_run(payload: &[u8]) {
             fail(format!("org: the {} did not start: {e}", request.label));
         }
     }
+}
+
+/// `:org-babel-cancel` reached us: kill this buffer's jobs and drop what
+/// was queued behind them. Each killed job still reports `job-finished`
+/// (`err("cancelled")`), which clears its claim and leaves its result alone.
+pub(crate) fn on_cancel(payload: &[u8]) {
+    let Ok(buffer) = String::from_utf8_lossy(payload).parse::<u32>() else {
+        return;
+    };
+    let ids: Vec<u64> = JOBS.with(|j| {
+        let mut jobs = j.borrow_mut();
+        jobs.iter_mut()
+            .filter(|(_, job)| job.request.buffer == buffer)
+            .map(|(id, job)| {
+                release(&job.rest);
+                job.rest.clear();
+                *id
+            })
+            .collect()
+    });
+    for id in ids {
+        host_services::cancel_job(id);
+    }
+    host_services::refresh_decorations();
 }
 
 /// `job-output`: keep the lines, up to the cap.
@@ -147,6 +192,16 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
     host_services::refresh_decorations();
 
     let label = job.request.label.clone();
+    // Cancelled: the user asked for nothing to happen, so nothing is
+    // written — the block keeps the result it had.
+    if outcome.as_ref().is_err_and(|e| e == "cancelled") {
+        post(vec![echo(
+            EchoLevel::Info,
+            format!("org: the {label} was cancelled"),
+        )]);
+        return;
+    }
+    let rest = job.rest;
     let mut output = job.output;
     if job.dropped > 0 {
         output.push(format!("… {} lines truncated", job.dropped));
@@ -176,6 +231,10 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
         }
     }
     post(effects);
+    // The next of its batch — after this one's result is posted, so the
+    // results land in document order. A failure does not stop the batch,
+    // as in emacs: each block's own result says how it went.
+    start_next(rest);
 }
 
 /// The edit that writes `output` as the block's result, or why there is none.

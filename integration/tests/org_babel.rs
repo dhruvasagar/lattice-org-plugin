@@ -147,7 +147,11 @@ async fn org_editor_with_languages(
     text: &str,
     languages: &[(&str, &str)],
 ) -> (Editor, Arc<PluginLoader>) {
-    org_editor_with_caps(base, text, &[], languages).await
+    let (mut editor, loader) = org_editor_with_caps(base, text, &[], languages).await;
+    // Most tests are about the run, not the question before it; the confirm
+    // tests turn it back on.
+    set_org_option(&mut editor, "babel.confirm", "false");
+    (editor, loader)
 }
 
 /// [`org_editor`], plus the OS capabilities the manifest declares.
@@ -278,13 +282,57 @@ async fn org_editor_with_caps(
     (editor, loader)
 }
 
-fn press(editor: &mut Editor, keys: &str) {
+/// Press `keys`; the effects a renderer peer would apply (a confirm) come
+/// back, since a bare `Editor` does not apply them.
+fn press(editor: &mut Editor, keys: &str) -> Vec<lattice_grammar::Effect> {
     let expanded = editor.keymap.expand_leader(keys);
     let seq = parse_chord_sequence(&expanded).expect("parses");
     let mut partial: Vec<KeyChord> = Vec::new();
+    let mut effects = Vec::new();
     for c in seq {
-        let _ = editor.dispatch_chord(c, &mut partial);
+        effects.extend(
+            editor
+                .dispatch_chord_with_outcome(c, &mut partial)
+                .1
+                .effects,
+        );
     }
+    editor.publish_render_state();
+    effects
+}
+
+/// Run an ex line; the effects come back as from [`press`].
+fn ex(editor: &mut Editor, line: &str) -> Vec<lattice_grammar::Effect> {
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.execute_ex_line(line, &mut out);
+    // A host-applied edit comes back as a next action, which the dispatch
+    // wrapper drains — do what it does.
+    for action in std::mem::take(&mut out.next_actions) {
+        let _ = editor.dispatch(action);
+    }
+    editor.publish_render_state();
+    out.effects
+}
+
+/// The confirm among `effects`: its prompt, and what `y` would dispatch.
+fn confirm_in(
+    effects: &[lattice_grammar::Effect],
+) -> Option<(String, String, lattice_grammar::Args)> {
+    effects.iter().find_map(|e| match e {
+        lattice_grammar::Effect::Confirm {
+            prompt,
+            yes_action,
+            args,
+        } => Some((prompt.clone(), yes_action.clone(), args.clone())),
+        _ => None,
+    })
+}
+
+/// Answer `y`: dispatch the yes-action with the arguments the confirm
+/// carried, as the dialog does.
+fn answer_yes(editor: &mut Editor, confirm: (String, String, lattice_grammar::Args)) {
+    let (_, yes, args) = confirm;
+    let _ = editor.invoke_command_named(&yes, args);
     editor.publish_render_state();
 }
 
@@ -837,5 +885,195 @@ async fn a_running_block_carries_a_sign_until_it_finishes() {
     assert!(
         signed_lines(&editor).await.is_empty(),
         "gone once it finished"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_yes_runs_and_no_does_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "* Run\n#+NAME: greet\n#+begin_src sh\necho hi\n#+end_src\nafter\n";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    set_org_option(&mut editor, "babel.confirm", "true");
+    goto_line(&mut editor, 3);
+    let confirm = confirm_in(&press(&mut editor, "<C-c><C-c>")).expect("a confirm first");
+    assert_eq!(confirm.0, "Run sh block \"greet\"? (y/n)");
+    // `n` dispatches nothing: nothing claimed, nothing signed, nothing ran.
+    assert!(signed_lines(&editor).await.is_empty());
+    assert_eq!(text(&editor), doc);
+    answer_yes(&mut editor, confirm);
+    settle(&mut editor, has("#+RESULTS: greet")).await;
+    assert!(
+        text(&editor).contains("#+RESULTS: greet\n: hi\n"),
+        "{}",
+        text(&editor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_carries_the_key_across_an_edit_made_while_the_prompt_is_open() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) =
+        org_editor_with_languages(base.path(), &sh_doc("echo hi"), &[("sh", "sh")]).await;
+    set_org_option(&mut editor, "babel.confirm", "true");
+    goto_line(&mut editor, 2);
+    let confirm = confirm_in(&press(&mut editor, "<C-c><C-c>")).expect("a confirm");
+    // Two lines above the block while the prompt is up, and the cursor
+    // somewhere else entirely: what runs is still the block the prompt named.
+    edit(&mut editor, (0, 0), (0, 0), "one\ntwo\n");
+    goto_line(&mut editor, 0);
+    answer_yes(&mut editor, confirm);
+    settle(&mut editor, has("#+RESULTS:")).await;
+    assert_eq!(
+        text(&editor),
+        "one\ntwo\n* Run\n#+begin_src sh\necho hi\n#+end_src\n\n#+RESULTS:\n: hi\nafter\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirm_whose_block_changed_runs_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = sh_doc("echo hi");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    set_org_option(&mut editor, "babel.confirm", "true");
+    goto_line(&mut editor, 2);
+    let confirm = confirm_in(&press(&mut editor, "<C-c><C-c>")).expect("a confirm");
+    edit(&mut editor, (2, 6), (2, 7), "o");
+    answer_yes(&mut editor, confirm);
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: the blocks changed while the prompt was open — nothing ran")
+    );
+    assert!(signed_lines(&editor).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_off_runs_at_once() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) =
+        org_editor_with_languages(base.path(), &sh_doc("echo hi"), &[("sh", "sh")]).await;
+    goto_line(&mut editor, 2);
+    assert!(confirm_in(&press(&mut editor, "<C-c><C-c>")).is_none());
+    settle(&mut editor, has("#+RESULTS:")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_buffer_asks_once_and_runs_in_order() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let order = base.path().join("order");
+    let order = order.display();
+    // The second block reads what the first writes after a pause: it shows
+    // `first` only if it started after the first finished.
+    let doc = format!(
+        "#+begin_src sh\nsleep 0.3\necho first > {order}\necho a\n#+end_src\n\
+         #+begin_src sh\ncat {order}\n#+end_src\n"
+    );
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    set_org_option(&mut editor, "babel.confirm", "true");
+    let confirm = confirm_in(&ex(&mut editor, "org-babel-execute-buffer")).expect("one confirm");
+    assert_eq!(confirm.0, "Run 2 blocks (sh ×2)? (y/n)");
+    answer_yes(&mut editor, confirm);
+    settle(&mut editor, |e| text(e).matches("#+RESULTS:").count() == 2).await;
+    let t = text(&editor);
+    assert!(t.contains("#+RESULTS:\n: a\n"), "{t}");
+    assert!(t.contains("#+RESULTS:\n: first\n"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_subtree_runs_only_its_blocks() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "* A\n#+begin_src sh\necho a\n#+end_src\n** A1\n#+begin_src sh\necho a1\n#+end_src\n\
+               * B\n#+begin_src sh\necho b\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    // By its key, so the binding is proven along with the command.
+    press(&mut editor, "<C-c><C-v>s");
+    settle(&mut editor, |e| text(e).matches("#+RESULTS:").count() == 2).await;
+    let t = text(&editor);
+    assert!(t.contains(": a\n") && t.contains(": a1\n"), "{t}");
+    assert!(!t.contains(": b\n"), "B is not under A: {t}");
+    assert!(signed_lines(&editor).await.is_empty(), "the batch is over");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_kills_a_never_ending_block() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) =
+        org_editor_with_languages(base.path(), &sh_doc("sleep 1000"), &[("sh", "sh")]).await;
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-c><C-c>");
+    assert_eq!(signed_lines(&editor).await, [1]);
+    ex(&mut editor, "org-babel-cancel");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: cancelling 1 block")
+    );
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("org: the sh block was cancelled")
+    })
+    .await;
+    assert_eq!(
+        text(&editor),
+        sh_doc("sleep 1000"),
+        "a cancelled run writes nothing"
+    );
+    assert!(signed_lines(&editor).await.is_empty(), "the sign is gone");
+    ex(&mut editor, "org-babel-cancel");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: no source block is running here")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_result_deletes_exactly_the_results() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let bare = sh_doc("echo hi");
+    let (mut editor, _loader) =
+        org_editor_with_languages(base.path(), &bare, &[("sh", "sh")]).await;
+    run_and_settle(&mut editor, 2, has("#+RESULTS:")).await;
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-c><C-v>k");
+    assert_eq!(text(&editor), bare, "run then remove is no change at all");
+    ex(&mut editor, "org-babel-remove-result");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: this block has no result")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_result_at_the_end_of_a_file_with_no_newline() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh\necho hi\n#+end_src\n\n#+RESULTS:\n: hi";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 1);
+    ex(&mut editor, "org-babel-remove-result");
+    assert_eq!(text(&editor), "#+begin_src sh\necho hi\n#+end_src");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_buffer_while_it_runs_sends_output_to_org_babel() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) =
+        org_editor_with_languages(base.path(), &sh_doc("sleep 0.5\necho hi"), &[("sh", "sh")])
+            .await;
+    goto_line(&mut editor, 2);
+    press(&mut editor, "<C-c><C-c>");
+    ex(&mut editor, "bd!");
+    editor.last_message = None;
+    settle(&mut editor, |e| e.last_message.is_some()).await;
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: its buffer closed while it ran — the sh block's output is in *org-babel*")
     );
 }

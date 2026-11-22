@@ -341,6 +341,20 @@ fn headline_level(line: &str) -> Option<usize> {
     (stars > 0 && line[stars..].starts_with(' ')).then_some(stars)
 }
 
+/// The subtree the line `at` is in: `(headline line, end)`, `end` being the
+/// next headline at its level or above (or the line count). `None` above
+/// the first headline.
+pub(crate) fn subtree_at(lines: &[&str], at: u32) -> Option<(u32, u32)> {
+    let at = (at as usize).min(lines.len().saturating_sub(1));
+    let (h, level) = (0..=at)
+        .rev()
+        .find_map(|i| headline_level(lines.get(i)?).map(|l| (i, l)))?;
+    let end = (h + 1..lines.len())
+        .find(|&i| headline_level(lines[i]).is_some_and(|l| l <= level))
+        .unwrap_or(lines.len());
+    Some((h as u32, end as u32))
+}
+
 /// The `:NAME: value` properties in the drawer under the headline on `h`.
 fn drawer_properties<'a>(lines: &[&'a str], h: usize) -> Vec<(String, &'a str)> {
     let mut i = h + 1;
@@ -817,5 +831,14 @@ mod tests {
             "{} lines: split + find + merge = {per:?} per run",
             text.lines().count()
         );
+    }
+
+    #[test]
+    fn a_subtree_runs_to_the_next_headline_at_its_level() {
+        let l = lines("pre\n* A\nx\n** A1\ny\n* B\nz\n");
+        assert_eq!(subtree_at(&l, 0), None);
+        assert_eq!(subtree_at(&l, 2), Some((1, 5)));
+        assert_eq!(subtree_at(&l, 4), Some((3, 5)));
+        assert_eq!(subtree_at(&l, 6), Some((5, 7)));
     }
 }

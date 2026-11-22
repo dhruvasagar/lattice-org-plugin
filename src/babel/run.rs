@@ -11,11 +11,12 @@
 use serde::{Deserialize, Serialize};
 
 use super::block::{BlockKey, SrcBlock};
-use super::header_args::HeaderArgs;
 use super::Language;
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::host_services;
-use crate::lattice::plugin_host::types::{EchoLevel, Effect, Position, Range};
+use crate::lattice::plugin_host::types::{
+    ArgValue, Args, ConfirmPayload, EchoLevel, Effect, Position, Range,
+};
 
 /// The plugin event carrying a [`RunRequest`] from the grammar seam to the
 /// events seam. Both ends are org; the host moves the bytes unread.
@@ -34,7 +35,8 @@ pub(crate) fn claim_key(buffer: u32, key: &str) -> String {
     format!("{}{key}", buffer_prefix(buffer))
 }
 
-/// Everything the events seam needs to run a block and put its result back,
+/// Everything the events seam needs to run a block and put its result back
+/// — a run request is a LIST of these, run in order (`execute-buffer`),
 /// so it never has to re-read the configuration the user may be editing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RunRequest {
@@ -101,50 +103,208 @@ fn number_option(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Claim `block` and ask the events seam to run it.
-pub(crate) fn start(
+/// The plugin event that asks the events seam to stop this buffer's runs;
+/// the payload is the buffer id, as text.
+pub(crate) const EV_CANCEL: &str = "org/babel-cancel";
+
+/// The blocks to run, checked: each in a configured language, none already
+/// running. `Err` is the echo saying why not.
+pub(crate) fn check<'a>(
     buffer: u32,
     lines: &[&str],
-    block: &SrcBlock,
-    lang: &Language,
-    header: &HeaderArgs,
-) -> Vec<Effect> {
-    let key = BlockKey::of(lines, block).encode();
-    let claim = claim_key(buffer, &key);
-    if let Err(e) = host_services::store_put(&claim, &[]) {
-        return super::echo(
-            EchoLevel::Error,
-            format!("org: cannot start the {}: {e}", label(block)),
-        );
+    blocks: &'a [SrcBlock],
+) -> Result<Vec<(&'a SrcBlock, Language)>, Vec<Effect>> {
+    if blocks.is_empty() {
+        return Err(super::echo(EchoLevel::Info, "org: no source blocks here"));
     }
-    let request = RunRequest {
-        buffer,
-        key,
-        label: label(block),
-        command: lang.command.clone(),
-        args: lang
-            .args
-            .clone()
-            .unwrap_or_else(|| vec!["{file}".to_string()]),
-        ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
-        body: block.body.clone(),
-        results: header.results(),
-        min_block: number_option("babel.min-lines-for-block-output", 10),
-        max_lines: number_option("babel.max-output-lines", 10_000),
+    let languages = super::languages().map_err(|e| super::echo(EchoLevel::Error, e))?;
+    let mut out = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        // Emacs refuses a buffer run that meets a language it cannot run,
+        // rather than skipping it; so does this.
+        let Some(lang) = languages.iter().find(|l| l.name == block.lang) else {
+            return Err(super::unconfigured(&block.lang));
+        };
+        if is_running(buffer, lines, block) {
+            return Err(super::echo(
+                EchoLevel::Info,
+                format!(
+                    "org: the {} is already running — :org-babel-cancel stops it",
+                    label(block)
+                ),
+            ));
+        }
+        out.push((block, lang.clone()));
+    }
+    Ok(out)
+}
+
+/// The confirm prompt for `blocks`: `Run sh block "disk"? (y/n)` for one,
+/// `Run 4 blocks (sh ×3, python)? (y/n)` for several — a count per language,
+/// in the order they first appear.
+pub(crate) fn prompt(blocks: &[(&SrcBlock, Language)]) -> String {
+    if let [(block, _)] = blocks {
+        return format!("Run {}? (y/n)", label(block));
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for (b, _) in blocks {
+        match counts.iter_mut().find(|(l, _)| *l == b.lang) {
+            Some(c) => c.1 += 1,
+            None => counts.push((&b.lang, 1)),
+        }
+    }
+    let langs: Vec<String> = counts
+        .iter()
+        .map(|(l, n)| {
+            if *n == 1 {
+                l.to_string()
+            } else {
+                format!("{l} ×{n}")
+            }
+        })
+        .collect();
+    format!("Run {} blocks ({})? (y/n)", blocks.len(), langs.join(", "))
+}
+
+/// The keys of `blocks`, packed into the confirm's ONE argument: a confirm's
+/// arguments are cut to the yes-action's declared arity, and a block name
+/// cannot hold a newline, so one string with one key per line is lossless.
+pub(crate) fn pack(lines: &[&str], blocks: &[(&SrcBlock, Language)]) -> String {
+    blocks
+        .iter()
+        .map(|(b, _)| BlockKey::of(lines, b).encode())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The blocks `packed` names, found again in `lines` as they are now — the
+/// user may have edited while the prompt was open — or `None` if any is gone.
+pub(crate) fn unpack(lines: &[&str], packed: &str) -> Option<Vec<SrcBlock>> {
+    packed
+        .lines()
+        .map(|k| BlockKey::decode(k)?.find(lines))
+        .collect()
+}
+
+/// Ask before running `blocks` — or, with `org.babel.confirm` off, run them.
+pub(crate) fn confirm_or_start(buffer: u32, lines: &[&str], blocks: &[SrcBlock]) -> Vec<Effect> {
+    let checked = match check(buffer, lines, blocks) {
+        Ok(c) => c,
+        Err(echo) => return echo,
     };
-    let bytes = match rmp_serde::to_vec(&request) {
+    if !crate::option_or("babel.confirm", "true").eq_ignore_ascii_case("true") {
+        return start(buffer, lines, &checked);
+    }
+    vec![Effect::Confirm(ConfirmPayload {
+        prompt: prompt(&checked),
+        yes_action: super::RUN_CONFIRMED_NAME.to_string(),
+        args: Args::List(vec![ArgValue::String(pack(lines, &checked))]),
+    })]
+}
+
+/// Claim each block and ask the events seam to run them, in order, one
+/// after another.
+pub(crate) fn start(buffer: u32, lines: &[&str], blocks: &[(&SrcBlock, Language)]) -> Vec<Effect> {
+    let min_block = number_option("babel.min-lines-for-block-output", 10);
+    let max_lines = number_option("babel.max-output-lines", 10_000);
+    let mut batch = Vec::with_capacity(blocks.len());
+    for (block, lang) in blocks {
+        let key = BlockKey::of(lines, block).encode();
+        let header = super::block::effective_header_args(lines, block);
+        batch.push(RunRequest {
+            buffer,
+            key,
+            label: label(block),
+            command: lang.command.clone(),
+            args: lang
+                .args
+                .clone()
+                .unwrap_or_else(|| vec!["{file}".to_string()]),
+            ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
+            body: block.body.clone(),
+            results: header.results(),
+            min_block,
+            max_lines,
+        });
+    }
+    let bytes = match rmp_serde::to_vec(&batch) {
         Ok(b) => b,
-        Err(e) => {
-            let _ = host_services::store_delete(&claim);
+        Err(e) => return super::echo(EchoLevel::Error, format!("org: cannot start: {e}")),
+    };
+    for request in &batch {
+        if let Err(e) = host_services::store_put(&claim_key(buffer, &request.key), &[]) {
+            for r in &batch {
+                let _ = host_services::store_delete(&claim_key(buffer, &r.key));
+            }
             return super::echo(
                 EchoLevel::Error,
-                format!("org: cannot start the block: {e}"),
+                format!("org: cannot start the {}: {e}", request.label),
             );
         }
-    };
+    }
     host_services::emit_event(EV_RUN, &bytes);
-    // The claim is what the sign producer reads, so the sign is up before
-    // the process is.
+    // The claims are what the sign producer reads, so the signs are up
+    // before the first process is.
     host_services::refresh_decorations();
     vec![Effect::None]
+}
+
+/// `:org-babel-cancel`: the events seam owns the jobs, so ask it.
+pub(crate) fn cancel(buffer: u32) -> Vec<Effect> {
+    let running = host_services::store_keys(&buffer_prefix(buffer)).len();
+    if running == 0 {
+        return super::echo(EchoLevel::Info, "org: no source block is running here");
+    }
+    host_services::emit_event(EV_CANCEL, buffer.to_string().as_bytes());
+    let what = if running == 1 {
+        "1 block".to_string()
+    } else {
+        format!("{running} blocks")
+    };
+    super::echo(EchoLevel::Info, format!("org: cancelling {what}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::block::src_blocks;
+    use super::*;
+
+    fn lang(name: &str) -> Language {
+        Language {
+            name: name.to_string(),
+            command: name.to_string(),
+            args: None,
+            ext: None,
+            value: None,
+        }
+    }
+
+    #[test]
+    fn the_prompt_names_one_block_or_counts_several_by_language() {
+        let text = "#+NAME: disk\n#+begin_src sh\nx\n#+end_src\n#+begin_src sh\ny\n#+end_src\n\
+                    #+begin_src python\nz\n#+end_src\n#+begin_src sh\nw\n#+end_src\n";
+        let l: Vec<&str> = text.lines().collect();
+        let blocks = src_blocks(&l);
+        let one = [(&blocks[0], lang("sh"))];
+        assert_eq!(prompt(&one), "Run sh block \"disk\"? (y/n)");
+        let all: Vec<_> = blocks.iter().map(|b| (b, lang(&b.lang))).collect();
+        assert_eq!(prompt(&all), "Run 4 blocks (sh ×3, python)? (y/n)");
+    }
+
+    #[test]
+    fn packed_keys_find_their_blocks_after_an_edit_above() {
+        let text = "#+begin_src sh\nx\n#+end_src\n#+begin_src sh\nx\n#+end_src\n";
+        let l: Vec<&str> = text.lines().collect();
+        let blocks = src_blocks(&l);
+        let checked: Vec<_> = blocks.iter().map(|b| (b, lang("sh"))).collect();
+        let packed = pack(&l, &checked);
+        let moved = format!("new\n{text}");
+        let l2: Vec<&str> = moved.lines().collect();
+        let found = unpack(&l2, &packed).unwrap();
+        assert_eq!(
+            found.iter().map(|b| b.begin_line).collect::<Vec<_>>(),
+            [1, 4]
+        );
+        assert!(unpack(&l2, "n:gone").is_none());
+    }
 }

@@ -2307,6 +2307,7 @@ impl Guest for Component {
             }
             // OB.6: a run request from babel's `C-c C-c`.
             babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
+            babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
             _ => {}
         }
     }

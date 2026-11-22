@@ -23,8 +23,9 @@ use crate::lattice::plugin_host::modes::{
 };
 use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
 use crate::lattice::plugin_host::types::{
-    ActionContext, ActionSpec, Args, EchoLevel, EchoPayload, Effect, Event, EventFilter, EventKind,
-    ExCommandContext, ExCommandSpec, LatencyClass, SurfaceForm,
+    ActionContext, ActionSpec, ApplyEditPayload, ArgDefault, ArgKind, ArgSpec, ArgValue, Args,
+    EchoLevel, EchoPayload, Edit, EditKind, Effect, Event, EventFilter, EventKind,
+    ExCommandContext, ExCommandSpec, LatencyClass, Position, Range, SurfaceForm,
 };
 use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
@@ -49,6 +50,11 @@ const EXECUTE_SUBTREE: u32 = 202;
 const REMOVE_RESULT: u32 = 203;
 /// `:org-babel-cancel`.
 const CANCEL: u32 = 204;
+/// The confirm's yes-half: run the blocks whose keys it carries. An ACTION,
+/// because a confirm dispatches an action by name with typed arguments.
+const RUN_CONFIRMED: u32 = 205;
+/// [`RUN_CONFIRMED`]'s name — what the confirm names as its `yes-action`.
+pub(crate) const RUN_CONFIRMED_NAME: &str = "org-babel-run-confirmed";
 
 /// The `:` line parse for every babel command: none takes arguments.
 const NO_ARGS_PARSE: u32 = 220;
@@ -58,7 +64,7 @@ pub(crate) const ON_JOB: u32 = 200;
 
 /// Whether `callback` is one of babel's action ids.
 pub(crate) fn is_action(callback: u32) -> bool {
-    callback == EXECUTE_SRC_BLOCK
+    matches!(callback, EXECUTE_SRC_BLOCK | RUN_CONFIRMED)
 }
 
 /// Whether `callback` is one of babel's ex-command ids.
@@ -195,6 +201,24 @@ pub(crate) fn register_grammar() {
         },
         EXECUTE_SRC_BLOCK,
     );
+    register_action(
+        RUN_CONFIRMED_NAME,
+        "Run the source blocks a babel confirm named (its `y`)",
+        &ActionSpec {
+            // ONE slot: a confirm's arguments are cut to the action's
+            // declared arity, so every block's key travels packed in it.
+            args_schema: vec![ArgSpec {
+                name: "blocks".to_string(),
+                kind: ArgKind::String,
+                doc: "the blocks' keys, one per line".to_string(),
+                prompt: String::new(),
+                default: ArgDefault::None,
+                completion: None,
+                picker: None,
+            }],
+        },
+        RUN_CONFIRMED,
+    );
     let spec = || ExCommandSpec {
         latency_class: LatencyClass::Reflex,
         accepts_bang: false,
@@ -307,24 +331,31 @@ pub(crate) fn apply_action(
             let Some(block) = block::src_block_at(&lines, ctx.cursor.line) else {
                 return Ok(vec![Effect::Declined]);
             };
-            let languages = match languages() {
-                Ok(l) => l,
-                Err(e) => return Ok(echo(EchoLevel::Error, e)),
+            Ok(run::confirm_or_start(ctx.buffer_id, &lines, &[block]))
+        }
+        RUN_CONFIRMED => {
+            let packed = match &ctx.args {
+                Args::List(v) => match v.first() {
+                    Some(ArgValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                },
+                Args::String(s) => s.clone(),
+                _ => String::new(),
             };
-            let Some(lang) = languages.iter().find(|l| l.name == block.lang) else {
-                return Ok(unconfigured(&block.lang));
-            };
-            if run::is_running(ctx.buffer_id, &lines, &block) {
+            let text = run::whole_text(doc);
+            let lines: Vec<&str> = text.lines().collect();
+            // Found again by key: the user may have typed while the prompt
+            // was open, and what runs must be what the prompt named.
+            let Some(blocks) = run::unpack(&lines, &packed).filter(|b| !b.is_empty()) else {
                 return Ok(echo(
-                    EchoLevel::Info,
-                    format!(
-                        "org: the {} is already running — :org-babel-cancel stops it",
-                        run::label(&block)
-                    ),
+                    EchoLevel::Warn,
+                    "org: the blocks changed while the prompt was open — nothing ran",
                 ));
+            };
+            match run::check(ctx.buffer_id, &lines, &blocks) {
+                Ok(checked) => Ok(run::start(ctx.buffer_id, &lines, &checked)),
+                Err(e) => Ok(e),
             }
-            let header = block::effective_header_args(&lines, &block);
-            Ok(run::start(ctx.buffer_id, &lines, &block, lang, &header))
         }
         other => Err(format!("org: unknown babel action callback {other}")),
     }
@@ -342,8 +373,8 @@ pub(crate) fn parse_ex_args(callback: u32, rest: &str) -> Result<Args, String> {
 /// `apply-ex-command` for babel's commands.
 pub(crate) fn apply_ex_command(
     callback: u32,
-    _ctx: &ExCommandContext,
-    _doc: &Document,
+    ctx: &ExCommandContext,
+    doc: &Document,
     _tree: Option<&TreeSnapshot>,
 ) -> Result<Vec<Effect>, String> {
     // A command is registered whatever the mode's state, so `:` reaches it
@@ -355,11 +386,81 @@ pub(crate) fn apply_ex_command(
             "org: babel is off — set org.babel.enabled to use it",
         ));
     }
+    if callback == CANCEL {
+        return Ok(run::cancel(ctx.buffer_id));
+    }
+    let text = run::whole_text(doc);
+    let lines: Vec<&str> = text.lines().collect();
     match callback {
-        EXECUTE_BUFFER | EXECUTE_SUBTREE | REMOVE_RESULT | CANCEL => Ok(echo(
-            EchoLevel::Info,
-            "org: this babel command lands in OB.7",
+        EXECUTE_BUFFER => Ok(run::confirm_or_start(
+            ctx.buffer_id,
+            &lines,
+            &block::src_blocks(&lines),
+        )),
+        EXECUTE_SUBTREE => {
+            let Some((first, end)) = block::subtree_at(&lines, ctx.cursor.line) else {
+                return Ok(echo(EchoLevel::Info, "org: not under a headline"));
+            };
+            let blocks: Vec<_> = block::src_blocks(&lines)
+                .into_iter()
+                .filter(|b| b.begin_line > first && b.end_line < end)
+                .collect();
+            Ok(run::confirm_or_start(ctx.buffer_id, &lines, &blocks))
+        }
+        REMOVE_RESULT => Ok(remove_result(
+            ctx.buffer_id,
+            &lines,
+            text.ends_with('\n'),
+            ctx.cursor.line,
         )),
         other => Err(format!("org: unknown babel ex-command callback {other}")),
     }
+}
+
+/// `:org-babel-remove-result`: delete the block's `#+RESULTS:` and the blank
+/// lines between it and the block, so running a block and removing its
+/// result leaves the file as it was.
+fn remove_result(buffer: u32, lines: &[&str], ends_with_newline: bool, at: u32) -> Vec<Effect> {
+    let Some(block) = block::src_block_at(lines, at) else {
+        return echo(EchoLevel::Info, "org: not in a source block");
+    };
+    let Some(r) = block.results else {
+        return echo(EchoLevel::Info, "org: this block has no result");
+    };
+    let gap_is_blank = r.keyword_line > block.end_line
+        && (block.end_line + 1..r.keyword_line).all(|i| lines[i as usize].trim().is_empty());
+    let first = if gap_is_blank {
+        block.end_line + 1
+    } else {
+        r.keyword_line
+    };
+    let count = lines.len() as u32;
+    let line_len = |n: u32| lines.get(n as usize).map_or(0, |l| l.len()) as u32;
+    let (start, end) = if r.end_line + 1 < count || ends_with_newline {
+        ((first, 0), (r.end_line + 1, 0))
+    } else {
+        // The result is the file's last line and has no newline: take the
+        // one before it instead, so no newline is left dangling.
+        (
+            (first - 1, line_len(first - 1)),
+            (r.end_line, line_len(r.end_line)),
+        )
+    };
+    vec![Effect::ApplyEdit(ApplyEditPayload {
+        target: buffer,
+        edit: Edit {
+            range: Range {
+                start: Position {
+                    line: start.0,
+                    byte: start.1,
+                },
+                end: Position {
+                    line: end.0,
+                    byte: end.1,
+                },
+            },
+            kind: EditKind::Replace(String::new()),
+        },
+        cursor: None,
+    })]
 }

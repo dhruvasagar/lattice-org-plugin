@@ -57,6 +57,26 @@ The block's header arguments are read as emacs reads them: the
 `#+PROPERTY: header-args` lines, the `header-args` properties of the headlines
 above it, its `#+HEADER:` lines, then its `#+begin_src` line, later winning.
 
+## Asking first, running many, stopping
+
+With `org.babel.confirm` on (the default) a run asks first: `Run sh block
+"disk"? (y/n)`. What runs on `y` is the block the question named, even if
+you typed elsewhere in the file while it was open. If that block itself
+changed, nothing runs and the echo area says so.
+
+`C-c C-v b` runs every block in the buffer, and `C-c C-v s` every block
+under the headline at the cursor. Each asks once for all of them (`Run 4
+blocks (sh ×3, python)? (y/n)`). The blocks run one after another, in the
+order they appear, so a later block can read what an earlier one wrote. A
+block that fails does not stop the rest. A block in a language with no
+`org.babel.languages` entry refuses the whole run before anything starts.
+
+`:org-babel-cancel` stops every block running in the buffer and drops the
+ones still waiting their turn. A cancelled block keeps the result it had.
+
+`C-c C-v k` deletes the block's `#+RESULTS:` and the blank line above it.
+Running a block and then removing its result leaves the file as it was.
+
 ## Keys and commands
 
 | key | command | does |

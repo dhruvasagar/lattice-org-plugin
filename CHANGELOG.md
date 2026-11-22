@@ -25,6 +25,9 @@ Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
   edit. `C-c C-v b` / `C-c C-v s` run a buffer's or subtree's blocks in order,
   asking once. `:org-babel-cancel` stops them, and `C-c C-v k` removes a
   result.
+- **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
+  its block changed, was deleted or closed before it finished. The echo used
+  to name that buffer, but nothing ever created it.
 
 ## 0.4.0 — 2026-11-17
 

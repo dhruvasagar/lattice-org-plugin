@@ -223,11 +223,18 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
         Err(why) => {
             let mut lines = vec![format!("── {label}: {why} ──")];
             lines.extend(output);
-            let _ = host_services::output_append(OUTPUT_BUFFER, &lines);
-            effects.push(echo(
-                EchoLevel::Warn,
-                format!("org: {why} — the {label}'s output is in {OUTPUT_BUFFER}"),
-            ));
+            // Never pointed at an empty buffer: if the lines did not go in,
+            // the echo says the output is lost, and why.
+            effects.push(match host_services::output_append(OUTPUT_BUFFER, &lines) {
+                Ok(()) => echo(
+                    EchoLevel::Warn,
+                    format!("org: {why} — :org-babel-output shows the {label}'s output"),
+                ),
+                Err(e) => echo(
+                    EchoLevel::Error,
+                    format!("org: {why}, and the {label}'s output was lost: {e}"),
+                ),
+            });
         }
     }
     post(effects);

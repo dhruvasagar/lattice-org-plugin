@@ -50,8 +50,10 @@ ended. A program that could not start at all writes the reason instead.
 
 The result goes where the block is when it finishes, so typing above it while
 it runs is fine. If the block itself was changed or deleted, nothing is
-written to the file: the output goes to `*org-babel*` and the echo area says
-so. A block that is already running is not started again.
+written to the file: the output goes to `*org-babel*`, and the echo area
+says so. `:org-babel-output` shows that buffer. It never opens by itself,
+because a run finishing in the background should not rearrange the window
+you are typing in. A block that is already running is not started again.
 
 The block's header arguments are read as emacs reads them: the
 `#+PROPERTY: header-args` lines, the `header-args` properties of the headlines
@@ -86,6 +88,7 @@ Running a block and then removing its result leaves the file as it was.
 | `C-c C-v s` | `:org-babel-execute-subtree` | run every block under the headline |
 | `C-c C-v k` | `:org-babel-remove-result` | delete the block's `#+RESULTS:` |
 | | `:org-babel-cancel` | stop the blocks running in this buffer |
+| | `:org-babel-output` | show `*org-babel*`, where output with no block to go to lands |
 
 `C-c C-c` anywhere outside a source block is org's, as before.
 

@@ -48,11 +48,19 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
     let host =
         Arc::new(PluginHost::with_dirs(component_cache(), base.join("data")).expect("host builds"));
     // OB.6: what `install` wires and a hand-built loader does not. Each one
-    // unwired fails a run silently in its own way: no store, and every
+    // unwired fails a run silently in its own way: no buffer store, and every
     // buffer reads as closed; no active-modes query, and `buffer-text`
     // refuses; no sink, and a finished job's edit goes nowhere.
     if let Some(buffers) = editor.services.get::<lattice_mode::BufferStoreHandle>() {
         host.set_buffer_store((*buffers).clone());
+    }
+    // And no output store: `output-append` fails, and `*org-babel*` stays
+    // empty however the run ended.
+    if let Some(output) = editor
+        .services
+        .get::<lattice_plugin_host::output::PluginOutputHandle>()
+    {
+        host.set_plugin_output((*output).clone());
     }
     if let Some(query) = editor
         .services
@@ -712,7 +720,7 @@ async fn editing_the_block_body_while_it_runs_sends_output_to_org_babel() {
     settle(&mut editor, |e| e.last_message.is_some()).await;
     assert_eq!(
         last_echo(&editor).as_deref(),
-        Some("org: the block changed while it ran — the sh block's output is in *org-babel*")
+        Some("org: the block changed while it ran — :org-babel-output shows the sh block's output")
     );
     assert_eq!(text(&editor), edited, "nothing written at a stale place");
 }
@@ -732,7 +740,7 @@ async fn deleting_the_block_while_it_runs_sends_output_to_org_babel() {
     assert!(
         last_echo(&editor)
             .unwrap_or_default()
-            .ends_with("output is in *org-babel*"),
+            .ends_with(":org-babel-output shows the sh block's output"),
         "{:?}",
         last_echo(&editor)
     );
@@ -1074,6 +1082,29 @@ async fn closing_the_buffer_while_it_runs_sends_output_to_org_babel() {
     settle(&mut editor, |e| e.last_message.is_some()).await;
     assert_eq!(
         last_echo(&editor).as_deref(),
-        Some("org: its buffer closed while it ran — the sh block's output is in *org-babel*")
+        Some("org: its buffer closed while it ran — :org-babel-output shows the sh block's output")
+    );
+    // Nothing opened by itself: the layout is the user's.
+    assert!(editor.buffers.by_name("*org-babel*").is_none());
+    let effects = ex(&mut editor, "org-babel-output");
+    for e in effects {
+        editor.handle_effect(e);
+    }
+    let out = editor
+        .buffers
+        .by_name("*org-babel*")
+        .expect(":org-babel-output opens it");
+    let shown = |e: &Editor| {
+        e.buffers
+            .document_handle(out)
+            .map(|h| h.snapshot().text().to_string())
+            .unwrap_or_default()
+    };
+    // The mode fills the buffer from the kept lines once it is open.
+    settle(&mut editor, |e| shown(e).contains("\nhi")).await;
+    assert!(
+        shown(&editor).contains("sh block: its buffer closed while it ran"),
+        "{}",
+        shown(&editor)
     );
 }

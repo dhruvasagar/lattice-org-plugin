@@ -25,7 +25,8 @@ use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
 use crate::lattice::plugin_host::types::{
     ActionContext, ActionSpec, ApplyEditPayload, ArgDefault, ArgKind, ArgSpec, ArgValue, Args,
     EchoLevel, EchoPayload, Edit, EditKind, Effect, Event, EventFilter, EventKind,
-    ExCommandContext, ExCommandSpec, LatencyClass, Position, Range, SurfaceForm,
+    ExCommandContext, ExCommandSpec, LatencyClass, OpenSyntheticBufferPayload, Position, Range,
+    SurfaceForm,
 };
 use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
@@ -50,6 +51,8 @@ const EXECUTE_SUBTREE: u32 = 202;
 const REMOVE_RESULT: u32 = 203;
 /// `:org-babel-cancel`.
 const CANCEL: u32 = 204;
+/// `:org-babel-output`.
+const OUTPUT: u32 = 206;
 /// The confirm's yes-half: run the blocks whose keys it carries. An ACTION,
 /// because a confirm dispatches an action by name with typed arguments.
 const RUN_CONFIRMED: u32 = 205;
@@ -71,7 +74,7 @@ pub(crate) fn is_action(callback: u32) -> bool {
 pub(crate) fn is_ex_command(callback: u32) -> bool {
     matches!(
         callback,
-        EXECUTE_BUFFER | EXECUTE_SUBTREE | REMOVE_RESULT | CANCEL
+        EXECUTE_BUFFER | EXECUTE_SUBTREE | REMOVE_RESULT | CANCEL | OUTPUT
     )
 }
 
@@ -247,6 +250,12 @@ pub(crate) fn register_grammar() {
             "Stop the source blocks running in this buffer.",
             CANCEL,
         ),
+        (
+            "org-babel-output",
+            "Show `*org-babel*`: the output of runs whose block changed, was \
+             deleted or closed before they finished.",
+            OUTPUT,
+        ),
     ] {
         register_ex_command(name, doc, &spec(), NO_ARGS_PARSE, id);
     }
@@ -388,6 +397,19 @@ pub(crate) fn apply_ex_command(
     }
     if callback == CANCEL {
         return Ok(run::cancel(ctx.buffer_id));
+    }
+    if callback == OUTPUT {
+        // Opened only when asked: a run finishing in the background never
+        // changes the layout of the file being edited (design §3).
+        return Ok(vec![Effect::OpenSyntheticBuffer(
+            OpenSyntheticBufferPayload {
+                name: jobs::OUTPUT_BUFFER.to_string(),
+                mode_id: "plugin-output-mode".to_string(),
+                content: None,
+                cursor: None,
+                activate_minor: None,
+            },
+        )]);
     }
     let text = run::whole_text(doc);
     let lines: Vec<&str> = text.lines().collect();

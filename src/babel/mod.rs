@@ -9,6 +9,10 @@
 //! org's own `C-c C-c` does not grow a src-block branch (§5.4).
 
 pub(crate) mod block;
+pub(crate) mod header_args;
+pub(crate) mod jobs;
+pub(crate) mod results;
+pub(crate) mod run;
 
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::config::{register_option, OptionType};
@@ -19,8 +23,8 @@ use crate::lattice::plugin_host::modes::{
 };
 use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
 use crate::lattice::plugin_host::types::{
-    ActionContext, ActionSpec, Args, EchoLevel, EchoPayload, Effect, ExCommandContext,
-    ExCommandSpec, LatencyClass, SurfaceForm,
+    ActionContext, ActionSpec, Args, EchoLevel, EchoPayload, Effect, Event, EventFilter, EventKind,
+    ExCommandContext, ExCommandSpec, LatencyClass, SurfaceForm,
 };
 use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
@@ -48,6 +52,9 @@ const CANCEL: u32 = 204;
 
 /// The `:` line parse for every babel command: none takes arguments.
 const NO_ARGS_PARSE: u32 = 220;
+
+/// The events handler for a babel job's `job-output` and `job-finished`.
+pub(crate) const ON_JOB: u32 = 200;
 
 /// Whether `callback` is one of babel's action ids.
 pub(crate) fn is_action(callback: u32) -> bool {
@@ -221,6 +228,45 @@ pub(crate) fn register_grammar() {
     }
 }
 
+/// `register-events`: clear what a previous load left, and hear our jobs.
+pub(crate) fn register_events() {
+    jobs::sweep();
+    crate::lattice::plugin_host::events::subscribe(
+        &EventFilter {
+            kinds: Some(vec![EventKind::JobOutput, EventKind::JobFinished]),
+            path_globs: None,
+            major_modes: None,
+            minor_modes: None,
+        },
+        ON_JOB,
+    );
+}
+
+/// `on-event` for [`ON_JOB`].
+pub(crate) fn on_job_event(ev: Event) {
+    match ev {
+        Event::JobOutput(o) => jobs::on_output(o.id, o.lines),
+        Event::JobFinished(f) => jobs::on_finished(f.id, f.outcome),
+        _ => {}
+    }
+}
+
+/// `register-signs`: the running sign. One glyph in both palettes, `▶`
+/// (a BMP shape in the fallback set), so turning nerd fonts on or off does
+/// not move the column — the agenda mark's reasoning.
+pub(crate) fn define_signs() {
+    let _ = crate::lattice::plugin_host::signs::define_sign(
+        jobs::RUNNING_SIGN,
+        &crate::lattice::plugin_host::signs::SignSpec {
+            text: "▶".to_string(),
+            fallback: "▶".to_string(),
+            theme_element: jobs::RUNNING_SIGN_NS.to_string(),
+            priority: 10,
+            column: "mark".to_string(),
+        },
+    );
+}
+
 fn echo(level: EchoLevel, text: impl Into<String>) -> Vec<Effect> {
     vec![Effect::Echo(EchoPayload {
         level,
@@ -251,21 +297,34 @@ pub(crate) fn apply_action(
 ) -> Result<Vec<Effect>, String> {
     match callback {
         EXECUTE_SRC_BLOCK => {
-            let line = |n: u32| doc.line(n);
+            // One crossing for the whole buffer: the header merge reads
+            // `#+PROPERTY:` lines and drawers anywhere above the block.
+            let text = run::whole_text(doc);
+            let lines: Vec<&str> = text.lines().collect();
             // Outside a src block this key is org's (a checkbox, a
             // headline's tags, a table): decline, and the layer below
             // answers as if babel's were not there.
-            let Some(block) = block::src_bounds_at(&line, doc.line_count(), ctx.cursor.line) else {
+            let Some(block) = block::src_block_at(&lines, ctx.cursor.line) else {
                 return Ok(vec![Effect::Declined]);
             };
             let languages = match languages() {
                 Ok(l) => l,
                 Err(e) => return Ok(echo(EchoLevel::Error, e)),
             };
-            if !languages.iter().any(|l| l.name == block.lang) {
+            let Some(lang) = languages.iter().find(|l| l.name == block.lang) else {
                 return Ok(unconfigured(&block.lang));
+            };
+            if run::is_running(ctx.buffer_id, &lines, &block) {
+                return Ok(echo(
+                    EchoLevel::Info,
+                    format!(
+                        "org: the {} is already running — :org-babel-cancel stops it",
+                        run::label(&block)
+                    ),
+                ));
             }
-            Ok(echo(EchoLevel::Info, "org: running blocks lands in OB.6"))
+            let header = block::effective_header_args(&lines, &block);
+            Ok(run::start(ctx.buffer_id, &lines, &block, lang, &header))
         }
         other => Err(format!("org: unknown babel action callback {other}")),
     }

@@ -1332,6 +1332,22 @@ mod todo_theme {
                 scale: None,
             },
         );
+        // OB.6: the sign on a running source block. Its own element for
+        // agenda-mark's reason: a theme must be able to reach every glyph.
+        let _ = register_element(
+            babel::jobs::RUNNING_SIGN,
+            "The sign on a source block's `#+begin_src` while it runs.",
+            &ThemeStyleSpec {
+                inherit: None,
+                fg: Some(ColorRef::Palette("blue".to_string())),
+                bg: None,
+                modifiers: ModifierSet {
+                    bold: Some(true),
+                    ..unset()
+                },
+                scale: None,
+            },
+        );
         let _ = register_element(
             "tag",
             "A headline's trailing `:tag:` list.",
@@ -1598,6 +1614,7 @@ impl Guest for Component {
     /// every marked line of every refresh would restate at 60Hz something that
     /// was settled at boot.
     fn register_signs() {
+        babel::define_signs();
         // Priority 10 — vim's default, and the floor. A mark is a selection the
         // user just made and can undo with the next keystroke; a diagnostic is
         // a fact about their code. When both land on one row the diagnostic
@@ -2059,6 +2076,7 @@ impl Guest for Component {
     /// nothing. Priority 8 puts it right of `lsp` (5) and `claude-code` (6) and
     /// left of `core.position` (10).
     fn register_events() {
+        babel::register_events();
         events::subscribe(
             &EventFilter {
                 kinds: Some(vec![EventKind::Plugin]),
@@ -2227,6 +2245,11 @@ impl Guest for Component {
             );
             return;
         }
+        // OB.6: a babel job's output and its end.
+        if handler == babel::ON_JOB {
+            babel::on_job_event(ev);
+            return;
+        }
         if handler != ON_CLOCK_EVENT {
             return;
         }
@@ -2282,6 +2305,8 @@ impl Guest for Component {
                 });
                 publish_clock_segment();
             }
+            // OB.6: a run request from babel's `C-c C-c`.
+            babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
             _ => {}
         }
     }
@@ -12324,28 +12349,31 @@ impl exports::lattice::plugin_host::decorations::Guest for Component {
         // nothing marked there is nothing to paint in ANY buffer, and this
         // producer is asked about every buffer in the editor, on every edit.
         // One store read answers it.
+        //
+        // OB.6: a running block's sign — nothing unless a block in THIS
+        // buffer is running, which costs one store listing to find out.
+        let mut signs = babel::jobs::running_signs(ctx.buffer_id);
         if host_services::store_keys(agenda_marks::MARK_PREFIX).is_empty() {
-            return Ok(Vec::new());
+            return Ok(signs);
         }
-        Ok((0..ctx.line_count)
-            .filter_map(|line| {
-                // `none` for a header, a separator, or any buffer that is not a
-                // composed view — which is how this producer stays inert
-                // everywhere but the agenda without asking what kind of buffer
-                // it is in.
-                let loc = host_services::excerpt_source(ctx.buffer_id, line)?;
-                host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line))?;
-                Some(lattice::plugin_host::types::GutterDecoration::Sign(
-                    lattice::plugin_host::types::GutterSign {
-                        line,
-                        // The NAMESPACED name: `define-sign` prefixed it with
-                        // the plugin's id, and a placement naming the bare one
-                        // resolves to nothing and is silently skipped.
-                        name: agenda_marks::MARK_THEME_ELEMENT.to_string(),
-                    },
-                ))
-            })
-            .collect())
+        signs.extend((0..ctx.line_count).filter_map(|line| {
+            // `none` for a header, a separator, or any buffer that is not a
+            // composed view — which is how this producer stays inert
+            // everywhere but the agenda without asking what kind of buffer
+            // it is in.
+            let loc = host_services::excerpt_source(ctx.buffer_id, line)?;
+            host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line))?;
+            Some(lattice::plugin_host::types::GutterDecoration::Sign(
+                lattice::plugin_host::types::GutterSign {
+                    line,
+                    // The NAMESPACED name: `define-sign` prefixed it with
+                    // the plugin's id, and a placement naming the bare one
+                    // resolves to nothing and is silently skipped.
+                    name: agenda_marks::MARK_THEME_ELEMENT.to_string(),
+                },
+            ))
+        }));
+        Ok(signs)
     }
 }
 

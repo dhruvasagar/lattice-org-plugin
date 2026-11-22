@@ -25,6 +25,38 @@ ext     = "sh"          # the script's extension (default: the name)
 Listing a program trusts it with whatever it can do, so `sh` lets a block do
 anything a shell script can. Changing the list restarts org.
 
+## Running a block
+
+`C-c C-c` in a source block runs it in the background, and you can keep
+working. A `▶` in the gutter marks the block while it runs. When it finishes,
+its output goes under it as `#+RESULTS:`, replacing what was there, and
+undoing that is one `u`.
+
+```org
+#+begin_src sh
+echo hi
+#+end_src
+
+#+RESULTS:
+: hi
+```
+
+Short output is written as `: ` lines. Output of
+`org.babel.min-lines-for-block-output` lines or more goes in an
+`#+begin_example` block instead, where a line that would read as org (`* …`,
+`#+…`) gets a `,` in front, so output can never turn into a headline. A
+program that fails still writes what it printed, and the echo area says how it
+ended. A program that could not start at all writes the reason instead.
+
+The result goes where the block is when it finishes, so typing above it while
+it runs is fine. If the block itself was changed or deleted, nothing is
+written to the file: the output goes to `*org-babel*` and the echo area says
+so. A block that is already running is not started again.
+
+The block's header arguments are read as emacs reads them: the
+`#+PROPERTY: header-args` lines, the `header-args` properties of the headlines
+above it, its `#+HEADER:` lines, then its `#+begin_src` line, later winning.
+
 ## Keys and commands
 
 | key | command | does |

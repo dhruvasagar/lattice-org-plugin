@@ -76,7 +76,11 @@ fn the_component_carries_its_manifest() {
         .collect();
     assert_eq!(
         bound,
-        ["org.directory", "org.roam-directory", "org.babel.tangle-directories"]
+        [
+            "org.directory",
+            "org.roam-directory",
+            "org.babel.tangle-directories"
+        ]
     );
 }
 
@@ -103,16 +107,27 @@ fn the_manifest_declares_babels_grants() {
         .collect();
     assert_eq!(
         spawn,
-        [("org.babel.languages".to_string(), Some("command".to_string()))]
+        [(
+            "org.babel.languages".to_string(),
+            Some("command".to_string())
+        )]
     );
     assert!(
-        !manifest.requested.iter().any(|c| matches!(c, Capability::ProcSpawn)),
+        !manifest
+            .requested
+            .iter()
+            .any(|c| matches!(c, Capability::ProcSpawn)),
         "org never asks to run any program"
     );
-    assert!(manifest.default_modes.contains(&"org-babel-mode".to_string()));
+    assert!(manifest
+        .default_modes
+        .contains(&"org-babel-mode".to_string()));
     assert_eq!(
         manifest.mode_gates,
-        [("org-babel-mode".to_string(), "org.babel.enabled".to_string())]
+        [(
+            "org-babel-mode".to_string(),
+            "org.babel.enabled".to_string()
+        )]
     );
 }
 
@@ -164,9 +179,8 @@ async fn each_grant_default_is_the_default_org_registers() {
         // Read as the loader reads it: a list option's default is its
         // entries, not its TOML (`org.babel.tangle-directories` defaults to
         // none, and so does its grant).
-        let registered = lattice_plugin_host::capability::registered_default_paths(
-            registered.as_ref(),
-        );
+        let registered =
+            lattice_plugin_host::capability::registered_default_paths(registered.as_ref());
         assert_eq!(
             grant_default.into_iter().collect::<Vec<_>>(),
             registered,

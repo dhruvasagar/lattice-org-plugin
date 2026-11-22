@@ -12,6 +12,15 @@ Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
   removes a block's result; `:org-babel-cancel` stops them. Nothing runs until
   you list a language in `org.babel.languages`, and that list is also all org
   may run. See `:help org.babel`.
+- **Babel runs a block.** `C-c C-c` runs it in the background with a `▶` in
+  the gutter, and writes its output under it as `#+RESULTS:`, replacing the
+  old result, in one undo step. Long output goes in an example block that
+  output cannot break out of. The result finds its block even if you typed
+  above it meanwhile. If the block itself changed, the output goes to
+  `*org-babel*` instead of the file. Header arguments merge from
+  `#+PROPERTY:`, headline drawers, `#+HEADER:` and the block line, as in
+  emacs.
+
 ## 0.4.0 — 2026-11-17
 
 Builds against `lattice:plugin-host@0.5.x` (lattice-wit 0.5.0).

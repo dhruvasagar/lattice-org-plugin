@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::block::{BlockKey, SrcBlock};
+use super::results::{Collection, ResultsSpec};
+use super::wrappers::Wrapper;
 use super::Language;
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::host_services;
@@ -49,8 +51,18 @@ pub(crate) struct RunRequest {
     pub(crate) args: Vec<String>,
     pub(crate) ext: String,
     pub(crate) body: String,
-    /// The effective `:results` words, for OB.8's formats.
-    pub(crate) results: Vec<String>,
+    /// The block's language, for `:results code`.
+    pub(crate) lang: String,
+    /// The effective `:results`, parsed.
+    pub(crate) results: ResultsSpec,
+    /// The language's value wrapper, when `results` collects `value`.
+    pub(crate) wrapper: Option<Wrapper>,
+    /// `:dir` as written, quotes stripped; resolved in the events seam,
+    /// where the environment (`HOME`) can be read.
+    pub(crate) dir: Option<String>,
+    /// The directory of the buffer's file: where a block runs without
+    /// `:dir`, and what a relative `:dir` is relative to, as in emacs.
+    pub(crate) base: Option<String>,
     /// `org.babel.min-lines-for-block-output`.
     pub(crate) min_block: usize,
     /// `org.babel.max-output-lines`.
@@ -107,6 +119,48 @@ fn number_option(name: &str, default: usize) -> usize {
 /// the payload is the buffer id, as text.
 pub(crate) const EV_CANCEL: &str = "org/babel-cancel";
 
+thread_local! {
+    /// Whether this session has said that a language without a value
+    /// wrapper runs `:results value` as output — said once (design §5.2).
+    static VALUE_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What a block's `:results` and language make of a run: the spec, the
+/// wrapper, and whether `value` was asked for and cannot be had.
+pub(crate) fn plan(
+    lines: &[&str],
+    block: &SrcBlock,
+    lang: &Language,
+) -> Result<(ResultsSpec, Option<Wrapper>, bool), String> {
+    let wrapper = match &lang.value {
+        None => None,
+        Some(name) => Some(Wrapper::named(name).ok_or_else(|| {
+            format!(
+                "org: no value wrapper \"{name}\" for {} — python, ruby, node or sh",
+                lang.name
+            )
+        })?),
+    };
+    let header = super::block::effective_header_args(lines, block);
+    let mut spec = ResultsSpec::parse(&header.results(), wrapper.is_some())?;
+    let fell_back = spec.collection == Collection::Value && wrapper.is_none();
+    if fell_back {
+        spec.collection = Collection::Output;
+    }
+    Ok((spec, wrapper, fell_back))
+}
+
+/// The directory of `doc`'s file, if it has one.
+pub(crate) fn base_dir(doc: &Document) -> Option<String> {
+    let path = doc.path()?;
+    let (dir, _) = path.rsplit_once('/')?;
+    Some(if dir.is_empty() {
+        "/".to_string()
+    } else {
+        dir.to_string()
+    })
+}
+
 /// The blocks to run, checked: each in a configured language, none already
 /// running. `Err` is the echo saying why not.
 pub(crate) fn check<'a>(
@@ -125,6 +179,9 @@ pub(crate) fn check<'a>(
         let Some(lang) = languages.iter().find(|l| l.name == block.lang) else {
             return Err(super::unconfigured(&block.lang));
         };
+        if let Err(e) = plan(lines, block, lang) {
+            return Err(super::echo(EchoLevel::Error, e));
+        }
         if is_running(buffer, lines, block) {
             return Err(super::echo(
                 EchoLevel::Info,
@@ -187,13 +244,18 @@ pub(crate) fn unpack(lines: &[&str], packed: &str) -> Option<Vec<SrcBlock>> {
 }
 
 /// Ask before running `blocks` — or, with `org.babel.confirm` off, run them.
-pub(crate) fn confirm_or_start(buffer: u32, lines: &[&str], blocks: &[SrcBlock]) -> Vec<Effect> {
+pub(crate) fn confirm_or_start(
+    buffer: u32,
+    lines: &[&str],
+    blocks: &[SrcBlock],
+    base: Option<&str>,
+) -> Vec<Effect> {
     let checked = match check(buffer, lines, blocks) {
         Ok(c) => c,
         Err(echo) => return echo,
     };
     if !crate::option_or("babel.confirm", "true").eq_ignore_ascii_case("true") {
-        return start(buffer, lines, &checked);
+        return start(buffer, lines, &checked, base);
     }
     vec![Effect::Confirm(ConfirmPayload {
         prompt: prompt(&checked),
@@ -204,13 +266,36 @@ pub(crate) fn confirm_or_start(buffer: u32, lines: &[&str], blocks: &[SrcBlock])
 
 /// Claim each block and ask the events seam to run them, in order, one
 /// after another.
-pub(crate) fn start(buffer: u32, lines: &[&str], blocks: &[(&SrcBlock, Language)]) -> Vec<Effect> {
+pub(crate) fn start(
+    buffer: u32,
+    lines: &[&str],
+    blocks: &[(&SrcBlock, Language)],
+    base: Option<&str>,
+) -> Vec<Effect> {
     let min_block = number_option("babel.min-lines-for-block-output", 10);
     let max_lines = number_option("babel.max-output-lines", 10_000);
     let mut batch = Vec::with_capacity(blocks.len());
+    let mut notes = Vec::new();
     for (block, lang) in blocks {
         let key = BlockKey::of(lines, block).encode();
+        let (results, wrapper, fell_back) = match plan(lines, block, lang) {
+            Ok(p) => p,
+            Err(e) => return super::echo(EchoLevel::Error, e),
+        };
+        if fell_back && !VALUE_NOTED.with(|n| n.replace(true)) {
+            notes.extend(super::echo(
+                EchoLevel::Info,
+                format!(
+                    "org: {} has no value wrapper, so `:results value` runs as output \
+                     — name one in its org.babel.languages entry",
+                    lang.name
+                ),
+            ));
+        }
         let header = super::block::effective_header_args(lines, block);
+        let dir = header
+            .get("dir")
+            .map(|w| w.join(" ").trim_matches('"').to_string());
         batch.push(RunRequest {
             buffer,
             key,
@@ -222,7 +307,11 @@ pub(crate) fn start(buffer: u32, lines: &[&str], blocks: &[(&SrcBlock, Language)
                 .unwrap_or_else(|| vec!["{file}".to_string()]),
             ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
             body: block.body.clone(),
-            results: header.results(),
+            lang: block.lang.clone(),
+            results,
+            wrapper,
+            dir,
+            base: base.map(str::to_string),
             min_block,
             max_lines,
         });
@@ -246,7 +335,11 @@ pub(crate) fn start(buffer: u32, lines: &[&str], blocks: &[(&SrcBlock, Language)
     // The claims are what the sign producer reads, so the signs are up
     // before the first process is.
     host_services::refresh_decorations();
-    vec![Effect::None]
+    if notes.is_empty() {
+        vec![Effect::None]
+    } else {
+        notes
+    }
 }
 
 /// `:org-babel-cancel`: the events seam owns the jobs, so ask it.

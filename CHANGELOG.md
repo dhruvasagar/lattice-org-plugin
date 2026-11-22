@@ -25,6 +25,12 @@ Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
   edit. `C-c C-v b` / `C-c C-v s` run a buffer's or subtree's blocks in order,
   asking once. `:org-babel-cancel` stops them, and `C-c C-v k` removes a
   result.
+- **Babel's `:results`, `value` and `:dir`.** Results can be appended or
+  prepended, shown only in the echo area, or not kept, and written as an
+  aligned table, raw org, a drawer or a code block. With a `value` wrapper
+  (`python`, `ruby`, `node`, `sh`) a block's result is its last expression,
+  not what it printed. A block runs in `:dir`, or else in its file's
+  directory.
 - **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
   its block changed, was deleted or closed before it finished. The echo used
   to name that buffer, but nothing ever created it.

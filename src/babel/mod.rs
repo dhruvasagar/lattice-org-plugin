@@ -13,6 +13,7 @@ pub(crate) mod header_args;
 pub(crate) mod jobs;
 pub(crate) mod results;
 pub(crate) mod run;
+mod wrappers;
 
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::config::{register_option, OptionType};
@@ -340,7 +341,12 @@ pub(crate) fn apply_action(
             let Some(block) = block::src_block_at(&lines, ctx.cursor.line) else {
                 return Ok(vec![Effect::Declined]);
             };
-            Ok(run::confirm_or_start(ctx.buffer_id, &lines, &[block]))
+            Ok(run::confirm_or_start(
+                ctx.buffer_id,
+                &lines,
+                &[block],
+                run::base_dir(doc).as_deref(),
+            ))
         }
         RUN_CONFIRMED => {
             let packed = match &ctx.args {
@@ -362,7 +368,12 @@ pub(crate) fn apply_action(
                 ));
             };
             match run::check(ctx.buffer_id, &lines, &blocks) {
-                Ok(checked) => Ok(run::start(ctx.buffer_id, &lines, &checked)),
+                Ok(checked) => Ok(run::start(
+                    ctx.buffer_id,
+                    &lines,
+                    &checked,
+                    run::base_dir(doc).as_deref(),
+                )),
                 Err(e) => Ok(e),
             }
         }
@@ -413,11 +424,13 @@ pub(crate) fn apply_ex_command(
     }
     let text = run::whole_text(doc);
     let lines: Vec<&str> = text.lines().collect();
+    let base = run::base_dir(doc);
     match callback {
         EXECUTE_BUFFER => Ok(run::confirm_or_start(
             ctx.buffer_id,
             &lines,
             &block::src_blocks(&lines),
+            base.as_deref(),
         )),
         EXECUTE_SUBTREE => {
             let Some((first, end)) = block::subtree_at(&lines, ctx.cursor.line) else {
@@ -427,7 +440,12 @@ pub(crate) fn apply_ex_command(
                 .into_iter()
                 .filter(|b| b.begin_line > first && b.end_line < end)
                 .collect();
-            Ok(run::confirm_or_start(ctx.buffer_id, &lines, &blocks))
+            Ok(run::confirm_or_start(
+                ctx.buffer_id,
+                &lines,
+                &blocks,
+                base.as_deref(),
+            ))
         }
         REMOVE_RESULT => Ok(remove_result(
             ctx.buffer_id,

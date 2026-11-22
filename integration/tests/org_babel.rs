@@ -155,7 +155,21 @@ async fn org_editor_with_languages(
     text: &str,
     languages: &[(&str, &str)],
 ) -> (Editor, Arc<PluginLoader>) {
-    let (mut editor, loader) = org_editor_with_caps(base, text, &[], languages).await;
+    let records: Vec<Vec<(&str, &str)>> = languages
+        .iter()
+        .map(|(name, command)| vec![("name", *name), ("command", *command)])
+        .collect();
+    org_editor_with_records(base, text, &records).await
+}
+
+/// [`org_editor_with_languages`] with whole `org.babel.languages` records:
+/// `(field, value)` pairs, `args` split on whitespace into its list.
+async fn org_editor_with_records(
+    base: &std::path::Path,
+    text: &str,
+    records: &[Vec<(&str, &str)>],
+) -> (Editor, Arc<PluginLoader>) {
+    let (mut editor, loader) = org_editor_with_caps(base, text, &[], records).await;
     // Most tests are about the run, not the question before it; the confirm
     // tests turn it back on.
     set_org_option(&mut editor, "babel.confirm", "false");
@@ -173,7 +187,7 @@ async fn org_editor_with_caps(
     base: &std::path::Path,
     text: &str,
     capabilities: &[String],
-    languages: &[(&str, &str)],
+    languages: &[Vec<(&str, &str)>],
 ) -> (Editor, Arc<PluginLoader>) {
     let plugins_dir = base.join("plugins");
     let dir = plugins_dir.join("org");
@@ -207,13 +221,23 @@ async fn org_editor_with_caps(
         use lattice_config::ConfigValue;
         let table = languages
             .iter()
-            .map(|(name, command)| {
+            .map(|fields| {
                 ConfigValue::Record(
-                    [
-                        ("name".to_string(), ConfigValue::Str(name.to_string())),
-                        ("command".to_string(), ConfigValue::Str(command.to_string())),
-                    ]
-                    .into(),
+                    fields
+                        .iter()
+                        .map(|(k, v)| {
+                            let value = if *k == "args" {
+                                ConfigValue::List(
+                                    v.split_whitespace()
+                                        .map(|a| ConfigValue::Str(a.to_string()))
+                                        .collect(),
+                                )
+                            } else {
+                                ConfigValue::Str(v.to_string())
+                            };
+                            (k.to_string(), value)
+                        })
+                        .collect(),
                 )
             })
             .collect();
@@ -1107,4 +1131,276 @@ async fn closing_the_buffer_while_it_runs_sends_output_to_org_babel() {
         "{}",
         shown(&editor)
     );
+}
+
+/// Whether `program` is on this host. A `value` test needs the interpreter,
+/// and says so when it is skipped rather than passing quietly.
+fn have(program: &str) -> bool {
+    let found = std::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !found {
+        eprintln!("skipping: `{program}` is not on this host");
+    }
+    found
+}
+
+fn block(header: &str, body: &str) -> String {
+    format!("#+begin_src sh {header}\n{body}\n#+end_src\nafter\n")
+}
+
+/// Run the block on line 0 of a one-block `doc` and return the text once
+/// `done` holds.
+async fn run_doc(doc: &str, done: impl Fn(&Editor) -> bool) -> String {
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    run_and_settle(&mut editor, 0, done).await;
+    text(&editor)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_append_adds_under_the_existing_result() {
+    require_component!();
+    let doc = "#+begin_src sh :results append\necho new\n#+end_src\n\n#+RESULTS:\n: old\nafter\n";
+    let t = run_doc(doc, has(": new")).await;
+    assert!(t.ends_with("#+RESULTS:\n: old\n: new\nafter\n"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_prepend_adds_above_the_existing_result() {
+    require_component!();
+    let doc = "#+begin_src sh :results prepend\necho new\n#+end_src\n\n#+RESULTS:\n: old\nafter\n";
+    let t = run_doc(doc, has(": new")).await;
+    assert!(t.ends_with("#+RESULTS:\n: new\n: old\nafter\n"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_silent_echoes_and_writes_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = block(":results silent", "echo quiet");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    editor.last_message = None;
+    settle(&mut editor, |e| e.last_message.is_some()).await;
+    assert_eq!(last_echo(&editor).as_deref(), Some("quiet"));
+    assert_eq!(text(&editor), doc);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_none_writes_and_echoes_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    // The second block runs after the first has finished: when its result
+    // is in, the first one's is long settled.
+    let doc = "#+begin_src sh :results none\necho gone\n#+end_src\n#+begin_src sh\necho kept\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    ex(&mut editor, "org-babel-execute-buffer");
+    settle(&mut editor, has(": kept")).await;
+    let t = text(&editor);
+    assert_eq!(t.matches("#+RESULTS:").count(), 1, "{t}");
+    assert!(!t.contains("gone\n:") && !t.contains(": gone"), "{t}");
+    assert_ne!(last_echo(&editor).as_deref(), Some("gone"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_table_is_an_aligned_org_table() {
+    require_component!();
+    let t = run_doc(
+        &block(":results table", "printf 'a\\t1\\nbb\\t22\\n'"),
+        has("#+RESULTS:"),
+    )
+    .await;
+    assert!(
+        t.contains("#+RESULTS:\n| a  |  1 |\n| bb | 22 |\nafter\n"),
+        "{t}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_raw_is_written_as_org() {
+    require_component!();
+    let t = run_doc(&block(":results raw", "echo '- item'"), has("#+RESULTS:")).await;
+    assert!(t.contains("#+RESULTS:\n- item\nafter\n"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_drawer_wraps_in_a_results_drawer() {
+    require_component!();
+    let t = run_doc(&block(":results drawer", "echo x"), has(":END:")).await;
+    assert!(
+        t.contains("#+RESULTS:\n:RESULTS:\nx\n:END:\nafter\n"),
+        "{t}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn results_code_is_a_src_block_in_the_language_and_escaped() {
+    require_component!();
+    let t = run_doc(&block(":results code", "echo '* x'"), has("#+RESULTS:")).await;
+    assert!(
+        t.contains("#+RESULTS:\n#+begin_src sh\n,* x\n#+end_src\nafter\n"),
+        "{t}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_result_kind_that_is_not_built_is_refused_before_anything_runs() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = block(":results file", "echo x");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    assert!(
+        last_echo(&editor)
+            .unwrap_or_default()
+            .starts_with("org: `:results file` is not supported"),
+        "{:?}",
+        last_echo(&editor)
+    );
+    assert!(signed_lines(&editor).await.is_empty(), "nothing started");
+}
+
+/// The value of `body` in `lang`, run through its built-in wrapper.
+async fn value_of(lang: &str, command: &str, ext: &str, body: &str) -> String {
+    let base = tempfile::tempdir().unwrap();
+    let doc = format!("#+begin_src {lang}\n{body}\n#+end_src\n");
+    let record = vec![
+        ("name", lang),
+        ("command", command),
+        ("ext", ext),
+        ("value", lang),
+    ];
+    let (mut editor, _loader) = org_editor_with_records(base.path(), &doc, &[record]).await;
+    run_and_settle(&mut editor, 0, has("#+RESULTS:")).await;
+    let t = text(&editor);
+    t.split_once("#+RESULTS:\n")
+        .map(|(_, r)| r.to_string())
+        .unwrap_or(t)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_python_is_the_last_expression_not_what_it_printed() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let v = value_of("python", "python3", "py", "x = 6\nprint('noise')\nx * 7").await;
+    assert_eq!(v, ": 42\n");
+    let v = value_of("python", "python3", "py", "x = 6\nreturn x * 7").await;
+    assert_eq!(v, ": 42\n", "a body that returns, babel's older rule");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_ruby_is_the_last_expression() {
+    require_component!();
+    if !have("ruby") {
+        return;
+    }
+    let v = value_of("ruby", "ruby", "rb", "x = 6\nputs 'noise'\nx * 7").await;
+    assert_eq!(v, ": 42\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_node_is_the_last_expression() {
+    require_component!();
+    if !have("node") {
+        return;
+    }
+    let v = value_of(
+        "node",
+        "node",
+        "js",
+        "const x = 6;\nconsole.log('noise');\nx * 7",
+    )
+    .await;
+    assert_eq!(v, ": 42\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_sh_is_what_it_printed() {
+    require_component!();
+    let v = value_of("sh", "sh", "sh", "echo one\necho two").await;
+    assert_eq!(v, ": one\n: two\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_value_body_writes_what_explains_it() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let v = value_of("python", "python3", "py", "1 / 0").await;
+    assert!(v.contains("ZeroDivisionError"), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn value_without_a_wrapper_falls_back_to_output_and_says_so() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = block(":results value", "echo hi");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some(
+            "org: sh has no value wrapper, so `:results value` runs as output \
+             — name one in its org.babel.languages entry"
+        )
+    );
+    settle(&mut editor, has("#+RESULTS:\n: hi\n")).await;
+    // Said once a session, not on every run.
+    editor.last_message = None;
+    press(&mut editor, "<C-c><C-c>");
+    assert!(last_echo(&editor).is_none(), "{:?}", last_echo(&editor));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dir_with_a_tilde_runs_there() {
+    require_component!();
+    let Some(home) = std::env::var_os("HOME") else {
+        eprintln!("skipping: no HOME");
+        return;
+    };
+    let there = tempfile::tempdir_in(&home).unwrap();
+    let name = there
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let real = there.path().canonicalize().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let doc = block(&format!(":dir ~/{name}"), "pwd -P");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    run_and_settle(&mut editor, 0, has("#+RESULTS:")).await;
+    assert!(
+        text(&editor).contains(&format!("#+RESULTS:\n: {}\n", real.display())),
+        "{}",
+        text(&editor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dir_that_is_not_a_directory_does_not_start() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = block(":dir /no/such/dir", "pwd");
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), &doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    editor.last_message = None;
+    settle(&mut editor, |e| e.last_message.is_some()).await;
+    assert!(
+        last_echo(&editor)
+            .unwrap_or_default()
+            .starts_with("org: the sh block did not start:"),
+        "{:?}",
+        last_echo(&editor)
+    );
+    assert_eq!(text(&editor), doc);
 }

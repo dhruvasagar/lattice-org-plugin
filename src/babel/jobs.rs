@@ -11,8 +11,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::block::BlockKey;
-use super::results::{result_edit, verbatim};
+use super::results::{format, insertion_edit, Collection, Insertion};
 use super::run::{claim_key, RunRequest, RUN_PREFIX};
+use super::wrappers::after_sentinel;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     ApplyEditPayload, EchoLevel, EchoPayload, Edit, EditKind, Effect, GutterDecoration, GutterSign,
@@ -34,6 +35,8 @@ struct Job {
     request: RunRequest,
     /// The rest of its batch, started when this one finishes.
     rest: Vec<RunRequest>,
+    /// The line a value wrapper prints before the value, if it was wrapped.
+    sentinel: Option<String>,
     /// The guest path of the script, removed at finish.
     script: String,
     output: Vec<String>,
@@ -108,7 +111,16 @@ fn start_next(mut runs: Vec<RunRequest>) {
     };
     let file = format!("{uuid}.{}", request.ext);
     let script = format!("{SCRIPT_DIR}/{file}");
-    let mut body = request.body.clone();
+    // `:results value`: the body runs inside its wrapper, which prints the
+    // value after a line no program prints by accident — this run's uuid.
+    let (mut body, sentinel) = match (request.results.collection, request.wrapper) {
+        (Collection::Value, Some(w)) => {
+            let sentinel = format!("org-babel-value-{uuid}");
+            let (script, cut) = w.wrap(&request.body, &sentinel);
+            (script, cut.then_some(sentinel))
+        }
+        _ => (request.body.clone(), None),
+    };
     body.push('\n');
     if let Err(e) = std::fs::create_dir_all(SCRIPT_DIR).and_then(|_| std::fs::write(&script, body))
     {
@@ -123,13 +135,15 @@ fn start_next(mut runs: Vec<RunRequest>) {
         .iter()
         .map(|a| a.replace("{file}", &host_file))
         .collect();
-    match host_services::spawn_process(&request.command, &args, "") {
+    let cwd = working_dir(request.dir.as_deref(), request.base.as_deref());
+    match host_services::spawn_process(&request.command, &args, &cwd) {
         Ok(id) => JOBS.with(|j| {
             j.borrow_mut().insert(
                 id,
                 Job {
                     request,
                     rest,
+                    sentinel,
                     script,
                     output: Vec::new(),
                     dropped: 0,
@@ -140,6 +154,19 @@ fn start_next(mut runs: Vec<RunRequest>) {
             let _ = std::fs::remove_file(&script);
             fail(format!("org: the {} did not start: {e}", request.label));
         }
+    }
+}
+
+/// Where a block runs: `:dir`, tilde-expanded, against the file's directory
+/// when relative; without `:dir`, the file's directory; with neither, the
+/// editor's (an empty `cwd`). A `:dir` that is not a directory is
+/// `spawn-process`'s refusal, reported as the block not starting.
+fn working_dir(dir: Option<&str>, base: Option<&str>) -> String {
+    match (dir.map(crate::roam_scan::expand_tilde), base) {
+        (Some(d), Some(b)) if !d.starts_with('/') => format!("{}/{d}", b.trim_end_matches('/')),
+        (Some(d), _) => d,
+        (None, Some(b)) => b.to_string(),
+        (None, None) => String::new(),
     }
 }
 
@@ -202,7 +229,12 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
         return;
     }
     let rest = job.rest;
-    let mut output = job.output;
+    let mut output = match &job.sentinel {
+        // No sentinel means the body failed before its value: the whole
+        // output is what says why.
+        Some(s) => after_sentinel(&job.output, s).unwrap_or(job.output),
+        None => job.output,
+    };
     if job.dropped > 0 {
         output.push(format!("… {} lines truncated", job.dropped));
     }
@@ -218,8 +250,27 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
             format!("org: the {label} failed: {e}"),
         ));
     }
+    let insertion = job.request.results.insertion;
+    if matches!(insertion, Insertion::Silent | Insertion::None) {
+        // `silent` shows the result in the echo area and `none` nowhere;
+        // neither touches the file. A failure's echo, above, stands.
+        if insertion == Insertion::Silent && outcome.is_ok() {
+            effects.push(echo(
+                EchoLevel::Info,
+                if output.is_empty() {
+                    format!("org: the {label} printed nothing")
+                } else {
+                    output.join("\n")
+                },
+            ));
+        }
+        post(effects);
+        start_next(rest);
+        return;
+    }
     match place(&job.request, &output) {
-        Ok(edit) => effects.insert(0, edit),
+        Ok(Some(edit)) => effects.insert(0, edit),
+        Ok(None) => {}
         Err(why) => {
             let mut lines = vec![format!("── {label}: {why} ──")];
             lines.extend(output);
@@ -245,16 +296,24 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
 }
 
 /// The edit that writes `output` as the block's result, or why there is none.
-fn place(request: &RunRequest, output: &[String]) -> Result<Effect, String> {
+fn place(request: &RunRequest, output: &[String]) -> Result<Option<Effect>, String> {
     let text = host_services::buffer_text(request.buffer)
         .ok_or_else(|| "its buffer closed while it ran".to_string())?;
     let lines: Vec<&str> = text.lines().collect();
     let block = BlockKey::decode(&request.key)
         .and_then(|k| k.find(&lines))
         .ok_or_else(|| "the block changed while it ran".to_string())?;
-    let body = verbatim(output, request.min_block);
-    let e = result_edit(&lines, text.ends_with('\n'), &block, &body);
-    Ok(Effect::ApplyEdit(ApplyEditPayload {
+    let body = format(&request.results, output, request.min_block, &request.lang);
+    let Some(e) = insertion_edit(
+        &lines,
+        text.ends_with('\n'),
+        &block,
+        &body,
+        request.results.insertion,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(Effect::ApplyEdit(ApplyEditPayload {
         target: request.buffer,
         edit: Edit {
             range: Range {
@@ -270,7 +329,7 @@ fn place(request: &RunRequest, output: &[String]) -> Result<Effect, String> {
             kind: EditKind::Replace(e.text),
         },
         cursor: None,
-    }))
+    })))
 }
 
 /// The running signs for `buffer`: one per claimed block that is still there.
@@ -299,4 +358,27 @@ pub(crate) fn running_signs(buffer: u64) -> Vec<GutterDecoration> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_runs_in_its_dir_or_its_files_dir() {
+        let base = Some("/notes");
+        assert_eq!(
+            working_dir(None, base),
+            "/notes",
+            "the file's directory, as in emacs"
+        );
+        assert_eq!(working_dir(Some("sub"), base), "/notes/sub");
+        assert_eq!(working_dir(Some("/abs"), base), "/abs");
+        assert_eq!(working_dir(Some("sub"), None), "sub");
+        assert_eq!(
+            working_dir(None, None),
+            "",
+            "no file: the editor's directory"
+        );
+    }
 }

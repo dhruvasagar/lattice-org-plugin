@@ -20,6 +20,12 @@ name    = "sh"          # the word after #+begin_src
 command = "sh"          # the program, on PATH or by path
 args    = ["{file}"]    # {file} is the block, written to a script (the default)
 ext     = "sh"          # the script's extension (default: the name)
+
+[[org.babel.languages]]
+name    = "python"
+command = "python3"
+ext     = "py"
+value   = "python"      # a value wrapper: python, ruby, node or sh
 ```
 
 Listing a program trusts it with whatever it can do, so `sh` lets a block do
@@ -58,6 +64,35 @@ you are typing in. A block that is already running is not started again.
 The block's header arguments are read as emacs reads them: the
 `#+PROPERTY: header-args` lines, the `header-args` properties of the headlines
 above it, its `#+HEADER:` lines, then its `#+begin_src` line, later winning.
+
+## What a result looks like
+
+`:results` takes babel's words, on the `#+begin_src` line, a `#+HEADER:` or
+a `header-args` property:
+
+| axis | words | |
+|---|---|---|
+| collect | `output`, `value` | what it printed, or its last expression's value |
+| type | `verbatim`, `table` | `table` splits each line on tabs, or else on spaces, into an aligned org table |
+| format | `raw`, `drawer`, `code`, `org` | written as org; in a `:RESULTS:` drawer; in a `#+begin_src` block of the block's language, or of `org` |
+| handling | `replace`, `append`, `prepend`, `silent`, `none` | `silent` shows the result in the echo area only; `none` keeps it nowhere |
+
+The default is `replace`, verbatim. Words babel has that are not built here
+(`file`, `list`, `html`, `latex`, `link`, `graphics`, `pp`) are refused before
+anything runs, with a message naming them, rather than written some other way.
+
+`value` needs the language to name a **value wrapper**. The wrapper runs the
+block and prints its last expression's value after a marker line, and only
+what follows the marker is the result, so a block's own `print`s are not.
+Python takes either a last expression or a `return`. A shell's value is what
+it printed, as in emacs. A language with a wrapper collects `value` unless
+you say `output`, as babel does. A language without one runs `value` as
+`output`, and the echo area says so once a session.
+
+`:dir` is where the block runs, with `~` expanded. A relative `:dir` is taken
+from the file's directory, and a block without one runs in the file's
+directory, as in emacs. A `:dir` that is not a directory stops the block from
+starting, and the echo area says why.
 
 ## Asking first, running many, stopping
 

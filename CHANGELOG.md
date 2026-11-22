@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Needs lattice 0.10.3 or later (lattice-wit 0.5.1).
+
+### Added
+- **Babel: `org-babel-mode`**, on in every org buffer and off with `:set
+  org.babel.enabled=false`, which leaves the rest of org on. It owns `C-c C-c`
+  inside a source block (anywhere else the key is org's, as before) and the
+  `C-c C-v` prefix: `b` runs the buffer's blocks, `s` the subtree's, `k`
+  removes a block's result; `:org-babel-cancel` stops them. Nothing runs until
+  you list a language in `org.babel.languages`, and that list is also all org
+  may run. See `:help org.babel`.
 ## 0.4.0 — 2026-11-17
 
 Builds against `lattice:plugin-host@0.5.x` (lattice-wit 0.5.0).

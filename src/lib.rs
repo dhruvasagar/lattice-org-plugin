@@ -68,14 +68,17 @@ provides = [
     "completion-source", "transient-source", "help", "config", "theme", "events",
     "llm-tools",
 ]
-default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
+default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode"]
 capabilities = [
     "fs:write:{org.directory|~/org}",
     "fs:write:{org.roam-directory|~/org-roam}",
+    "fs:write:{org.babel.tangle-directories}",
+    "proc:spawn:{org.babel.languages:command}",
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-min_lattice = "0.10.1"
+mode_gates = { "org-babel-mode" = "org.babel.enabled" }
+min_lattice = "0.10.3"
 "#
 );
 
@@ -216,6 +219,8 @@ mod agenda_marks;
 mod agenda_match;
 mod agenda_sections;
 mod archive;
+// OB.4: running source blocks — the whole of `org-babel-mode`.
+mod babel;
 mod capture;
 mod capture_drafts;
 mod capture_flow;
@@ -1696,6 +1701,8 @@ impl Guest for Component {
     }
 
     fn register_options() {
+        // OB.4: babel's `org.babel.*`, declared by its own module.
+        babel::register_options();
         // TK.2 / TC.7: a LIST of sequence lines, not one newline-joined string.
         //
         // The lines keep emacs' own grammar — that grammar is org's public
@@ -2289,6 +2296,8 @@ impl Guest for Component {
     }
 
     fn register_modes() {
+        // OB.4: `org-babel-mode`, declared by its own module.
+        babel::register();
         let bind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Normal,
             chord: chord.to_string(),
@@ -3170,6 +3179,8 @@ impl Guest for Component {
     /// text objects that DO compose with operators (`ih`/`ah`/`is`/`as`) are a
     /// separate contribution, OM.4.
     fn register_grammar() {
+        // OB.4: babel's action and commands, declared by its own module.
+        babel::register_grammar();
         let spec = || ActionSpec {
             args_schema: Vec::new(),
         };
@@ -4042,6 +4053,13 @@ impl Guest for Component {
                 "org-review".to_string(),
                 "org-report".to_string(),
             ],
+        );
+        // OB.4: babel, at `:help org.babel`.
+        let _ = register_topic(
+            "babel",
+            "Org babel: running source blocks and writing their results.",
+            include_str!("../doc/babel.md"),
+            &["org-babel".to_string()],
         );
         let _ = register_topic(
             "roam",
@@ -9798,6 +9816,8 @@ impl GrammarCallbacks for Component {
                 planning::Field::Deadline,
                 &ctx.args,
             )),
+            // OB.4: babel owns its ids; see `babel` for why none is here.
+            cb if babel::is_action(cb) => babel::apply_action(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }
@@ -10023,6 +10043,7 @@ impl GrammarCallbacks for Component {
                     Args::String(trimmed.to_string())
                 })
             }
+            cb if babel::is_ex_parse(cb) => babel::parse_ex_args(cb, &rest),
             other => Err(format!("org: unknown ex-command parse callback {other}")),
         }
     }
@@ -10308,6 +10329,7 @@ impl GrammarCallbacks for Component {
                     scan_args: vec![String::new()],
                 },
             ))]),
+            cb if babel::is_ex_command(cb) => babel::apply_ex_command(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown ex-command callback {other}")),
         }
     }

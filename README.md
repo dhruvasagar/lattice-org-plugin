@@ -40,9 +40,9 @@ reached the network.
 | seam | what org contributes |
 |---|---|
 | `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
-| `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-agenda-mode`, `org-global-mode` |
+| `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-babel-mode`, `org-agenda-mode`, `org-global-mode` |
 | `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, the clock, archive / refile / capture, the agenda's bulk marks, and org-roam's commands |
-| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates` |
+| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates`, and babel's `org.babel.*` (`enabled`, `confirm`, `languages`, `tangle-directories`, `min-lines-for-block-output`, `max-output-lines`) |
 | `theme` | one theme element per TODO keyword, so `:colorscheme` recolours your own states |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
 | `scanned-excerpt-source` | dated rows for the agenda — what a row is, when it falls, how it sorts, and which files to scan |
@@ -54,7 +54,7 @@ reached the network.
 | `decorations` | which agenda rows carry that mark — re-asked through `refresh-decorations`, because a mark changes no text |
 | `events` | the clock's session, its minute wake and its modeline segment |
 | `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), `org.query` (entries by tags, properties or TODO state), `org.entry` (one entry whole, by its ref or `ID`), `org.clock` (clocked time over a range, per entry, file or tag), `org.notes` (roam notes by title, alias or tag, with backlinks), read through the agenda's own scan so the assistant and `:org-agenda` agree; and `org.change`, which sets an entry's TODO state, schedule, deadline or tags, adds a note to its log or refiles it, or captures something new through one of your capture templates, through the verbs the keys use and hands the edit to lattice's review. Five workflows ride with them as chat profiles (`org`, `org-plan`, `org-review`, `org-report`, `org-research`), opened by `:org-plan-day`, `:org-plan-week`, `:org-review` and `:org-report`. The same tools reach Claude Code and other MCP or ACP agents through `lattice --mcp` (`llm.serve_tools`); see `:help org.assistant` |
-| `help` | `doc/org.md` and `doc/roam.md`, shipped inside the component; `:help org`, `:help org.roam`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
+| `help` | `doc/org.md`, `doc/roam.md` and `doc/babel.md`, shipped inside the component; `:help org`, `:help org.roam`, `:help org.babel`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.
@@ -154,7 +154,7 @@ with **zero renderer changes**. Pinned by
 
 ## Installing it
 
-You need **lattice 0.10.1 or later** and an `init.rs` — your lattice config,
+You need **lattice 0.10.3 or later** and an `init.rs` — your lattice config,
 which is itself a plugin (`lattice --scaffold-init` writes one). Org is
 installed from it: ready-built from a release, or built from source.
 
@@ -209,7 +209,7 @@ starting the editor makes no network request.
 `release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
 you in `org-mode`. If it was refused, it is under the failed loads in
 `:plugins` with the reason — a release with no build for your editor says
-which it has, and an editor older than 0.10.1 says the version org needs.
+which it has, and an editor older than 0.10.3 says the version org needs.
 
 **Updating:** with a tag, change it and `:reload-config`. With `None`,
 `:plugin-update org` (or `u` on its row in `:plugins`) installs a newer
@@ -397,9 +397,12 @@ after a restart.
 
 `default_modes` is load-bearing: it is what publishes the enablement request
 for each mode named, and without it a mode registers correctly and simply never
-activates — the chords are silently dead. Three are named because they answer
+activates — the chords are silently dead. Four are named because they answer
 different questions: `org-todo-mode` is keyword cycling *inside org files*,
-`org-table-mode` is table editing in them, and `org-global-mode` is the
+`org-table-mode` is table editing in them, `org-babel-mode` is running their
+source blocks (with a switch of its own, `org.babel.enabled`, through the
+manifest's `mode_gates`, because it is the one part of org that runs
+programs), and `org-global-mode` is the
 `<leader>o` prefix (capture, agenda, roam) that has to work *wherever you are*.
 It is `<leader>o` and not `<C-x>o`: org's MAJOR keymap binds a TERMINAL `<C-x>`
 (timestamp decrement), so inside an org buffer `<C-x>` fires that and never

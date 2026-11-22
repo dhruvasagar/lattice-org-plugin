@@ -54,6 +54,9 @@ Only `src` blocks inject. `#+begin_example`, `#+begin_quote` and the rest are
 verbatim or prose by definition, and stay that way even when they name a
 language.
 
+Running a block and keeping its output under it, `C-c C-c` in the block, is
+babel: see [`org.babel`](help:org.babel).
+
 ## Clocking
 
 Track time against an entry. The clock line lives in a `:LOGBOOK:` drawer under
@@ -136,10 +139,10 @@ everything under it while its children keep their own fold state.
 A headline with nothing under it is not foldable — there would be nothing to
 hide, and a fold marker on every bare headline is noise.
 
-## Source blocks
+## Folding source blocks
 
-A `#+BEGIN_SRC` block is highlighted as a block and folds as one. Highlighting
-the code *inside* it in its own language is injection, and is not wired yet.
+A `#+BEGIN_SRC` block folds as one; its body is highlighted in its own
+language (see Source blocks, above).
 
 ## Moving around
 

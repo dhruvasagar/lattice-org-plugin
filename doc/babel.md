@@ -114,6 +114,38 @@ ones still waiting their turn. A cancelled block keeps the result it had.
 `C-c C-v k` deletes the block's `#+RESULTS:` and the blank line above it.
 Running a block and then removing its result leaves the file as it was.
 
+## Tangling
+
+`C-c C-v t` (`:org-babel-tangle`) writes every block with a `:tangle` header
+argument out to a file. Babel's default is `:tangle no`, so a block is
+tangled only when it, its headline or the file asks:
+
+```org
+#+PROPERTY: header-args:sh :tangle setup.sh
+
+#+begin_src sh :shebang "#!/bin/sh"
+echo one
+#+end_src
+```
+
+- `:tangle yes` names the file after the org file, with the language's
+  extension: `notes.org` tangles its python to `notes.py`. The `ext` in the
+  language's `org.babel.languages` entry wins when it has one.
+- Any other value is a path, relative to the org file. `~` is your home.
+- Blocks tangling to one file are joined in the order they appear, with a
+  blank line between two of them unless the later says `:padline no`.
+- `:shebang` puts its line first and makes the file executable.
+
+A tangle **replaces** each file it writes, which is what lets you tangle
+again after editing. A file you have open changes in place, and one `u`
+there brings back what it held. A file you did not have open is opened
+unlisted, so `:ls` does not fill up.
+
+Org may write only under `org.directory` and the directories in
+`org.babel.tangle-directories`. Every file is checked before any is
+written: if one is outside, nothing is tangled and the echo area names it.
+Directories are not created (no `:mkdirp`).
+
 ## Keys and commands
 
 | key | command | does |
@@ -122,6 +154,7 @@ Running a block and then removing its result leaves the file as it was.
 | `C-c C-v b` | `:org-babel-execute-buffer` | run every block in the buffer, in order |
 | `C-c C-v s` | `:org-babel-execute-subtree` | run every block under the headline |
 | `C-c C-v k` | `:org-babel-remove-result` | delete the block's `#+RESULTS:` |
+| `C-c C-v t` | `:org-babel-tangle` | write the `:tangle` blocks to their files |
 | | `:org-babel-cancel` | stop the blocks running in this buffer |
 | | `:org-babel-output` | show `*org-babel*`, where output with no block to go to lands |
 

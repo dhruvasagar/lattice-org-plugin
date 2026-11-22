@@ -13,6 +13,7 @@ pub(crate) mod header_args;
 pub(crate) mod jobs;
 pub(crate) mod results;
 pub(crate) mod run;
+mod tangle;
 mod wrappers;
 
 use crate::lattice::plugin_host::buffer::Document;
@@ -54,6 +55,8 @@ const REMOVE_RESULT: u32 = 203;
 const CANCEL: u32 = 204;
 /// `:org-babel-output`.
 const OUTPUT: u32 = 206;
+/// `:org-babel-tangle` (`C-c C-v t`).
+const TANGLE: u32 = 207;
 /// The confirm's yes-half: run the blocks whose keys it carries. An ACTION,
 /// because a confirm dispatches an action by name with typed arguments.
 const RUN_CONFIRMED: u32 = 205;
@@ -75,7 +78,7 @@ pub(crate) fn is_action(callback: u32) -> bool {
 pub(crate) fn is_ex_command(callback: u32) -> bool {
     matches!(
         callback,
-        EXECUTE_BUFFER | EXECUTE_SUBTREE | REMOVE_RESULT | CANCEL | OUTPUT
+        EXECUTE_BUFFER | EXECUTE_SUBTREE | REMOVE_RESULT | CANCEL | OUTPUT | TANGLE
     )
 }
 
@@ -182,12 +185,13 @@ pub(crate) fn register() {
         activation_policy: ActivationPolicy::Majors(vec!["org-mode".to_string()]),
         capabilities: ModeCapabilities::empty(),
         // The `C-c C-v` prefix and its letters are emacs's
-        // (`org-babel-key-prefix`). Tangle (`t`) arrives with tangling.
+        // (`org-babel-key-prefix`).
         keymap: vec![
             bind("<C-c><C-c>", "org-babel-execute-src-block"),
             bind("<C-c><C-v>b", "org-babel-execute-buffer"),
             bind("<C-c><C-v>s", "org-babel-execute-subtree"),
             bind("<C-c><C-v>k", "org-babel-remove-result"),
+            bind("<C-c><C-v>t", "org-babel-tangle"),
         ],
         target_language: None,
         options: vec![],
@@ -257,6 +261,12 @@ pub(crate) fn register_grammar() {
              deleted or closed before they finished.",
             OUTPUT,
         ),
+        (
+            "org-babel-tangle",
+            "Write every source block with a `:tangle` to its file, replacing \
+             what was there; nothing is written when any target is refused.",
+            TANGLE,
+        ),
     ] {
         register_ex_command(name, doc, &spec(), NO_ARGS_PARSE, id);
     }
@@ -265,9 +275,15 @@ pub(crate) fn register_grammar() {
 /// `register-events`: clear what a previous load left, and hear our jobs.
 pub(crate) fn register_events() {
     jobs::sweep();
+    tangle::sweep();
     crate::lattice::plugin_host::events::subscribe(
         &EventFilter {
-            kinds: Some(vec![EventKind::JobOutput, EventKind::JobFinished]),
+            kinds: Some(vec![
+                EventKind::JobOutput,
+                EventKind::JobFinished,
+                // OB.10: a `:shebang` target is made executable once saved.
+                EventKind::DocumentSaved,
+            ]),
             path_globs: None,
             major_modes: None,
             minor_modes: None,
@@ -281,6 +297,7 @@ pub(crate) fn on_job_event(ev: Event) {
     match ev {
         Event::JobOutput(o) => jobs::on_output(o.id, o.lines),
         Event::JobFinished(f) => jobs::on_finished(f.id, f.outcome),
+        Event::DocumentSaved(d) => tangle::on_saved(&d.path),
         _ => {}
     }
 }
@@ -447,6 +464,13 @@ pub(crate) fn apply_ex_command(
                 base.as_deref(),
             ))
         }
+        TANGLE => Ok(tangle::tangle(
+            &lines,
+            doc.path().as_deref(),
+            // A bad languages table costs `:tangle yes` its configured
+            // extensions, not the tangle: babel's own names still apply.
+            &languages().unwrap_or_default(),
+        )),
         REMOVE_RESULT => Ok(remove_result(
             ctx.buffer_id,
             &lines,

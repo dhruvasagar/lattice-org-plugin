@@ -1404,3 +1404,155 @@ async fn a_dir_that_is_not_a_directory_does_not_start() {
     );
     assert_eq!(text(&editor), doc);
 }
+
+// ---------------------------------------------------------------------------
+// OB.10 — `:tangle`.
+// ---------------------------------------------------------------------------
+
+/// An org editor whose plugin may write under `base`, as the shipped manifest
+/// lets it write under `org.directory`.
+async fn tangle_editor(base: &std::path::Path, doc: &str) -> (Editor, Arc<PluginLoader>) {
+    let grant = vec![format!("fs:write:{}", base.display())];
+    org_editor_with_caps(base, doc, &grant, &[]).await
+}
+
+fn on_disk(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tangle_yes_names_the_file_after_the_org_file() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src python :tangle yes\nprint(1)\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(on_disk(&base.path().join("notes.py")), "print(1)\n");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: tangled 1 block to 1 file")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocks_to_one_file_concatenate_in_order() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "* A\n#+begin_src sh :tangle out.sh\necho one\n#+end_src\n\
+               * B\n#+begin_src sh :tangle other.sh\necho x\n#+end_src\n\
+               #+begin_src sh :tangle out.sh\necho two\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(
+        on_disk(&base.path().join("out.sh")),
+        "echo one\n\necho two\n"
+    );
+    assert_eq!(on_disk(&base.path().join("other.sh")), "echo x\n");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: tangled 3 blocks to 2 files")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn padline_no() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :tangle out.sh\na\n#+end_src\n\
+               #+begin_src sh :tangle out.sh :padline no\nb\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(on_disk(&base.path().join("out.sh")), "a\nb\n");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shebang_sets_the_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :tangle run.sh :shebang \"#!/bin/sh\"\necho hi\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    let target = base.path().join("run.sh");
+    assert_eq!(on_disk(&target), "#!/bin/sh\necho hi\n");
+
+    // The bit is set from the target's `document-saved`, off the keystroke,
+    // and it touches only the disk: nothing in the editor changes, so there is
+    // no wake to settle on. Poll the file itself, bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let executable = || {
+        std::fs::metadata(&target)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    while !executable() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run.sh was never made executable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_disallowed_target_writes_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = elsewhere.path().join("x.sh");
+    let doc = format!(
+        "#+begin_src sh :tangle inside.sh\na\n#+end_src\n\
+         #+begin_src sh :tangle {}\nb\n#+end_src\n",
+        outside.display()
+    );
+    let (mut editor, _loader) = tangle_editor(base.path(), &doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    assert!(!base.path().join("inside.sh").exists(), "all or nothing");
+    assert!(!outside.exists());
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("nothing tangled"), "{echo}");
+    assert!(echo.contains(&outside.display().to_string()), "{echo}");
+    assert!(echo.contains("org.babel.tangle-directories"), "{echo}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tangle_into_an_open_buffer_is_undoable() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let target = base.path().join("out.sh");
+    std::fs::write(&target, "old one\nold two\n").unwrap();
+    let doc = "#+begin_src sh :tangle out.sh\nnew\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    let notes = editor.document_buffer_id;
+    editor.do_edit(Some(target.clone()), false);
+    let opened = editor.document_buffer_id;
+    let _ = editor.activate_buffer(notes);
+    editor.publish_render_state();
+
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(on_disk(&target), "new\n");
+
+    let _ = editor.activate_buffer(opened);
+    editor.undo_blocking().expect("undo");
+    assert_eq!(
+        text(&editor),
+        "old one\nold two\n",
+        "one `u` restores the target"
+    );
+}
+
+/// `#+PROPERTY: header-args :tangle …` reaches every block, and `C-c C-v t`
+/// is the same command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_wide_property_tangle_applies() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+PROPERTY: header-args :tangle all.sh\n\
+               #+begin_src sh\na\n#+end_src\n\
+               #+begin_src sh :tangle no\nskipped\n#+end_src\n\
+               #+begin_src sh\nb\n#+end_src\n";
+    let (mut editor, _loader) = tangle_editor(base.path(), doc).await;
+    press(&mut editor, "<C-c><C-v>t");
+    assert_eq!(on_disk(&base.path().join("all.sh")), "a\n\nb\n");
+}

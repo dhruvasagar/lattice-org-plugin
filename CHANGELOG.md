@@ -31,6 +31,14 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   (`python`, `ruby`, `node`, `sh`) a block's result is its last expression,
   not what it printed. A block runs in `:dir`, or else in its file's
   directory.
+- **Babel tangles.** `C-c C-v t` (`:org-babel-tangle`) writes each block
+  with a `:tangle` to its file: `yes` is the org file's name with the
+  language's extension, and a path is relative to the org file. Blocks for
+  one file are joined in order (`:padline no` drops the blank line between),
+  and `:shebang` heads the file and makes it executable. Each file is
+  replaced whole, as one undo step if you have it open. Nothing is written
+  if any target is outside `org.directory` and
+  `org.babel.tangle-directories`.
 - **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
   its block changed, was deleted or closed before it finished. The echo used
   to name that buffer, but nothing ever created it.

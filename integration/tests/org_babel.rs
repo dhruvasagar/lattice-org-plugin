@@ -2088,3 +2088,30 @@ async fn a_value_survives_glued_output_and_the_output_cap() {
         "the noise was capped, not the value:\n{t}"
     );
 }
+
+/// Review: a block tangling to the org file it is in replaced the whole
+/// document with its code, and saved it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_cannot_tangle_into_its_own_file() {
+    require_component!();
+    for header in [
+        ":tangle yes",
+        ":tangle notes.org",
+        ":tangle ./sub/../notes.org",
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let doc = format!(
+            "#+begin_src sh :tangle out.sh\necho ok\n#+end_src\n\
+             #+begin_src org {header}\n* replaced\n#+end_src\n"
+        );
+        let (mut editor, _loader) = tangle_editor(base.path(), &doc).await;
+        ex(&mut editor, "org-babel-tangle");
+        let echo = last_echo(&editor).unwrap_or_default();
+        assert!(echo.contains("the file it is in"), "{header}: {echo}");
+        assert_eq!(text(&editor), doc, "{header}: the document is untouched");
+        assert!(
+            !base.path().join("out.sh").exists(),
+            "{header}: all or nothing"
+        );
+    }
+}

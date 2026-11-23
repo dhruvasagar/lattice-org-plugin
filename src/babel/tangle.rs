@@ -249,6 +249,18 @@ pub(crate) fn tangle(lines: &[&str], file: Option<&str>, languages: &[Language])
             text: "org: no source block here has a `:tangle`".to_string(),
         })];
     }
+    // A target that IS this file would replace the document being tangled
+    // with one block's code (`#+begin_src org :tangle yes` names exactly
+    // that) and save it. Refused whole, like any other refusal.
+    if let Some(own) = file.map(normalize) {
+        if let Some(t) = targets.iter().find(|t| t.path == own) {
+            return warn(format!(
+                "org: nothing tangled — a block tangles to {}, the file it is in, which would \
+                 replace it",
+                t.path
+            ));
+        }
+    }
     // All or nothing: one refusal and no file is touched, so a tangle never
     // leaves half its outputs from this run and half from the last.
     for t in &targets {

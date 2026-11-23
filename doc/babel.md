@@ -281,7 +281,9 @@ unlisted, so `:ls` does not fill up.
 Org may write only under `org.directory` and the directories in
 `org.babel.tangle-directories`. Every file is checked before any is
 written: if one is outside, nothing is tangled and the echo area names it.
-Directories are not created (no `:mkdirp`).
+A block that would tangle into the org file it is in (an `org` block with
+`:tangle yes` does) refuses the tangle the same way. Directories are not
+created (no `:mkdirp`).
 
 ## Keys and commands
 

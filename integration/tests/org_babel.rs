@@ -1556,3 +1556,139 @@ async fn file_wide_property_tangle_applies() {
     press(&mut editor, "<C-c><C-v>t");
     assert_eq!(on_disk(&base.path().join("all.sh")), "a\n\nb\n");
 }
+
+// ---------------------------------------------------------------------------
+// OB.11 — `:var`.
+// ---------------------------------------------------------------------------
+
+/// Run, in `lang`, a block taking every kind of `:var` value: a number, a
+/// quoted literal, a named table, and a named block's two-line result. The
+/// strings carry `'`, `"`, `$` and a newline, which a prelude that pasted
+/// them in would break on. Returns the block's result lines.
+async fn vars_in(lang: &str, command: &str, ext: &str, body: &str) -> String {
+    let base = tempfile::tempdir().unwrap();
+    let doc = format!(
+        "#+NAME: tbl\n| a | 1 |\n| b | 2 |\n\n\
+         #+NAME: prev\n#+begin_src {lang}\nx\n#+end_src\n\n\
+         #+RESULTS: prev\n: it's \"q\" $HOME\n: line two\n\n\
+         #+begin_src {lang} :results output :var n=41 s=\"say \\\"hi\\\" it's $HOME\" t=tbl r=prev\n\
+         {body}\n#+end_src\n"
+    );
+    let at = doc.lines().position(|l| l.contains(":var")).unwrap() as u32;
+    let record = vec![
+        ("name", lang),
+        ("command", command),
+        ("ext", ext),
+        ("value", lang),
+    ];
+    let (mut editor, _loader) = org_editor_with_records(base.path(), &doc, &[record]).await;
+    run_and_settle(&mut editor, at, |e| {
+        text(e).matches("#+RESULTS:").count() == 2
+    })
+    .await;
+    let t = text(&editor);
+    t.rsplit_once("#+RESULTS:\n")
+        .map(|(_, r)| r.to_string())
+        .unwrap_or(t)
+}
+
+const VARS_SEEN: &str = ": 42\n: say \"hi\" it's $HOME\n: b 3\n: it's \"q\" $HOME\n: line two\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_reaches_sh_as_strings() {
+    require_component!();
+    let body = "echo $((n + 1))\necho \"$s\"\n\
+                set -- $(printf '%s\\n' \"$t\" | sed -n 2p)\necho \"$1 $(($2 + 1))\"\n\
+                echo \"$r\"";
+    assert_eq!(vars_in("sh", "sh", "sh", body).await, VARS_SEEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_reaches_python_as_values() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let body = "print(n + 1)\nprint(s)\nprint(t[1][0], t[1][1] + 1)\nprint(r)";
+    assert_eq!(vars_in("python", "python3", "py", body).await, VARS_SEEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_reaches_ruby_as_values() {
+    require_component!();
+    if !have("ruby") {
+        return;
+    }
+    let body = "puts n + 1\nputs s\nputs \"#{t[1][0]} #{t[1][1] + 1}\"\nputs r";
+    assert_eq!(vars_in("ruby", "ruby", "rb", body).await, VARS_SEEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_reaches_node_as_values() {
+    require_component!();
+    if !have("node") {
+        return;
+    }
+    let body =
+        "console.log(n + 1)\nconsole.log(s)\nconsole.log(t[1][0], t[1][1] + 1)\nconsole.log(r)";
+    assert_eq!(vars_in("node", "node", "js", body).await, VARS_SEEN);
+}
+
+/// `:results value` sees the variables too: the prelude goes in before the
+/// value wrapper does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_is_seen_by_a_value_wrapper() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src python :var x=20\nx * 2 + 2\n#+end_src\n";
+    let record = vec![
+        ("name", "python"),
+        ("command", "python3"),
+        ("ext", "py"),
+        ("value", "python"),
+    ];
+    let (mut editor, _loader) = org_editor_with_records(base.path(), doc, &[record]).await;
+    run_and_settle(&mut editor, 0, has("#+RESULTS:")).await;
+    assert!(
+        text(&editor).ends_with("#+RESULTS:\n: 42\n"),
+        "{}",
+        text(&editor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_reference_runs_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :var x=nope\necho ran\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_records(
+        base.path(),
+        doc,
+        &[vec![("name", "sh"), ("command", "sh"), ("value", "sh")]],
+    )
+    .await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("`nope`"), "{echo}");
+    assert_eq!(text(&editor), doc, "nothing ran, nothing written");
+}
+
+/// A language whose record names no `value` has no prelude, and says which
+/// field to add rather than running the body with `x` unset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn var_in_a_language_without_a_prelude_is_refused_by_name() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :var x=1\necho $x\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 0);
+    press(&mut editor, "<C-c><C-c>");
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("cannot take `:var`"), "{echo}");
+    assert!(echo.contains("value = \"sh\""), "{echo}");
+    assert_eq!(text(&editor), doc);
+}

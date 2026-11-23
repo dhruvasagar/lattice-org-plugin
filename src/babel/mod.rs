@@ -14,6 +14,7 @@ pub(crate) mod jobs;
 pub(crate) mod results;
 pub(crate) mod run;
 mod tangle;
+mod vars;
 mod wrappers;
 
 use crate::lattice::plugin_host::buffer::Document;

@@ -114,6 +114,39 @@ ones still waiting their turn. A cancelled block keeps the result it had.
 `C-c C-v k` deletes the block's `#+RESULTS:` and the blank line above it.
 Running a block and then removing its result leaves the file as it was.
 
+## Handing a block values: `:var`
+
+`:var` binds a variable before the body runs:
+
+```org
+#+NAME: hosts
+| web | 10.0.0.5 |
+| db  | 10.0.0.6 |
+
+#+begin_src python :var rows=hosts n=2 who="ops"
+print(rows[n - 1][1], who)
+#+end_src
+```
+
+- A number (`n=2`) or a quoted string (`who="ops"`, with `\"` for a quote).
+- The name of a table, which becomes a list of rows. A number in a cell
+  arrives as a number.
+- The name of a block, which gives its `#+RESULTS:`: a table as rows, one
+  line that is a number as a number, anything else as text. The block is not
+  run again. One with no result yet refuses, and says to run it first.
+
+Several go on one `:var`, separated by spaces or commas. A name given in
+`#+PROPERTY:` or a headline's drawer and again on the block takes the
+block's.
+
+The variables are set by lines put ahead of the body, in the language its
+`org.babel.languages` entry names with `value`. python, ruby and node get
+real values (numbers, strings, lists of lists). sh gets strings, a table as
+lines of tab-separated cells. A language whose entry has no `value` cannot
+take `:var`, and the echo area says to add one. Indexing (`hosts[0]`),
+calling a block (`x=disk()`) and other files are not supported. Each is
+refused by name and nothing runs, as with a name that is not there.
+
 ## Tangling
 
 `C-c C-v t` (`:org-babel-tangle`) writes every block with a `:tangle` header

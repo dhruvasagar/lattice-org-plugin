@@ -39,6 +39,11 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   replaced whole, as one undo step if you have it open. Nothing is written
   if any target is outside `org.directory` and
   `org.babel.tangle-directories`.
+- **Babel's `:var`.** A block can take numbers, strings, a named table
+  (as rows) or a named block's `#+RESULTS:` as variables, set ahead of its
+  body. python, ruby and node get real values, and sh gets strings. A value
+  with quotes, `$` or a newline arrives intact. A name that is not in the
+  file refuses the run before anything starts.
 - **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
   its block changed, was deleted or closed before it finished. The echo used
   to name that buffer, but nothing ever created it.

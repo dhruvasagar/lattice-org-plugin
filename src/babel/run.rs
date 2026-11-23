@@ -125,13 +125,20 @@ thread_local! {
     static VALUE_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// What a block's `:results` and language make of a run: the spec, the
-/// wrapper, and whether `value` was asked for and cannot be had.
-pub(crate) fn plan(
-    lines: &[&str],
-    block: &SrcBlock,
-    lang: &Language,
-) -> Result<(ResultsSpec, Option<Wrapper>, bool), String> {
+/// What a block's header and language make of a run.
+pub(crate) struct Plan {
+    pub(crate) results: ResultsSpec,
+    pub(crate) wrapper: Option<Wrapper>,
+    /// `value` was asked for and cannot be had, so it runs as output.
+    pub(crate) fell_back: bool,
+    /// The `:var` assignments to put ahead of the body (OB.11); empty with
+    /// none.
+    pub(crate) prelude: String,
+}
+
+/// What a block's `:results`, `:var` and language make of a run, or why it
+/// cannot run.
+pub(crate) fn plan(lines: &[&str], block: &SrcBlock, lang: &Language) -> Result<Plan, String> {
     let wrapper = match &lang.value {
         None => None,
         Some(name) => Some(Wrapper::named(name).ok_or_else(|| {
@@ -147,7 +154,26 @@ pub(crate) fn plan(
     if fell_back {
         spec.collection = Collection::Output;
     }
-    Ok((spec, wrapper, fell_back))
+    // Resolved now, on the grammar seam, from the text the user sees: a bad
+    // reference refuses before the confirm, and nothing runs.
+    let vars = super::vars::resolve(lines, &header)?;
+    let prelude = match (wrapper, vars.is_empty()) {
+        (_, true) => String::new(),
+        (Some(w), false) => super::vars::prelude(w, &vars),
+        (None, false) => {
+            return Err(format!(
+                "org: {} cannot take `:var` — name its language in its org.babel.languages \
+                 entry: `value = \"sh\"` (or python, ruby, node)",
+                lang.name
+            ))
+        }
+    };
+    Ok(Plan {
+        results: spec,
+        wrapper,
+        fell_back,
+        prelude,
+    })
 }
 
 /// The directory of `doc`'s file, if it has one.
@@ -278,7 +304,12 @@ pub(crate) fn start(
     let mut notes = Vec::new();
     for (block, lang) in blocks {
         let key = BlockKey::of(lines, block).encode();
-        let (results, wrapper, fell_back) = match plan(lines, block, lang) {
+        let Plan {
+            results,
+            wrapper,
+            fell_back,
+            prelude,
+        } = match plan(lines, block, lang) {
             Ok(p) => p,
             Err(e) => return super::echo(EchoLevel::Error, e),
         };
@@ -306,7 +337,7 @@ pub(crate) fn start(
                 .clone()
                 .unwrap_or_else(|| vec!["{file}".to_string()]),
             ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
-            body: block.body.clone(),
+            body: format!("{prelude}{}", block.body),
             lang: block.lang.clone(),
             results,
             wrapper,

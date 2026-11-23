@@ -119,12 +119,21 @@ impl HeaderArgs {
 
     /// The words given for `key`, if it was given.
     pub(crate) fn get(&self, key: &str) -> Option<&[String]> {
-        // The LAST entry: for `var` that is one of several, which `vars`
+        // The LAST entry: for `var` that is one of several, which `all`
         // reads instead; for every other key there is only one.
         self.entries
             .iter()
             .rev()
             .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// Every entry given for `key`, outermost first — `:var`, which
+    /// accumulates across the levels instead of being replaced.
+    pub(crate) fn all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a [String]> + 'a {
+        self.entries
+            .iter()
+            .filter(move |(k, _)| k == key)
             .map(|(_, v)| v.as_slice())
     }
 

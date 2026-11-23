@@ -132,7 +132,7 @@ pub(crate) struct Results {
 }
 
 /// The value after a case-insensitive `#+<keyword>:` (indentation allowed).
-fn keyword_value<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+pub(crate) fn keyword_value<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
     let t = line.trim_start();
     let head = t.get(..keyword.len() + 3)?;
     let (marker, colon) = head.split_at(keyword.len() + 2);
@@ -162,7 +162,7 @@ fn results_keyword(line: &str) -> Option<(Option<String>, String)> {
 /// Undo org's escape of code lines that would otherwise read as org:
 /// `,*` and `,#+` (and `,,*` for a line that really began `,*`). One comma
 /// goes, the indentation stays.
-fn unescape(line: &str) -> String {
+pub(crate) fn unescape(line: &str) -> String {
     let indent = line.len() - line.trim_start().len();
     let rest = &line[indent..];
     match rest.strip_prefix(',') {

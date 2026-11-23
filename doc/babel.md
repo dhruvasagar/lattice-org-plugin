@@ -154,6 +154,40 @@ take `:var`, and the echo area says to add one. Indexing (`hosts[0]`),
 calling a block (`x=disk()`) and other files are not supported. Each is
 refused by name and nothing runs, as with a name that is not there.
 
+## Putting one block in another: noweb
+
+With `:noweb yes`, `<<name>>` in a body is replaced by the body of the block
+named `name` before the block runs or is tangled:
+
+```org
+#+NAME: connect
+#+begin_src python
+db = open_db()
+#+end_src
+
+#+begin_src python :noweb yes
+def report():
+    <<connect>>
+    return db.count()
+#+end_src
+```
+
+- What comes before `<<` on the line goes in front of every line put in its
+  place, and what follows `>>` after the last, so the reference above stays
+  indented inside `report`.
+- With no block named `connect`, the bodies of the blocks marked
+  `:noweb-ref connect` are used instead, one after another.
+- `<<name()>>` is the block's `#+RESULTS:` instead of its body. A block with
+  no result refuses, and arguments (`<<name(x=1)>>`) are not supported.
+- A block put in place is expanded in turn when its own `:noweb` allows it.
+  Blocks that would put each other in place refuse, and nothing runs.
+- A `<<...>>` that names nothing is left as written, so a shell heredoc
+  (`cat <<EOF`) is safe.
+
+`:noweb` says when: `yes` always, `tangle` only when tangling, `eval` only
+when running, `no` (the default) never. `no-export` and `strip-export` act
+as `yes`, since lattice does not export.
+
 ## Tangling
 
 `C-c C-v t` (`:org-babel-tangle`) writes every block with a `:tangle` header
@@ -172,6 +206,8 @@ echo one
   extension: `notes.org` tangles its python to `notes.py`. The `ext` in the
   language's `org.babel.languages` entry wins when it has one.
 - Any other value is a path, relative to the org file. `~` is your home.
+- A block's `:noweb` references are expanded in what is written, when its
+  `:noweb` is `yes` or `tangle`.
 - Blocks tangling to one file are joined in the order they appear, with a
   blank line between two of them unless the later says `:padline no`.
 - `:shebang` puts its line first and makes the file executable.

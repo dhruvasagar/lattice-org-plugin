@@ -140,6 +140,8 @@ pub(crate) struct Plan {
     pub(crate) fell_back: bool,
     /// `:var` (OB.11): values, or blocks earlier in the chain (OB.12).
     pub(crate) vars: Vec<(String, Binding)>,
+    /// The body as it runs: noweb-expanded when `:noweb` says so (OB.13).
+    pub(crate) body: String,
 }
 
 /// What a block's `:results`, `:var` and language make of a run, or why it
@@ -176,11 +178,13 @@ pub(crate) fn plan(
             lang.name
         ));
     }
+    let body = super::noweb::expand(lines, block, super::noweb::Context::Run)?;
     Ok(Plan {
         results: spec,
         wrapper,
         fell_back,
         vars,
+        body,
     })
 }
 
@@ -376,6 +380,7 @@ pub(crate) fn start(
             wrapper,
             fell_back,
             vars,
+            body,
         } = match plan(lines, block, lang, &scheduled) {
             Ok(p) => p,
             Err(e) => return super::echo(EchoLevel::Error, e),
@@ -405,7 +410,7 @@ pub(crate) fn start(
                 .clone()
                 .unwrap_or_else(|| vec!["{file}".to_string()]),
             ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
-            body: block.body.clone(),
+            body,
             name: block.name.clone(),
             vars,
             lang: block.lang.clone(),

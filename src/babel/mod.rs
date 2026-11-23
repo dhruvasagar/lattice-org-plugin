@@ -11,6 +11,7 @@
 pub(crate) mod block;
 pub(crate) mod header_args;
 pub(crate) mod jobs;
+mod noweb;
 pub(crate) mod results;
 pub(crate) mod run;
 mod tangle;

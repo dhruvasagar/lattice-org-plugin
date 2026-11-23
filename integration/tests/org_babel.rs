@@ -1786,3 +1786,76 @@ async fn a_failing_dependency_stops_the_chain_and_says_where() {
     );
     assert_eq!(t.matches("#+RESULTS:").count(), 1, "`b` never ran: {t}");
 }
+
+// ---------------------------------------------------------------------------
+// OB.13 — noweb.
+// ---------------------------------------------------------------------------
+
+/// An org editor that may both run `sh` and tangle under `base`.
+async fn noweb_editor(base: &std::path::Path, doc: &str) -> (Editor, Arc<PluginLoader>) {
+    let grant = vec![format!("fs:write:{}", base.display())];
+    let (mut editor, loader) = org_editor_with_caps(
+        base,
+        doc,
+        &grant,
+        &[vec![("name", "sh"), ("command", "sh")]],
+    )
+    .await;
+    set_org_option(&mut editor, "babel.confirm", "false");
+    (editor, loader)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noweb_yes_expands_a_block_before_it_runs() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: greet\n#+begin_src sh\necho hi\n#+end_src\n\n\
+               #+begin_src sh :noweb yes\n  <<greet>>\necho bye\n#+end_src\n";
+    let (mut editor, _loader) = noweb_editor(base.path(), doc).await;
+    run_and_settle(&mut editor, line_of(doc, ":noweb yes"), has("#+RESULTS:")).await;
+    assert!(
+        text(&editor).ends_with("#+RESULTS:\n: hi\n: bye\n"),
+        "{}",
+        text(&editor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noweb_tangle_expands_only_when_tangling() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: x\n#+begin_src sh\necho x\n#+end_src\n\n\
+               #+begin_src sh :noweb tangle :tangle out.sh\necho \"<<x>>\"\n#+end_src\n";
+    let (mut editor, _loader) = noweb_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(
+        std::fs::read_to_string(base.path().join("out.sh")).unwrap(),
+        "echo \"echo x\"\n",
+        "tangled: expanded"
+    );
+    run_and_settle(
+        &mut editor,
+        line_of(doc, ":noweb tangle"),
+        has("#+RESULTS:"),
+    )
+    .await;
+    assert!(
+        text(&editor).ends_with("#+RESULTS:\n: <<x>>\n"),
+        "run: as written — {}",
+        text(&editor)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_noweb_cycle_runs_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: a\n#+begin_src sh :noweb yes\n<<b>>\n#+end_src\n\n\
+               #+NAME: b\n#+begin_src sh :noweb yes\n<<a>>\n#+end_src\n";
+    let (mut editor, _loader) = noweb_editor(base.path(), doc).await;
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("a → b → a"), "{echo}");
+    assert_eq!(text(&editor), doc);
+}

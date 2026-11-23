@@ -49,6 +49,12 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   fresh result is the value. Chains run in order. A failure stops what
   depended on it and says which block it was, and blocks that need each
   other refuse before anything runs.
+- **Babel's noweb.** With `:noweb yes`, `<<name>>` in a body becomes the
+  named block's body (or the `:noweb-ref name` blocks'), indented as the
+  reference is, before the block runs or is tangled. `<<name()>>` becomes
+  its result. `:noweb tangle` expands only when tangling, and `eval` only
+  when running. A loop refuses, and a name that is not there is left
+  alone.
 - **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
   its block changed, was deleted or closed before it finished. The echo used
   to name that buffer, but nothing ever created it.

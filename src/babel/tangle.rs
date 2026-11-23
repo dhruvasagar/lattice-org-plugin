@@ -177,7 +177,8 @@ pub(crate) fn plan(
         if t.shebang.is_none() {
             t.shebang = shebang;
         }
-        t.parts.push((padline, block.body.clone()));
+        let body = super::noweb::expand(lines, &block, super::noweb::Context::Tangle)?;
+        t.parts.push((padline, body));
     }
     Ok(targets
         .into_iter()

@@ -38,7 +38,8 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   and `:shebang` heads the file and makes it executable. Each file is
   replaced whole, as one undo step if you have it open. Nothing is written
   if any target is outside `org.directory` and
-  `org.babel.tangle-directories`.
+  `org.babel.tangle-directories`. A block's `:var`s are written into the
+  file ahead of it, as readable assignments.
 - **Babel's `:var`.** A block can take numbers, strings, a named table
   (as rows) or a named block's `#+RESULTS:` as variables, set ahead of its
   body. python, ruby and node get real values, and sh gets strings. A value

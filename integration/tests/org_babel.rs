@@ -1563,14 +1563,14 @@ async fn file_wide_property_tangle_applies() {
 
 /// Run, in `lang`, a block taking every kind of `:var` value: a number, a
 /// quoted literal, a named table, and a named block's two-line result. The
-/// strings carry `'`, `"`, `$` and a newline, which a prelude that pasted
-/// them in would break on. Returns the block's result lines.
+/// strings carry `'`, `"`, `$`, `#{…}` (ruby interpolation) and a newline,
+/// which a prelude that pasted them in unescaped would break on. Returns the block's result lines.
 async fn vars_in(lang: &str, command: &str, ext: &str, body: &str) -> String {
     let base = tempfile::tempdir().unwrap();
     let doc = format!(
         "#+NAME: tbl\n| a | 1 |\n| b | 2 |\n\n\
          #+NAME: prev\n#+begin_src {lang}\nx\n#+end_src\n\n\
-         #+RESULTS: prev\n: it's \"q\" $HOME\n: line two\n\n\
+         #+RESULTS: prev\n: it's \"q\" $HOME #{{x}}\n: line two\n\n\
          #+begin_src {lang} :results output :var n=41 s=\"say \\\"hi\\\" it's $HOME\" t=tbl r=prev\n\
          {body}\n#+end_src\n"
     );
@@ -1592,7 +1592,8 @@ async fn vars_in(lang: &str, command: &str, ext: &str, body: &str) -> String {
         .unwrap_or(t)
 }
 
-const VARS_SEEN: &str = ": 42\n: say \"hi\" it's $HOME\n: b 3\n: it's \"q\" $HOME\n: line two\n";
+const VARS_SEEN: &str =
+    ": 42\n: say \"hi\" it's $HOME\n: b 3\n: it's \"q\" $HOME #{x}\n: line two\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn var_reaches_sh_as_strings() {
@@ -1858,4 +1859,31 @@ async fn a_noweb_cycle_runs_nothing() {
     let echo = last_echo(&editor).unwrap_or_default();
     assert!(echo.contains("a → b → a"), "{echo}");
     assert_eq!(text(&editor), doc);
+}
+
+/// A tangled block's `:var`s go into the file as readable assignments ahead
+/// of its body, as babel writes them; the file is code someone reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tangle_writes_a_blocks_vars_ahead_of_it() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: hosts\n| web | 1 |\n\n\
+               #+begin_src python :tangle yes :var n=5 rows=hosts\nprint(n, rows)\n#+end_src\n";
+    let grant = vec![format!("fs:write:{}", base.path().display())];
+    let (mut editor, _loader) = org_editor_with_caps(
+        base.path(),
+        doc,
+        &grant,
+        &[vec![
+            ("name", "python"),
+            ("command", "python3"),
+            ("value", "python"),
+        ]],
+    )
+    .await;
+    ex(&mut editor, "org-babel-tangle");
+    assert_eq!(
+        std::fs::read_to_string(base.path().join("notes.py")).unwrap(),
+        "n = 5\nrows = [[\"web\",1]]\nprint(n, rows)\n"
+    );
 }

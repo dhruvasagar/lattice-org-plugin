@@ -208,6 +208,9 @@ echo one
 - Any other value is a path, relative to the org file. `~` is your home.
 - A block's `:noweb` references are expanded in what is written, when its
   `:noweb` is `yes` or `tangle`.
+- A block's `:var`s are written ahead of it as plain assignments
+  (`n = 5`), in the language its `value` names. One with no `value` is
+  written without them, and the echo area says so.
 - Blocks tangling to one file are joined in the order they appear, with a
   blank line between two of them unless the later says `:padline no`.
 - `:shebang` puts its line first and makes the file executable.

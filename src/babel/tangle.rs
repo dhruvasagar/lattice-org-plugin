@@ -32,6 +32,8 @@ pub(crate) struct Target {
     pub(crate) blocks: usize,
     /// It has a `:shebang`, so it is made executable.
     pub(crate) executable: bool,
+    /// What was written without something the blocks asked for.
+    pub(crate) notes: Vec<String>,
 }
 
 /// A header argument as one string, quotes stripped: `:shebang "#!/bin/sh"`.
@@ -149,6 +151,7 @@ pub(crate) fn plan(
         path: String,
         shebang: Option<String>,
         parts: Vec<(bool, String)>,
+        notes: Vec<String>,
     }
     let mut targets: Vec<Building> = Vec::new();
     for block in src_blocks(lines) {
@@ -169,6 +172,7 @@ pub(crate) fn plan(
                     path,
                     shebang: None,
                     parts: Vec::new(),
+                    notes: Vec::new(),
                 });
                 targets.len() - 1
             }
@@ -177,7 +181,25 @@ pub(crate) fn plan(
         if t.shebang.is_none() {
             t.shebang = shebang;
         }
-        let body = super::noweb::expand(lines, &block, super::noweb::Context::Tangle)?;
+        let mut body = super::noweb::expand(lines, &block, super::noweb::Context::Tangle)?;
+        // `:var` goes into the file as the run would set it, as babel's
+        // `org-babel-expand-body` writes it: readable assignments first.
+        let vars = super::vars::resolve_ready(lines, &header)?;
+        if !vars.is_empty() {
+            let wrapper = languages
+                .iter()
+                .find(|l| l.name == block.lang)
+                .and_then(|l| l.value.as_deref())
+                .and_then(super::wrappers::Wrapper::named);
+            match wrapper {
+                Some(w) => body = format!("{}{body}", super::vars::prelude(w, &vars)),
+                None => t.notes.push(format!(
+                    "org: {}'s `:var` is not in it — {} names no `value` in \
+                     org.babel.languages",
+                    t.path, block.lang
+                )),
+            }
+        }
         t.parts.push((padline, body));
     }
     Ok(targets
@@ -202,6 +224,7 @@ pub(crate) fn plan(
                 text,
                 blocks: t.parts.len(),
                 executable: t.shebang.is_some(),
+                notes: t.notes,
             }
         })
         .collect())
@@ -240,6 +263,7 @@ pub(crate) fn tangle(lines: &[&str], file: Option<&str>, languages: &[Language])
     let mut effects = Vec::new();
     let mut notes = Vec::new();
     for t in &targets {
+        notes.extend(t.notes.iter().cloned());
         if t.executable {
             if let Err(e) = host_services::store_put(&chmod_key(&t.path), t.path.as_bytes()) {
                 notes.push(format!("org: {} will not be made executable: {e}", t.path));

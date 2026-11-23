@@ -7,9 +7,13 @@
 //! `value` names. The prelude goes in before the value wrapper runs, so
 //! `:results value` sees the variables too.
 //!
-//! Values cross as hex, as the wrappers' bodies do. Python, ruby and node
-//! decode JSON from hex; sh gets a single-quoted string. No quote,
-//! backslash, `$` or newline in a value can end the literal it is in.
+//! Values are written as READABLE literals, because a tangled file keeps
+//! them: `n = 5`, `rows = [["a", 1]]`. JSON's literal syntax is a valid
+//! python and JS expression for numbers, strings and lists, and ruby's
+//! with `#` escaped too (`#{…}` interpolates in a ruby string). sh gets a
+//! single-quoted string. Every string is escaped by the one encoder here,
+//! so no quote, backslash, `$`, `#` or newline in a value can end the
+//! literal it is in.
 
 use serde::{Deserialize, Serialize};
 
@@ -294,17 +298,32 @@ pub(crate) fn resolve(
     Ok(out)
 }
 
-fn hex(s: &str) -> String {
-    s.bytes().map(|b| format!("{b:02x}")).collect()
+/// [`resolve`] outside a chain, as a tangle reads its blocks: with nothing
+/// scheduled before, every reference is read from the file.
+pub(crate) fn resolve_ready(
+    lines: &[&str],
+    header: &HeaderArgs,
+) -> Result<Vec<(String, Value)>, String> {
+    Ok(resolve(lines, header, &[])?
+        .into_iter()
+        .filter_map(|(n, b)| match b {
+            Binding::Ready(v) => Some((n, v)),
+            // Only a scheduled name becomes `After`, and none is.
+            Binding::After(_) => None,
+        })
+        .collect())
 }
 
-fn json(v: &Value, out: &mut String) {
+/// `v` as a literal: JSON's syntax, which python and JS read as written.
+/// `ruby` also escapes `#`, which would start interpolation there.
+fn literal(v: &Value, ruby: bool, out: &mut String) {
     match v {
         Value::Number(n) => out.push_str(n),
         Value::Str(s) => {
             out.push('"');
             for c in s.chars() {
                 match c {
+                    '#' if ruby => out.push_str("\\#"),
                     '"' => out.push_str("\\\""),
                     '\\' => out.push_str("\\\\"),
                     '\n' => out.push_str("\\n"),
@@ -327,7 +346,7 @@ fn json(v: &Value, out: &mut String) {
                     if j > 0 {
                         out.push(',');
                     }
-                    json(cell, out);
+                    literal(cell, ruby, out);
                 }
                 out.push(']');
             }
@@ -336,9 +355,9 @@ fn json(v: &Value, out: &mut String) {
     }
 }
 
-fn to_json(v: &Value) -> String {
+fn literal_of(v: &Value, ruby: bool) -> String {
     let mut s = String::new();
-    json(v, &mut s);
+    literal(v, ruby, &mut s);
     s
 }
 
@@ -360,28 +379,13 @@ pub(crate) fn prelude(wrapper: Wrapper, vars: &[(String, Value)]) -> String {
         return String::new();
     }
     let mut out = String::new();
-    match wrapper {
-        Wrapper::Python => out.push_str("import json as __ob_json\n"),
-        Wrapper::Ruby => out.push_str("require \"json\"\n"),
-        Wrapper::Node | Wrapper::Sh => {}
-    }
     for (name, v) in vars {
         let line = match wrapper {
             // `'…'` holds anything but `'`, which closes, escapes and reopens.
             Wrapper::Sh => format!("{name}='{}'", sh_text(v).replace('\'', r"'\''")),
-            Wrapper::Python => format!(
-                "{name} = __ob_json.loads(bytes.fromhex(\"{}\").decode(\"utf-8\"))",
-                hex(&to_json(v))
-            ),
-            // Wrapped in an array: not every `json` takes a bare scalar.
-            Wrapper::Ruby => format!(
-                "{name} = JSON.parse([\"{}\"].pack(\"H*\").force_encoding(\"UTF-8\"))[0]",
-                hex(&format!("[{}]", to_json(v)))
-            ),
-            Wrapper::Node => format!(
-                "var {name} = JSON.parse(Buffer.from(\"{}\", \"hex\").toString(\"utf8\"));",
-                hex(&to_json(v))
-            ),
+            Wrapper::Python => format!("{name} = {}", literal_of(v, false)),
+            Wrapper::Ruby => format!("{name} = {}", literal_of(v, true)),
+            Wrapper::Node => format!("var {name} = {};", literal_of(v, false)),
         };
         out.push_str(&line);
         out.push('\n');
@@ -497,13 +501,23 @@ mod tests {
     }
 
     #[test]
-    fn preludes_cannot_be_escaped() {
-        let v = vec![("q".to_string(), s("it's \"$HOME\"\n\\"))];
-        assert_eq!(prelude(Wrapper::Sh, &v), "q='it'\\''s \"$HOME\"\n\\'\n");
-        for w in [Wrapper::Python, Wrapper::Ruby, Wrapper::Node] {
-            let p = prelude(w, &v);
-            assert!(!p.contains("HOME"), "{w:?}: the value is not in the clear");
-        }
+    fn preludes_are_readable_and_cannot_be_escaped() {
+        let v = vec![("q".to_string(), s("it's \"$HOME\" #{x}\n\\"))];
+        assert_eq!(
+            prelude(Wrapper::Sh, &v),
+            "q='it'\\''s \"$HOME\" #{x}\n\\'\n"
+        );
+        assert_eq!(
+            prelude(Wrapper::Python, &v),
+            "q = \"it's \\\"$HOME\\\" #{x}\\n\\\\\"\n"
+        );
+        assert_eq!(
+            prelude(Wrapper::Ruby, &v),
+            "q = \"it's \\\"$HOME\\\" \\#{x}\\n\\\\\"\n",
+            "ruby's `#{{` cannot interpolate"
+        );
+        let t = vec![("t".to_string(), Value::Table(vec![vec![s("a"), n("1")]]))];
+        assert_eq!(prelude(Wrapper::Node, &t), "var t = [[\"a\",1]];\n");
         assert_eq!(prelude(Wrapper::Python, &[]), "");
     }
 

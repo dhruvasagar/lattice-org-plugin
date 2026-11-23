@@ -2042,3 +2042,49 @@ async fn a_language_without_session_args_refuses_a_session() {
     assert!(echo.contains("session-args"), "names the field: {echo}");
     assert_eq!(text(&editor), doc, "nothing ran");
 }
+
+/// Review: a block whose last output has no newline glued the end sentinel
+/// onto it, the session never saw the end, and every later block waited
+/// forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_block_ending_without_a_newline_still_ends() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\nprintf abc\n#+end_src\n\n\
+               #+begin_src sh :session\necho next\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    run_at(&mut editor, "printf abc", has(": abc")).await;
+    run_at(&mut editor, "echo next", has(": next")).await;
+}
+
+/// Review: a value sentinel glued to output, and a value past the output
+/// cap, were both lost: the whole raw output became the result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_value_survives_glued_output_and_the_output_cap() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src python :results value\nprint('no newline', end='')\n41 + 1\n#+end_src\n\n\
+               #+begin_src python :results value\nfor i in range(50):\n    print(i)\n'kept'\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_records(
+        base.path(),
+        doc,
+        &[vec![
+            ("name", "python"),
+            ("command", "python3"),
+            ("value", "python"),
+        ]],
+    )
+    .await;
+    set_org_option(&mut editor, "babel.max-output-lines", "5");
+    ex(&mut editor, "org-babel-execute-buffer");
+    settle(&mut editor, has(": kept")).await;
+    let t = text(&editor);
+    assert!(t.contains(": 42"), "{t}");
+    assert!(
+        !t.contains("truncated"),
+        "the noise was capped, not the value:\n{t}"
+    );
+}

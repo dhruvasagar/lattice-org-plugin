@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 
-use super::jobs::{self, echo, post, Finished, OUTPUT_BUFFER};
+use super::jobs::{self, echo, post, Finished, Output, OUTPUT_BUFFER};
 use super::results::Collection;
 use super::run::RunRequest;
 use super::vars::{prelude, Value};
@@ -71,8 +71,7 @@ struct Block {
 /// The block a session is running.
 struct Running {
     block: Block,
-    output: Vec<String>,
-    dropped: usize,
+    output: Output,
     /// How many of the block's two end sentinels have come.
     ends: u8,
 }
@@ -200,10 +199,10 @@ fn pump(job: u64) {
         }
         let block = session.queue.pop_front()?;
         let line = format!("{}\n", block.line);
+        let output = Output::new(block.value.clone(), block.request.max_lines);
         session.current = Some(Running {
             block,
-            output: Vec::new(),
-            dropped: 0,
+            output,
             ends: 0,
         });
         Some(line)
@@ -227,14 +226,15 @@ pub(crate) fn on_output(job: u64, lines: Vec<String>) -> Option<Vec<String>> {
         let session = s.get_mut(&job)?;
         let running = session.current.as_mut()?;
         for line in lines {
-            if line == running.block.end {
+            // At the END of a line: a block whose last output had no newline
+            // (`printf abc`) leaves the sentinel glued to it.
+            if let Some(before) = line.strip_suffix(running.block.end.as_str()) {
+                if !before.is_empty() && running.ends < 2 {
+                    running.output.push(before.to_string());
+                }
                 running.ends += 1;
             } else if running.ends < 2 {
-                if running.output.len() < running.block.request.max_lines {
-                    running.output.push(line);
-                } else {
-                    running.dropped += 1;
-                }
+                running.output.push(line);
             }
         }
         if running.ends >= 2 {
@@ -255,8 +255,6 @@ fn finished(r: Running) -> Finished {
         request: r.block.request,
         rest: r.block.rest,
         output: r.output,
-        dropped: r.dropped,
-        sentinel: r.block.value,
     }
 }
 

@@ -187,14 +187,6 @@ fn hex(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The value in `output`: the lines after the LAST sentinel line. `None` when
-/// the sentinel never came — the body failed before it — and the caller
-/// keeps the whole output, which is what says why.
-pub(crate) fn after_sentinel(output: &[String], sentinel: &str) -> Option<Vec<String>> {
-    let at = output.iter().rposition(|l| l == sentinel)?;
-    Some(output[at + 1..].to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,16 +208,6 @@ mod tests {
             Wrapper::Sh.wrap("echo hi", "SENT"),
             ("echo hi".to_string(), false)
         );
-    }
-
-    #[test]
-    fn the_value_is_what_follows_the_last_sentinel() {
-        let out: Vec<String> = ["noise", "S", "printed S", "S", "42"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(after_sentinel(&out, "S"), Some(vec!["42".to_string()]));
-        assert_eq!(after_sentinel(&out[..1], "S"), None);
     }
 
     #[test]

@@ -14,7 +14,6 @@ use super::block::BlockKey;
 use super::results::{format, insertion_edit, Collection, Insertion};
 use super::run::{claim_key, RunRequest, RUN_PREFIX};
 use super::vars::{prelude, value_of_result, Binding, Value};
-use super::wrappers::after_sentinel;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     ApplyEditPayload, EchoLevel, EchoPayload, Edit, EditKind, Effect, GutterDecoration, GutterSign,
@@ -36,13 +35,70 @@ struct Job {
     request: RunRequest,
     /// The rest of its batch, started when this one finishes.
     rest: Vec<RunRequest>,
-    /// The line a value wrapper prints before the value, if it was wrapped.
-    sentinel: Option<String>,
     /// The guest path of the script, removed at finish.
     script: String,
-    output: Vec<String>,
-    /// Lines past `max_lines`, counted and dropped.
-    dropped: usize,
+    output: Output,
+}
+
+/// A run's output as it arrives, capped at `max-output-lines`.
+///
+/// With a value sentinel (`:results value`), the cap applies on each side of
+/// it. Whatever the body printed is noise, and the value after the sentinel
+/// is the result, so a body that prints past the cap still has its value
+/// kept. A sentinel is found at the END of a line: a body whose last output
+/// had no newline (`print("a", end="")`) leaves it glued to that text.
+pub(crate) struct Output {
+    sentinel: Option<String>,
+    max: usize,
+    lines: Vec<String>,
+    /// Where the sentinel line is in `lines`, once it has come.
+    value_at: Option<usize>,
+    dropped_before: usize,
+    dropped_after: usize,
+}
+
+impl Output {
+    pub(crate) fn new(sentinel: Option<String>, max: usize) -> Self {
+        Self {
+            sentinel,
+            max,
+            lines: Vec::new(),
+            value_at: None,
+            dropped_before: 0,
+            dropped_after: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, line: String) {
+        if self.value_at.is_none() && self.sentinel.as_deref().is_some_and(|s| line.ends_with(s)) {
+            self.value_at = Some(self.lines.len());
+            self.lines.push(line);
+            return;
+        }
+        let (kept, dropped) = match self.value_at {
+            Some(at) => (self.lines.len() - at - 1, &mut self.dropped_after),
+            None => (self.lines.len(), &mut self.dropped_before),
+        };
+        if kept < self.max {
+            self.lines.push(line);
+        } else {
+            *dropped += 1;
+        }
+    }
+
+    /// The result: what followed the sentinel when it came, everything
+    /// otherwise, since a body that failed before its value printed why. A
+    /// final line counts what the cap dropped from it.
+    pub(crate) fn into_result(mut self) -> Vec<String> {
+        let (mut out, dropped) = match self.value_at {
+            Some(at) => (self.lines.split_off(at + 1), self.dropped_after),
+            None => (self.lines, self.dropped_before),
+        };
+        if dropped > 0 {
+            out.push(format!("… {dropped} lines truncated"));
+        }
+        out
+    }
 }
 
 thread_local! {
@@ -201,12 +257,10 @@ pub(crate) fn start_next(mut runs: Vec<RunRequest>) {
             j.borrow_mut().insert(
                 id,
                 Job {
+                    output: Output::new(sentinel, request.max_lines),
                     request,
                     rest,
-                    sentinel,
                     script,
-                    output: Vec::new(),
-                    dropped: 0,
                 },
             );
         }),
@@ -263,11 +317,7 @@ pub(crate) fn on_output(id: u64, lines: Vec<String>) {
     JOBS.with(|j| {
         if let Some(job) = j.borrow_mut().get_mut(&id) {
             for line in lines {
-                if job.output.len() < job.request.max_lines {
-                    job.output.push(line);
-                } else {
-                    job.dropped += 1;
-                }
+                job.output.push(line);
             }
         }
     });
@@ -287,8 +337,6 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
             request: job.request,
             rest: job.rest,
             output: job.output,
-            dropped: job.dropped,
-            sentinel: job.sentinel,
         },
         outcome,
     );
@@ -300,11 +348,7 @@ pub(crate) struct Finished {
     pub(crate) request: RunRequest,
     /// The rest of its batch.
     pub(crate) rest: Vec<RunRequest>,
-    pub(crate) output: Vec<String>,
-    /// Lines past `max_lines`, counted and dropped.
-    pub(crate) dropped: usize,
-    /// The line a value is printed after, when `:results value` has one.
-    pub(crate) sentinel: Option<String>,
+    pub(crate) output: Output,
 }
 
 /// Put a finished run's result back, or say where it went, and start the
@@ -324,15 +368,7 @@ pub(crate) fn complete(job: Finished, outcome: Result<(), String>) {
         return;
     }
     let mut rest = job.rest;
-    let mut output = match &job.sentinel {
-        // No sentinel means the body failed before its value: the whole
-        // output is what says why.
-        Some(s) => after_sentinel(&job.output, s).unwrap_or(job.output),
-        None => job.output,
-    };
-    if job.dropped > 0 {
-        output.push(format!("… {} lines truncated", job.dropped));
-    }
+    let mut output = job.output.into_result();
     let mut effects = Vec::new();
     if let Err(e) = &outcome {
         // A program that never started has written nothing; its reason is
@@ -474,6 +510,43 @@ pub(crate) fn running_signs(buffer: u64) -> Vec<GutterDecoration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect(sentinel: Option<&str>, max: usize, lines: &[&str]) -> Vec<String> {
+        let mut o = Output::new(sentinel.map(str::to_string), max);
+        for l in lines {
+            o.push(l.to_string());
+        }
+        o.into_result()
+    }
+
+    #[test]
+    fn the_value_is_what_follows_the_sentinel_even_glued_to_output() {
+        assert_eq!(collect(Some("S"), 10, &["noise", "S", "42"]), ["42"]);
+        assert_eq!(collect(Some("S"), 10, &["no newline S", "42"]), ["42"]);
+        assert_eq!(
+            collect(Some("S"), 10, &["Traceback", "boom"]),
+            ["Traceback", "boom"],
+            "no sentinel: the body failed, and all of it says why"
+        );
+    }
+
+    #[test]
+    fn printing_past_the_cap_keeps_the_value() {
+        let mut lines = vec!["x"; 50];
+        lines.extend(["S", "42"]);
+        assert_eq!(collect(Some("S"), 5, &lines), ["42"]);
+        assert_eq!(
+            collect(None, 2, &["a", "b", "c"]),
+            ["a", "b", "… 1 lines truncated"]
+        );
+        let mut long = vec!["S"];
+        long.extend(["v"; 4]);
+        assert_eq!(
+            collect(Some("S"), 2, &long),
+            ["v", "v", "… 2 lines truncated"],
+            "a long value is capped too"
+        );
+    }
 
     #[test]
     fn a_block_runs_in_its_dir_or_its_files_dir() {

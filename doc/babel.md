@@ -188,6 +188,64 @@ def report():
 when running, `no` (the default) never. `no-export` and `strip-export` act
 as `yes`, since lattice does not export.
 
+## Sessions: `:session`
+
+A block with `:session` runs in an interpreter that stays alive, so what one
+block defines the next can use:
+
+```org
+#+begin_src python :session
+rows = load("disk.csv")
+#+end_src
+
+#+begin_src python :session :results value
+len(rows)
+#+end_src
+```
+
+`:session name` picks a session by name, and a bare `:session` is the
+language's default one. Each session belongs to one buffer, so two files
+never share one. `:session none` (the default) runs the block as a script.
+
+A language has sessions only when its entry says how to start one, with
+`session-args`, and names a value wrapper:
+
+```toml
+[[org.babel.languages]]
+name         = "python"
+command      = "python3"
+value        = "python"
+session-args = ["-u", "-c", "{driver}"]
+
+[[org.babel.languages]]
+name         = "sh"
+command      = "sh"
+value        = "sh"
+session-args = []        # sh reads its commands from stdin as it is
+```
+
+`{driver}` is a small program, built into the wrapper, that the
+interpreter runs instead of its own prompt. It reads the blocks one at a time
+and runs each where the last one left off. Ruby and node take it with `-e`
+(`["-e", "{driver}"]`). Without `{driver}`, python, ruby or node would never
+read a block. A prompt would end up in the results, so the driver is used
+instead.
+
+A session starts when its first block runs, in that block's directory. It
+runs one block at a time; a block whose session is busy waits for it. An
+error in a block is printed as its result and the session carries on. In
+node, `let` and `const` last from block to block. Running a block that
+declares one again is an error, which `var` avoids.
+
+A session ends:
+- when you close its buffer;
+- on `:org-babel-cancel`, which also cancels a block it is running;
+- when the interpreter exits, for example on an `exit` in a block.
+
+Running a block afterwards starts a fresh session, so `:org-babel-cancel` is
+also how you reset one. `*org-babel*` (`:org-babel-output`) logs each
+session's start and end.
+
 ## Tangling
 
 `C-c C-v t` (`:org-babel-tangle`) writes every block with a `:tangle` header
@@ -234,7 +292,7 @@ Directories are not created (no `:mkdirp`).
 | `C-c C-v s` | `:org-babel-execute-subtree` | run every block under the headline |
 | `C-c C-v k` | `:org-babel-remove-result` | delete the block's `#+RESULTS:` |
 | `C-c C-v t` | `:org-babel-tangle` | write the `:tangle` blocks to their files |
-| | `:org-babel-cancel` | stop the blocks running in this buffer |
+| | `:org-babel-cancel` | stop the blocks running in this buffer, and end its sessions |
 | | `:org-babel-output` | show `*org-babel*`, where output with no block to go to lands |
 
 `C-c C-c` anywhere outside a source block is org's, as before.
@@ -245,7 +303,7 @@ Directories are not created (no `:mkdirp`).
 |---|---|---|
 | `org.babel.enabled` | `true` | `false` turns babel off and leaves the rest of org on |
 | `org.babel.confirm` | `true` | ask before running a block |
-| `org.babel.languages` | none | what blocks may run (above) |
+| `org.babel.languages` | none | what blocks may run, and how to start their sessions (above) |
 | `org.babel.tangle-directories` | none | where tangling may write, besides `org.directory` |
 | `org.babel.min-lines-for-block-output` | `10` | results this long become an `#+begin_example` block |
 | `org.babel.max-output-lines` | `10000` | output past this is counted, not kept |

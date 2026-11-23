@@ -49,11 +49,11 @@ thread_local! {
     static JOBS: RefCell<HashMap<u64, Job>> = RefCell::new(HashMap::new());
 }
 
-fn echo(level: EchoLevel, text: String) -> Effect {
+pub(crate) fn echo(level: EchoLevel, text: String) -> Effect {
     Effect::Echo(EchoPayload { level, text })
 }
 
-fn post(effects: Vec<Effect>) {
+pub(crate) fn post(effects: Vec<Effect>) {
     // `err` only when the editor wired nowhere to post to — then there is
     // no one to tell either.
     let _ = host_services::post_effects(&effects);
@@ -69,7 +69,10 @@ pub(crate) fn sweep() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    for key in host_services::store_keys(RUN_PREFIX) {
+    for key in host_services::store_keys(RUN_PREFIX)
+        .into_iter()
+        .chain(host_services::store_keys(super::session::SESSION_PREFIX))
+    {
         let _ = host_services::store_delete(&key);
     }
 }
@@ -82,8 +85,17 @@ pub(crate) fn on_run(payload: &[u8]) {
     start_next(batch);
 }
 
+/// `request` could not start, and so `rest`, which was to follow it, does
+/// not either: their claims go, and the echo says why.
+pub(crate) fn not_started(request: &RunRequest, rest: &[RunRequest], text: String) {
+    release(std::slice::from_ref(request));
+    release(rest);
+    host_services::refresh_decorations();
+    post(vec![echo(EchoLevel::Error, text)]);
+}
+
 /// Forget the claims of runs that will not start now.
-fn release(runs: &[RunRequest]) {
+pub(crate) fn release(runs: &[RunRequest]) {
     for r in runs {
         let _ = host_services::store_delete(&claim_key(r.buffer, &r.key));
     }
@@ -107,7 +119,7 @@ fn ready_vars(request: &RunRequest) -> Result<Vec<(String, Value)>, String> {
 /// cannot start stops the batch — what follows it was meant to follow it.
 /// A run whose `:var` waits on a block that failed is skipped, and says so;
 /// the rest go on, and any waiting on IT are skipped in turn (OB.12).
-fn start_next(mut runs: Vec<RunRequest>) {
+pub(crate) fn start_next(mut runs: Vec<RunRequest>) {
     let mut skipped = Vec::new();
     let (request, vars) = loop {
         if runs.is_empty() {
@@ -137,13 +149,13 @@ fn start_next(mut runs: Vec<RunRequest>) {
         host_services::refresh_decorations();
         post(skipped);
     }
+    // OB.15: a `:session` block goes to its session, which reports it as
+    // this function's jobs are reported, and starts the rest after it.
+    if request.session.is_some() {
+        return super::session::submit(request, runs, &vars);
+    }
     let rest = runs;
-    let fail = |text: String| {
-        release(std::slice::from_ref(&request));
-        release(&rest);
-        host_services::refresh_decorations();
-        post(vec![echo(EchoLevel::Error, text)]);
-    };
+    let fail = |text: String| not_started(&request, &rest, text);
     let Some(host_dir) = host_services::data_dir() else {
         return fail("org: babel needs this plugin's data directory, and it has none".to_string());
     };
@@ -209,7 +221,7 @@ fn start_next(mut runs: Vec<RunRequest>) {
 /// when relative; without `:dir`, the file's directory; with neither, the
 /// editor's (an empty `cwd`). A `:dir` that is not a directory is
 /// `spawn-process`'s refusal, reported as the block not starting.
-fn working_dir(dir: Option<&str>, base: Option<&str>) -> String {
+pub(crate) fn working_dir(dir: Option<&str>, base: Option<&str>) -> String {
     match (dir.map(crate::roam_scan::expand_tilde), base) {
         (Some(d), Some(b)) if !d.starts_with('/') => format!("{}/{d}", b.trim_end_matches('/')),
         (Some(d), _) => d,
@@ -239,11 +251,15 @@ pub(crate) fn on_cancel(payload: &[u8]) {
     for id in ids {
         host_services::cancel_job(id);
     }
+    super::session::end_all(buffer, super::session::Ending::Cancelled);
     host_services::refresh_decorations();
 }
 
 /// `job-output`: keep the lines, up to the cap.
 pub(crate) fn on_output(id: u64, lines: Vec<String>) {
+    let Some(lines) = super::session::on_output(id, lines) else {
+        return;
+    };
     JOBS.with(|j| {
         if let Some(job) = j.borrow_mut().get_mut(&id) {
             for line in lines {
@@ -259,10 +275,41 @@ pub(crate) fn on_output(id: u64, lines: Vec<String>) {
 
 /// `job-finished`: put the result back, or say where it went.
 pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
+    let Some(outcome) = super::session::on_finished(id, outcome) else {
+        return;
+    };
     let Some(job) = JOBS.with(|j| j.borrow_mut().remove(&id)) else {
         return;
     };
     let _ = std::fs::remove_file(&job.script);
+    complete(
+        Finished {
+            request: job.request,
+            rest: job.rest,
+            output: job.output,
+            dropped: job.dropped,
+            sentinel: job.sentinel,
+        },
+        outcome,
+    );
+}
+
+/// A block's run, over: a script's process exited, or a session printed the
+/// block's end (OB.15).
+pub(crate) struct Finished {
+    pub(crate) request: RunRequest,
+    /// The rest of its batch.
+    pub(crate) rest: Vec<RunRequest>,
+    pub(crate) output: Vec<String>,
+    /// Lines past `max_lines`, counted and dropped.
+    pub(crate) dropped: usize,
+    /// The line a value is printed after, when `:results value` has one.
+    pub(crate) sentinel: Option<String>,
+}
+
+/// Put a finished run's result back, or say where it went, and start the
+/// rest of its batch.
+pub(crate) fn complete(job: Finished, outcome: Result<(), String>) {
     let _ = host_services::store_delete(&claim_key(job.request.buffer, &job.request.key));
     host_services::refresh_decorations();
 

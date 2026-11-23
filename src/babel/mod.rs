@@ -14,6 +14,7 @@ pub(crate) mod jobs;
 mod noweb;
 pub(crate) mod results;
 pub(crate) mod run;
+mod session;
 mod tangle;
 mod vars;
 mod wrappers;
@@ -106,6 +107,10 @@ pub(crate) struct Language {
     pub(crate) args: Option<Vec<String>>,
     /// The script's extension. Absent means the language's name.
     pub(crate) ext: Option<String>,
+    /// How to start the interpreter as a `:session` (OB.15): its arguments,
+    /// where `{driver}` is the value wrapper's session driver. Absent means
+    /// the language has no sessions, and `:session` is refused.
+    pub(crate) session_args: Option<Vec<String>>,
     /// The built-in wrapper `:results value` uses (`python`, `ruby`,
     /// `node`, `sh`). Absent means the language has none, and `value`
     /// falls back to `output` (design §5.2).
@@ -137,8 +142,9 @@ pub(crate) fn register_options() {
         "The languages source blocks may run, one `[[org.babel.languages]]` \
          per language: `name` (the word after `#+begin_src`), `command` (the \
          program), `args` (default `[\"{file}\"]`, the block written to a \
-         script), `ext` (the script's extension) and `value` (a built-in \
-         `:results value` wrapper). Empty by default, and this list is also \
+         script), `ext` (the script's extension), `value` (a built-in \
+         `:results value` wrapper) and `session-args` (how to start it as a \
+         `:session`; `{driver}` is the wrapper's driver). Empty by default, and this list is also \
          what org may run: a program is run only if it is a `command` here.",
     );
     let _ = crate::config_shape::register_option::<Vec<String>>(
@@ -254,7 +260,7 @@ pub(crate) fn register_grammar() {
         ),
         (
             "org-babel-cancel",
-            "Stop the source blocks running in this buffer.",
+            "Stop the source blocks running in this buffer, and end its sessions.",
             CANCEL,
         ),
         (
@@ -285,6 +291,8 @@ pub(crate) fn register_events() {
                 EventKind::JobFinished,
                 // OB.10: a `:shebang` target is made executable once saved.
                 EventKind::DocumentSaved,
+                // OB.15: a buffer's sessions end with it.
+                EventKind::DocumentClosed,
             ]),
             path_globs: None,
             major_modes: None,
@@ -300,6 +308,7 @@ pub(crate) fn on_job_event(ev: Event) {
         Event::JobOutput(o) => jobs::on_output(o.id, o.lines),
         Event::JobFinished(f) => jobs::on_finished(f.id, f.outcome),
         Event::DocumentSaved(d) => tangle::on_saved(&d.path),
+        Event::DocumentClosed(id) => session::on_closed(id),
         _ => {}
     }
 }

@@ -31,6 +31,13 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   (`python`, `ruby`, `node`, `sh`) a block's result is its last expression,
   not what it printed. A block runs in `:dir`, or else in its file's
   directory.
+- **Babel sessions.** A block with `:session` runs in an interpreter that
+  stays alive, so what one block defines the next can use. `:session name`
+  picks a session by name; each belongs to one buffer and runs one block at a
+  time. A language gets sessions from its entry's `session-args`
+  (`["-u", "-c", "{driver}"]` for python, `[]` for sh). A session ends when
+  its buffer closes, on `:org-babel-cancel`, or when the interpreter exits.
+  `*org-babel*` logs each start and end.
 - **Babel tangles.** `C-c C-v t` (`:org-babel-tangle`) writes each block
   with a `:tangle` to its file: `yes` is the org file's name with the
   language's extension, and a path is relative to the org file. Blocks for

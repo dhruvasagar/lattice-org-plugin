@@ -74,6 +74,11 @@ pub(crate) struct RunRequest {
     pub(crate) min_block: usize,
     /// `org.babel.max-output-lines`.
     pub(crate) max_lines: usize,
+    /// `:session` (OB.15): the session's name, `""` for the language's
+    /// default one; `None` runs the block as a script.
+    pub(crate) session: Option<String>,
+    /// The language's `session-args`, `{driver}` filled in.
+    pub(crate) session_args: Vec<String>,
 }
 
 /// The whole buffer, in one crossing.
@@ -142,6 +147,8 @@ pub(crate) struct Plan {
     pub(crate) vars: Vec<(String, Binding)>,
     /// The body as it runs: noweb-expanded when `:noweb` says so (OB.13).
     pub(crate) body: String,
+    /// `:session` (OB.15) and the arguments that start it.
+    pub(crate) session: Option<(String, Vec<String>)>,
 }
 
 /// What a block's `:results`, `:var` and language make of a run, or why it
@@ -179,13 +186,71 @@ pub(crate) fn plan(
         ));
     }
     let body = super::noweb::expand(lines, block, super::noweb::Context::Run)?;
+    let session = session_of(&header, lang, wrapper)?;
     Ok(Plan {
         results: spec,
         wrapper,
         fell_back,
         vars,
         body,
+        session,
     })
+}
+
+/// `:session`: its name (`""` for a bare `:session`, the language's default)
+/// and the arguments that start it, or `None` for `none` and no header. A
+/// session runs each block through its wrapper's driver, so it needs the
+/// record to say how to start one, and a wrapper to drive it.
+fn session_of(
+    header: &super::header_args::HeaderArgs,
+    lang: &Language,
+    wrapper: Option<Wrapper>,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let Some(words) = header.get("session") else {
+        return Ok(None);
+    };
+    let name = words.join(" ").trim().trim_matches('"').to_string();
+    if name.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let Some(args) = &lang.session_args else {
+        return Err(format!(
+            "org: {} has no sessions — give its org.babel.languages entry `session-args` \
+             (see the babel guide's Sessions)",
+            lang.name
+        ));
+    };
+    let Some(wrapper) = wrapper else {
+        return Err(format!(
+            "org: a {} `:session` needs a value wrapper — name it in its org.babel.languages \
+             entry: `value = \"sh\"` (or python, ruby, node)",
+            lang.name
+        ));
+    };
+    let driver = wrapper.driver();
+    let mut filled = Vec::with_capacity(args.len());
+    for a in args {
+        if !a.contains("{driver}") {
+            filled.push(a.clone());
+            continue;
+        }
+        let Some(d) = driver else {
+            return Err(format!(
+                "org: {}'s session-args name `{{driver}}`, and its wrapper has none — sh reads \
+                 its commands from stdin, so leave it out",
+                lang.name
+            ));
+        };
+        filled.push(a.replace("{driver}", d));
+    }
+    if driver.is_some() && !args.iter().any(|a| a.contains("{driver}")) {
+        return Err(format!(
+            "org: {}'s session-args must pass `{{driver}}` to the interpreter, which is what \
+             reads the blocks (see the babel guide's Sessions)",
+            lang.name
+        ));
+    }
+    Ok(Some((name, filled)))
 }
 
 /// The directory of `doc`'s file, if it has one.
@@ -381,6 +446,7 @@ pub(crate) fn start(
             fell_back,
             vars,
             body,
+            session,
         } = match plan(lines, block, lang, &scheduled) {
             Ok(p) => p,
             Err(e) => return super::echo(EchoLevel::Error, e),
@@ -420,6 +486,8 @@ pub(crate) fn start(
             base: base.map(str::to_string),
             min_block,
             max_lines,
+            session: session.as_ref().map(|(n, _)| n.clone()),
+            session_args: session.map(|(_, a)| a).unwrap_or_default(),
         });
     }
     let bytes = match rmp_serde::to_vec(&batch) {
@@ -449,18 +517,32 @@ pub(crate) fn start(
 }
 
 /// `:org-babel-cancel`: the events seam owns the jobs, so ask it.
+/// It ends the buffer's sessions too, idle ones included (OB.15): cancelling
+/// is how a session is reset.
 pub(crate) fn cancel(buffer: u32) -> Vec<Effect> {
     let running = host_services::store_keys(&buffer_prefix(buffer)).len();
-    if running == 0 {
+    let sessions = host_services::store_keys(&super::session::buffer_prefix(buffer)).len();
+    if running == 0 && sessions == 0 {
         return super::echo(EchoLevel::Info, "org: no source block is running here");
     }
     host_services::emit_event(EV_CANCEL, buffer.to_string().as_bytes());
-    let what = if running == 1 {
-        "1 block".to_string()
-    } else {
-        format!("{running} blocks")
+    let count = |n: usize, one: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {one}s")
+        }
     };
-    super::echo(EchoLevel::Info, format!("org: cancelling {what}"))
+    let what = match (running, sessions) {
+        (_, 0) => format!("cancelling {}", count(running, "block")),
+        (0, _) => format!("ending {}", count(sessions, "session")),
+        _ => format!(
+            "cancelling {} and ending {}",
+            count(running, "block"),
+            count(sessions, "session")
+        ),
+    };
+    super::echo(EchoLevel::Info, format!("org: {what}"))
 }
 
 #[cfg(test)]
@@ -534,8 +616,77 @@ mod tests {
             command: name.to_string(),
             args: None,
             ext: None,
+            session_args: None,
             value: None,
         }
+    }
+
+    fn session(
+        lang: &Language,
+        value: Option<Wrapper>,
+        header: &str,
+    ) -> Result<Option<(String, Vec<String>)>, String> {
+        let text = format!("#+begin_src {} {header}\nx\n#+end_src\n", lang.name);
+        let lines: Vec<&str> = text.lines().collect();
+        let block = super::super::block::src_blocks(&lines).remove(0);
+        session_of(
+            &super::super::block::effective_header_args(&lines, &block),
+            lang,
+            value,
+        )
+    }
+
+    #[test]
+    fn a_session_needs_session_args_a_wrapper_and_the_driver() {
+        let mut py = lang("python");
+        assert_eq!(
+            session(&py, Some(Wrapper::Python), "").unwrap(),
+            None,
+            "no header"
+        );
+        assert_eq!(
+            session(&py, Some(Wrapper::Python), ":session none").unwrap(),
+            None
+        );
+        let e = session(&py, Some(Wrapper::Python), ":session").unwrap_err();
+        assert!(e.contains("python has no sessions"), "{e}");
+
+        py.session_args = Some(vec!["-c".to_string(), "{driver}".to_string()]);
+        let (name, args) = session(&py, Some(Wrapper::Python), ":session main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(name, "main");
+        assert_eq!(
+            args[1],
+            Wrapper::Python.driver().unwrap(),
+            "{{driver}} filled in"
+        );
+        assert_eq!(
+            session(&py, Some(Wrapper::Python), ":session")
+                .unwrap()
+                .unwrap()
+                .0,
+            "",
+            "a bare :session is the default one"
+        );
+        let e = session(&py, None, ":session").unwrap_err();
+        assert!(e.contains("value wrapper"), "{e}");
+
+        py.session_args = Some(vec!["-i".to_string()]);
+        let e = session(&py, Some(Wrapper::Python), ":session").unwrap_err();
+        assert!(
+            e.contains("{driver}"),
+            "a driver-less python would read nothing: {e}"
+        );
+
+        let mut sh = lang("sh");
+        sh.session_args = Some(vec!["{driver}".to_string()]);
+        let e = session(&sh, Some(Wrapper::Sh), ":session").unwrap_err();
+        assert!(e.contains("sh reads"), "{e}");
+        sh.session_args = Some(Vec::new());
+        assert!(session(&sh, Some(Wrapper::Sh), ":session")
+            .unwrap()
+            .is_some());
     }
 
     #[test]

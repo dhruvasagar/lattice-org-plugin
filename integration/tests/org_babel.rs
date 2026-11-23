@@ -226,7 +226,7 @@ async fn org_editor_with_caps(
                     fields
                         .iter()
                         .map(|(k, v)| {
-                            let value = if *k == "args" {
+                            let value = if *k == "args" || *k == "session-args" {
                                 ConfigValue::List(
                                     v.split_whitespace()
                                         .map(|a| ConfigValue::Str(a.to_string()))
@@ -1886,4 +1886,159 @@ async fn tangle_writes_a_blocks_vars_ahead_of_it() {
         std::fs::read_to_string(base.path().join("notes.py")).unwrap(),
         "n = 5\nrows = [[\"web\",1]]\nprint(n, rows)\n"
     );
+}
+
+// ---- OB.15: `:session` ---------------------------------------------------
+
+/// `sh` with sessions, as a user would configure it: no `{driver}`, since sh
+/// reads its commands from stdin.
+async fn session_editor(base: &std::path::Path, doc: &str) -> (Editor, Arc<PluginLoader>) {
+    org_editor_with_records(
+        base,
+        doc,
+        &[vec![
+            ("name", "sh"),
+            ("command", "sh"),
+            ("value", "sh"),
+            ("session-args", ""),
+        ]],
+    )
+    .await
+}
+
+/// Run the block whose line holds `needle` and wait until `done`.
+async fn run_at(editor: &mut Editor, needle: &str, done: impl Fn(&Editor) -> bool) {
+    let line = line_of(&text(editor), needle);
+    run_and_settle(editor, line, done).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_persists_between_blocks_in_a_session() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\nx=42; cd /\n#+end_src\n\n\
+               #+begin_src sh :session\necho \"x is $x in $(pwd)\"\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    run_at(&mut editor, "x=42", has("#+RESULTS:")).await;
+    run_at(&mut editor, "echo \"x is", has(": x is 42 in /")).await;
+
+    // Cancelling with nothing running ends the session: the reset.
+    ex(&mut editor, "org-babel-cancel");
+    assert_eq!(last_echo(&editor).as_deref(), Some("org: ending 1 session"));
+    let fresh = base.path().display().to_string();
+    let want = format!(": x is  in {fresh}");
+    run_at(&mut editor, "echo \"x is", move |e| text(e).contains(&want)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_are_independent() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session a\nx=1\n#+end_src\n\n\
+               #+begin_src sh :session b\necho \"b[$x]\"\n#+end_src\n\n\
+               #+begin_src sh :session a\necho \"a[$x]\"\n#+end_src\n\n\
+               #+begin_src sh\necho \"script[$x]\"\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-execute-buffer");
+    settle(&mut editor, has(": script[]")).await;
+    let t = text(&editor);
+    assert!(t.contains(": b[]"), "b never saw a's x:\n{t}");
+    assert!(t.contains(": a[1]"), "a kept its own:\n{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_the_buffer_ends_its_sessions() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\necho \"pid $$\"\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    run_at(&mut editor, "echo", has(": pid ")).await;
+    let t = text(&editor);
+    let pid = t
+        .lines()
+        .find_map(|l| l.strip_prefix(": pid "))
+        .expect("the session printed its pid")
+        .to_string();
+    let alive = |pid: &str| {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    assert!(alive(&pid), "the session outlives its block");
+    ex(&mut editor, "bd!");
+    // The process is the host's to end, on the plugin's word; nothing in
+    // the editor changes, so this waits on the process itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive(&pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!alive(&pid), "the session ({pid}) ended with its buffer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_that_never_prints_the_sentinel_can_be_cancelled() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\nsleep 1000\n#+end_src\n\n\
+               #+begin_src sh :session\necho again\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+    assert_eq!(signed_lines(&editor).await, [0]);
+    ex(&mut editor, "org-babel-cancel");
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("org: cancelling 1 block and ending 1 session")
+    );
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("org: the sh block was cancelled")
+    })
+    .await;
+    assert_eq!(text(&editor), doc, "a cancelled block writes nothing");
+    assert!(signed_lines(&editor).await.is_empty(), "the sign is gone");
+    // The session went with it; the next block starts a new one.
+    run_at(&mut editor, "echo again", has(": again")).await;
+}
+
+/// Through a real interpreter's driver: `:results value` in a python
+/// session sees what an earlier block defined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_python_session_keeps_state_and_gives_values() {
+    require_component!();
+    if !have("python3") {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src python :session :results output\nx = 41\nprint('set')\n#+end_src\n\n\
+               #+begin_src python :session :results value\nx + 1\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_records(
+        base.path(),
+        doc,
+        &[vec![
+            ("name", "python"),
+            ("command", "python3"),
+            ("value", "python"),
+            ("session-args", "-u -c {driver}"),
+        ]],
+    )
+    .await;
+    ex(&mut editor, "org-babel-execute-buffer");
+    settle(&mut editor, has(": 42")).await;
+    assert!(text(&editor).contains(": set"), "{}", text(&editor));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_language_without_session_args_refuses_a_session() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\necho hi\n#+end_src\n";
+    let (mut editor, _loader) = org_editor_with_languages(base.path(), doc, &[("sh", "sh")]).await;
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("sh has no sessions"), "{echo}");
+    assert!(echo.contains("session-args"), "names the field: {echo}");
+    assert_eq!(text(&editor), doc, "nothing ran");
 }

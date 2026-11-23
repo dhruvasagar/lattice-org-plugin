@@ -44,6 +44,11 @@ Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
   body. python, ruby and node get real values, and sh gets strings. A value
   with quotes, `$` or a newline arrives intact. A name that is not in the
   file refuses the run before anything starts.
+- **Babel runs what a block needs first.** When a `:var` names a block with
+  no result yet, that block runs first, under the same question, and its
+  fresh result is the value. Chains run in order. A failure stops what
+  depended on it and says which block it was, and blocks that need each
+  other refuse before anything runs.
 - **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
   its block changed, was deleted or closed before it finished. The echo used
   to name that buffer, but nothing ever created it.

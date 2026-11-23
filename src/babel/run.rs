@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use super::block::{BlockKey, SrcBlock};
 use super::results::{Collection, ResultsSpec};
+use super::vars::Binding;
 use super::wrappers::Wrapper;
 use super::Language;
 use crate::lattice::plugin_host::buffer::Document;
@@ -50,7 +51,13 @@ pub(crate) struct RunRequest {
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
     pub(crate) ext: String,
+    /// The body as written; the `:var` prelude goes ahead of it at start,
+    /// once every binding is known.
     pub(crate) body: String,
+    /// `#+NAME:`, which later blocks in the chain wait on (OB.12).
+    pub(crate) name: Option<String>,
+    /// `:var`, in order: values, or the earlier block each waits on.
+    pub(crate) vars: Vec<(String, Binding)>,
     /// The block's language, for `:results code`.
     pub(crate) lang: String,
     /// The effective `:results`, parsed.
@@ -131,14 +138,19 @@ pub(crate) struct Plan {
     pub(crate) wrapper: Option<Wrapper>,
     /// `value` was asked for and cannot be had, so it runs as output.
     pub(crate) fell_back: bool,
-    /// The `:var` assignments to put ahead of the body (OB.11); empty with
-    /// none.
-    pub(crate) prelude: String,
+    /// `:var` (OB.11): values, or blocks earlier in the chain (OB.12).
+    pub(crate) vars: Vec<(String, Binding)>,
 }
 
 /// What a block's `:results`, `:var` and language make of a run, or why it
-/// cannot run.
-pub(crate) fn plan(lines: &[&str], block: &SrcBlock, lang: &Language) -> Result<Plan, String> {
+/// cannot run. `scheduled` names the blocks running before it in the same
+/// chain, whose fresh results its `:var`s take.
+pub(crate) fn plan(
+    lines: &[&str],
+    block: &SrcBlock,
+    lang: &Language,
+    scheduled: &[String],
+) -> Result<Plan, String> {
     let wrapper = match &lang.value {
         None => None,
         Some(name) => Some(Wrapper::named(name).ok_or_else(|| {
@@ -156,23 +168,19 @@ pub(crate) fn plan(lines: &[&str], block: &SrcBlock, lang: &Language) -> Result<
     }
     // Resolved now, on the grammar seam, from the text the user sees: a bad
     // reference refuses before the confirm, and nothing runs.
-    let vars = super::vars::resolve(lines, &header)?;
-    let prelude = match (wrapper, vars.is_empty()) {
-        (_, true) => String::new(),
-        (Some(w), false) => super::vars::prelude(w, &vars),
-        (None, false) => {
-            return Err(format!(
-                "org: {} cannot take `:var` — name its language in its org.babel.languages \
-                 entry: `value = \"sh\"` (or python, ruby, node)",
-                lang.name
-            ))
-        }
-    };
+    let vars = super::vars::resolve(lines, &header, scheduled)?;
+    if !vars.is_empty() && wrapper.is_none() {
+        return Err(format!(
+            "org: {} cannot take `:var` — name its language in its org.babel.languages \
+             entry: `value = \"sh\"` (or python, ruby, node)",
+            lang.name
+        ));
+    }
     Ok(Plan {
         results: spec,
         wrapper,
         fell_back,
-        prelude,
+        vars,
     })
 }
 
@@ -199,15 +207,17 @@ pub(crate) fn check<'a>(
     }
     let languages = super::languages().map_err(|e| super::echo(EchoLevel::Error, e))?;
     let mut out = Vec::with_capacity(blocks.len());
+    let mut scheduled = Vec::new();
     for block in blocks {
         // Emacs refuses a buffer run that meets a language it cannot run,
         // rather than skipping it; so does this.
         let Some(lang) = languages.iter().find(|l| l.name == block.lang) else {
             return Err(super::unconfigured(&block.lang));
         };
-        if let Err(e) = plan(lines, block, lang) {
+        if let Err(e) = plan(lines, block, lang, &scheduled) {
             return Err(super::echo(EchoLevel::Error, e));
         }
+        scheduled.extend(block.name.clone());
         if is_running(buffer, lines, block) {
             return Err(super::echo(
                 EchoLevel::Info,
@@ -269,14 +279,70 @@ pub(crate) fn unpack(lines: &[&str], packed: &str) -> Option<Vec<SrcBlock>> {
         .collect()
 }
 
+/// `blocks` with what they need run first (OB.12): a block a `:var` names
+/// that has no `#+RESULTS:`, or that is in this run anyway, runs before the
+/// block naming it, and each block runs once. A cycle over names refuses the
+/// whole run before anything starts.
+pub(crate) fn expand(lines: &[&str], blocks: &[SrcBlock]) -> Result<Vec<SrcBlock>, String> {
+    fn visit(
+        lines: &[&str],
+        all: &[SrcBlock],
+        asked: &[SrcBlock],
+        block: &SrcBlock,
+        order: &mut Vec<SrcBlock>,
+        path: &mut Vec<SrcBlock>,
+    ) -> Result<(), String> {
+        let same = |b: &SrcBlock| b.begin_line == block.begin_line;
+        if order.iter().any(same) {
+            return Ok(());
+        }
+        if let Some(at) = path.iter().position(same) {
+            let names: Vec<String> = path[at..]
+                .iter()
+                .chain(std::iter::once(block))
+                .map(|b| b.name.clone().unwrap_or_else(|| label(b)))
+                .collect();
+            return Err(format!(
+                "org: these blocks need each other's results ({}); nothing ran",
+                names.join(" → ")
+            ));
+        }
+        path.push(block.clone());
+        let header = super::block::effective_header_args(lines, block);
+        for name in super::vars::references(&header) {
+            let Some(dep) = all.iter().find(|b| b.name.as_deref() == Some(&name)) else {
+                continue;
+            };
+            let in_run = asked.iter().any(|b| b.begin_line == dep.begin_line);
+            if dep.results.is_none() || in_run {
+                visit(lines, all, asked, dep, order, path)?;
+            }
+        }
+        path.pop();
+        order.push(block.clone());
+        Ok(())
+    }
+    let all = super::block::src_blocks(lines);
+    let mut order = Vec::new();
+    for b in blocks {
+        visit(lines, &all, blocks, b, &mut order, &mut Vec::new())?;
+    }
+    Ok(order)
+}
+
 /// Ask before running `blocks` — or, with `org.babel.confirm` off, run them.
+/// What they need is run first, and asked about in the same question.
 pub(crate) fn confirm_or_start(
     buffer: u32,
     lines: &[&str],
     blocks: &[SrcBlock],
     base: Option<&str>,
 ) -> Vec<Effect> {
-    let checked = match check(buffer, lines, blocks) {
+    let blocks = match expand(lines, blocks) {
+        Ok(b) => b,
+        Err(e) => return super::echo(EchoLevel::Error, e),
+    };
+    let checked = match check(buffer, lines, &blocks) {
         Ok(c) => c,
         Err(echo) => return echo,
     };
@@ -302,17 +368,19 @@ pub(crate) fn start(
     let max_lines = number_option("babel.max-output-lines", 10_000);
     let mut batch = Vec::with_capacity(blocks.len());
     let mut notes = Vec::new();
+    let mut scheduled = Vec::new();
     for (block, lang) in blocks {
         let key = BlockKey::of(lines, block).encode();
         let Plan {
             results,
             wrapper,
             fell_back,
-            prelude,
-        } = match plan(lines, block, lang) {
+            vars,
+        } = match plan(lines, block, lang, &scheduled) {
             Ok(p) => p,
             Err(e) => return super::echo(EchoLevel::Error, e),
         };
+        scheduled.extend(block.name.clone());
         if fell_back && !VALUE_NOTED.with(|n| n.replace(true)) {
             notes.extend(super::echo(
                 EchoLevel::Info,
@@ -337,7 +405,9 @@ pub(crate) fn start(
                 .clone()
                 .unwrap_or_else(|| vec!["{file}".to_string()]),
             ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
-            body: format!("{prelude}{}", block.body),
+            body: block.body.clone(),
+            name: block.name.clone(),
+            vars,
             lang: block.lang.clone(),
             results,
             wrapper,
@@ -392,6 +462,66 @@ pub(crate) fn cancel(buffer: u32) -> Vec<Effect> {
 mod tests {
     use super::super::block::src_blocks;
     use super::*;
+
+    fn names(blocks: &[SrcBlock]) -> Vec<String> {
+        blocks
+            .iter()
+            .map(|b| b.name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    fn named(lines: &[&str], name: &str) -> SrcBlock {
+        src_blocks(lines)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(name))
+            .unwrap()
+    }
+
+    #[test]
+    fn what_a_block_needs_runs_first_and_once() {
+        let doc = "#+NAME: a\n#+begin_src sh\nx\n#+end_src\n\
+                   #+NAME: b\n#+begin_src sh :var x=a\nx\n#+end_src\n\
+                   #+NAME: c\n#+begin_src sh :var y=b z=a\nx\n#+end_src\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        let order = expand(&lines, &[named(&lines, "c")]).unwrap();
+        assert_eq!(names(&order), ["a", "b", "c"]);
+        // The whole buffer: `a` and `b` are in the run already, and run once.
+        let order = expand(&lines, &src_blocks(&lines)).unwrap();
+        assert_eq!(names(&order), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_result_in_the_file_is_read_not_rerun() {
+        let doc = "#+NAME: a\n#+begin_src sh\nx\n#+end_src\n\n#+RESULTS: a\n: 1\n\n\
+                   #+NAME: b\n#+begin_src sh :var x=a\nx\n#+end_src\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        assert_eq!(
+            names(&expand(&lines, &[named(&lines, "b")]).unwrap()),
+            ["b"]
+        );
+    }
+
+    #[test]
+    fn a_later_block_in_the_run_moves_before_what_needs_it() {
+        let doc = "#+NAME: b\n#+begin_src sh :var x=a\nx\n#+end_src\n\
+                   #+NAME: a\n#+begin_src sh\nx\n#+end_src\n\n#+RESULTS: a\n: old\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        assert_eq!(
+            names(&expand(&lines, &src_blocks(&lines)).unwrap()),
+            ["a", "b"],
+            "`a` runs in this run anyway, so `b` takes its fresh result"
+        );
+    }
+
+    #[test]
+    fn a_cycle_names_itself() {
+        let doc = "#+NAME: a\n#+begin_src sh :var x=b\nx\n#+end_src\n\
+                   #+NAME: b\n#+begin_src sh :var y=a\nx\n#+end_src\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        let e = expand(&lines, &[named(&lines, "a")]).unwrap_err();
+        assert!(e.contains("a → b → a"), "{e}");
+        assert!(e.contains("nothing ran"), "{e}");
+    }
 
     fn lang(name: &str) -> Language {
         Language {

@@ -11,18 +11,29 @@
 //! decode JSON from hex; sh gets a single-quoted string. No quote,
 //! backslash, `$` or newline in a value can end the literal it is in.
 
+use serde::{Deserialize, Serialize};
+
 use super::block::{keyword_value, src_blocks, unescape, SrcBlock};
 use super::header_args::HeaderArgs;
 use super::wrappers::Wrapper;
 
 /// A resolved `:var` value.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Value {
     /// Written as a JSON number: babel reads `5` and `: 5` as numbers.
     Number(String),
     Str(String),
     /// Rows of cells, horizontal rules dropped.
     Table(Vec<Vec<Value>>),
+}
+
+/// A variable's value, or the block it waits on (OB.12): one that runs
+/// earlier in the same chain, whose fresh result is the value. The events
+/// seam fills it when that block finishes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Binding {
+    Ready(Value),
+    After(String),
 }
 
 /// Whether `s` is a number as JSON writes one, so it can cross as-is.
@@ -136,19 +147,26 @@ fn table_rows<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Vec<Value>> {
         .collect()
 }
 
-/// A named block's `#+RESULTS:` as a value: a table when it is one, else its
-/// text, a number when that is one line that reads as one.
+/// A named block's `#+RESULTS:` as a value ([`value_of_result`]).
 fn result_value(lines: &[&str], block: &SrcBlock) -> Option<Value> {
     let r = block.results.as_ref()?;
-    let body: Vec<&str> = lines
-        .get(r.keyword_line as usize + 1..=r.end_line as usize)
-        .unwrap_or_default()
-        .to_vec();
+    Some(value_of_result(
+        lines
+            .get(r.keyword_line as usize + 1..=r.end_line as usize)
+            .unwrap_or_default(),
+    ))
+}
+
+/// The lines under a `#+RESULTS:` as a value: a table when they are one,
+/// else their text, a number when that is one line that reads as one. Read
+/// from the file for a block that is not run, and from a fresh result's
+/// lines for one that ran earlier in the chain, so both read alike.
+pub(crate) fn value_of_result(body: &[&str]) -> Value {
     if body
         .first()
         .is_some_and(|l| l.trim_start().starts_with('|'))
     {
-        return Some(Value::Table(table_rows(body.into_iter())));
+        return Value::Table(table_rows(body.iter().copied()));
     }
     let wrapped = body
         .first()
@@ -172,10 +190,10 @@ fn result_value(lines: &[&str], block: &SrcBlock) -> Option<Value> {
             })
             .collect()
     };
-    Some(match text.as_slice() {
+    match text.as_slice() {
         [one] => scalar(one),
         _ => Value::Str(text.join("\n")),
-    })
+    }
 }
 
 /// The table under the `#+NAME: name` line, when one is there.
@@ -192,7 +210,34 @@ fn named_table(lines: &[&str], name: &str) -> Option<Value> {
 }
 
 /// What `value` (the right of one `name=value`) means.
-fn resolve_one(lines: &[&str], blocks: &[SrcBlock], value: &str) -> Result<Value, String> {
+fn resolve_one(
+    lines: &[&str],
+    blocks: &[SrcBlock],
+    scheduled: &[String],
+    value: &str,
+) -> Result<Binding, String> {
+    if is_reference(value) && scheduled.iter().any(|s| s == value) {
+        return Ok(Binding::After(value.to_string()));
+    }
+    resolve_literal(lines, blocks, value).map(Binding::Ready)
+}
+
+/// Whether `value` (the right of one `name=value`) is a reference, not a
+/// literal: what a block's name could be.
+fn is_reference(value: &str) -> bool {
+    !value.starts_with('"') && !json_number(value) && !value.contains(['[', '(', ':'])
+}
+
+/// The names a block's `:var`s refer to: what may be a block to run first.
+pub(crate) fn references(header: &HeaderArgs) -> Vec<String> {
+    assignments(header)
+        .into_iter()
+        .filter_map(|a| Some(a.split_once('=')?.1.to_string()))
+        .filter(|v| is_reference(v))
+        .collect()
+}
+
+fn resolve_literal(lines: &[&str], blocks: &[SrcBlock], value: &str) -> Result<Value, String> {
     if let Some(s) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
         let mut out = String::new();
         let mut chars = s.chars();
@@ -225,9 +270,14 @@ fn resolve_one(lines: &[&str], blocks: &[SrcBlock], value: &str) -> Result<Value
 /// The variables a block's `header` declares, resolved against `lines`, in
 /// order. A name bound at two levels takes the innermost binding (the
 /// block's over its headline's over the file's), in the outer one's place.
-pub(crate) fn resolve(lines: &[&str], header: &HeaderArgs) -> Result<Vec<(String, Value)>, String> {
+/// A reference to a block in `scheduled` waits for that block's run.
+pub(crate) fn resolve(
+    lines: &[&str],
+    header: &HeaderArgs,
+    scheduled: &[String],
+) -> Result<Vec<(String, Binding)>, String> {
     let blocks = src_blocks(lines);
-    let mut out: Vec<(String, Value)> = Vec::new();
+    let mut out: Vec<(String, Binding)> = Vec::new();
     for a in assignments(header) {
         let Some((name, value)) = a.split_once('=') else {
             return Err(format!("org: `:var {a}` needs a value — `:var {a}=…`"));
@@ -235,7 +285,7 @@ pub(crate) fn resolve(lines: &[&str], header: &HeaderArgs) -> Result<Vec<(String
         if !identifier(name) {
             return Err(format!("org: `:var {name}` is not a variable name"));
         }
-        let value = resolve_one(lines, &blocks, value)?;
+        let value = resolve_one(lines, &blocks, scheduled, value)?;
         match out.iter_mut().find(|(n, _)| n == name) {
             Some(slot) => slot.1 = value,
             None => out.push((name.to_string(), value)),
@@ -350,7 +400,29 @@ mod tests {
             .into_iter()
             .find(|b| b.name.as_deref() == Some("main"))
             .expect("a block named main");
-        resolve(&lines, &effective_header_args(&lines, &block))
+        resolve(&lines, &effective_header_args(&lines, &block), &[]).map(|v| {
+            v.into_iter()
+                .map(|(n, b)| match b {
+                    Binding::Ready(v) => (n, v),
+                    Binding::After(a) => panic!("{n} waits on {a}"),
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_block_run_earlier_in_the_chain_is_waited_on() {
+        let doc = "#+NAME: a\n#+begin_src sh\nx\n#+end_src\n\n#+RESULTS: a\n: old\n\n\
+                   #+NAME: main\n#+begin_src sh :var x=a y=2\nx\n#+end_src\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        let main = src_blocks(&lines).pop().unwrap();
+        let header = effective_header_args(&lines, &main);
+        assert_eq!(references(&header), vec!["a".to_string()]);
+        assert_eq!(
+            resolve(&lines, &header, &["a".to_string()]).unwrap()[0].1,
+            Binding::After("a".to_string()),
+            "a fresh run, not the old result"
+        );
     }
 
     fn n(s: &str) -> Value {

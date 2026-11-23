@@ -1692,3 +1692,97 @@ async fn var_in_a_language_without_a_prelude_is_refused_by_name() {
     assert!(echo.contains("value = \"sh\""), "{echo}");
     assert_eq!(text(&editor), doc);
 }
+
+// ---------------------------------------------------------------------------
+// OB.12 — dependency chains.
+// ---------------------------------------------------------------------------
+
+/// An org editor with `sh` able to take `:var` (its record names `value`).
+async fn chain_editor(base: &std::path::Path, doc: &str) -> (Editor, Arc<PluginLoader>) {
+    org_editor_with_records(
+        base,
+        doc,
+        &[vec![("name", "sh"), ("command", "sh"), ("value", "sh")]],
+    )
+    .await
+}
+
+fn line_of(doc: &str, needle: &str) -> u32 {
+    doc.lines().position(|l| l.contains(needle)).unwrap() as u32
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_result_is_computed_first() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: a\n#+begin_src sh\necho 21\n#+end_src\n\n\
+               #+NAME: b\n#+begin_src sh :var x=a\necho $((x * 2))\n#+end_src\n";
+    let (mut editor, _loader) = chain_editor(base.path(), doc).await;
+    set_org_option(&mut editor, "babel.confirm", "true");
+    goto_line(&mut editor, line_of(doc, ":var x=a"));
+    // One question for the chain: `a` is asked about with `b`, not after.
+    let confirm = confirm_in(&press(&mut editor, "<C-c><C-c>")).expect("a confirm");
+    assert_eq!(confirm.0, "Run 2 blocks (sh ×2)? (y/n)");
+    answer_yes(&mut editor, confirm);
+    settle(&mut editor, |e| text(e).matches("#+RESULTS:").count() == 2).await;
+    assert_eq!(
+        text(&editor),
+        "#+NAME: a\n#+begin_src sh\necho 21\n#+end_src\n\n#+RESULTS: a\n: 21\n\n\
+         #+NAME: b\n#+begin_src sh :var x=a\necho $((x * 2))\n#+end_src\n\n#+RESULTS: b\n: 42\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_three_block_chain() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: a\n#+begin_src sh\necho 1\n#+end_src\n\n\
+               #+NAME: b\n#+begin_src sh :var x=a\necho $((x + 10))\n#+end_src\n\n\
+               #+NAME: c\n#+begin_src sh :var y=b z=a\necho $((y * 2 + z))\n#+end_src\n";
+    let (mut editor, _loader) = chain_editor(base.path(), doc).await;
+    goto_line(&mut editor, line_of(doc, ":var y=b"));
+    press(&mut editor, "<C-c><C-c>");
+    settle(&mut editor, |e| text(e).matches("#+RESULTS:").count() == 3).await;
+    let t = text(&editor);
+    assert!(t.contains("#+RESULTS: a\n: 1\n"), "{t}");
+    assert!(t.contains("#+RESULTS: b\n: 11\n"), "{t}");
+    assert!(t.ends_with("#+RESULTS: c\n: 23\n"), "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cycle_is_refused_before_anything_runs() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: a\n#+begin_src sh :var x=b\necho a\n#+end_src\n\n\
+               #+NAME: b\n#+begin_src sh :var y=a\necho b\n#+end_src\n";
+    let (mut editor, _loader) = chain_editor(base.path(), doc).await;
+    goto_line(&mut editor, 1);
+    press(&mut editor, "<C-c><C-c>");
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("a → b → a"), "{echo}");
+    assert_eq!(text(&editor), doc, "nothing ran");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_dependency_stops_the_chain_and_says_where() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+NAME: a\n#+begin_src sh\necho broke; exit 3\n#+end_src\n\n\
+               #+NAME: b\n#+begin_src sh :var x=a\necho \"got $x\"\n#+end_src\n";
+    let (mut editor, _loader) = chain_editor(base.path(), doc).await;
+    goto_line(&mut editor, line_of(doc, ":var x=a"));
+    press(&mut editor, "<C-c><C-c>");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.contains("did not run"))
+    })
+    .await;
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains("sh block \"b\""), "says which block: {echo}");
+    assert!(echo.contains("`a`"), "and which dependency: {echo}");
+    let t = text(&editor);
+    assert!(
+        t.contains("#+RESULTS: a\n: broke\n"),
+        "the failure shows: {t}"
+    );
+    assert_eq!(t.matches("#+RESULTS:").count(), 1, "`b` never ran: {t}");
+}

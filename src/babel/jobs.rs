@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use super::block::BlockKey;
 use super::results::{format, insertion_edit, Collection, Insertion};
 use super::run::{claim_key, RunRequest, RUN_PREFIX};
+use super::vars::{prelude, value_of_result, Binding, Value};
 use super::wrappers::after_sentinel;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
@@ -88,13 +89,54 @@ fn release(runs: &[RunRequest]) {
     }
 }
 
+/// The values of `request`'s `:var`s, or the block one still waits on —
+/// which can only mean that block did not finish well, since every block a
+/// chain waits on runs before the blocks waiting.
+fn ready_vars(request: &RunRequest) -> Result<Vec<(String, Value)>, String> {
+    request
+        .vars
+        .iter()
+        .map(|(name, b)| match b {
+            Binding::Ready(v) => Ok((name.clone(), v.clone())),
+            Binding::After(block) => Err(block.clone()),
+        })
+        .collect()
+}
+
 /// Start the first of `runs`; the others wait for it to finish. A run that
 /// cannot start stops the batch — what follows it was meant to follow it.
+/// A run whose `:var` waits on a block that failed is skipped, and says so;
+/// the rest go on, and any waiting on IT are skipped in turn (OB.12).
 fn start_next(mut runs: Vec<RunRequest>) {
-    if runs.is_empty() {
-        return;
+    let mut skipped = Vec::new();
+    let (request, vars) = loop {
+        if runs.is_empty() {
+            if !skipped.is_empty() {
+                host_services::refresh_decorations();
+                post(skipped);
+            }
+            return;
+        }
+        let request = runs.remove(0);
+        match ready_vars(&request) {
+            Ok(vars) => break (request, vars),
+            Err(needed) => {
+                release(std::slice::from_ref(&request));
+                skipped.push(echo(
+                    EchoLevel::Warn,
+                    format!(
+                        "org: the {} did not run — it needs `{needed}`'s result, and `{needed}` \
+                         did not finish",
+                        request.label
+                    ),
+                ));
+            }
+        }
+    };
+    if !skipped.is_empty() {
+        host_services::refresh_decorations();
+        post(skipped);
     }
-    let request = runs.remove(0);
     let rest = runs;
     let fail = |text: String| {
         release(std::slice::from_ref(&request));
@@ -113,13 +155,19 @@ fn start_next(mut runs: Vec<RunRequest>) {
     let script = format!("{SCRIPT_DIR}/{file}");
     // `:results value`: the body runs inside its wrapper, which prints the
     // value after a line no program prints by accident — this run's uuid.
+    // `:var` (OB.11): assignments ahead of the body, inside any wrapper, so
+    // `:results value` sees them. `plan` refused `:var` without a wrapper.
+    let source = match request.wrapper {
+        Some(w) => format!("{}{}", prelude(w, &vars), request.body),
+        None => request.body.clone(),
+    };
     let (mut body, sentinel) = match (request.results.collection, request.wrapper) {
         (Collection::Value, Some(w)) => {
             let sentinel = format!("org-babel-value-{uuid}");
-            let (script, cut) = w.wrap(&request.body, &sentinel);
+            let (script, cut) = w.wrap(&source, &sentinel);
             (script, cut.then_some(sentinel))
         }
-        _ => (request.body.clone(), None),
+        _ => (source, None),
     };
     body.push('\n');
     if let Err(e) = std::fs::create_dir_all(SCRIPT_DIR).and_then(|_| std::fs::write(&script, body))
@@ -228,7 +276,7 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
         )]);
         return;
     }
-    let rest = job.rest;
+    let mut rest = job.rest;
     let mut output = match &job.sentinel {
         // No sentinel means the body failed before its value: the whole
         // output is what says why.
@@ -249,6 +297,22 @@ pub(crate) fn on_finished(id: u64, outcome: Result<(), String>) {
             EchoLevel::Warn,
             format!("org: the {label} failed: {e}"),
         ));
+    }
+    // OB.12: a block later in the chain waits on this one's result. It gets
+    // what `#+RESULTS:` would now say, read the way a result in the file is.
+    // A failed run fills nothing, and what waited on it is skipped.
+    if let (Ok(()), Some(name)) = (&outcome, &job.request.name) {
+        let r = &job.request;
+        let placed = format(&r.results, &output, r.min_block, &r.lang);
+        let lines: Vec<&str> = placed.iter().map(String::as_str).collect();
+        let value = value_of_result(&lines);
+        for waiting in &mut rest {
+            for (_, b) in &mut waiting.vars {
+                if *b == Binding::After(name.clone()) {
+                    *b = Binding::Ready(value.clone());
+                }
+            }
+        }
     }
     let insertion = job.request.results.insertion;
     if matches!(insertion, Insertion::Silent | Insertion::None) {

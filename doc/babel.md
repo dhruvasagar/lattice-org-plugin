@@ -132,8 +132,15 @@ print(rows[n - 1][1], who)
 - The name of a table, which becomes a list of rows. A number in a cell
   arrives as a number.
 - The name of a block, which gives its `#+RESULTS:`: a table as rows, one
-  line that is a number as a number, anything else as text. The block is not
-  run again. One with no result yet refuses, and says to run it first.
+  line that is a number as a number, anything else as text. A block with a
+  result is not run again. One with no result yet runs first, and so does
+  one that is part of the same run (`C-c C-v b`), so you get its fresh
+  result. One question covers them all, and each writes its own result.
+
+A block that fails stops what needs it: the blocks waiting on its result do
+not run, and the echo area names the block that failed. Blocks that need
+each other's results (`a` needs `b`, which needs `a`) refuse before
+anything runs.
 
 Several go on one `:var`, separated by spaces or commas. A name given in
 `#+PROPERTY:` or a headline's drawer and again on the block takes the

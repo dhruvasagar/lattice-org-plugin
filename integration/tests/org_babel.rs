@@ -2115,3 +2115,17 @@ async fn a_block_cannot_tangle_into_its_own_file() {
         );
     }
 }
+
+/// Review: a session block that read stdin swallowed the line of the block
+/// after it, which then never ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_block_reading_stdin_does_not_take_the_next_block() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "#+begin_src sh :session\nread x; echo \"read[$x]\"\n#+end_src\n\n\
+               #+begin_src sh :session\necho after\n#+end_src\n";
+    let (mut editor, _loader) = session_editor(base.path(), doc).await;
+    ex(&mut editor, "org-babel-execute-buffer");
+    settle(&mut editor, has(": after")).await;
+    assert!(text(&editor).contains(": read[]"), "{}", text(&editor));
+}

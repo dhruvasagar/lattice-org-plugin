@@ -240,6 +240,10 @@ error in a block is printed as its result and the session carries on. In
 node, `let` and `const` last from block to block. Running a block that
 declares one again is an error, which `var` avoids.
 
+A block that reads stdin reads nothing, since the session's input is its
+blocks. Node is the exception: a node block that reads `process.stdin`
+takes the blocks after it, so don't.
+
 A session ends:
 - when you close its buffer;
 - on `:org-babel-cancel`, which also cancels a block it is running;

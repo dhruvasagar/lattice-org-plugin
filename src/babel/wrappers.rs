@@ -92,17 +92,27 @@ impl Wrapper {
     /// A driver, not the interpreter's own REPL: a REPL prints prompts, and
     /// node's echoes every expression's value, and none of that is the block's
     /// output.
+    ///
+    /// The python and ruby drivers keep a copy of stdin for themselves and put
+    /// `/dev/null` on fd 0, so a block that reads stdin (`input()`, a child
+    /// process) reads nothing rather than swallowing the blocks after it. Node
+    /// cannot move its fd 0, so a node block that reads `process.stdin` takes
+    /// the session's input; the guide says so.
     pub(crate) fn driver(self) -> Option<&'static str> {
         match self {
             Self::Sh => None,
             Self::Python => Some(
-                "import sys\n\
-                 for __ob_l in sys.stdin:\n\
+                "import os, sys\n\
+                 __ob_in = os.fdopen(os.dup(0), \"r\")\n\
+                 os.dup2(os.open(os.devnull, os.O_RDONLY), 0)\n\
+                 sys.stdin = open(os.devnull)\n\
+                 for __ob_l in __ob_in:\n\
                  \x20   exec(bytes.fromhex(__ob_l.strip()).decode(\"utf-8\"))\n",
             ),
             Self::Ruby => Some(
                 "STDOUT.sync = true; STDERR.sync = true; \
-                 STDIN.each_line { |__ob_l| \
+                 __ob_in = STDIN.dup; STDIN.reopen(File::NULL); \
+                 __ob_in.each_line { |__ob_l| \
                  eval([__ob_l.strip].pack(\"H*\").force_encoding(\"UTF-8\"), TOPLEVEL_BINDING, \"<babel>\") }",
             ),
             // `runInThisContext`, so a `let` in one block is there in the next.
@@ -124,9 +134,14 @@ impl Wrapper {
         let program = match self {
             // `command eval`: a syntax error in a plain `eval` exits a
             // non-interactive shell, and the session with it.
+            // Its stdin is `/dev/null`: the shell's own is the session's
+            // input, and a block that read it (`read x`) would swallow the
+            // next block.
             Self::Sh => {
                 let octal: String = body.bytes().map(|b| format!("\\{b:03o}")).collect();
-                return format!("command eval \"$(printf '{octal}')\"; echo {end}; echo {end} >&2");
+                return format!(
+                    "command eval \"$(printf '{octal}')\" </dev/null; echo {end}; echo {end} >&2"
+                );
             }
             Self::Python => {
                 let run = match value {
@@ -229,33 +244,45 @@ mod tests {
     fn each_driver_keeps_state_across_blocks_and_survives_an_error() {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
-        let cases: [(Wrapper, &str, Vec<&str>, [&str; 3]); 4] = [
+        // The third block reads stdin, which must not take the fourth.
+        let cases: [(Wrapper, &str, Vec<&str>, [&str; 4]); 4] = [
             (
                 Wrapper::Sh,
                 "sh",
                 vec![],
-                ["x=41", "echo \"unterminated", "echo $((x + 1))"],
+                [
+                    "x=41",
+                    "echo \"unterminated",
+                    "read y; cat",
+                    "echo $((x + 1))",
+                ],
             ),
             (
                 Wrapper::Python,
                 "python3",
                 vec!["-u", "-c"],
-                ["x = 41", "raise ValueError('no')", "x + 1"],
+                [
+                    "x = 41",
+                    "raise ValueError('no')",
+                    "import subprocess, sys\nsubprocess.run(['cat'])\nsys.stdin.read()",
+                    "x + 1",
+                ],
             ),
             (
                 Wrapper::Ruby,
                 "ruby",
                 vec!["-e"],
-                ["x = 41", "raise 'no'", "x + 1"],
+                ["x = 41", "raise 'no'", "STDIN.read; system('cat')", "x + 1"],
             ),
+            // Node keeps its fd 0 (see `driver`): its reader is a no-op here.
             (
                 Wrapper::Node,
                 "node",
                 vec!["-e"],
-                ["let x = 41", "throw new Error('no')", "x + 1"],
+                ["let x = 41", "throw new Error('no')", "0", "x + 1"],
             ),
         ];
-        for (w, program, mut args, [set, fail, read]) in cases {
+        for (w, program, mut args, [set, fail, reader, read]) in cases {
             let driver = w.driver().map(str::to_string);
             if let Some(d) = &driver {
                 args.push(d);
@@ -274,7 +301,7 @@ mod tests {
             {
                 // Closed at the end of this scope: the driver's end of input.
                 let mut stdin = child.stdin.take().unwrap();
-                for body in [set, fail, read] {
+                for body in [set, fail, reader, read] {
                     writeln!(stdin, "{}", w.session_line(body, value, "END")).unwrap();
                 }
             }
@@ -283,10 +310,10 @@ mod tests {
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert_eq!(
                 stdout.matches("END\n").count(),
-                3,
+                4,
                 "{program}: {stdout}\n{stderr}"
             );
-            assert_eq!(stderr.matches("END\n").count(), 3, "{program}: {stderr}");
+            assert_eq!(stderr.matches("END\n").count(), 4, "{program}: {stderr}");
             assert!(
                 stdout.trim_end().ends_with("42\nEND"),
                 "{program}: {stdout}\n{stderr}"

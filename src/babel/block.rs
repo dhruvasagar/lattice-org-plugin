@@ -132,12 +132,17 @@ pub(crate) struct Results {
 }
 
 /// The value after a case-insensitive `#+<keyword>:` (indentation allowed).
+///
+/// Every slice is `get`, never an index: this reads every `#+` line in the
+/// buffer, and a `#+TITLE: É…` puts a multibyte character exactly where a
+/// longer keyword's colon would be.
 pub(crate) fn keyword_value<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
     let t = line.trim_start();
-    let head = t.get(..keyword.len() + 3)?;
-    let (marker, colon) = head.split_at(keyword.len() + 2);
-    (marker.eq_ignore_ascii_case(&format!("#+{keyword}")) && colon == ":")
-        .then(|| t[keyword.len() + 3..].trim())
+    let marker = t.get(..keyword.len() + 2)?;
+    let rest = t.get(keyword.len() + 2..)?.strip_prefix(':')?;
+    marker
+        .eq_ignore_ascii_case(&format!("#+{keyword}"))
+        .then(|| rest.trim())
 }
 
 /// `#+RESULTS:` / `#+RESULTS[hash]:`, as `(hash, name)`.
@@ -589,6 +594,32 @@ fn twins<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// A multibyte character where a longer keyword's colon would be. Every
+    /// `#+` line is read for `property`, `name` and `header`.
+    #[test]
+    fn a_non_ascii_keyword_line_is_read_not_split() {
+        for line in [
+            "#+TITLE: Écrire",
+            "#+NAMÉ: x",
+            "#+name:é",
+            "  #+TITLE:Über",
+            "#+É",
+        ] {
+            for keyword in ["property", "name", "header", "headers", "tblfm"] {
+                let _ = keyword_value(line, keyword);
+            }
+        }
+        assert_eq!(keyword_value("#+NAME: Écrire", "name"), Some("Écrire"));
+        assert_eq!(keyword_value("#+name:é", "name"), Some("é"));
+        let doc = "#+TITLE: Écrire\n#+begin_src sh\necho hi\n#+end_src\n";
+        let lines: Vec<&str> = doc.lines().collect();
+        let block = src_blocks(&lines).remove(0);
+        assert!(effective_header_args(&lines, &block)
+            .get("session")
+            .is_some());
+    }
+
     use super::*;
 
     fn bounds(text: &str, at: u32) -> Option<SrcBounds> {

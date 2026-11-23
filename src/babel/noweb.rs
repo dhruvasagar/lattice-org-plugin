@@ -115,14 +115,17 @@ fn expand_body(
 }
 
 /// The first `<<name>>` on `line`: what is before it, the name, and what is
-/// after it. A name holds no whitespace, so `a << b >> c` is not one.
+/// after it. A name holds no whitespace, so `a << b >> c` is not one, and a
+/// `<<` that starts none (`cat <<EOF; echo <<real>>`) is passed over for
+/// the next.
 fn reference_in(line: &str) -> Option<(&str, &str, &str)> {
-    let start = line.find("<<")?;
-    let rest = &line[start + 2..];
-    let end = rest.find(">>")?;
-    let name = &rest[..end];
-    (!name.is_empty() && !name.contains(char::is_whitespace) && !name.contains('<'))
-        .then(|| (&line[..start], name, &rest[end + 2..]))
+    line.match_indices("<<").find_map(|(start, _)| {
+        let rest = &line[start + 2..];
+        let end = rest.find(">>")?;
+        let name = &rest[..end];
+        (!name.is_empty() && !name.contains(char::is_whitespace) && !name.contains('<'))
+            .then(|| (&line[..start], name, &rest[end + 2..]))
+    })
 }
 
 /// The text `<<reference>>` stands for, or `None` when nothing is named so.
@@ -274,6 +277,16 @@ mod tests {
             expand_named(doc, "main", Context::Run).unwrap(),
             "a\nb\ncat <<EOF\n<<nope>>"
         );
+    }
+
+    #[test]
+    fn a_heredoc_before_a_reference_does_not_hide_it() {
+        assert_eq!(
+            reference_in("cat <<EOF; echo <<real>> done"),
+            Some(("cat <<EOF; echo ", "real", " done"))
+        );
+        assert_eq!(reference_in("a << b >> c"), None);
+        assert_eq!(reference_in("x <<<<y>>"), Some(("x <<", "y", "")));
     }
 
     /// Review: thirty blocks each naming the next twice is 2^30 lines. It

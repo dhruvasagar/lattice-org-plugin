@@ -17,6 +17,23 @@
 use super::block::{effective_header_args, src_blocks, SrcBlock};
 use super::vars::{value_of_result, Value};
 
+/// The most text one expansion may produce. References form a graph, not
+/// a tree: a block naming the next twice, thirty deep, is 2^30 lines, and
+/// this runs on the keystroke path, before the confirm. Counted at every
+/// level, so a nested line counts once per level it is copied through: the
+/// budget bounds the work, not only the result.
+const MAX_EXPANSION: usize = 1 << 20;
+
+/// Spend `n` bytes of the budget, or refuse.
+fn spend(budget: &mut usize, n: usize) -> Result<(), String> {
+    *budget = budget.checked_sub(n).ok_or_else(|| {
+        "org: noweb references expand past 1 MiB — a reference used more than once is \
+         expanded each time"
+            .to_string()
+    })?;
+    Ok(())
+}
+
 /// What the body is being expanded for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Context {
@@ -50,7 +67,8 @@ pub(crate) fn expand(lines: &[&str], block: &SrcBlock, ctx: Context) -> Result<S
         .name
         .clone()
         .unwrap_or_else(|| "this block".to_string())];
-    expand_body(lines, &all, block, ctx, &mut path)
+    let mut budget = MAX_EXPANSION;
+    expand_body(lines, &all, block, ctx, &mut path, &mut budget)
 }
 
 fn expand_body(
@@ -59,6 +77,7 @@ fn expand_body(
     block: &SrcBlock,
     ctx: Context,
     path: &mut Vec<String>,
+    budget: &mut usize,
 ) -> Result<String, String> {
     if !applies(lines, block, ctx)? {
         return Ok(block.body.clone());
@@ -66,10 +85,12 @@ fn expand_body(
     let mut out: Vec<String> = Vec::new();
     for line in block.body.lines() {
         let Some((prefix, reference, suffix)) = reference_in(line) else {
+            spend(budget, line.len() + 1)?;
             out.push(line.to_string());
             continue;
         };
-        let Some(text) = resolve(lines, all, reference, ctx, path)? else {
+        let Some(text) = resolve(lines, all, reference, ctx, path, budget)? else {
+            spend(budget, line.len() + 1)?;
             out.push(line.to_string());
             continue;
         };
@@ -77,7 +98,11 @@ fn expand_body(
         match expanded.as_slice() {
             [] => out.push(format!("{prefix}{suffix}")),
             [rest @ .., last] => {
-                out.extend(rest.iter().map(|l| format!("{prefix}{l}")));
+                for l in rest {
+                    spend(budget, prefix.len() + l.len() + 1)?;
+                    out.push(format!("{prefix}{l}"));
+                }
+                spend(budget, prefix.len() + last.len() + suffix.len() + 1)?;
                 out.push(format!("{prefix}{last}{suffix}"));
             }
         }
@@ -107,6 +132,7 @@ fn resolve(
     reference: &str,
     ctx: Context,
     path: &mut Vec<String>,
+    budget: &mut usize,
 ) -> Result<Option<String>, String> {
     if let Some(name) = reference.strip_suffix("()") {
         let Some(block) = all.iter().find(|b| b.name.as_deref() == Some(name)) else {
@@ -155,7 +181,7 @@ fn resolve(
     path.push(reference.to_string());
     let mut parts = Vec::with_capacity(named.len());
     for b in named {
-        let body = expand_body(lines, all, b, ctx, path)?;
+        let body = expand_body(lines, all, b, ctx, path, budget)?;
         parts.push(body.strip_suffix('\n').unwrap_or(&body).to_string());
     }
     path.pop();
@@ -247,6 +273,27 @@ mod tests {
         assert_eq!(
             expand_named(doc, "main", Context::Run).unwrap(),
             "a\nb\ncat <<EOF\n<<nope>>"
+        );
+    }
+
+    /// Review: thirty blocks each naming the next twice is 2^30 lines. It
+    /// must be refused, not computed.
+    #[test]
+    fn an_exponential_expansion_is_refused() {
+        let mut doc = String::new();
+        for i in 0..30 {
+            doc.push_str(&format!(
+                "#+NAME: b{i}\n#+begin_src sh :noweb yes\n<<b{n}>>\n<<b{n}>>\n#+end_src\n",
+                n = i + 1
+            ));
+        }
+        doc.push_str("#+NAME: b30\n#+begin_src sh\necho leaf\n#+end_src\n");
+        let e = expand_named(&doc, "b0", Context::Run).unwrap_err();
+        assert!(e.contains("1 MiB"), "{e}");
+        assert_eq!(
+            expand_named(&doc, "b28", Context::Run).unwrap(),
+            "echo leaf\necho leaf\necho leaf\necho leaf",
+            "a small one still expands"
         );
     }
 

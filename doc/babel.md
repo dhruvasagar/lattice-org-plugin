@@ -181,6 +181,9 @@ def report():
   no result refuses, and arguments (`<<name(x=1)>>`) are not supported.
 - A block put in place is expanded in turn when its own `:noweb` allows it.
   Blocks that would put each other in place refuse, and nothing runs.
+- An expansion over 1 MiB refuses too. A reference used more than once is
+  expanded each time, so a few blocks that each use the next twice grow
+  very fast.
 - A `<<...>>` that names nothing is left as written, so a shell heredoc
   (`cat <<EOF`) is safe.
 

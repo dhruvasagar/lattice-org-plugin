@@ -1648,8 +1648,8 @@ set `org.roam-directory`, and it has its own page:
 ## What this plugin is not
 
 Code highlighting *inside* a source block is not here; it needs injection.
-Export backends, babel, table formulas and column view are out of scope rather
-than pending.
+Export backends, table formulas and column view are out of scope rather than
+pending. Babel is here, on its own page: [`org.babel`](help:org.babel).
 
 Everything above rides seams that already exist (`language`, `modes`,
 `grammar`, `config`, `media`, `agenda-source`, `help`) — nothing in lattice

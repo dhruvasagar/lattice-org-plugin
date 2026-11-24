@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- `:help org` no longer lists babel among what the plugin does not do; it
+  points to `:help org.babel` instead.
+
 ## 0.5.0 — 2026-11-24
 
 Builds against `lattice:plugin-host@0.6.x` (lattice-wit 0.6.0).

@@ -600,11 +600,12 @@ async fn every_auto_activating_minor_is_in_the_shipped_manifests_default_modes()
     assert_eq!(
         checked,
         vec![
+            "org-babel-mode".to_string(),
             "org-global-mode".to_string(),
             "org-table-mode".to_string(),
             "org-todo-mode".to_string(),
         ],
-        "org's three auto-activating minors — asserted by name rather than by \
+        "org's four auto-activating minors — asserted by name rather than by \
          count so a rename cannot quietly leave this test checking nothing"
     );
 }

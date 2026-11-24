@@ -68,14 +68,17 @@ provides = [
     "completion-source", "transient-source", "help", "config", "theme", "events",
     "llm-tools",
 ]
-default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode"]
+default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode"]
 capabilities = [
     "fs:write:{org.directory|~/org}",
     "fs:write:{org.roam-directory|~/org-roam}",
+    "fs:write:{org.babel.tangle-directories}",
+    "proc:spawn:{org.babel.languages:command}",
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-min_lattice = "0.10.1"
+mode_gates = { "org-babel-mode" = "org.babel.enabled" }
+min_lattice = "0.10.3"
 "#
 );
 
@@ -90,8 +93,8 @@ min_lattice = "0.10.1"
 // both exports. Nothing in lattice changes to allow it.
 //
 // Three details, each of which is a build error if missed:
-//   * `include` needs the VERSION (`@0.5.0`) — the resolver knows
-//     `lattice:plugin-host@0.5.0`, not `lattice:plugin-host`.
+//   * `include` needs the VERSION (`@0.6.0`) — the resolver knows
+//     `lattice:plugin-host@0.6.0`, not `lattice:plugin-host`.
 //   * `generate_all` — without it wit-bindgen demands a `with` mapping for
 //     every interface reached through the include.
 //   * the inline package needs its own name, distinct from lattice's.
@@ -99,17 +102,17 @@ wit_bindgen::generate!({
     inline: r#"
         package lattice:org-plugin@0.1.0;
         world org-plugin {
-            include lattice:plugin-host/language-plugin@0.5.0;
-            include lattice:plugin-host/help-plugin@0.5.0;
-            include lattice:plugin-host/modes-plugin@0.5.0;
-            include lattice:plugin-host/grammar-plugin@0.5.0;
-            include lattice:plugin-host/config-plugin@0.5.0;
-            include lattice:plugin-host/media-plugin@0.5.0;
+            include lattice:plugin-host/language-plugin@0.6.0;
+            include lattice:plugin-host/help-plugin@0.6.0;
+            include lattice:plugin-host/modes-plugin@0.6.0;
+            include lattice:plugin-host/grammar-plugin@0.6.0;
+            include lattice:plugin-host/config-plugin@0.6.0;
+            include lattice:plugin-host/media-plugin@0.6.0;
             // OM.A1: the agenda seam. Its three exports (`extensions` /
             // `begin` / `scan`) sit at WORLD level, so they land on the same
             // `Guest` trait as `register-languages` rather than behind an
             // interface — which is why they read differently below.
-            include lattice:plugin-host/scanned-excerpt-source-plugin@0.5.0;
+            include lattice:plugin-host/scanned-excerpt-source-plugin@0.6.0;
             // OM.11: refile's target list. NOT `include
             // picker-source-plugin` — that world also imports `logging`, and
             // a component's imports must ALL be satisfiable on EVERY seam's
@@ -118,14 +121,14 @@ wit_bindgen::generate!({
             // "no logging reachable from the grammar hot path" invariant is
             // structural rather than a matter of discipline. Declaring only
             // what the source actually uses keeps it that way.
-            import lattice:plugin-host/host-services@0.5.0;
+            import lattice:plugin-host/host-services@0.6.0;
             // TK.3: one theme element per TODO state. NOT `include
             // theme-plugin` — that world imports `logging` too, and this
             // component is instantiated against the grammar seam's sync
             // linker where `logging` is absent. Same scar as the three
             // seams below; the export sits at world level, so it lands on
             // the same `Guest` trait as `register-languages`.
-            import lattice:plugin-host/theme@0.5.0;
+            import lattice:plugin-host/theme@0.6.0;
             export register-theme-elements: func();
             // OA.30: the agenda's bulk marks paint into the gutter. Two
             // seams, both exported BARE for the scar the comments above
@@ -136,16 +139,16 @@ wit_bindgen::generate!({
             // deliberately absent. `signs` declares what a mark looks like,
             // once; `decorations` says which lines carry one, on every
             // refresh.
-            import lattice:plugin-host/signs@0.5.0;
+            import lattice:plugin-host/signs@0.6.0;
             export register-signs: func();
-            export lattice:plugin-host/decorations@0.5.0;
+            export lattice:plugin-host/decorations@0.6.0;
             // OR.5b: the registry a picker plugin declares its sources
             // through. NOT `include picker-source-plugin` — that world also
             // imports `logging`, and this component is instantiated against
             // the grammar seam's sync linker where `logging` is absent. Same
             // scar as the seams below.
-            import lattice:plugin-host/picker-registry@0.5.0;
-            export lattice:plugin-host/picker-source@0.5.0;
+            import lattice:plugin-host/picker-registry@0.6.0;
+            export lattice:plugin-host/picker-source@0.6.0;
             export register-picker-sources: func();
             // MV.3: the agenda is org's view, so org declares it. NOT
             // `include multibuffer-view-plugin` — that world imports
@@ -155,8 +158,8 @@ wit_bindgen::generate!({
             // deliberately absent. Same scar as the seams above: OC.2 added
             // one `logging::log` call and the WHOLE plugin stopped
             // instantiating.
-            import lattice:plugin-host/multibuffer-view-registry@0.5.0;
-            export lattice:plugin-host/multibuffer-view-source@0.5.0;
+            import lattice:plugin-host/multibuffer-view-registry@0.6.0;
+            export lattice:plugin-host/multibuffer-view-source@0.6.0;
             export register-multibuffer-views: func();
             // OR.7: org-roam nodes inside an `[[…]]` link. NOT `include
             // completion-source-plugin` — that world imports `logging` too,
@@ -164,7 +167,7 @@ wit_bindgen::generate!({
             // EVERY linker it is instantiated against, including the grammar
             // seam's sync one where `logging` is deliberately absent. Same
             // scar as `picker-source` and `transient-source` above.
-            export lattice:plugin-host/completion-source@0.5.0;
+            export lattice:plugin-host/completion-source@0.6.0;
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
             // `logging` and `project`, and an import a component declares
@@ -174,7 +177,7 @@ wit_bindgen::generate!({
             // constraint: OC.2 added one `logging::log` call, the component
             // started importing `logging`, and the WHOLE plugin stopped
             // instantiating.
-            export lattice:plugin-host/transient-source@0.5.0;
+            export lattice:plugin-host/transient-source@0.6.0;
             // OC.6: the clock's async side. NOT `include events-plugin` — that
             // world also imports `logging` and `project`, and every import a
             // component declares must be satisfiable on EVERY linker it is
@@ -189,10 +192,10 @@ wit_bindgen::generate!({
             // neither a wake nor a modeline context. That is where "the clock's
             // session is off the keystroke path" (design D6) is actually
             // enforced.
-            import lattice:plugin-host/events@0.5.0;
-            import lattice:plugin-host/ui@0.5.0;
-            use lattice:plugin-host/types@0.5.0.{event};
-            use lattice:plugin-host/events@0.5.0.{wake-id};
+            import lattice:plugin-host/events@0.6.0;
+            import lattice:plugin-host/ui@0.6.0;
+            use lattice:plugin-host/types@0.6.0.{event};
+            use lattice:plugin-host/events@0.6.0.{wake-id};
             export register-events: func();
             export on-event: func(handler: u32, ev: event);
             export on-wake: func(id: wake-id);
@@ -200,7 +203,7 @@ wit_bindgen::generate!({
             // call reads through, is imported above; the host makes this
             // seam's store read-only whatever the fs grant says, so a tool
             // proposes edits rather than writing them.
-            export lattice:plugin-host/llm-tools@0.5.0;
+            export lattice:plugin-host/llm-tools@0.6.0;
         }
     "#,
     path: "wit",
@@ -216,6 +219,8 @@ mod agenda_marks;
 mod agenda_match;
 mod agenda_sections;
 mod archive;
+// OB.4: running source blocks — the whole of `org-babel-mode`.
+mod babel;
 mod capture;
 mod capture_drafts;
 mod capture_flow;
@@ -1327,6 +1332,22 @@ mod todo_theme {
                 scale: None,
             },
         );
+        // OB.6: the sign on a running source block. Its own element for
+        // agenda-mark's reason: a theme must be able to reach every glyph.
+        let _ = register_element(
+            babel::jobs::RUNNING_SIGN,
+            "The sign on a source block's `#+begin_src` while it runs.",
+            &ThemeStyleSpec {
+                inherit: None,
+                fg: Some(ColorRef::Palette("blue".to_string())),
+                bg: None,
+                modifiers: ModifierSet {
+                    bold: Some(true),
+                    ..unset()
+                },
+                scale: None,
+            },
+        );
         let _ = register_element(
             "tag",
             "A headline's trailing `:tag:` list.",
@@ -1593,6 +1614,7 @@ impl Guest for Component {
     /// every marked line of every refresh would restate at 60Hz something that
     /// was settled at boot.
     fn register_signs() {
+        babel::define_signs();
         // Priority 10 — vim's default, and the floor. A mark is a selection the
         // user just made and can undo with the next keystroke; a diagnostic is
         // a fact about their code. When both land on one row the diagnostic
@@ -1696,6 +1718,8 @@ impl Guest for Component {
     }
 
     fn register_options() {
+        // OB.4: babel's `org.babel.*`, declared by its own module.
+        babel::register_options();
         // TK.2 / TC.7: a LIST of sequence lines, not one newline-joined string.
         //
         // The lines keep emacs' own grammar — that grammar is org's public
@@ -2052,6 +2076,7 @@ impl Guest for Component {
     /// nothing. Priority 8 puts it right of `lsp` (5) and `claude-code` (6) and
     /// left of `core.position` (10).
     fn register_events() {
+        babel::register_events();
         events::subscribe(
             &EventFilter {
                 kinds: Some(vec![EventKind::Plugin]),
@@ -2220,6 +2245,11 @@ impl Guest for Component {
             );
             return;
         }
+        // OB.6: a babel job's output and its end.
+        if handler == babel::ON_JOB {
+            babel::on_job_event(ev);
+            return;
+        }
         if handler != ON_CLOCK_EVENT {
             return;
         }
@@ -2275,6 +2305,9 @@ impl Guest for Component {
                 });
                 publish_clock_segment();
             }
+            // OB.6: a run request from babel's `C-c C-c`.
+            babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
+            babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
             _ => {}
         }
     }
@@ -2289,6 +2322,8 @@ impl Guest for Component {
     }
 
     fn register_modes() {
+        // OB.4: `org-babel-mode`, declared by its own module.
+        babel::register();
         let bind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Normal,
             chord: chord.to_string(),
@@ -3170,6 +3205,8 @@ impl Guest for Component {
     /// text objects that DO compose with operators (`ih`/`ah`/`is`/`as`) are a
     /// separate contribution, OM.4.
     fn register_grammar() {
+        // OB.4: babel's action and commands, declared by its own module.
+        babel::register_grammar();
         let spec = || ActionSpec {
             args_schema: Vec::new(),
         };
@@ -4042,6 +4079,13 @@ impl Guest for Component {
                 "org-review".to_string(),
                 "org-report".to_string(),
             ],
+        );
+        // OB.4: babel, at `:help org.babel`.
+        let _ = register_topic(
+            "babel",
+            "Org babel: running source blocks and writing their results.",
+            include_str!("../doc/babel.md"),
+            &["org-babel".to_string()],
         );
         let _ = register_topic(
             "roam",
@@ -9798,6 +9842,8 @@ impl GrammarCallbacks for Component {
                 planning::Field::Deadline,
                 &ctx.args,
             )),
+            // OB.4: babel owns its ids; see `babel` for why none is here.
+            cb if babel::is_action(cb) => babel::apply_action(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }
@@ -10023,6 +10069,7 @@ impl GrammarCallbacks for Component {
                     Args::String(trimmed.to_string())
                 })
             }
+            cb if babel::is_ex_parse(cb) => babel::parse_ex_args(cb, &rest),
             other => Err(format!("org: unknown ex-command parse callback {other}")),
         }
     }
@@ -10308,6 +10355,7 @@ impl GrammarCallbacks for Component {
                     scan_args: vec![String::new()],
                 },
             ))]),
+            cb if babel::is_ex_command(cb) => babel::apply_ex_command(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown ex-command callback {other}")),
         }
     }
@@ -12172,15 +12220,24 @@ impl llm_tools::Org for HostOrg {
         let mut writes = Vec::new();
         for effect in capture_effects(&dest, body) {
             match effect {
-                Effect::WriteToFile(w) => writes.push((
-                    w.path,
-                    match w.anchor {
+                Effect::WriteToFile(w) => {
+                    let anchor = match w.anchor {
                         FileAnchor::Start => llm_tools::Anchor::Start,
                         FileAnchor::End => llm_tools::Anchor::End,
                         FileAnchor::Line(n) => llm_tools::Anchor::Line(n),
-                    },
-                    w.text,
-                )),
+                        // Capture inserts; it never replaces a file, and the
+                        // assistant's anchors cannot say so. Refused rather
+                        // than passed on as an insert it is not.
+                        FileAnchor::Whole => {
+                            notes.push(
+                                "Capture would have replaced a whole file; nothing was written."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                    writes.push((w.path, anchor, w.text));
+                }
                 Effect::Echo(p) => notes.push(p.text.trim_start_matches("org: ").to_string()),
                 _ => {}
             }
@@ -12302,28 +12359,31 @@ impl exports::lattice::plugin_host::decorations::Guest for Component {
         // nothing marked there is nothing to paint in ANY buffer, and this
         // producer is asked about every buffer in the editor, on every edit.
         // One store read answers it.
+        //
+        // OB.6: a running block's sign — nothing unless a block in THIS
+        // buffer is running, which costs one store listing to find out.
+        let mut signs = babel::jobs::running_signs(ctx.buffer_id);
         if host_services::store_keys(agenda_marks::MARK_PREFIX).is_empty() {
-            return Ok(Vec::new());
+            return Ok(signs);
         }
-        Ok((0..ctx.line_count)
-            .filter_map(|line| {
-                // `none` for a header, a separator, or any buffer that is not a
-                // composed view — which is how this producer stays inert
-                // everywhere but the agenda without asking what kind of buffer
-                // it is in.
-                let loc = host_services::excerpt_source(ctx.buffer_id, line)?;
-                host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line))?;
-                Some(lattice::plugin_host::types::GutterDecoration::Sign(
-                    lattice::plugin_host::types::GutterSign {
-                        line,
-                        // The NAMESPACED name: `define-sign` prefixed it with
-                        // the plugin's id, and a placement naming the bare one
-                        // resolves to nothing and is silently skipped.
-                        name: agenda_marks::MARK_THEME_ELEMENT.to_string(),
-                    },
-                ))
-            })
-            .collect())
+        signs.extend((0..ctx.line_count).filter_map(|line| {
+            // `none` for a header, a separator, or any buffer that is not a
+            // composed view — which is how this producer stays inert
+            // everywhere but the agenda without asking what kind of buffer
+            // it is in.
+            let loc = host_services::excerpt_source(ctx.buffer_id, line)?;
+            host_services::store_get(&agenda_marks::mark_key(&loc.path, loc.line))?;
+            Some(lattice::plugin_host::types::GutterDecoration::Sign(
+                lattice::plugin_host::types::GutterSign {
+                    line,
+                    // The NAMESPACED name: `define-sign` prefixed it with
+                    // the plugin's id, and a placement naming the bare one
+                    // resolves to nothing and is silently skipped.
+                    name: agenda_marks::MARK_THEME_ELEMENT.to_string(),
+                },
+            ))
+        }));
+        Ok(signs)
     }
 }
 

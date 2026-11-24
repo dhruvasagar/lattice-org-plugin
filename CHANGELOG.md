@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+Needs lattice 0.10.3 or later (lattice-wit 0.6.0, `lattice:plugin-host@0.6.0`).
+
+### Added
+- **Babel: `org-babel-mode`**, on in every org buffer and off with `:set
+  org.babel.enabled=false`, which leaves the rest of org on. It owns `C-c C-c`
+  inside a source block (anywhere else the key is org's, as before) and the
+  `C-c C-v` prefix: `b` runs the buffer's blocks, `s` the subtree's, `k`
+  removes a block's result; `:org-babel-cancel` stops them. Nothing runs until
+  you list a language in `org.babel.languages`, and that list is also all org
+  may run. See `:help org.babel`.
+- **Babel runs a block.** `C-c C-c` runs it in the background with a `▶` in
+  the gutter, and writes its output under it as `#+RESULTS:`, replacing the
+  old result, in one undo step. Long output goes in an example block that
+  output cannot break out of. The result finds its block even if you typed
+  above it meanwhile. If the block itself changed, the output goes to
+  `*org-babel*` instead of the file. Header arguments merge from
+  `#+PROPERTY:`, headline drawers, `#+HEADER:` and the block line, as in
+  emacs.
+- **Babel asks, runs many, and stops.** `C-c C-c` asks before it runs
+  (`org.babel.confirm`), and `y` runs the block it asked about even after an
+  edit. `C-c C-v b` / `C-c C-v s` run a buffer's or subtree's blocks in order,
+  asking once. `:org-babel-cancel` stops them, and `C-c C-v k` removes a
+  result.
+- **Babel's `:results`, `value` and `:dir`.** Results can be appended or
+  prepended, shown only in the echo area, or not kept, and written as an
+  aligned table, raw org, a drawer or a code block. With a `value` wrapper
+  (`python`, `ruby`, `node`, `sh`) a block's result is its last expression,
+  not what it printed. A block runs in `:dir`, or else in its file's
+  directory.
+- **Babel sessions.** A block with `:session` runs in an interpreter that
+  stays alive, so what one block defines the next can use. `:session name`
+  picks a session by name; each belongs to one buffer and runs one block at a
+  time. A language gets sessions from its entry's `session-args`
+  (`["-u", "-c", "{driver}"]` for python, `[]` for sh). A session ends when
+  its buffer closes, on `:org-babel-cancel`, or when the interpreter exits.
+  `*org-babel*` logs each start and end.
+- **Babel tangles.** `C-c C-v t` (`:org-babel-tangle`) writes each block
+  with a `:tangle` to its file: `yes` is the org file's name with the
+  language's extension, and a path is relative to the org file. Blocks for
+  one file are joined in order (`:padline no` drops the blank line between),
+  and `:shebang` heads the file and makes it executable. Each file is
+  replaced whole, as one undo step if you have it open. Nothing is written
+  if any target is outside `org.directory` and
+  `org.babel.tangle-directories`. A block's `:var`s are written into the
+  file ahead of it, as readable assignments.
+- **Babel's `:var`.** A block can take numbers, strings, a named table
+  (as rows) or a named block's `#+RESULTS:` as variables, set ahead of its
+  body. python, ruby and node get real values, and sh gets strings. A value
+  with quotes, `$` or a newline arrives intact. A name that is not in the
+  file refuses the run before anything starts.
+- **Babel runs what a block needs first.** When a `:var` names a block with
+  no result yet, that block runs first, under the same question, and its
+  fresh result is the value. Chains run in order. A failure stops what
+  depended on it and says which block it was, and blocks that need each
+  other refuse before anything runs.
+- **Babel's noweb.** With `:noweb yes`, `<<name>>` in a body becomes the
+  named block's body (or the `:noweb-ref name` blocks'), indented as the
+  reference is, before the block runs or is tangled. `<<name()>>` becomes
+  its result. `:noweb tangle` expands only when tangling, and `eval` only
+  when running. A loop refuses, and a name that is not there is left
+  alone.
+- **`:org-babel-output`** shows `*org-babel*`, where a run's output goes when
+  its block changed, was deleted or closed before it finished. The echo used
+  to name that buffer, but nothing ever created it.
+
 ## 0.4.0 — 2026-11-17
 
 Builds against `lattice:plugin-host@0.5.x` (lattice-wit 0.5.0).

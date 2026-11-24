@@ -66,14 +66,69 @@ fn the_component_carries_its_manifest() {
     assert_eq!(manifest.id, "org");
     assert_eq!(
         manifest.min_lattice,
-        Some((0, 10, 1)),
-        "`llm-tools` needs 0.10.1 (`ui.notify` 0.9.14, embedded manifests and option-bound grants 0.9.11)"
+        Some((0, 10, 3)),
+        "babel needs 0.10.3 (option-bound process grants, `post-effects`, \
+         `mode_gates`; `llm-tools` 0.10.1)"
     );
     let bound: Vec<String> = option_bound(&manifest)
         .into_iter()
         .map(|(o, _)| o)
         .collect();
-    assert_eq!(bound, ["org.directory", "org.roam-directory"]);
+    assert_eq!(
+        bound,
+        [
+            "org.directory",
+            "org.roam-directory",
+            "org.babel.tangle-directories"
+        ]
+    );
+}
+
+/// OB.4: babel's grants and its switch. What org may RUN follows only the
+/// user's `org.babel.languages` — never unbound `proc:spawn`, which a
+/// user-installed org would be refused anyway, and which would let it run
+/// anything. `org.babel.enabled` is the host's to act on (`mode_gates`).
+#[test]
+fn the_manifest_declares_babels_grants() {
+    let Some(wasm) = org_component() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+    let manifest = PluginManifest::from_component_bytes(&wasm)
+        .expect("the embedded manifest parses")
+        .expect("the release build kept the lattice-manifest section");
+    let spawn: Vec<(String, Option<String>)> = manifest
+        .requested
+        .iter()
+        .filter_map(|cap| match cap {
+            Capability::ProcSpawnOption(op) => Some((op.option.clone(), op.field.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        spawn,
+        [(
+            "org.babel.languages".to_string(),
+            Some("command".to_string())
+        )]
+    );
+    assert!(
+        !manifest
+            .requested
+            .iter()
+            .any(|c| matches!(c, Capability::ProcSpawn)),
+        "org never asks to run any program"
+    );
+    assert!(manifest
+        .default_modes
+        .contains(&"org-babel-mode".to_string()));
+    assert_eq!(
+        manifest.mode_gates,
+        [(
+            "org-babel-mode".to_string(),
+            "org.babel.enabled".to_string()
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -121,12 +176,14 @@ async fn each_grant_default_is_the_default_org_registers() {
         let registered = config
             .lookup(&option)
             .unwrap_or_else(|| panic!("org registers `{option}`, which a grant follows"));
-        let registered = PathBuf::from(lattice_core::home::expand_tilde(
-            registered.default_formatted(),
-        ));
+        // Read as the loader reads it: a list option's default is its
+        // entries, not its TOML (`org.babel.tangle-directories` defaults to
+        // none, and so does its grant).
+        let registered =
+            lattice_plugin_host::capability::registered_default_paths(registered.as_ref());
         assert_eq!(
-            grant_default.as_ref(),
-            Some(&registered),
+            grant_default.into_iter().collect::<Vec<_>>(),
+            registered,
             "`{option}`: the manifest grants one default directory and the option uses another"
         );
     }

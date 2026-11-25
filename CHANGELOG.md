@@ -18,10 +18,12 @@ the lattice release that carries it.
   exports in steps, a piece per background call, so no file is too big to
   export and none holds the plugin up while it runs; a second export of the
   same file replaces one still running. The output is a placeholder for now
-  (the parsed outline and elements, verbatim, in the format's document) until
-  the real HTML, Markdown and LaTeX writers land.
+  (the parsed outline, elements and inline markup, verbatim, in the format's
+  document) until the real HTML, Markdown and LaTeX writers land.
 
 ### Fixed
+- A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`
+  as in emacs, rather than a file with a backslash in its name.
 - `:help org` no longer lists babel among what the plugin does not do; it
   points to `:help org.babel` instead.
 

@@ -6,6 +6,7 @@
 
 use std::fmt::Write;
 
+use super::objects::{Emphasis, Object};
 use super::{Affiliated, Block, BlockKind, Element, ElementKind, Headline, Row};
 
 /// The whole tree.
@@ -53,7 +54,7 @@ pub(crate) fn headline(out: &mut String, h: &Headline, depth: usize) {
     if h.commented {
         out.push_str(" COMMENT");
     }
-    let _ = write!(out, " {:?}", h.title);
+    let _ = write!(out, " [{}]", objects(&h.title));
     if !h.tags.is_empty() {
         let _ = write!(out, " :{}:", h.tags.join(":"));
     }
@@ -92,7 +93,7 @@ fn affiliated(out: &mut String, a: &Affiliated, depth: usize) {
         let _ = write!(out, " name={n:?}");
     }
     for c in &a.caption {
-        let _ = write!(out, " caption={c:?}");
+        let _ = write!(out, " caption=[{}]", objects(c));
     }
     for (b, v) in &a.attr {
         let _ = write!(out, " attr_{b}={v:?}");
@@ -110,7 +111,7 @@ fn element(out: &mut String, e: &Element, depth: usize) {
     pad(out, depth);
     match &e.kind {
         ElementKind::Paragraph(t) => {
-            let _ = writeln!(out, "paragraph @{} {t:?}", e.line);
+            let _ = writeln!(out, "paragraph @{} {}", e.line, objects(t));
         }
         ElementKind::PlainList(l) => {
             let _ = writeln!(out, "list {:?} @{}", l.kind, e.line);
@@ -125,7 +126,7 @@ fn element(out: &mut String, e: &Element, depth: usize) {
                     let _ = write!(out, " {c:?}");
                 }
                 if let Some(t) = &item.tag {
-                    let _ = write!(out, " tag={t:?}");
+                    let _ = write!(out, " tag=[{}]", objects(t));
                 }
                 out.push('\n');
                 elements(out, &item.contents, depth + 2);
@@ -143,8 +144,12 @@ fn element(out: &mut String, e: &Element, depth: usize) {
                 pad(out, depth + 1);
                 match row {
                     Row::Rule => out.push_str("rule\n"),
-                    Row::Cells(c) => {
-                        let _ = writeln!(out, "row {c:?}");
+                    Row::Cells(cells) => {
+                        out.push_str("row");
+                        for c in cells {
+                            let _ = write!(out, " [{}]", objects(c));
+                        }
+                        out.push('\n');
                     }
                 }
             }
@@ -215,4 +220,84 @@ fn block(out: &mut String, b: &Block, e: &Element, depth: usize) {
     out.push('\n');
     affiliated(out, &e.affiliated, depth);
     elements(out, &b.contents, depth + 1);
+}
+
+/// Objects on one line: text quoted, the rest as `kind(args)[contents]`.
+pub(crate) fn objects(list: &[Object]) -> String {
+    let mut out = String::new();
+    for (i, o) in list.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        object(&mut out, o);
+    }
+    out
+}
+
+fn object(out: &mut String, o: &Object) {
+    let nested = |out: &mut String, name: &str, contents: &[Object]| {
+        let _ = write!(out, "{name}[{}]", objects(contents));
+    };
+    match o {
+        Object::Text(t) => {
+            let _ = write!(out, "{t:?}");
+        }
+        Object::Emphasis { kind, contents } => {
+            let name = match kind {
+                Emphasis::Bold => "bold",
+                Emphasis::Italic => "italic",
+                Emphasis::Underline => "underline",
+                Emphasis::Strike => "strike",
+            };
+            nested(out, name, contents);
+        }
+        Object::Verbatim(t) => {
+            let _ = write!(out, "verbatim({t:?})");
+        }
+        Object::Code(t) => {
+            let _ = write!(out, "code({t:?})");
+        }
+        Object::Link { path, description } => {
+            let _ = write!(out, "link({path:?})");
+            if !description.is_empty() {
+                nested(out, "", description);
+            }
+        }
+        Object::FootnoteReference { label, definition } => {
+            match label {
+                Some(l) => {
+                    let _ = write!(out, "fn({l:?})");
+                }
+                None => out.push_str("fn(None)"),
+            }
+            if !definition.is_empty() {
+                nested(out, "", definition);
+            }
+        }
+        Object::Entity { name, .. } => {
+            let _ = write!(out, "entity({name})");
+        }
+        Object::LatexFragment(t) => {
+            let _ = write!(out, "latex({t:?})");
+        }
+        Object::Subscript(c) => nested(out, "sub", c),
+        Object::Superscript(c) => nested(out, "sup", c),
+        Object::LineBreak => out.push_str("linebreak"),
+        Object::Timestamp(t) => {
+            let _ = write!(out, "timestamp({t:?})");
+        }
+        Object::Target(t) => {
+            let _ = write!(out, "target({t:?})");
+        }
+        Object::RadioTarget(c) => nested(out, "radio", c),
+        Object::StatisticsCookie(t) => {
+            let _ = write!(out, "cookie({t:?})");
+        }
+        Object::Macro { name, args } => {
+            let _ = write!(out, "macro({name} {args:?})");
+        }
+        Object::ExportSnippet { backend, value } => {
+            let _ = write!(out, "snippet({backend} {value:?})");
+        }
+    }
 }

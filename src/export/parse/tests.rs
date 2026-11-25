@@ -4,6 +4,7 @@ use super::*;
 fn ctx() -> Context {
     Context {
         todo_keywords: ["TODO", "NEXT", "DONE"].map(String::from).to_vec(),
+        ..Context::default()
     }
 }
 
@@ -45,6 +46,11 @@ fn golden_misc() {
     golden("misc");
 }
 
+#[test]
+fn golden_objects() {
+    golden("objects");
+}
+
 /// The file's own `#+TODO:` replaces the configured set, as in emacs.
 #[test]
 fn the_files_todo_line_replaces_the_configured_keywords() {
@@ -52,7 +58,7 @@ fn the_files_todo_line_replaces_the_configured_keywords() {
     let doc = parse(text, &Context::for_file(text, ctx().todo_keywords));
     assert_eq!(doc.headlines[0].todo.as_deref(), Some("PROPOSED"));
     assert_eq!(doc.headlines[1].todo, None);
-    assert_eq!(doc.headlines[1].title, "TODO b");
+    assert_eq!(doc.headlines[1].raw_title, "TODO b");
 }
 
 /// Parsing a file a chunk at a time, cut at headlines, builds the same tree
@@ -77,7 +83,7 @@ fn chunked_equals_whole(text: &str, every: usize) {
 
 #[test]
 fn a_file_parsed_in_chunks_is_the_file_parsed_whole() {
-    for name in ["headlines", "lists", "blocks", "misc"] {
+    for name in ["headlines", "lists", "blocks", "misc", "objects"] {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export/parse/testdata");
         let org = std::fs::read_to_string(dir.join(format!("{name}.org"))).unwrap();
@@ -208,7 +214,7 @@ fn deep_nesting_is_bounded() {
     }
     assert!(depth <= MAX_DEPTH, "{depth}");
     assert!(
-        matches!(&at.kind, ElementKind::Paragraph(t) if t.contains("#+begin_b") && !t.ends_with('x')),
+        matches!(&at.kind, ElementKind::Paragraph(t) if super::dump::objects(t).contains("#+begin")),
         "past the bound the rest is text: {:?}",
         at.kind
     );

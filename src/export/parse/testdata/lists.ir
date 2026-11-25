@@ -1,4 +1,4 @@
-headline 1 @0 "Lists"
+headline 1 @0 ["Lists"]
   list Unordered @1
     item "-" @1
       paragraph @1 "one"
@@ -25,9 +25,9 @@ headline 1 @0 "Lists"
     item "3)" @14
       paragraph @14 "third"
   list Descriptive @17
-    item "-" @17 tag="term"
+    item "-" @17 tag=["term"]
       paragraph @17 "description"
-    item "-" @18 tag="other term"
+    item "-" @18 tag=["other term"]
       paragraph @18 "more\nthat goes on"
   list Unordered @22
     item "-" @22

@@ -1,11 +1,11 @@
 //! The export parser: org text to a backend-neutral tree, shaped like
 //! emacs's org-element (lattice's `org-export.md` §3.1).
 //!
-//! **Elements here, objects later.** This pass finds the elements: sections
-//! and headlines, paragraphs, lists, tables, blocks, drawers, keywords,
-//! footnote definitions and the rest. Text that holds objects (a paragraph, a
-//! headline's title, a table cell, an item's tag) is kept as the source wrote
-//! it, for the object pass to read.
+//! **Elements, then objects.** The element pass finds sections and
+//! headlines, paragraphs, lists, tables, blocks, drawers, keywords, footnote
+//! definitions and the rest; the text inside them that holds objects (a
+//! paragraph, a headline's title, a table cell, an item's tag, a caption) goes
+//! through [`objects`], bounded per piece of text.
 //!
 //! **A headline ends everything.** Org's grammar lets no element cross a
 //! headline: a block whose `#+end_` is below the next headline is not a
@@ -21,6 +21,9 @@
 
 pub(crate) mod dump;
 mod element;
+pub(crate) mod objects;
+
+use objects::{Object, SubSuperscripts};
 
 /// How deep lists, drawers and greater blocks nest before their contents are
 /// read as plain text. Org files nest a handful of levels; this bounds the
@@ -45,8 +48,9 @@ pub(crate) struct Headline {
     /// A TODO keyword, only if it is one of the file's set.
     pub(crate) todo: Option<String>,
     pub(crate) priority: Option<char>,
-    /// The title as written, for the object pass.
-    pub(crate) title: String,
+    pub(crate) title: Vec<Object>,
+    /// The title as written: what an internal `[[*Title]]` link matches.
+    pub(crate) raw_title: String,
     pub(crate) tags: Vec<String>,
     /// Titled `COMMENT`: the subtree is not exported.
     pub(crate) commented: bool,
@@ -89,7 +93,7 @@ pub(crate) struct Element {
 pub(crate) struct Affiliated {
     pub(crate) name: Option<String>,
     /// One entry per `#+CAPTION:` line, as org concatenates them.
-    pub(crate) caption: Vec<String>,
+    pub(crate) caption: Vec<Vec<Object>>,
     /// `(backend, value)` per `#+ATTR_<backend>:` line, backend lowercased.
     pub(crate) attr: Vec<(String, String)>,
     /// `#+RESULTS:`'s value, when the element is a block's result.
@@ -105,8 +109,8 @@ impl Affiliated {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ElementKind {
-    /// Lines of text, joined with `\n`, as written.
-    Paragraph(String),
+    /// Lines of text, joined with `\n`.
+    Paragraph(Vec<Object>),
     PlainList(List),
     Table(Table),
     /// A `table.el` table (`+---+`), kept as its lines.
@@ -200,8 +204,8 @@ pub(crate) struct Item {
     /// `[@3]`.
     pub(crate) counter: Option<u32>,
     pub(crate) checkbox: Option<Checkbox>,
-    /// A descriptive item's term, for the object pass.
-    pub(crate) tag: Option<String>,
+    /// A descriptive item's term.
+    pub(crate) tag: Option<Vec<Object>>,
     pub(crate) contents: Vec<Element>,
 }
 
@@ -229,8 +233,8 @@ pub(crate) struct Table {
 pub(crate) enum Row {
     /// `|---+---|`.
     Rule,
-    /// Each cell's text, trimmed, for the object pass.
-    Cells(Vec<String>),
+    /// Each cell, trimmed.
+    Cells(Vec<Vec<Object>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,10 +245,11 @@ pub(crate) enum Align {
 }
 
 /// What a parse needs from outside the text: the TODO keywords a headline's
-/// first word is checked against.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// first word is checked against, and which `_` / `^` are scripts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Context {
     pub(crate) todo_keywords: Vec<String>,
+    pub(crate) subsup: SubSuperscripts,
 }
 
 impl Context {
@@ -263,6 +268,7 @@ impl Context {
         }
         Self {
             todo_keywords: if own.is_empty() { configured } else { own },
+            subsup: SubSuperscripts::default(),
         }
     }
 }
@@ -309,7 +315,7 @@ fn section(lines: &[&str], first_line: u32, ctx: &Context) -> FlatSection {
     let Some(head) = lines.first().and_then(|l| headline_of(l, first_line, ctx)) else {
         return FlatSection {
             headline: None,
-            elements: element::parse(lines, first_line),
+            elements: element::parse(lines, first_line, ctx),
         };
     };
     let mut head = head;
@@ -324,7 +330,7 @@ fn section(lines: &[&str], first_line: u32, ctx: &Context) -> FlatSection {
     }
     FlatSection {
         headline: Some(head),
-        elements: element::parse(&lines[body..], first_line + body as u32),
+        elements: element::parse(&lines[body..], first_line + body as u32, ctx),
     }
 }
 
@@ -339,7 +345,8 @@ fn headline_of(line: &str, at: u32, ctx: &Context) -> Option<Headline> {
         level: h.stars.len(),
         todo: h.keyword.map(str::to_string),
         priority: h.priority,
-        title: title.to_string(),
+        title: objects::parse(title, ctx.subsup),
+        raw_title: title.to_string(),
         tags: h.tags.iter().map(|t| t.to_string()).collect(),
         commented,
         planning: Planning::default(),

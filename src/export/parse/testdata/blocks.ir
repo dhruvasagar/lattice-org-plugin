@@ -1,4 +1,4 @@
-headline 1 @0 "Blocks"
+headline 1 @0 ["Blocks"]
   block src "python" @1 params=":results output :exports both" "    def f():\n        return 1\n* escaped headline\n#+begin_src escaped keyword"
   block example @8 "example  text"
   block export "html" @12 "<div>raw</div>"
@@ -13,4 +13,4 @@ headline 1 @0 "Blocks"
     paragraph @30 "centered"
   block special "note" @33 params=":class x"
     paragraph @34 "special block"
-  paragraph @37 "#+begin_src sh\nnever closed, so a paragraph"
+  paragraph @37 "#+begin" sub["src"] " sh\nnever closed, so a paragraph"

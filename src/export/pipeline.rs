@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(w.path, "/notes/plan.html");
         assert!(
             w.text
-                .contains("headline 1 @0 &quot;One &lt;&amp;&gt;&quot;"),
+                .contains("headline 1 @0 [&quot;One &lt;&amp;&gt;&quot;]"),
             "{}",
             w.text
         );
@@ -579,7 +579,7 @@ mod tests {
         );
         assert_eq!(
             written(&effects).1,
-            "```\nheadline 1 @2 \"Two\"\n  paragraph @3 \"y\"\n  headline 2 @4 \"Deep\"\n```\n"
+            "```\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n```\n"
         );
         r.line = 0;
         let outside = run(&r, Some("text\n* One\n".to_string()));
@@ -621,6 +621,7 @@ mod tests {
         assert!(steps > 3, "{steps} steps");
         let ctx = Context {
             todo_keywords: vec!["TODO".to_string(), "DONE".to_string()],
+            ..Context::default()
         };
         let whole = parse::dump::dump(&parse::parse(&text, &ctx));
         assert_eq!(written(&effects).1, format!("```\n{whole}```\n"));
@@ -634,7 +635,7 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export/parse/testdata");
         let mut r = request(Backend::Markdown);
         r.body_only = true;
-        for name in ["headlines", "lists", "blocks", "misc"] {
+        for name in ["headlines", "lists", "blocks", "misc", "objects"] {
             let text = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus");
             let ctx = Context::for_file(&text, vec!["TODO".to_string(), "DONE".to_string()]);
             let whole = parse::dump::dump(&parse::parse(&text, &ctx));

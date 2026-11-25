@@ -1,21 +1,21 @@
-headline 1 @0 "Tables"
+headline 1 @0 ["Tables"]
   table @1 align=[Some(Left), Some(Right), None]
-    with name="data" caption="A table" caption="continued"
-    row ["a", "b", "c"]
+    with name="data" caption=["A table"] caption=["continued"]
+    row ["a"] ["b"] ["c"]
     rule
-    row ["1", "2", "3"]
+    row ["1"] ["2"] ["3"]
     tblfm "$3=$1+$2"
   table.el @10 ["+---+---+", "| x | y |", "+---+---+"]
-headline 1 @14 "Drawers and keywords"
+headline 1 @14 ["Drawers and keywords"]
   drawer LOGBOOK @15
     clock @16 "[2026-01-01 Thu 09:00]--[2026-01-01 Thu 10:00] =>  1:00"
-  paragraph @18 ":NEVER_CLOSED:\ntext after an unclosed drawer"
-  paragraph @20 "[[file:pic.png]]"
+  paragraph @18 ":NEVER" sub["CLOSED"] ":\ntext after an unclosed drawer"
+  paragraph @20 link("file:pic.png")
     with attr_html=":width 300"
   keyword NAME @23 "alone"
   keyword OPTIONS @25 "toc:nil"
-headline 1 @26 "Footnotes and the rest"
-  paragraph @27 "Text with a reference[fn:1]."
+headline 1 @26 ["Footnotes and the rest"]
+  paragraph @27 "Text with a reference" fn("1") "."
   footnote 1 @29
     paragraph @29 "The definition,\non two lines."
   footnote two @31

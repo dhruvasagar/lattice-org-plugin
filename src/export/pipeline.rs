@@ -107,6 +107,9 @@ pub(crate) fn target_path(source: &str, backend: Backend) -> String {
         .rsplit_once('/')
         .map_or(source, |(_, name)| name)
         .rsplit_once('.')
+        // A leading dot is a hidden file's name, not its extension: emacs
+        // exports `.notes` to `.notes.html`.
+        .filter(|(stem, _)| !stem.is_empty())
         .map(|(stem, _)| stem.len());
     let base = match stem {
         Some(len) => {
@@ -141,6 +144,12 @@ thread_local! {
 /// `on-event` for [`EV_REQUESTED`]: read the buffer and start a run.
 pub(crate) fn on_requested(payload: &[u8]) {
     let Ok(request) = rmp_serde::from_slice::<Request>(payload) else {
+        // The plugin's own event, so this is a bug; the guest has no log, so
+        // the user is told.
+        post(vec![echo(
+            EchoLevel::Error,
+            "org: an export request was unreadable",
+        )]);
         return;
     };
     let text = host_services::buffer_text(request.buffer);
@@ -181,6 +190,10 @@ pub(crate) fn on_step(payload: &[u8]) {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
     else {
+        post(vec![echo(
+            EchoLevel::Error,
+            "org: an export step was unreadable",
+        )]);
         return;
     };
     let step = RUNS.with(|runs| {
@@ -656,7 +669,7 @@ fn echo(level: EchoLevel, text: impl Into<String>) -> Effect {
 
 fn post(effects: Vec<Effect>) {
     // `err` only when the editor wired nowhere to post to; then there is no
-    // one to tell either.
+    // one to tell, and the guest has no log of its own to write it to.
     let _ = host_services::post_effects(&effects);
 }
 
@@ -760,6 +773,11 @@ mod tests {
             "/a/v1.2/README.tex"
         );
         assert_eq!(target_path("/a/x.y.org", Backend::Html), "/a/x.y.html");
+        assert_eq!(target_path("/a/.notes", Backend::Html), "/a/.notes.html");
+        assert_eq!(
+            target_path("/a/.notes.org", Backend::Html),
+            "/a/.notes.html"
+        );
     }
 
     /// The write replaces the target whole and saves it: the file is for

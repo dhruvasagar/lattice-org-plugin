@@ -249,7 +249,8 @@ pub(crate) struct Footnotes {
     /// Keys in the order first referenced; a key is the label, or a made-up
     /// one for an anonymous inline footnote.
     order: Vec<String>,
-    refs: HashMap<String, usize>,
+    /// Key → its number and how many times it has been referenced.
+    refs: HashMap<String, (usize, usize)>,
     definitions: HashMap<String, Definition>,
     anonymous: usize,
     /// How many of `order` have been written out.
@@ -276,16 +277,13 @@ impl Footnotes {
                 .entry(key.clone())
                 .or_insert_with(|| Definition::Inline(definition.to_vec()));
         }
-        let n = match self.order.iter().position(|k| *k == key) {
-            Some(i) => i + 1,
-            None => {
-                self.order.push(key.clone());
-                self.order.len()
-            }
-        };
-        let count = self.refs.entry(key).or_insert(0);
+        let next = self.order.len() + 1;
+        let (n, count) = self.refs.entry(key.clone()).or_insert((next, 0));
+        if *count == 0 {
+            self.order.push(key);
+        }
         *count += 1;
-        (n, *count)
+        (*n, *count)
     }
 
     /// Keep the definitions among `elements`.

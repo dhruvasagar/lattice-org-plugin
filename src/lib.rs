@@ -68,16 +68,19 @@ provides = [
     "completion-source", "transient-source", "help", "config", "theme", "events",
     "llm-tools",
 ]
-default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode"]
+default_modes = [
+    "org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode", "org-export-mode",
+]
 capabilities = [
     "fs:write:{org.directory|~/org}",
     "fs:write:{org.roam-directory|~/org-roam}",
     "fs:write:{org.babel.tangle-directories}",
+    "fs:write:{org.export.directories}",
     "proc:spawn:{org.babel.languages:command}",
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-mode_gates = { "org-babel-mode" = "org.babel.enabled" }
+mode_gates = { "org-babel-mode" = "org.babel.enabled", "org-export-mode" = "org.export.enabled" }
 min_lattice = "0.10.3"
 "#
 );
@@ -221,6 +224,7 @@ mod agenda_sections;
 mod archive;
 // OB.4: running source blocks — the whole of `org-babel-mode`.
 mod babel;
+// HTML, Markdown and LaTeX export: the whole of `org-export-mode`.
 mod capture;
 mod capture_drafts;
 mod capture_flow;
@@ -231,6 +235,7 @@ mod clock;
 mod clock_scan;
 mod config_shape;
 mod datetree;
+mod export;
 mod habit_graph;
 mod habit_row;
 mod habit_stats;
@@ -1720,6 +1725,7 @@ impl Guest for Component {
     fn register_options() {
         // OB.4: babel's `org.babel.*`, declared by its own module.
         babel::register_options();
+        export::register_options();
         // TK.2 / TC.7: a LIST of sequence lines, not one newline-joined string.
         //
         // The lines keep emacs' own grammar — that grammar is org's public
@@ -2077,6 +2083,7 @@ impl Guest for Component {
     /// left of `core.position` (10).
     fn register_events() {
         babel::register_events();
+        export::register_events();
         events::subscribe(
             &EventFilter {
                 kinds: Some(vec![EventKind::Plugin]),
@@ -2308,6 +2315,7 @@ impl Guest for Component {
             // OB.6: a run request from babel's `C-c C-c`.
             babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
             babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
+            export::pipeline::EV_REQUESTED => export::pipeline::on_requested(&p.payload),
             _ => {}
         }
     }
@@ -2324,6 +2332,7 @@ impl Guest for Component {
     fn register_modes() {
         // OB.4: `org-babel-mode`, declared by its own module.
         babel::register();
+        export::register();
         let bind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Normal,
             chord: chord.to_string(),
@@ -3207,6 +3216,7 @@ impl Guest for Component {
     fn register_grammar() {
         // OB.4: babel's action and commands, declared by its own module.
         babel::register_grammar();
+        export::register_grammar();
         let spec = || ActionSpec {
             args_schema: Vec::new(),
         };
@@ -9844,6 +9854,7 @@ impl GrammarCallbacks for Component {
             )),
             // OB.4: babel owns its ids; see `babel` for why none is here.
             cb if babel::is_action(cb) => babel::apply_action(cb, &ctx, doc, tree),
+            cb if export::is_action(cb) => export::apply_action(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }
@@ -10070,6 +10081,7 @@ impl GrammarCallbacks for Component {
                 })
             }
             cb if babel::is_ex_parse(cb) => babel::parse_ex_args(cb, &rest),
+            cb if export::is_ex_parse(cb) => export::parse_ex_args(cb, &rest),
             other => Err(format!("org: unknown ex-command parse callback {other}")),
         }
     }
@@ -10356,6 +10368,7 @@ impl GrammarCallbacks for Component {
                 },
             ))]),
             cb if babel::is_ex_command(cb) => babel::apply_ex_command(cb, &ctx, doc, tree),
+            cb if export::is_ex_command(cb) => export::apply_ex_command(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown ex-command callback {other}")),
         }
     }
@@ -12436,6 +12449,11 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             }
             if key == ORG_TRANSIENT_AGENDA_BULK_TODO {
                 return agenda_bulk_todo_menu();
+            }
+            // Export's dispatcher, before the capture parse for the same
+            // reason as the menus above.
+            if key == export::TRANSIENT_KEY {
+                return export::dispatcher_menu();
             }
         }
 

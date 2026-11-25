@@ -5,6 +5,19 @@
 Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.0), and so needs
 the lattice release that carries it.
 
+### Added
+- **Export: `org-export-mode`** (in progress), on in every org buffer and off
+  with `:set org.export.enabled=false`. `C-c C-e` opens the dispatcher, emacs's
+  `org-export-dispatch`: `h h`, `m m` and `l l` write HTML, Markdown or LaTeX
+  beside the file, and `C-s` / `C-b` switch to the subtree at point and to the
+  body only, and stay set for the next export. `:org-export-html`,
+  `:org-export-markdown` and `:org-export-latex` do the same, with
+  `--subtree` and `--body-only`. The export runs in the background and writes
+  only where org may write: a target outside `org.directory` is refused at once,
+  naming `org.export.directories`, the list that allows more. The output is a
+  placeholder for now (the source, verbatim, in the format's document) until
+  the parser and the real HTML, Markdown and LaTeX writers land.
+
 ### Fixed
 - `:help org` no longer lists babel among what the plugin does not do; it
   points to `:help org.babel` instead.

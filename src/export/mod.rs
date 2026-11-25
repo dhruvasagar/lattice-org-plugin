@@ -157,6 +157,10 @@ const LOG: u32 = 312;
 const RUN_BLOCKS: u32 = 313;
 /// [`RUN_BLOCKS`]'s name, which the question names as its `yes-action`.
 pub(crate) const RUN_BLOCKS_NAME: &str = "org-export-run-blocks";
+/// The `n` to that question: export with the results already in the file.
+const KEEP_RESULTS: u32 = 314;
+/// [`KEEP_RESULTS`]'s name, the question's `no-action`.
+pub(crate) const KEEP_RESULTS_NAME: &str = "org-export-keep-results";
 
 /// The events handler for an output buffer's minor going on.
 pub(crate) const ON_OUTPUT_MODE: u32 = 300;
@@ -226,7 +230,7 @@ impl Switches {
 
 /// Whether `callback` is one of export's action ids.
 pub(crate) fn is_action(callback: u32) -> bool {
-    callback == DISPATCH || callback == RUN_BLOCKS
+    matches!(callback, DISPATCH | RUN_BLOCKS | KEEP_RESULTS)
 }
 
 /// Whether `callback` is one of export's ex-command ids.
@@ -498,21 +502,28 @@ pub(crate) fn register_grammar() {
         },
         DISPATCH,
     );
+    let run_arg = || ActionSpec {
+        args_schema: vec![ArgSpec {
+            name: "run".to_string(),
+            kind: ArgKind::String,
+            doc: "the export's run".to_string(),
+            prompt: String::new(),
+            default: ArgDefault::None,
+            completion: None,
+            picker: None,
+        }],
+    };
     register_action(
         RUN_BLOCKS_NAME,
         "Run the source blocks an export asked about (its `y`)",
-        &ActionSpec {
-            args_schema: vec![ArgSpec {
-                name: "run".to_string(),
-                kind: ArgKind::String,
-                doc: "the export's run".to_string(),
-                prompt: String::new(),
-                default: ArgDefault::None,
-                completion: None,
-                picker: None,
-            }],
-        },
+        &run_arg(),
         RUN_BLOCKS,
+    );
+    register_action(
+        KEEP_RESULTS_NAME,
+        "Export with the results already in the file, running nothing (its `n`)",
+        &run_arg(),
+        KEEP_RESULTS,
     );
     // Named `subtree` and `body-only`: the dispatcher's flag rows fill the
     // slots by these names.
@@ -674,7 +685,7 @@ pub(crate) fn apply_action(
             source: crate::CAPTURE_TRANSIENT.to_string(),
             args: Args::String(TRANSIENT_KEY.to_string()),
         })]),
-        RUN_BLOCKS => {
+        RUN_BLOCKS | KEEP_RESULTS => {
             let run = match &ctx.args {
                 Args::List(v) => match v.first() {
                     Some(ArgValue::String(s)) => s.parse::<u64>().ok(),
@@ -685,8 +696,12 @@ pub(crate) fn apply_action(
             };
             match run {
                 // The runs live in the events seam.
-                Some(run) => {
+                Some(run) if callback == RUN_BLOCKS => {
                     pipeline::request_run_blocks(run);
+                    Ok(Vec::new())
+                }
+                Some(run) => {
+                    pipeline::request_keep_results(run);
                     Ok(Vec::new())
                 }
                 None => Err("org: the export's question named no run".to_string()),

@@ -835,6 +835,33 @@ async fn an_export_asks_once_before_running() {
     assert!(out.contains("fresh-greet"), "{out}");
 }
 
+/// `n` to the question still exports, with the results already in the
+/// file, and runs nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_to_the_question_exports_the_results_in_the_file() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = RUNS.replace("echo fresh-greet", "touch ran-anyway; echo fresh-greet");
+    let (mut editor, _loader) = babel_export_editor(base.path(), &doc, true).await;
+    let md = base.path().join("notes.md");
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    let prompt = "Export runs sh block \"greet\"? (y/n)";
+    settle(&mut editor, |e| menu_title(e).as_deref() == Some(prompt)).await;
+    press(&mut editor, "n");
+    settle(&mut editor, |e| md.exists()).await;
+    let out = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        out.contains("stale-greet") && !out.contains("fresh-greet"),
+        "{out}"
+    );
+    assert!(
+        !base.path().join("ran-anyway").exists(),
+        "`n` ran the block"
+    );
+    assert_eq!(text(&editor), doc);
+}
+
 /// Wait for a block's process to make `path`: a process is outside the
 /// editor, so nothing wakes it when the file appears.
 async fn wait_for_file(path: &std::path::Path) {

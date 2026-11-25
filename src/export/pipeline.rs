@@ -63,6 +63,9 @@ pub(crate) const EV_CANCEL: &str = "org/export-cancel";
 /// grammar seam: the run's id.
 pub(crate) const EV_RUN_BLOCKS: &str = "org/export-run-blocks";
 
+/// The `n` to it: export with the results already in the file.
+pub(crate) const EV_KEEP_RESULTS: &str = "org/export-keep-results";
+
 /// How much one step does: the source a parse step reads, and the output a
 /// render step writes. A parse chunk ends at the first headline past this,
 /// and a render step at the first headline past it, so one section larger
@@ -366,6 +369,32 @@ pub(crate) fn on_step(payload: &[u8]) {
 /// `y` to its question.
 pub(crate) fn request_run_blocks(id: u64) {
     host_services::emit_event(EV_RUN_BLOCKS, id.to_string().as_bytes());
+}
+
+/// Ask the events seam to go on with export `id` without running its
+/// blocks, for the `n` to its question.
+pub(crate) fn request_keep_results(id: u64) {
+    host_services::emit_event(EV_KEEP_RESULTS, id.to_string().as_bytes());
+}
+
+/// `on-event` for [`EV_KEEP_RESULTS`]: go on with the run named, over the
+/// file as it is, if it is still waiting for an answer.
+pub(crate) fn on_keep_results(payload: &[u8]) {
+    let Some(id) = std::str::from_utf8(payload)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let waiting = RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        runs.iter_mut()
+            .find(|r| r.id == id)
+            .is_some_and(Run::declined)
+    });
+    if waiting {
+        host_services::emit_event(EV_STEP, payload);
+    }
 }
 
 /// `on-event` for [`EV_RUN_BLOCKS`]: start the blocks of the run named,
@@ -874,6 +903,9 @@ impl Run {
                             let effects = vec![Effect::Confirm(ConfirmPayload {
                                 prompt: planning.prompt(),
                                 yes_action: super::RUN_BLOCKS_NAME.to_string(),
+                                // `n` still exports, with the results the
+                                // file already has, as in emacs.
+                                no_action: Some(super::KEEP_RESULTS_NAME.to_string()),
                                 args: Args::List(vec![ArgValue::String(self.id.to_string())]),
                             })];
                             self.eval = Eval::Asking(runs);
@@ -885,6 +917,16 @@ impl Run {
                 }
             }
         }
+    }
+
+    /// The `n`: render over the file as it is. `false` when the run was not
+    /// waiting for an answer.
+    fn declined(&mut self) -> bool {
+        if !matches!(self.eval, Eval::Asking(_)) {
+            return false;
+        }
+        self.eval = Eval::Done;
+        true
     }
 
     /// The `y`: the runs to start, if the run is waiting for it.

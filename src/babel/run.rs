@@ -432,6 +432,7 @@ pub(crate) fn confirm_or_start(
     vec![Effect::Confirm(ConfirmPayload {
         prompt: prompt(&checked),
         yes_action: super::RUN_CONFIRMED_NAME.to_string(),
+        no_action: None,
         args: Args::List(vec![ArgValue::String(pack(lines, &checked))]),
     })]
 }

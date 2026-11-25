@@ -2328,6 +2328,7 @@ impl Guest for Component {
             export::pipeline::EV_STEP => export::pipeline::on_step(&p.payload),
             export::pipeline::EV_CANCEL => export::pipeline::on_cancel(),
             export::pipeline::EV_RUN_BLOCKS => export::pipeline::on_run_blocks(&p.payload),
+            export::pipeline::EV_KEEP_RESULTS => export::pipeline::on_keep_results(&p.payload),
             _ => {}
         }
     }

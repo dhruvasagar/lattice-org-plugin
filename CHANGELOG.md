@@ -100,7 +100,8 @@ the lattice release that carries it.
   babel, with its languages table, `:var` chains, noweb and sessions, and
   its fresh result appears in the export. It runs on a copy, so the file's
   own `#+RESULTS:` are never touched. With `org.babel.confirm` on, the
-  export asks once (`Export runs 2 blocks (sh ×2)? (y/n)`). `:eval
+  export asks once (`Export runs 2 blocks (sh ×2)? (y/n)`). `n` still
+  exports, with the results already in the file; `q` cancels. `:eval
   no-export` (or `never-export`, `no`, `never`) keeps a block from running
   for an export, so it shows the result already in the file, as does a
   block whose language has no `org.babel.languages` entry (the echo names

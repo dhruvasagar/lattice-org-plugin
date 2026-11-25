@@ -452,7 +452,10 @@ async fn a_buffer_export_opens_then_replaces_its_buffer() {
         .expect("the export buffer opened");
     assert_eq!(editor.document_buffer_id, out, "and has focus");
     assert!(buffer_text(&editor, out).contains("<title>Plan</title>"));
-    assert!(!base.path().join("notes.html").exists(), "no file is written");
+    assert!(
+        !base.path().join("notes.html").exists(),
+        "no file is written"
+    );
 
     // Back in the org buffer, change the title and export again.
     editor.do_edit(Some(source), false);
@@ -461,7 +464,10 @@ async fn a_buffer_export_opens_then_replaces_its_buffer() {
     assert!(text(&editor).starts_with("* One"), "{}", text(&editor));
     assert!(open_dispatcher(&mut editor).await.is_some());
     press(&mut editor, "hH");
-    settle(&mut editor, |e| buffer_text(e, out).contains("<title>notes</title>")).await;
+    settle(&mut editor, |e| {
+        buffer_text(e, out).contains("<title>notes</title>")
+    })
+    .await;
     assert_eq!(
         buffers(&editor).find_by_name("*Org HTML Export*"),
         Some(out),
@@ -485,7 +491,9 @@ async fn an_open_export_writes_then_opens_the_file() {
         buffers(e).path_for(e.document_buffer_id).as_deref() == Some(html.as_path())
     })
     .await;
-    assert!(std::fs::read_to_string(&html).unwrap().contains("<title>Plan</title>"));
+    assert!(std::fs::read_to_string(&html)
+        .unwrap()
+        .contains("<title>Plan</title>"));
 }
 
 /// A file whose parse does not fit one call's fuel is exported over several
@@ -516,8 +524,19 @@ async fn a_file_too_large_for_one_call_is_exported_in_steps() {
     .await;
     let written = std::fs::read_to_string(&md)
         .unwrap_or_else(|_| panic!("nothing written; the echo is {:?}", last_echo(&editor)));
-    assert!(written.contains("\"Heading 0\""), "the first section");
-    assert!(written.contains("\"Heading 3999\""), "and the last");
+    assert!(
+        written.contains("\n# <a id=\""),
+        "headings: {}",
+        &written[..200]
+    );
+    assert!(
+        written.contains("1. TODO Heading 0   `:tag:`\n"),
+        "the first section"
+    );
+    assert!(
+        written.contains("4000. TODO Heading 3999   `:tag:`\n"),
+        "and the last"
+    );
 }
 
 /// The file's options and macros shape what is exported, and what it asks
@@ -541,7 +560,7 @@ async fn the_files_options_and_macros_shape_the_export_and_the_unsupported_are_n
     .await;
     let written = std::fs::read_to_string(&md).unwrap();
     assert!(
-        written.contains("\"Kept\"") && written.contains("\"Last\""),
+        written.contains("1. Kept\n") && written.contains("2. Last\n"),
         "{written}"
     );
     assert!(
@@ -549,7 +568,7 @@ async fn the_files_options_and_macros_shape_the_export_and_the_unsupported_are_n
         "{written}"
     );
     assert!(
-        written.contains("\"a_b by Ada\""),
+        written.contains("\na\\_b by Ada\n"),
         "^:nil, set after the text, and the macro: {written}"
     );
     assert_eq!(
@@ -580,8 +599,8 @@ async fn includes_read_what_the_grant_allows_and_name_what_it_does_not() {
     .await;
     let written = std::fs::read_to_string(&md).unwrap();
     assert!(
-        written.contains("headline 2 @1 [\"Included\"]") && written.contains("\"from part\""),
-        "{written}"
+        written.contains("\n## <a id=") && written.contains("1.1. Included\n\nfrom part\n"),
+        "the include's headline under the one it is in: {written}"
     );
 
     let secret = outside.path().join("secret.org");
@@ -633,10 +652,12 @@ async fn the_switches_reach_the_export_and_stay_set() {
     assert!(open_dispatcher(&mut editor).await.is_some());
     press(&mut editor, "<C-b>mm");
     settle(&mut editor, |_| md.exists()).await;
+    // Body only leaves out the contents, and with them the anchors only
+    // they link to.
     let body_only = std::fs::read_to_string(&md).unwrap();
     assert!(
-        body_only.starts_with("```\n") && !body_only.contains("# Plan"),
-        "no title heading: {body_only}"
+        body_only.starts_with("# 1. One\n"),
+        "no contents: {body_only}"
     );
 
     std::fs::remove_file(&md).unwrap();
@@ -644,5 +665,5 @@ async fn the_switches_reach_the_export_and_stay_set() {
     press(&mut editor, "mm");
     settle(&mut editor, |_| md.exists()).await;
     let again = std::fs::read_to_string(&md).unwrap();
-    assert!(again.starts_with("```\n"), "still body only: {again}");
+    assert!(again.starts_with("# 1. One\n"), "still body only: {again}");
 }

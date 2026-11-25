@@ -53,6 +53,9 @@ pub(crate) struct Targets {
     names: HashMap<String, Option<u32>>,
     /// Radio targets: the text as matched (normalised) and its anchor.
     radios: Vec<(String, String)>,
+    /// Every link path in the file, as written, for which anchors something
+    /// links to.
+    links: HashSet<String>,
     /// The headlines the export shows; `None` until the selection is known.
     live: Option<HashSet<u32>>,
     /// Whether the text before the first headline is exported.
@@ -150,6 +153,14 @@ impl Targets {
                 | Object::Subscript { contents, .. }
                 | Object::Superscript { contents, .. } => self.objects(contents, at),
                 Object::FootnoteReference { definition, .. } => self.objects(definition, at),
+                Object::Link {
+                    path, description, ..
+                } => {
+                    if !self.links.contains(path) {
+                        self.links.insert(path.clone());
+                    }
+                    self.objects(description, at);
+                }
                 _ => {}
             }
         }
@@ -186,6 +197,20 @@ impl Targets {
     /// The anchor of an element with this `#+NAME:`.
     pub(crate) fn name_anchor(&self, name: &str) -> String {
         hashed("name", &norm(name))
+    }
+
+    /// The anchors some link in the file goes to: a backend that writes an
+    /// anchor only where one is needed (Markdown's headings) asks this
+    /// before the walk, since a link may come before what it names. One
+    /// resolution per distinct path.
+    pub(crate) fn referred(&self, host: &dyn Host) -> HashSet<String> {
+        self.links
+            .iter()
+            .filter_map(|path| match self.resolve(path, host) {
+                Resolution::Internal(anchor) => Some(anchor),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The live radio targets, as `(normalised text, anchor)`.

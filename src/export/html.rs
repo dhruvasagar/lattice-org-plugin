@@ -15,11 +15,11 @@
 //! (open containers, footnote numbers, the figure and table counters, whether
 //! any math needs MathJax) lives on [`Html`] between steps.
 
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use super::common::{self, Definition, Footnotes, Outline};
 use super::filter::{self, Selection, View};
-use super::options::{Depth, Options, Tags, Tex};
+use super::options::{Options, Tags, Tex};
 use super::parse::objects::{Emphasis, Object};
 use super::parse::{
     Align, Block, BlockKind, Checkbox, Doc, Element, ElementKind, Headline, ListKind, Row, Table,
@@ -78,38 +78,16 @@ enum Open {
     Item(usize),
 }
 
-/// A footnote's definition, as it is found.
-enum Definition {
-    Elements(Vec<Element>),
-    Inline(Vec<Object>),
-}
-
 /// The document-wide state of one HTML export.
 pub(crate) struct Html {
     open: Vec<Open>,
-    /// Headline line → its section number, for the numbered ones.
-    numbers: HashMap<u32, Vec<usize>>,
-    /// Added to a headline's level to give its level in the export: a
-    /// subtree export's top headline is level 1.
-    offset: i64,
-    /// An internal link's text when it has no description: the number of a
-    /// numbered headline, else its title.
-    labels: HashMap<String, String>,
+    outline: Outline,
     done: Vec<String>,
     /// The exported file, and its directory, for links to other files.
     source: String,
     dir: String,
-    /// Headline line → its `:ID:`, which an `id:` link from another file
-    /// reaches as `#ID-<id>`. Taken before the filter, which may drop the
-    /// properties.
-    org_ids: HashMap<u32, String>,
     body_only: bool,
-    /// Footnote keys in the order first referenced; a key is the label, or a
-    /// made-up one for an anonymous inline footnote.
-    footnote_order: Vec<String>,
-    footnote_refs: HashMap<String, usize>,
-    definitions: HashMap<String, Definition>,
-    anonymous: usize,
+    footnotes: Footnotes,
     figures: usize,
     tables: usize,
     listings: usize,
@@ -136,16 +114,6 @@ fn escaped(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     esc(s, &mut out);
     out
-}
-
-/// Whether `path` names an image a browser shows inline.
-fn is_image(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [
-        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".avif",
-    ]
-    .iter()
-    .any(|ext| lower.ends_with(ext))
 }
 
 /// `#+ATTR_HTML: :key value :key2 value…` as attributes, each ` key="value"`.
@@ -192,33 +160,21 @@ impl Html {
             .parent()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
-        let offset = doc
-            .headlines
-            .iter()
-            .map(|h| h.level)
-            .min()
-            .map_or(0, |min| 1 - min as i64);
         let mut html = Html {
             open: Vec::new(),
-            numbers: HashMap::new(),
-            offset,
-            labels: HashMap::new(),
+            outline: Outline::new(doc, selection, view),
             done,
             dir,
             source,
-            org_ids: HashMap::new(),
             body_only,
-            footnote_order: Vec::new(),
-            footnote_refs: HashMap::new(),
-            definitions: HashMap::new(),
-            anonymous: 0,
+            footnotes: Footnotes::default(),
             figures: 0,
             tables: 0,
             listings: 0,
             mathjax: false,
             head_end: None,
         };
-        let toc = html.number(doc, selection, view);
+        let toc = html.toc(view);
         if !body_only {
             html.head(view, &stylesheet, out);
         }
@@ -228,84 +184,20 @@ impl Html {
         html
     }
 
-    fn level(&self, h: &Headline) -> usize {
-        (h.level as i64 + self.offset).max(1) as usize
-    }
-
-    /// Number the exported headlines and give back the table of contents.
-    /// One pass over the headlines, not their sections.
-    fn number(&mut self, doc: &Doc, selection: &Selection, view: &mut View) -> String {
-        let o = &view.options;
-        let deepest = o.headline_levels;
-        // `num:` reaches below `H:`, as in ox: a numbered headline there is
-        // an item in an ordered list.
-        let numbered_to = match o.num {
-            Depth::Off => 0,
-            Depth::On => usize::MAX,
-            Depth::To(n) => n,
-        };
-        let toc_to = match o.toc {
-            Depth::Off => 0,
-            Depth::On => deepest,
-            Depth::To(n) => n.min(deepest),
-        };
-        let toc_tags = o.tags == Tags::On;
-        let mut counters: Vec<usize> = Vec::new();
-        // (headline, inherited UNNUMBERED: 0 none, 1 t, 2 notoc)
-        let mut stack: Vec<(&Headline, u8)> = doc.headlines.iter().rev().map(|h| (h, 0)).collect();
-        let mut entries: Vec<(usize, String, String)> = Vec::new();
-        while let Some((h, inherited)) = stack.pop() {
-            if !filter::visits(h, selection, &view.options) {
-                continue;
+    /// The table of contents, from the outline's entries.
+    fn toc(&mut self, view: &mut View) -> String {
+        let toc = std::mem::take(&mut self.outline.toc);
+        let mut entries: Vec<(usize, &str, String)> = Vec::new();
+        for e in &toc {
+            let mut entry = String::new();
+            if let Some(n) = &e.number {
+                let _ = write!(entry, "{n}. ");
             }
-            let own = h
-                .properties
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("UNNUMBERED"))
-                .map(|(_, v)| v.trim());
-            let unnumbered = match own {
-                Some("notoc") => 2,
-                Some("nil") => 0,
-                Some(_) => 1,
-                None => inherited,
-            };
-            stack.extend(h.children.iter().rev().map(|c| (c, unnumbered)));
-            if let Some((_, id)) = h
-                .properties
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("ID"))
-            {
-                self.org_ids.insert(h.line, id.trim().to_string());
+            self.toc_objects(&e.title, view, &mut entry);
+            if !e.tags.is_empty() {
+                self.tags(&e.tags, &mut entry);
             }
-            let level = self.level(h);
-            let anchor = view.targets().headline_anchor(h.line);
-            let number = if unnumbered == 0 && level <= numbered_to {
-                counters.truncate(level);
-                while counters.len() < level {
-                    counters.push(0);
-                }
-                counters[level - 1] += 1;
-                self.numbers.insert(h.line, counters.clone());
-                Some(dotted(&counters))
-            } else {
-                None
-            };
-            self.labels.insert(
-                anchor.clone(),
-                number.clone().unwrap_or_else(|| h.raw_title.clone()),
-            );
-            if level <= toc_to && unnumbered != 2 && !is_footnote_section(h) {
-                let mut entry = String::new();
-                if let Some(n) = &number {
-                    let _ = write!(entry, "{n}. ");
-                }
-                let title = filter::objects(&h.title, view);
-                self.toc_objects(&title, view, &mut entry);
-                if toc_tags && !h.tags.is_empty() {
-                    self.tags(&h.tags, &mut entry);
-                }
-                entries.push((level, anchor, entry));
-            }
+            entries.push((e.level, &e.anchor, entry));
         }
         if entries.is_empty() {
             return String::new();
@@ -422,15 +314,15 @@ impl Html {
 
     /// One visited headline's own parts, already filtered (`filter::own`).
     pub(crate) fn headline(&mut self, h: &Headline, view: &mut View, out: &mut String) {
-        if is_footnote_section(h) {
+        if common::is_footnote_section(h) {
             // The footnotes are collected; the heading that holds them is not
             // exported, as in ox.
-            self.collect_definitions(&h.section);
+            self.footnotes.collect(&h.section);
             return;
         }
-        let level = self.level(h);
+        let level = self.outline.level(h);
         let anchor = view.targets().headline_anchor(h.line);
-        let number = self.numbers.get(&h.line).map(|n| dotted(n));
+        let number = self.outline.number(h);
         if level > view.options.headline_levels {
             self.deep_headline(h, level, &anchor, number.is_some(), view, out);
             return;
@@ -507,7 +399,7 @@ impl Html {
     /// `<a id="ID-…">` for a headline with an `:ID:`, so `id:` links from
     /// other files land on it.
     fn id_anchor(&self, h: &Headline, anchor: &str, out: &mut String) {
-        if let Some(id) = self.org_ids.get(&h.line) {
+        if let Some(id) = self.outline.org_id(h) {
             let id = format!("ID-{id}");
             if id != anchor {
                 let _ = write!(out, "<a id=\"{}\"></a>", escaped(&id));
@@ -589,16 +481,6 @@ impl Html {
         }
     }
 
-    fn collect_definitions(&mut self, elements: &[Element]) {
-        for e in elements {
-            if let ElementKind::FootnoteDefinition { label, contents } = &e.kind {
-                self.definitions
-                    .entry(label.clone())
-                    .or_insert_with(|| Definition::Elements(contents.clone()));
-            }
-        }
-    }
-
     /// Elements, as HTML.
     pub(crate) fn elements(&mut self, list: &[Element], view: &mut View, out: &mut String) {
         for e in list {
@@ -617,7 +499,7 @@ impl Html {
             .unwrap_or_default();
         match &e.kind {
             ElementKind::Paragraph(objects) => {
-                if let Some(img) = standalone_image(objects) {
+                if let Some(img) = common::standalone_image(objects) {
                     self.figure(e, img, &id, view, out);
                 } else if bare {
                     self.objects(objects, view, out);
@@ -693,7 +575,7 @@ impl Html {
                 }
             }
             ElementKind::FootnoteDefinition { .. } => {
-                self.collect_definitions(std::slice::from_ref(e));
+                self.footnotes.collect(std::slice::from_ref(e));
             }
             ElementKind::FixedWidth(lines) => {
                 out.push_str("<pre class=\"example\">\n");
@@ -729,15 +611,7 @@ impl Html {
         }
     }
 
-    fn figure(
-        &mut self,
-        e: &Element,
-        img: (&str, ()),
-        id: &str,
-        view: &mut View,
-        out: &mut String,
-    ) {
-        let (path, ()) = img;
+    fn figure(&mut self, e: &Element, path: &str, id: &str, view: &mut View, out: &mut String) {
         let _ = writeln!(out, "<div{id} class=\"figure\">");
         out.push_str("<p>");
         self.image(path, &attributes(e, &[]), out);
@@ -987,28 +861,8 @@ impl Html {
                 target,
             } => self.link(path, description, target.as_deref(), view, out),
             Object::FootnoteReference { label, definition } => {
-                let key = match label {
-                    Some(l) => l.clone(),
-                    None => {
-                        self.anonymous += 1;
-                        format!(" anonymous {}", self.anonymous)
-                    }
-                };
-                if !definition.is_empty() {
-                    self.definitions
-                        .entry(key.clone())
-                        .or_insert_with(|| Definition::Inline(definition.clone()));
-                }
-                let n = match self.footnote_order.iter().position(|k| *k == key) {
-                    Some(i) => i + 1,
-                    None => {
-                        self.footnote_order.push(key.clone());
-                        self.footnote_order.len()
-                    }
-                };
-                let count = self.footnote_refs.entry(key).or_insert(0);
-                *count += 1;
-                let id = if *count == 1 {
+                let (n, count) = self.footnotes.reference(label.as_deref(), definition);
+                let id = if count == 1 {
                     format!("fnr.{n}")
                 } else {
                     format!("fnr.{n}.{count}")
@@ -1098,27 +952,22 @@ impl Html {
             let _ = write!(out, "<a href=\"#{}\">", escaped(anchor));
             if description.is_empty() {
                 let label = self
-                    .labels
-                    .get(anchor)
-                    .cloned()
-                    .unwrap_or_else(|| path.trim_start_matches(['#', '*']).to_string());
-                esc(&label, out);
+                    .outline
+                    .label(anchor)
+                    .unwrap_or_else(|| path.trim_start_matches(['#', '*']));
+                esc(label, out);
             } else {
                 self.objects(description, view, out);
             }
             out.push_str("</a>");
             return;
         }
-        let file = path.strip_prefix("file:").unwrap_or(path);
-        let is_file = path.starts_with("file:")
-            || ["/", "./", "../", "~/"].iter().any(|p| path.starts_with(p));
-        if description.is_empty()
-            && (is_file || path.starts_with("http://") || path.starts_with("https://"))
-            && is_image(file)
-        {
-            self.image(file, "", out);
+        if let Some(image) = common::inline_image(path, description) {
+            self.image(image, "", out);
             return;
         }
+        let file = path.strip_prefix("file:").unwrap_or(path);
+        let is_file = common::is_file_path(path);
         let href = if let Some(id) = path.strip_prefix("id:") {
             match view.host().id_file(id) {
                 IdFile::In(file) if file == self.source => format!("#ID-{id}"),
@@ -1210,23 +1059,19 @@ impl Html {
     /// order first referenced. A definition may reference another, which is
     /// numbered and written in turn.
     fn footnotes(&mut self, view: &mut View, out: &mut String) {
-        if self.footnote_order.is_empty() {
+        if self.footnotes.is_empty() {
             return;
         }
         out.push_str(
             "<div id=\"footnotes\">\n<h2 class=\"footnotes\">Footnotes: </h2>\n<div id=\"text-footnotes\">\n\n",
         );
-        let mut i = 0;
-        while i < self.footnote_order.len() {
-            let key = self.footnote_order[i].clone();
-            let n = i + 1;
-            i += 1;
+        while let Some((n, definition)) = self.footnotes.next() {
             let _ = write!(
                 out,
                 "<div class=\"footdef\"><sup><a id=\"fn.{n}\" class=\"footnum\" href=\"#fnr.{n}\" \
                  role=\"doc-backlink\">{n}</a></sup> <div class=\"footpara\" role=\"doc-footnote\">"
             );
-            match self.definitions.remove(&key) {
+            match definition {
                 Some(Definition::Elements(elements)) => {
                     let elements = filter::elements(&elements, view);
                     for e in &elements {
@@ -1250,47 +1095,6 @@ impl Html {
         }
         out.push_str("\n</div>\n</div>\n");
     }
-}
-
-/// `1.2.3`.
-fn dotted(numbers: &[usize]) -> String {
-    numbers
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// The heading org keeps footnote definitions under, which export leaves out.
-fn is_footnote_section(h: &Headline) -> bool {
-    h.raw_title == "Footnotes"
-}
-
-/// A paragraph that is one image link and nothing else.
-fn standalone_image(objects: &[Object]) -> Option<(&str, ())> {
-    let mut found = None;
-    for o in objects {
-        match o {
-            Object::Text(t) if t.trim().is_empty() => {}
-            Object::Link {
-                path,
-                description,
-                target: None,
-            } if description.is_empty() && found.is_none() => {
-                let file = path.strip_prefix("file:").unwrap_or(path);
-                let local = path.starts_with("file:")
-                    || ["/", "./", "../", "~/"].iter().any(|p| path.starts_with(p))
-                    || path.starts_with("http://")
-                    || path.starts_with("https://");
-                if !(local && is_image(file)) {
-                    return None;
-                }
-                found = Some((file, ()));
-            }
-            _ => return None,
-        }
-    }
-    found
 }
 
 /// Whether most of a column's non-empty cells are numbers: such a column is

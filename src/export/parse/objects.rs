@@ -924,6 +924,9 @@ const ENTITIES: &[(&str, &str)] = &[
     ("upsilon", "υ"),
     ("varepsilon", "ε"),
     ("varphi", "ϕ"),
+    // How a table cell holds a `|`, which would otherwise split it.
+    ("vbar", "|"),
+    ("vert", "|"),
     ("xi", "ξ"),
     ("yen", "¥"),
     ("zeta", "ζ"),

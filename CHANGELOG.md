@@ -42,8 +42,16 @@ the lattice release that carries it.
   replaces that buffer's text in one undo step; `h o` and `m o` write the
   file and then open it, in lattice, or with the system's handler when
   `org.export.open-with` is `system`. Each has a `:` command
-  (`:org-export-html-buffer`, `:org-export-html-open`, …). Markdown and LaTeX output is still a placeholder (the
-  parsed outline, verbatim) until their writers land.
+  (`:org-export-html-buffer`, `:org-export-html-open`, …).
+  Markdown is GitHub-flavoured, in emacs's `ox-md` shape: ATX headings (and
+  numbered list items below `H:`), the table of contents as a nested list,
+  pipe tables with their column alignment, `[^n]` footnotes, fenced code with
+  its language, task-list checkboxes, autolinks, `$…$` math, and raw
+  `#+begin_export markdown` / `@@md:…@@`. A heading carries an anchor only
+  when something links to it, and text that Markdown would read as markup
+  stays text. `\vert` puts a `|` in a table cell, as in emacs. LaTeX output
+  is still a placeholder (the parsed outline, verbatim) until its writer
+  lands.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

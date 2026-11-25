@@ -22,11 +22,13 @@
 //! are placeholders still: the parse tree, in the format's document shell.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::ops::Range;
 
 use super::filter::{self, Selection, View};
 use super::html::{self, Html, Stylesheet};
 use super::include::Includes;
+use super::markdown::{self, Markdown};
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
 use super::sink::{self, Sink};
@@ -255,6 +257,7 @@ struct Render {
 /// What writes the output.
 enum Writer {
     Html(Box<Html>),
+    Markdown(Box<Markdown>),
     /// The placeholder: the filtered tree, dumped.
     Dump,
 }
@@ -369,6 +372,7 @@ impl Run {
                     let own = filter::own(h, &mut render.view);
                     match &mut render.writer {
                         Writer::Html(w) => w.headline(&own, &mut render.view, &mut render.out),
+                        Writer::Markdown(w) => w.headline(&own, &mut render.view, &mut render.out),
                         Writer::Dump => {
                             anchor_line(&mut body, &render.view, h.line, depth);
                             parse::dump::headline(&mut body, &own, depth);
@@ -380,16 +384,15 @@ impl Run {
             if let Some(why) = render.view.error() {
                 return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
             }
-            escape_into(backend, &body, &mut render.out);
+            render.out.push_str(&body);
             if !render.next.is_empty() {
                 return Step::More;
             }
         }
         match &mut render.writer {
             Writer::Html(w) => w.finish(&mut render.view, &mut render.out),
-            Writer::Dump => render
-                .out
-                .push_str(shell_tail(backend, self.request.body_only)),
+            Writer::Markdown(w) => w.finish(&mut render.view, &mut render.out),
+            Writer::Dump => render.out.push_str(shell_tail(self.request.body_only)),
         }
         if let Some(why) = render.view.error() {
             return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
@@ -451,6 +454,11 @@ impl Run {
             filter::live(&doc, &selection, &options),
             !self.request.subtree,
         );
+        let referred = if self.request.backend == Backend::Markdown {
+            targets.referred(&*self.host)
+        } else {
+            HashSet::new()
+        };
         let mut view = View::new(
             options,
             self.keywords.clone(),
@@ -470,14 +478,23 @@ impl Run {
             Writer::Html(Box::new(Html::start(
                 &doc, &selection, &mut view, settings, &mut out,
             )))
+        } else if backend == Backend::Markdown {
+            let settings = markdown::Settings {
+                source: self.request.source.clone(),
+                body_only: self.request.body_only,
+                referred,
+            };
+            Writer::Markdown(Box::new(Markdown::start(
+                &doc, &selection, &mut view, settings, &mut out,
+            )))
         } else {
             let title = view.options.title.clone();
             let title = filter::plain(&filter::objects(&title, &mut view));
-            out = shell_head(backend, &title, self.request.body_only);
+            out = shell_head(&title, self.request.body_only);
             let mut body = parse::dump::options(&view.options);
             let preamble = filter::elements(&doc.preamble, &mut view);
             parse::dump::preamble(&mut body, &preamble);
-            escape_into(backend, &body, &mut out);
+            out.push_str(&body);
             Writer::Dump
         };
         if let Some(why) = view.error() {
@@ -579,59 +596,24 @@ fn chunks(text: &str, budget: usize) -> Vec<(Range<usize>, u32)> {
     out
 }
 
-/// The placeholder renderers: the parse tree, verbatim inside the format's
-/// shell, written in three parts so each step escapes only what it adds.
-fn shell_head(backend: Backend, title: &str, body_only: bool) -> String {
-    match (backend, body_only) {
-        (Backend::Html, true) => "<pre class=\"example\">\n".to_string(),
-        (Backend::Html, false) => {
-            let mut escaped = String::new();
-            html_escape_into(title, &mut escaped);
-            let title = escaped;
-            format!(
-                "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
-                 <title>{title}</title>\n</head>\n<body>\n<div id=\"content\">\n\
-                 <h1 class=\"title\">{title}</h1>\n<pre class=\"example\">\n"
-            )
-        }
-        (Backend::Markdown, true) => "```\n".to_string(),
-        (Backend::Markdown, false) => format!("# {title}\n\n```\n"),
-        (Backend::Latex, true) => "\\begin{verbatim}\n".to_string(),
-        (Backend::Latex, false) => format!(
+/// The placeholder LaTeX renderer: the parse tree, verbatim inside the
+/// document's shell, written in three parts.
+fn shell_head(title: &str, body_only: bool) -> String {
+    if body_only {
+        "\\begin{verbatim}\n".to_string()
+    } else {
+        format!(
             "\\documentclass{{article}}\n\\title{{{title}}}\n\\begin{{document}}\n\
              \\maketitle\n\\begin{{verbatim}}\n"
-        ),
+        )
     }
 }
 
-/// `body` as the shell's verbatim block holds it.
-fn escape_into(backend: Backend, body: &str, out: &mut String) {
-    match backend {
-        Backend::Html => html_escape_into(body, out),
-        Backend::Markdown | Backend::Latex => out.push_str(body),
-    }
-}
-
-fn shell_tail(backend: Backend, body_only: bool) -> &'static str {
-    match (backend, body_only) {
-        (Backend::Html, true) => "</pre>\n",
-        (Backend::Html, false) => "</pre>\n</div>\n</body>\n</html>\n",
-        (Backend::Markdown, _) => "```\n",
-        (Backend::Latex, true) => "\\end{verbatim}\n",
-        (Backend::Latex, false) => "\\end{verbatim}\n\\end{document}\n",
-    }
-}
-
-fn html_escape_into(s: &str, out: &mut String) {
-    out.reserve(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            c => out.push(c),
-        }
+fn shell_tail(body_only: bool) -> &'static str {
+    if body_only {
+        "\\end{verbatim}\n"
+    } else {
+        "\\end{verbatim}\n\\end{document}\n"
     }
 }
 
@@ -773,10 +755,10 @@ mod tests {
     #[test]
     fn the_title_keyword_names_the_document() {
         let effects = run(
-            &request(Backend::Markdown),
+            &request(Backend::Latex),
             Some("#+title: The Plan\n* One\n".to_string()),
         );
-        assert!(written(&effects).1.starts_with("# The Plan\n"));
+        assert!(written(&effects).1.contains("\\title{The Plan}\n"));
     }
 
     #[test]
@@ -792,7 +774,7 @@ mod tests {
 
     #[test]
     fn a_subtree_export_takes_the_headline_around_the_cursor() {
-        let mut r = request(Backend::Markdown);
+        let mut r = request(Backend::Latex);
         r.subtree = true;
         r.body_only = true;
         r.line = 2;
@@ -807,7 +789,7 @@ mod tests {
         );
         assert!(
             text.ends_with(
-                "\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n```\n"
+                "\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n\\end{verbatim}\n"
             ),
             "{text}"
         );
@@ -816,7 +798,7 @@ mod tests {
         let effects = run(&r, Some("* One\nx\n* Two\ny\n** Deep\nz\n".to_string()));
         let deep = without_anchors(written(&effects).1);
         assert!(
-            deep.ends_with("\nheadline 2 @4 [\"Deep\"]\n  paragraph @5 \"z\"\n```\n"),
+            deep.ends_with("\nheadline 2 @4 [\"Deep\"]\n  paragraph @5 \"z\"\n\\end{verbatim}\n"),
             "{deep}"
         );
         r.line = 0;
@@ -898,13 +880,16 @@ mod tests {
     fn a_large_file_is_parsed_in_steps_into_the_whole_files_tree() {
         let section = format!("* TODO Heading\n{}\n", "- item\n  text\n".repeat(200));
         let text = section.repeat(1 + 3 * STEP_BYTES / section.len());
-        let mut r = request(Backend::Markdown);
+        let mut r = request(Backend::Latex);
         r.body_only = true;
         let (effects, steps) = run_counting(&r, Some(text.clone()));
         assert!(steps > 3, "{steps} steps");
         let ctx = Context::for_file("", vec!["TODO DONE".to_string()]);
         let whole = filtered_dump(&text, &ctx);
-        assert_eq!(written(&effects).1, format!("```\n{whole}```\n"));
+        assert_eq!(
+            written(&effects).1,
+            format!("\\begin{{verbatim}}\n{whole}\\end{{verbatim}}\n")
+        );
     }
 
     /// The render walks the outline in document order: nested, sibling and
@@ -913,7 +898,7 @@ mod tests {
     fn the_render_walks_every_headline_in_order() {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export/parse/testdata");
-        let mut r = request(Backend::Markdown);
+        let mut r = request(Backend::Latex);
         r.body_only = true;
         for name in ["headlines", "lists", "blocks", "misc", "objects"] {
             let text = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus");
@@ -921,7 +906,7 @@ mod tests {
             let whole = filtered_dump(&text, &ctx);
             assert_eq!(
                 written(&run(&r, Some(text))).1,
-                format!("```\n{whole}```\n"),
+                format!("\\begin{{verbatim}}\n{whole}\\end{{verbatim}}\n"),
                 "{name}"
             );
         }
@@ -939,10 +924,10 @@ mod tests {
             );
         }
         let effects = run(
-            &request(Backend::Markdown),
+            &request(Backend::Latex),
             Some("#+MACRO: who Ada\n#+TITLE: By {{{who}}}\n".to_string()),
         );
-        assert!(written(&effects).1.starts_with("# By Ada\n"));
+        assert!(written(&effects).1.contains("\\title{By Ada}\n"));
     }
 
     /// Includes are read a step each before the parse, their keywords
@@ -958,10 +943,10 @@ mod tests {
             ),
             ("/notes/part.org", "* A\n* B\n"),
         ];
-        let mut r = request(Backend::Markdown);
+        let mut r = request(Backend::Latex);
         let (effects, steps) = run_with_files(&r, Some(text.to_string()), &files);
         let out = without_anchors(written(&effects).1);
-        assert!(out.starts_with("# By Ada\n"), "{out}");
+        assert!(out.contains("\\title{By Ada}\n"), "{out}");
         assert!(
             out.contains("headline 1 @2 [\"One\"]\n  headline 2 @3 [\"A\"]\n  headline 2 @4 [\"B\"]\nheadline 1 @5"),
             "{out}"
@@ -975,7 +960,7 @@ mod tests {
         let out = without_anchors(written(&effects).1);
         assert!(out.contains("\n  title [\"Two\"]\n"), "{out}");
         assert!(
-            out.ends_with("\nheadline 1 @5 [\"Two\"]\n  paragraph @6 \"y\"\n```\n"),
+            out.ends_with("\nheadline 1 @5 [\"Two\"]\n  paragraph @6 \"y\"\n\\end{verbatim}\n"),
             "{out}"
         );
 

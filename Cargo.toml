@@ -100,6 +100,10 @@ toml = { version = "0.9", default-features = false, features = ["parse", "serde"
 # A strict XML reader, so the HTML tests check the output is well-formed
 # rather than only that it matches a golden.
 quick-xml = "0.38"
+# A CommonMark / GFM parser, so the Markdown tests check that tables,
+# fences, footnotes and task boxes parse as GFM rather than only that the
+# text matches a golden.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [profile.release]
 opt-level = "s"

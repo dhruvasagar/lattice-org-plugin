@@ -25,7 +25,9 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
-use super::parse::{self, Context, Doc, FlatSection, Headline};
+use super::filter::{self, Selection};
+use super::options::Options;
+use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     EchoLevel, EchoPayload, Effect, FileAnchor, WriteToFilePayload,
@@ -193,23 +195,27 @@ pub(crate) struct Run {
     request: Request,
     /// The buffer's text, as it was when the export was asked for.
     text: String,
-    title: String,
     ctx: Context,
     /// What each parse step reads: a byte range of `text`, starting at a
-    /// headline or at the start of the exported range, and its first line.
+    /// headline or at the top of the file, and its first line.
     chunks: Vec<(Range<usize>, u32)>,
     /// The next chunk to parse.
     next: usize,
     sections: Vec<FlatSection>,
+    /// The file's keywords, in order, gathered as the chunks are parsed.
+    keywords: Vec<(String, String)>,
     /// Set once the parse is done.
     render: Option<Render>,
 }
 
-/// The render phase: the tree, where the walk is, and the output so far.
+/// The render phase: the tree, its options, where the walk is, and the
+/// output so far.
 struct Render {
     doc: Doc,
-    /// The next headline to render, as indices from `doc.headlines` down
-    /// through `children`; empty once every headline is rendered.
+    options: Options,
+    selection: Selection,
+    /// The next headline to visit, as indices from `doc.headlines` down
+    /// through `children`; empty once the walk is over.
     next: Vec<usize>,
     out: String,
 }
@@ -217,6 +223,11 @@ struct Render {
 impl Run {
     /// A run over `text` (`None` when the buffer closed before the export
     /// read it), or the effects that say why there is none.
+    ///
+    /// The whole file is parsed even for a subtree export: the file's
+    /// keywords (`#+OPTIONS:`, `#+TITLE:`, `#+EXCLUDE_TAGS:`…) apply to a
+    /// subtree too, and only the parse tells a keyword from a line inside an
+    /// example block that looks like one.
     pub(crate) fn new(
         id: u64,
         request: Request,
@@ -232,69 +243,58 @@ impl Run {
                 ),
             )]);
         };
-        let range = if request.subtree {
-            let lines: Vec<&str> = text.lines().collect();
-            match crate::babel::block::subtree_at(&lines, request.line) {
-                Some((first, end)) => first..end,
-                None => {
-                    return Err(vec![echo(
-                        EchoLevel::Warn,
-                        "org: a subtree export needs the cursor under a headline",
-                    )])
-                }
-            }
-        } else {
-            0..u32::MAX
-        };
-        // A file's `#+TODO:` lines apply to all of it, so they are read from
-        // the whole file even for a subtree.
         let ctx = Context::for_file(&text, configured_keywords);
-        let title = title_of(&text, &request.source);
-        let chunks = chunks(&text, range, STEP_BYTES);
+        let chunks = chunks(&text, STEP_BYTES);
         Ok(Run {
             id,
             request,
-            title,
             ctx,
             chunks,
             next: 0,
             sections: Vec::new(),
+            keywords: Vec::new(),
             render: None,
             text,
         })
     }
 
-    /// One step: parse the next chunk, or render the next headlines, or
-    /// finish the file and write it.
+    /// One step: parse the next chunk, or prepare the render, or render the
+    /// next headlines, or finish the file and write it.
     pub(crate) fn step(&mut self) -> Step {
         if let Some((bytes, first_line)) = self.chunks.get(self.next).cloned() {
             let lines: Vec<&str> = self.text[bytes].lines().collect();
-            self.sections
-                .extend(parse::parse_chunk(&lines, first_line, &self.ctx));
+            let parsed = parse::parse_chunk(&lines, first_line, &self.ctx);
+            for section in &parsed {
+                self.keywords
+                    .extend(section.elements.iter().filter_map(|e| match &e.kind {
+                        ElementKind::Keyword { key, value } => Some((key.clone(), value.clone())),
+                        _ => None,
+                    }));
+            }
+            self.sections.extend(parsed);
             self.next += 1;
             return Step::More;
         }
         let backend = self.request.backend;
         let Some(render) = self.render.as_mut() else {
-            let doc = parse::assemble(std::mem::take(&mut self.sections));
-            let mut out = shell_head(backend, &self.title, self.request.body_only);
-            let mut body = String::new();
-            parse::dump::preamble(&mut body, &doc.preamble);
-            escape_into(backend, &body, &mut out);
-            let next = if doc.headlines.is_empty() {
-                Vec::new()
-            } else {
-                vec![0]
+            return match self.prepare() {
+                Ok(render) => {
+                    self.render = Some(render);
+                    Step::More
+                }
+                Err(effects) => Step::Done(effects),
             };
-            self.render = Some(Render { doc, next, out });
-            return Step::More;
         };
         if !render.next.is_empty() {
             let mut body = String::new();
             while !render.next.is_empty() && body.len() < STEP_BYTES {
-                let depth = render.next.len() - 1;
-                parse::dump::headline(&mut body, at(&render.doc, &render.next), depth);
-                advance(&render.doc, &mut render.next);
+                let h = at(&render.doc, &render.next);
+                let visit = filter::visits(h, &render.selection, &render.options);
+                if visit {
+                    let depth = render.next.len() - 1;
+                    parse::dump::headline(&mut body, &filter::own(h, &render.options), depth);
+                }
+                advance(&render.doc, &mut render.next, visit);
             }
             escape_into(backend, &body, &mut render.out);
             if !render.next.is_empty() {
@@ -303,6 +303,18 @@ impl Run {
         }
         let mut output = std::mem::take(&mut render.out);
         output.push_str(shell_tail(backend, self.request.body_only));
+        let target = file_name(&self.request.target);
+        let done = if render.options.ignored.is_empty() {
+            echo(EchoLevel::Info, format!("Exported {target}"))
+        } else {
+            echo(
+                EchoLevel::Warn,
+                format!(
+                    "Exported {target}; not supported, so left out: {}",
+                    render.options.ignored.join(", ")
+                ),
+            )
+        };
         Step::Done(vec![
             Effect::WriteToFile(WriteToFilePayload {
                 path: self.request.target.clone(),
@@ -315,12 +327,83 @@ impl Run {
                 // it.
                 save: true,
             }),
-            echo(
-                EchoLevel::Info,
-                format!("Exported {}", file_name(&self.request.target)),
-            ),
+            done,
         ])
     }
+
+    /// The step between the parse and the render: build the tree, take the
+    /// subtree when that is what was asked for, resolve the options, and
+    /// start the output. `Err` when a subtree was asked for and the cursor is
+    /// under no headline.
+    fn prepare(&mut self) -> Result<Render, Vec<Effect>> {
+        let mut doc = parse::assemble(std::mem::take(&mut self.sections));
+        let name = file_name(&self.request.source);
+        let stem = name.strip_suffix(".org").unwrap_or(name);
+        let options = if self.request.subtree {
+            let Some(headline) = take_subtree(&mut doc, self.request.line) else {
+                return Err(vec![echo(
+                    EchoLevel::Warn,
+                    "org: a subtree export needs the cursor under a headline",
+                )]);
+            };
+            let options = Options::resolve(
+                &self.keywords,
+                Some((&headline.raw_title, &headline.properties)),
+                stem,
+            );
+            doc = Doc {
+                preamble: Vec::new(),
+                headlines: vec![headline],
+            };
+            options
+        } else {
+            Options::resolve(&self.keywords, None, stem)
+        };
+        let selection = filter::selection(&doc, &options);
+        let backend = self.request.backend;
+        let mut out = shell_head(
+            backend,
+            &filter::plain(&options.title),
+            self.request.body_only,
+        );
+        let mut body = parse::dump::options(&options);
+        parse::dump::preamble(&mut body, &filter::elements(&doc.preamble, &options));
+        escape_into(backend, &body, &mut out);
+        let next = if doc.headlines.is_empty() {
+            Vec::new()
+        } else {
+            vec![0]
+        };
+        Ok(Render {
+            doc,
+            options,
+            selection,
+            next,
+            out,
+        })
+    }
+}
+
+/// Take out of `doc` the innermost headline whose subtree holds `line`.
+fn take_subtree(doc: &mut Doc, line: u32) -> Option<Headline> {
+    // The last of a run of siblings that starts at or before `line` is the
+    // one whose subtree holds it.
+    let pick = |list: &[Headline]| list.iter().rposition(|h| h.line <= line);
+    let mut path = vec![pick(&doc.headlines)?];
+    while let Some(i) = pick(&at(doc, &path).children) {
+        path.push(i);
+    }
+    let last = path.pop()?;
+    let siblings = if path.is_empty() {
+        &mut doc.headlines
+    } else {
+        let mut h = &mut doc.headlines[path[0]];
+        for &i in &path[1..] {
+            h = &mut h.children[i];
+        }
+        &mut h.children
+    };
+    Some(siblings.remove(last))
 }
 
 /// The headline at `path`, which [`advance`] keeps valid.
@@ -332,10 +415,11 @@ fn at<'d>(doc: &'d Doc, path: &[usize]) -> &'d Headline {
     h
 }
 
-/// Move `path` to the next headline in document order: the first child, else
-/// the next sibling of the nearest ancestor that has one. Empty at the end.
-fn advance(doc: &Doc, path: &mut Vec<usize>) {
-    if !at(doc, path).children.is_empty() {
+/// Move `path` to the next headline in document order: the first child when
+/// `descend` and there is one, else the next sibling of the nearest ancestor
+/// that has one. Empty at the end.
+fn advance(doc: &Doc, path: &mut Vec<usize>, descend: bool) {
+    if descend && !at(doc, path).children.is_empty() {
         path.push(0);
         return;
     }
@@ -352,55 +436,24 @@ fn advance(doc: &Doc, path: &mut Vec<usize>) {
     }
 }
 
-/// Cut lines `range` of `text` into chunks of about `budget` bytes, each
-/// starting at a headline (or at the range's start), as `(bytes, first
-/// line)`. One pass; an empty range is one empty chunk, so a run always
-/// takes a step.
-fn chunks(text: &str, range: Range<u32>, budget: usize) -> Vec<(Range<usize>, u32)> {
+/// Cut `text` into chunks of about `budget` bytes, each starting at a
+/// headline (or at the top of the file), as `(bytes, first line)`. One pass;
+/// an empty text is one empty chunk, so a run always takes a step.
+fn chunks(text: &str, budget: usize) -> Vec<(Range<usize>, u32)> {
     let mut out = Vec::new();
-    let mut start: Option<(usize, u32)> = None;
+    let mut from = 0;
+    let mut first = 0;
     let mut at = 0;
-    let mut end = 0;
     for (i, line) in text.split_inclusive('\n').enumerate() {
-        let i = i as u32;
-        let offset = at;
+        if at - from >= budget && crate::headline::headline_level(line).is_some() {
+            out.push((from..at, first));
+            from = at;
+            first = i as u32;
+        }
         at += line.len();
-        if i < range.start {
-            end = at;
-            continue;
-        }
-        if i >= range.end {
-            break;
-        }
-        match start {
-            None => start = Some((offset, i)),
-            Some((from, first)) => {
-                if offset - from >= budget && crate::headline::headline_level(line).is_some() {
-                    out.push((from..offset, first));
-                    start = Some((offset, i));
-                }
-            }
-        }
-        end = at;
     }
-    let (from, first) = start.unwrap_or((end, range.start));
-    out.push((from..end, first));
+    out.push((from..at, first));
     out
-}
-
-/// The document's title: `#+TITLE:`, else the file's name without `.org`.
-fn title_of(text: &str, source: &str) -> String {
-    text.lines()
-        .find_map(|l| {
-            let rest = l.trim_start();
-            let (key, value) = rest.split_once(':')?;
-            key.eq_ignore_ascii_case("#+title")
-                .then(|| value.trim().to_string())
-        })
-        .unwrap_or_else(|| {
-            let name = file_name(source);
-            name.strip_suffix(".org").unwrap_or(name).to_string()
-        })
 }
 
 /// The placeholder renderers: the parse tree, verbatim inside the format's
@@ -563,7 +616,8 @@ mod tests {
         r.body_only = true;
         let effects = run(&r, Some("* One\n".to_string()));
         let text = written(&effects).1;
-        assert!(text.starts_with("\\begin{verbatim}\nheadline 1"), "{text}");
+        assert!(text.starts_with("\\begin{verbatim}\noptions\n"), "{text}");
+        assert!(text.contains("\nheadline 1 @0"), "{text}");
         assert!(!text.contains("documentclass"));
     }
 
@@ -577,9 +631,24 @@ mod tests {
             &r,
             Some("* One\nx\n* Two\ny\n** Deep\n* Three\n".to_string()),
         );
-        assert_eq!(
-            written(&effects).1,
-            "```\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n```\n"
+        let text = written(&effects).1;
+        assert!(
+            text.contains("\n  title [\"Two\"]\n"),
+            "the headline titles it: {text}"
+        );
+        assert!(
+            text.ends_with(
+                "\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n```\n"
+            ),
+            "{text}"
+        );
+        // In the section of a nested headline, the innermost one.
+        r.line = 5;
+        let effects = run(&r, Some("* One\nx\n* Two\ny\n** Deep\nz\n".to_string()));
+        let deep = written(&effects).1;
+        assert!(
+            deep.ends_with("\nheadline 2 @4 [\"Deep\"]\n  paragraph @5 \"z\"\n```\n"),
+            "{deep}"
         );
         r.line = 0;
         let outside = run(&r, Some("text\n* One\n".to_string()));
@@ -591,22 +660,50 @@ mod tests {
         let text = "pre\n* a\nxxxxxxxx\n* b\n* c\nyy\n";
         // Line starts: pre 0, * a 4, xxxxxxxx 8, * b 17, * c 21, yy 25, end 28.
         assert_eq!(
-            chunks(text, 0..6, 10),
+            chunks(text, 10),
             vec![(0..17, 0), (17..28, 3)],
             "a chunk runs to the first headline at least the budget in"
         );
         assert_eq!(
-            chunks(text, 0..6, 1),
+            chunks(text, 1),
             vec![(0..4, 0), (4..17, 1), (17..21, 3), (21..28, 4)]
         );
-        assert_eq!(chunks(text, 0..6, 1000), vec![(0..28, 0)]);
-        assert_eq!(
-            chunks(text, 3..5, 1),
-            vec![(17..21, 3), (21..25, 4)],
-            "a subtree's lines only"
-        );
-        assert_eq!(chunks("", 0..0, 10), vec![(0..0, 0)]);
-        assert_eq!(chunks("a\r\n* b\r\n", 0..2, 1), vec![(0..3, 0), (3..8, 1)]);
+        assert_eq!(chunks(text, 1000), vec![(0..28, 0)]);
+        assert_eq!(chunks("", 10), vec![(0..0, 0)]);
+        assert_eq!(chunks("a\r\n* b\r\n", 1), vec![(0..3, 0), (3..8, 1)]);
+    }
+
+    /// What the stepped walk should produce, computed in one go: the options
+    /// header, then the whole tree's filtered dump, by plain recursion.
+    fn filtered_dump(text: &str, ctx: &Context) -> String {
+        let doc = parse::parse(text, ctx);
+        // Keywords count wherever they are, as in ox.
+        let mut keywords = Vec::new();
+        let mut sections = vec![&doc.preamble];
+        let mut stack: Vec<&Headline> = doc.headlines.iter().rev().collect();
+        while let Some(h) = stack.pop() {
+            sections.push(&h.section);
+            stack.extend(h.children.iter().rev());
+        }
+        for e in sections.into_iter().flatten() {
+            if let ElementKind::Keyword { key, value } = &e.kind {
+                keywords.push((key.clone(), value.clone()));
+            }
+        }
+        let o = Options::resolve(&keywords, None, "plan");
+        let sel = filter::selection(&doc, &o);
+        let mut out = parse::dump::options(&o);
+        parse::dump::preamble(&mut out, &filter::elements(&doc.preamble, &o));
+        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, o: &Options) {
+            for h in hs {
+                if filter::visits(h, sel, o) {
+                    parse::dump::headline(out, &filter::own(h, o), depth);
+                    walk(out, &h.children, depth + 1, sel, o);
+                }
+            }
+        }
+        walk(&mut out, &doc.headlines, 0, &sel, &o);
+        out
     }
 
     /// A file larger than a step is parsed over several, and the tree is the
@@ -621,9 +718,8 @@ mod tests {
         assert!(steps > 3, "{steps} steps");
         let ctx = Context {
             todo_keywords: vec!["TODO".to_string(), "DONE".to_string()],
-            ..Context::default()
         };
-        let whole = parse::dump::dump(&parse::parse(&text, &ctx));
+        let whole = filtered_dump(&text, &ctx);
         assert_eq!(written(&effects).1, format!("```\n{whole}```\n"));
     }
 
@@ -638,7 +734,7 @@ mod tests {
         for name in ["headlines", "lists", "blocks", "misc", "objects"] {
             let text = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus");
             let ctx = Context::for_file(&text, vec!["TODO".to_string(), "DONE".to_string()]);
-            let whole = parse::dump::dump(&parse::parse(&text, &ctx));
+            let whole = filtered_dump(&text, &ctx);
             assert_eq!(
                 written(&run(&r, Some(text))).1,
                 format!("```\n{whole}```\n"),

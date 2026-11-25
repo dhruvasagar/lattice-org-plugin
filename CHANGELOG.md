@@ -17,8 +17,12 @@ the lattice release that carries it.
   naming `org.export.directories`, the list that allows more. A large file
   exports in steps, a piece per background call, so no file is too big to
   export and none holds the plugin up while it runs; a second export of the
-  same file replaces one still running. The output is a placeholder for now
-  (the parsed outline, elements and inline markup, verbatim, in the format's
+  same file replaces one still running. The file's `#+OPTIONS:`, `#+TITLE:`,
+  `#+SELECT_TAGS:` / `#+EXCLUDE_TAGS:`, `COMMENT` headlines and a subtree's
+  `EXPORT_*` properties decide what is exported, with emacs's defaults; what
+  the file asks for and the export does not do (`#+SETUPFILE`, an unknown
+  option) is named when the export finishes. The output is a placeholder for now
+  (the options, then the parsed outline, elements and inline markup, verbatim, in the format's
   document) until the real HTML, Markdown and LaTeX writers land.
 
 ### Fixed

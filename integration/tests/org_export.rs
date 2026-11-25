@@ -436,11 +436,47 @@ async fn a_file_too_large_for_one_call_is_exported_in_steps() {
         md.exists() || last_echo(e).is_some_and(|m| !m.starts_with("Exporting"))
     })
     .await;
-    let written = std::fs::read_to_string(&md).unwrap_or_else(|_| {
-        panic!("nothing written; the echo is {:?}", last_echo(&editor))
-    });
+    let written = std::fs::read_to_string(&md)
+        .unwrap_or_else(|_| panic!("nothing written; the echo is {:?}", last_echo(&editor)));
     assert!(written.contains("\"Heading 0\""), "the first section");
     assert!(written.contains("\"Heading 3999\""), "and the last");
+}
+
+/// The file's options shape what is exported, and what it asks for that the
+/// export does not do is named in the closing echo rather than dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_files_options_shape_the_export_and_the_unsupported_are_named() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let doc = "#+SETUPFILE: theme.org\n* Kept\n* Dropped :noexport:\n* COMMENT Draft\n\
+               * Last\n#+OPTIONS: ^:nil html-postamble:nil\na_b\n";
+    let (mut editor, _loader) = org_editor(base.path(), doc, &grant).await;
+    let md = base.path().join("notes.md");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("Exported"))
+    })
+    .await;
+    let written = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        written.contains("\"Kept\"") && written.contains("\"Last\""),
+        "{written}"
+    );
+    assert!(
+        !written.contains("Dropped") && !written.contains("Draft"),
+        "{written}"
+    );
+    assert!(
+        written.contains("\"a_b\""),
+        "^:nil, set after the text: {written}"
+    );
+    assert_eq!(
+        last_echo(&editor).as_deref(),
+        Some("Exported notes.md; not supported, so left out: #+SETUPFILE, html-postamble:")
+    );
 }
 
 /// A switch flipped in the dispatcher reaches the command, and is still set

@@ -2,7 +2,8 @@
 //! its file line, strings in Rust's quoting.
 //!
 //! What the golden tests compare, and what the export pipeline's placeholder
-//! renderers show until the transcoders replace them.
+//! renderers show until the transcoders replace them: the resolved options,
+//! then the filtered tree.
 
 use std::fmt::Write;
 
@@ -274,14 +275,18 @@ fn object(out: &mut String, o: &Object) {
                 nested(out, "", definition);
             }
         }
-        Object::Entity { name, .. } => {
-            let _ = write!(out, "entity({name})");
+        Object::Entity { name, braces, .. } => {
+            let _ = write!(out, "entity({name}{})", if *braces { "{}" } else { "" });
         }
         Object::LatexFragment(t) => {
             let _ = write!(out, "latex({t:?})");
         }
-        Object::Subscript(c) => nested(out, "sub", c),
-        Object::Superscript(c) => nested(out, "sup", c),
+        Object::Subscript { braced, contents } => {
+            nested(out, if *braced { "sub{}" } else { "sub" }, contents)
+        }
+        Object::Superscript { braced, contents } => {
+            nested(out, if *braced { "sup{}" } else { "sup" }, contents)
+        }
         Object::LineBreak => out.push_str("linebreak"),
         Object::Timestamp(t) => {
             let _ = write!(out, "timestamp({t:?})");
@@ -300,4 +305,65 @@ fn object(out: &mut String, o: &Object) {
             let _ = write!(out, "snippet({backend} {value:?})");
         }
     }
+}
+
+/// The resolved options, one per line.
+pub(crate) fn options(o: &crate::export::options::Options) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "options");
+    let _ = writeln!(
+        out,
+        "  toc={:?} num={:?} H={} ^={:?} tags={:?} todo={} pri={} <={:?} tex={:?} broken-links={:?}",
+        o.toc,
+        o.num,
+        o.headline_levels,
+        o.subsup,
+        o.tags,
+        o.todo,
+        o.priority,
+        o.timestamps,
+        o.tex,
+        o.broken_links
+    );
+    let _ = writeln!(
+        out,
+        "  author={} date={} title={} email={} *={} -={} e={} \\n={} p={} c={} prop={} d={:?} f={} stat={} :={} |={}",
+        o.with_author,
+        o.with_date,
+        o.with_title,
+        o.with_email,
+        o.emphasis,
+        o.special_strings,
+        o.entities,
+        o.preserve_breaks,
+        o.planning,
+        o.clocks,
+        o.properties,
+        o.drawers,
+        o.footnotes,
+        o.statistics_cookies,
+        o.fixed_width,
+        o.tables
+    );
+    for (name, value) in [
+        ("title", &o.title),
+        ("subtitle", &o.subtitle),
+        ("author", &o.author),
+        ("date", &o.date),
+    ] {
+        if !value.is_empty() {
+            let _ = writeln!(out, "  {name} [{}]", objects(value));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  email={:?} language={:?} select={:?} exclude={:?} filetags={:?}",
+        o.email, o.language, o.select_tags, o.exclude_tags, o.file_tags
+    );
+    let _ = writeln!(
+        out,
+        "  html-head={:?} html-head-extra={:?} latex-class={:?} latex-class-options={:?} latex-header={:?}",
+        o.html_head, o.html_head_extra, o.latex_class, o.latex_class_options, o.latex_header
+    );
+    out
 }

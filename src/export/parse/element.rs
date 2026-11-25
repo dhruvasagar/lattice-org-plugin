@@ -3,15 +3,15 @@
 
 use std::collections::HashMap;
 
-use super::objects::{self, SubSuperscripts};
+use super::objects;
 use super::{
-    keyword_parts, Affiliated, Align, Block, BlockKind, Checkbox, Context, Element, ElementKind,
-    Item, List, ListKind, Row, Table, MAX_DEPTH,
+    keyword_parts, Affiliated, Align, Block, BlockKind, Checkbox, Element, ElementKind, Item, List,
+    ListKind, Row, Table, MAX_DEPTH,
 };
 
 /// Parse a section body: `lines`, the first of which is file line
 /// `first_line`.
-pub(super) fn parse(lines: &[&str], first_line: u32, ctx: &Context) -> Vec<Element> {
+pub(super) fn parse(lines: &[&str], first_line: u32) -> Vec<Element> {
     let index = Index::build(lines, first_line);
     let view: Vec<Line<'_>> = lines
         .iter()
@@ -21,11 +21,7 @@ pub(super) fn parse(lines: &[&str], first_line: u32, ctx: &Context) -> Vec<Eleme
             text,
         })
         .collect();
-    Parser {
-        index: &index,
-        subsup: ctx.subsup,
-    }
-    .elements(&view, 0)
+    Parser { index: &index }.elements(&view, 0)
 }
 
 /// One line of a view: its line in the file, and its text with whatever
@@ -86,7 +82,6 @@ impl Index {
 
 struct Parser<'i> {
     index: &'i Index,
-    subsup: SubSuperscripts,
 }
 
 impl Parser<'_> {
@@ -103,7 +98,7 @@ impl Parser<'_> {
             // with a blank line or nothing under them, they stand alone.
             let mut affiliated = Affiliated::default();
             let mut j = i;
-            while j < view.len() && add_affiliated(&mut affiliated, view[j].text, self.subsup) {
+            while j < view.len() && add_affiliated(&mut affiliated, view[j].text) {
                 j += 1;
             }
             if j > i {
@@ -148,7 +143,7 @@ impl Parser<'_> {
             return self.footnote(view, i, label, rest, depth);
         }
         if t.starts_with('|') {
-            return table(view, i, self.subsup);
+            return table(view, i);
         }
         if is_table_el(t) {
             let end = run(view, i, |l| {
@@ -209,10 +204,7 @@ impl Parser<'_> {
             .map(|l| l.text.trim_start())
             .collect::<Vec<_>>()
             .join("\n");
-        (
-            ElementKind::Paragraph(objects::parse(&text, self.subsup)),
-            end,
-        )
+        (ElementKind::Paragraph(objects::parse(&text)), end)
     }
 
     /// Whether `view[i]` begins an element, so ends a paragraph above it.
@@ -251,7 +243,7 @@ impl Parser<'_> {
             Some(first) if !text.is_empty() => vec![Element {
                 line: first.abs,
                 affiliated: Affiliated::default(),
-                kind: ElementKind::Paragraph(objects::parse(&text, self.subsup)),
+                kind: ElementKind::Paragraph(objects::parse(&text)),
             }],
             _ => Vec::new(),
         }
@@ -429,7 +421,7 @@ impl Parser<'_> {
                 bullet: start.bullet.to_string(),
                 counter: start.counter,
                 checkbox: start.checkbox,
-                tag: start.tag.map(|t| objects::parse(t, self.subsup)),
+                tag: start.tag.map(objects::parse),
                 contents: self.nested(&body, depth),
             });
             k = end;
@@ -504,7 +496,7 @@ fn run(view: &[Line<'_>], i: usize, keep: impl Fn(&str) -> bool) -> usize {
     end
 }
 
-fn table(view: &[Line<'_>], i: usize, subsup: SubSuperscripts) -> (ElementKind, usize) {
+fn table(view: &[Line<'_>], i: usize) -> (ElementKind, usize) {
     let end = run(view, i, |l| l.trim_start().starts_with('|'));
     let mut rows = Vec::new();
     let mut align: Vec<Option<Align>> = Vec::new();
@@ -526,7 +518,7 @@ fn table(view: &[Line<'_>], i: usize, subsup: SubSuperscripts) -> (ElementKind, 
         match cookies {
             Some(cols) if cells.iter().any(|c| !c.is_empty()) => align = cols,
             _ => rows.push(Row::Cells(
-                cells.iter().map(|c| objects::parse(c, subsup)).collect(),
+                cells.iter().map(|c| objects::parse(c)).collect(),
             )),
         }
     }
@@ -623,7 +615,7 @@ fn is_affiliated_line(t: &str) -> bool {
 }
 
 /// Fold an affiliated keyword line into `into`; `false` when it is not one.
-fn add_affiliated(into: &mut Affiliated, text: &str, subsup: SubSuperscripts) -> bool {
+fn add_affiliated(into: &mut Affiliated, text: &str) -> bool {
     let Some((key, value)) = keyword_parts(text) else {
         return false;
     };
@@ -632,7 +624,7 @@ fn add_affiliated(into: &mut Affiliated, text: &str, subsup: SubSuperscripts) ->
     };
     let value = value.to_string();
     match kind {
-        "CAPTION" => into.caption.push(objects::parse(&value, subsup)),
+        "CAPTION" => into.caption.push(objects::parse(&value)),
         "NAME" => into.name = Some(value),
         "RESULTS" => into.results = Some(value),
         "HEADER" => into.header.push(value),

@@ -4,7 +4,6 @@ use super::*;
 fn ctx() -> Context {
     Context {
         todo_keywords: ["TODO", "NEXT", "DONE"].map(String::from).to_vec(),
-        ..Context::default()
     }
 }
 

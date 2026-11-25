@@ -23,7 +23,7 @@ pub(crate) mod dump;
 mod element;
 pub(crate) mod objects;
 
-use objects::{Object, SubSuperscripts};
+use objects::Object;
 
 /// How deep lists, drawers and greater blocks nest before their contents are
 /// read as plain text. Org files nest a handful of levels; this bounds the
@@ -245,11 +245,10 @@ pub(crate) enum Align {
 }
 
 /// What a parse needs from outside the text: the TODO keywords a headline's
-/// first word is checked against, and which `_` / `^` are scripts.
+/// first word is checked against.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Context {
     pub(crate) todo_keywords: Vec<String>,
-    pub(crate) subsup: SubSuperscripts,
 }
 
 impl Context {
@@ -268,7 +267,6 @@ impl Context {
         }
         Self {
             todo_keywords: if own.is_empty() { configured } else { own },
-            subsup: SubSuperscripts::default(),
         }
     }
 }
@@ -315,7 +313,7 @@ fn section(lines: &[&str], first_line: u32, ctx: &Context) -> FlatSection {
     let Some(head) = lines.first().and_then(|l| headline_of(l, first_line, ctx)) else {
         return FlatSection {
             headline: None,
-            elements: element::parse(lines, first_line, ctx),
+            elements: element::parse(lines, first_line),
         };
     };
     let mut head = head;
@@ -330,7 +328,7 @@ fn section(lines: &[&str], first_line: u32, ctx: &Context) -> FlatSection {
     }
     FlatSection {
         headline: Some(head),
-        elements: element::parse(&lines[body..], first_line + body as u32, ctx),
+        elements: element::parse(&lines[body..], first_line + body as u32),
     }
 }
 
@@ -345,7 +343,7 @@ fn headline_of(line: &str, at: u32, ctx: &Context) -> Option<Headline> {
         level: h.stars.len(),
         todo: h.keyword.map(str::to_string),
         priority: h.priority,
-        title: objects::parse(title, ctx.subsup),
+        title: objects::parse(title),
         raw_title: title.to_string(),
         tags: h.tags.iter().map(|t| t.to_string()).collect(),
         commented,

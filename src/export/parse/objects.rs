@@ -57,12 +57,22 @@ pub(crate) enum Object {
         name: String,
         /// The character it stands for.
         utf8: &'static str,
+        /// Written with `{}` after the name.
+        braces: bool,
     },
     /// `\(…\)`, `\[…\]`, `$…$`, `$$…$$`, or a `\command{…}` org does not
     /// know as an entity: the source, delimiters included.
     LatexFragment(String),
-    Subscript(Vec<Object>),
-    Superscript(Vec<Object>),
+    /// `_x` or `_{x}`.
+    Subscript {
+        braced: bool,
+        contents: Vec<Object>,
+    },
+    /// `^x` or `^{x}`.
+    Superscript {
+        braced: bool,
+        contents: Vec<Object>,
+    },
     /// `\\` at the end of a line.
     LineBreak,
     /// `<2026-01-05 Mon>`, `[2026-01-05 Mon 10:00]`, ranges included, as
@@ -94,31 +104,20 @@ pub(crate) enum Emphasis {
     Strike,
 }
 
-/// Which `_` / `^` are sub- and superscripts: ox's `^:` option.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum SubSuperscripts {
-    /// `^:t`: `a_b`, `a^{bc}`.
-    #[default]
-    All,
-    /// `^:{}`: only the braced forms.
-    Braced,
-    /// `^:nil`: none; `_` and `^` are characters.
-    None,
-}
-
 /// The schemes a plain or angle link may have.
 const SCHEMES: &[&str] = &[
     "https", "http", "ftp", "mailto", "file", "doi", "news", "id", "irc", "shell",
 ];
 
-/// Parse `text` into objects.
-pub(crate) fn parse(text: &str, subsup: SubSuperscripts) -> Vec<Object> {
-    Parser { subsup }.objects(text, 0, true)
+/// Parse `text` into objects, every `_` / `^` that can be a script read as
+/// one (`^:t`). A file's `^:{}` or `^:nil` comes from `#+OPTIONS:`, which may
+/// sit below the text it governs, so it is applied after the parse, by
+/// reverting the scripts it does not allow (as ox does).
+pub(crate) fn parse(text: &str) -> Vec<Object> {
+    Parser.objects(text, 0, true)
 }
 
-struct Parser {
-    subsup: SubSuperscripts,
-}
+struct Parser;
 
 /// What is found once per text: where each emphasis marker can close, and
 /// where the newlines are.
@@ -337,19 +336,18 @@ impl Parser {
         depth: usize,
         links: bool,
     ) -> Option<(Object, usize)> {
-        if self.subsup == SubSuperscripts::None || before.is_none_or(char::is_whitespace) {
+        if before.is_none_or(char::is_whitespace) {
             return None;
         }
         let sub = rest.starts_with('_');
         let after = &rest[1..];
+        let braced = after.starts_with('{');
         let (contents, len) = if let Some(inner) = after.strip_prefix('{') {
             let end = script_braces(inner)?;
             (
                 self.objects(&inner[..end], depth + 1, links),
                 1 + 1 + end + 1,
             )
-        } else if self.subsup == SubSuperscripts::Braced {
-            return None;
         } else if after.starts_with('*') {
             (vec![Object::Text("*".to_string())], 2)
         } else {
@@ -370,9 +368,9 @@ impl Parser {
             (vec![Object::Text(after[..end].to_string())], 1 + end)
         };
         let object = if sub {
-            Object::Subscript(contents)
+            Object::Subscript { braced, contents }
         } else {
-            Object::Superscript(contents)
+            Object::Superscript { braced, contents }
         };
         Some((object, len))
     }
@@ -644,7 +642,8 @@ fn entity_or_command(rest: &str) -> Option<(Object, usize)> {
     let name = &rest[1..1 + name_len];
     let mut len = 1 + name_len;
     if let Some(utf8) = entity(name) {
-        if rest[len..].starts_with("{}") {
+        let braces = rest[len..].starts_with("{}");
+        if braces {
             len += 2;
         } else if rest[len..].starts_with(|c: char| c.is_alphabetic()) {
             return None;
@@ -653,6 +652,7 @@ fn entity_or_command(rest: &str) -> Option<(Object, usize)> {
             Object::Entity {
                 name: name.to_string(),
                 utf8,
+                braces,
             },
             len,
         ));
@@ -922,7 +922,7 @@ mod tests {
     use super::*;
 
     fn dump(s: &str) -> String {
-        super::super::dump::objects(&parse(s, SubSuperscripts::All))
+        super::super::dump::objects(&parse(s))
     }
 
     #[test]
@@ -952,7 +952,7 @@ mod tests {
             ("snake_case", r#""snake" sub["case"]"#),
             (" _u_ ", r#"" " underline["u"] " ""#),
             ("E=mc^2.", r#""E=mc" sup["2"] ".""#),
-            ("a^{b c}", r#""a" sup["b c"]"#),
+            ("a^{b c}", r#""a" sup{}["b c"]"#),
             ("price $5 and $6", r#""price $5 and $6""#),
             ("$x^2$ ok", r#"latex("$x^2$") " ok""#),
         ];
@@ -986,7 +986,10 @@ mod tests {
             ("a[fn:1] b", r#""a" fn("1") " b""#),
             ("[fn::inline *def*]", r#"fn(None)["inline " bold["def"]]"#),
             ("[fn:n:def [x]]", r#"fn("n")["def [x]"]"#),
-            ("\\alpha{}b \\to x", r#"entity(alpha) "b " entity(to) " x""#),
+            (
+                "\\alpha{}b \\to x",
+                r#"entity(alpha{}) "b " entity(to) " x""#,
+            ),
             ("\\alphabet", r#"latex("\\alphabet")"#),
             ("\\frac{a}{b}", r#"latex("\\frac{a}{b}")"#),
             (
@@ -1023,14 +1026,6 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(&dump(input), want, "{input:?}");
         }
-    }
-
-    #[test]
-    fn braced_only_scripts_leave_bare_ones_as_text() {
-        let got = super::super::dump::objects(&parse("a_b c_{d}", SubSuperscripts::Braced));
-        assert_eq!(got, r#""a_b c" sub["d"]"#);
-        let got = super::super::dump::objects(&parse("a_b c^{d}", SubSuperscripts::None));
-        assert_eq!(got, r#""a_b c^{d}""#);
     }
 
     /// Nothing panics on text built from the characters objects turn on.
@@ -1091,7 +1086,7 @@ mod tests {
             for _ in 0..(next() % 40) {
                 s.push_str(PIECES[(next() % PIECES.len() as u64) as usize]);
             }
-            let _ = parse(&s, SubSuperscripts::All);
+            let _ = parse(&s);
         }
     }
 
@@ -1104,7 +1099,7 @@ mod tests {
         ] {
             let s = unit.repeat(60_000 / unit.len());
             let start = std::time::Instant::now();
-            let _ = parse(&s, SubSuperscripts::All);
+            let _ = parse(&s);
             let spent = start.elapsed();
             assert!(
                 spent < std::time::Duration::from_secs(1),
@@ -1117,8 +1112,8 @@ mod tests {
     fn deep_nesting_is_bounded() {
         let n = 5_000;
         let s = format!("{}x{}", "*/".repeat(n), "/*".repeat(n));
-        let _ = parse(&s, SubSuperscripts::All);
+        let _ = parse(&s);
         let s = format!("{}x{}", "a^{".repeat(n), "}".repeat(n));
-        let _ = parse(&s, SubSuperscripts::All);
+        let _ = parse(&s);
     }
 }

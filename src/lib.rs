@@ -1052,7 +1052,7 @@ fn expand_each(paths: Vec<String>) -> Vec<String> {
 /// changed is the container: a list of lines instead of one newline-joined
 /// string, so `:describe-option` says `list<string>` and a TOML array is what
 /// a user writes.
-fn todo_keyword_lines() -> Vec<String> {
+pub(crate) fn todo_keyword_lines() -> Vec<String> {
     let lines = string_list("todo-keywords");
     if lines.is_empty() {
         DEFAULT_TODO_KEYWORDS

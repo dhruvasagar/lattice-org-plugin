@@ -29,9 +29,16 @@ the lattice release that carries it.
   `src` / `example` / `export` wrapping; a file org may not read stops the
   export, naming it. Internal links resolve as emacs's do (`#custom-id`,
   `*Heading`, `id:`, targets, names, headline text, radio targets), and a link
-  to nothing stops the export unless `#+OPTIONS: broken-links:mark` or `t`. The output is a placeholder for now
-  (the options, then the parsed outline, elements and inline markup, verbatim, in the format's
-  document) until the real HTML, Markdown and LaTeX writers land.
+  to nothing stops the export unless `#+OPTIONS: broken-links:mark` or `t`.
+  HTML is written in emacs's shape and with its class names, so a stylesheet
+  made for emacs's output styles it: a table of contents, numbered sections,
+  footnotes numbered as referenced, tables with a header and aligned columns,
+  figures and captions, source blocks classed by language, math through
+  MathJax when there is any, and an author / date footer. Links to other org
+  files go to their HTML, and an `id:` link to the node's file.
+  `org.export.html-stylesheet` is `default` (org's own, inline), `none`, or a
+  stylesheet to link. Markdown and LaTeX output is still a placeholder (the
+  parsed outline, verbatim) until their writers land.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

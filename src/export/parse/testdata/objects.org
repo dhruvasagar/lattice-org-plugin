@@ -9,7 +9,7 @@ H_2O, x^{n+1} and e^-1 but not a_ or snake_case_name.
 A line break\\
 and a timestamp <2026-03-01 Sun 09:00>--<2026-03-01 Sun 10:00>.
 <<anchor>> and a <<<radio>>> target, a cookie [2/3], a macro {{{kbd(C-c\, C-e)}}}.
-@@html:<kbd>@@ snippet, a plain link https://lattice.dev/docs. and <mailto:a@b.c>.
+@@html:<kbd>@@snippet@@html:</kbd>@@, a plain link https://lattice.dev/docs. and <mailto:a@b.c>.
 Traps: a*b*c, 2*3*4 and price $5 and $6.
 Verbatim wins: =a *b* c=.
 No close: *not bold * here.

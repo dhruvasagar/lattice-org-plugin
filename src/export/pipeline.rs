@@ -18,14 +18,14 @@
 //! target replaces the one in flight, and an export of another runs beside
 //! it.
 //!
-//! The renderers are placeholders: the parse tree, in each format's document
-//! shell. The transcoders replace them; the request, the crossing, the steps
-//! and the sink do not change.
+//! HTML is written by its transcoder ([`super::html`]). Markdown and LaTeX
+//! are placeholders still: the parse tree, in the format's document shell.
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
 use super::filter::{self, Selection, View};
+use super::html::{self, Html, Stylesheet};
 use super::include::Includes;
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
@@ -150,9 +150,10 @@ pub(crate) fn on_requested(payload: &[u8]) {
         id,
         request,
         text,
-        crate::todo_keywords(),
+        crate::todo_keyword_lines(),
         now,
         Rc::new(super::Guest),
+        Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
     ) {
         Ok(run) => {
             RUNS.with(|runs| {
@@ -231,6 +232,8 @@ pub(crate) struct Run {
     /// The link targets, gathered as the chunks are parsed.
     targets: Targets,
     host: Rc<dyn Host>,
+    /// `org.export.html-stylesheet`, read when the export was asked for.
+    stylesheet: Stylesheet,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -245,6 +248,14 @@ struct Render {
     /// through `children`; empty once the walk is over.
     next: Vec<usize>,
     out: String,
+    writer: Writer,
+}
+
+/// What writes the output.
+enum Writer {
+    Html(Box<Html>),
+    /// The placeholder: the filtered tree, dumped.
+    Dump,
 }
 
 impl Run {
@@ -262,6 +273,7 @@ impl Run {
         configured_keywords: Vec<String>,
         now: When,
         host: Rc<dyn Host>,
+        stylesheet: Stylesheet,
     ) -> Result<Self, Vec<Effect>> {
         let Some(text) = text else {
             return Err(vec![echo(
@@ -295,6 +307,7 @@ impl Run {
             now,
             targets: Targets::default(),
             host,
+            stylesheet,
             render: None,
             text,
         })
@@ -346,14 +359,20 @@ impl Run {
         };
         if !render.next.is_empty() {
             let mut body = String::new();
-            while !render.next.is_empty() && body.len() < STEP_BYTES {
+            let from = render.out.len();
+            while !render.next.is_empty() && body.len() + render.out.len() - from < STEP_BYTES {
                 let h = at(&render.doc, &render.next);
                 let visit = filter::visits(h, &render.selection, &render.view.options);
                 if visit {
                     let depth = render.next.len() - 1;
                     let own = filter::own(h, &mut render.view);
-                    anchor_line(&mut body, &render.view, h.line, depth);
-                    parse::dump::headline(&mut body, &own, depth);
+                    match &mut render.writer {
+                        Writer::Html(w) => w.headline(&own, &mut render.view, &mut render.out),
+                        Writer::Dump => {
+                            anchor_line(&mut body, &render.view, h.line, depth);
+                            parse::dump::headline(&mut body, &own, depth);
+                        }
+                    }
                 }
                 advance(&render.doc, &mut render.next, visit);
             }
@@ -365,8 +384,16 @@ impl Run {
                 return Step::More;
             }
         }
-        let mut output = std::mem::take(&mut render.out);
-        output.push_str(shell_tail(backend, self.request.body_only));
+        match &mut render.writer {
+            Writer::Html(w) => w.finish(&mut render.view, &mut render.out),
+            Writer::Dump => render
+                .out
+                .push_str(shell_tail(backend, self.request.body_only)),
+        }
+        if let Some(why) = render.view.error() {
+            return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
+        }
+        let output = std::mem::take(&mut render.out);
         let target = file_name(&self.request.target);
         let ignored = &render.view.options.ignored;
         let done = if ignored.is_empty() {
@@ -437,16 +464,30 @@ impl Run {
             Rc::clone(&self.host),
         );
         let backend = self.request.backend;
-        let title = view.options.title.clone();
-        let title = filter::plain(&filter::objects(&title, &mut view));
-        let mut out = shell_head(backend, &title, self.request.body_only);
-        let mut body = parse::dump::options(&view.options);
-        let preamble = filter::elements(&doc.preamble, &mut view);
-        parse::dump::preamble(&mut body, &preamble);
+        let mut out = String::new();
+        let writer = if backend == Backend::Html {
+            let settings = html::Settings {
+                done: self.ctx.done_keywords.clone(),
+                source: self.request.source.clone(),
+                body_only: self.request.body_only,
+                stylesheet: self.stylesheet.clone(),
+            };
+            Writer::Html(Box::new(Html::start(
+                &doc, &selection, &mut view, settings, &mut out,
+            )))
+        } else {
+            let title = view.options.title.clone();
+            let title = filter::plain(&filter::objects(&title, &mut view));
+            out = shell_head(backend, &title, self.request.body_only);
+            let mut body = parse::dump::options(&view.options);
+            let preamble = filter::elements(&doc.preamble, &mut view);
+            parse::dump::preamble(&mut body, &preamble);
+            escape_into(backend, &body, &mut out);
+            Writer::Dump
+        };
         if let Some(why) = view.error() {
             return Err(vec![echo(EchoLevel::Error, why.to_string())]);
         }
-        escape_into(backend, &body, &mut out);
         let next = if doc.headlines.is_empty() {
             Vec::new()
         } else {
@@ -458,6 +499,7 @@ impl Run {
             selection,
             next,
             out,
+            writer,
         })
     }
 }
@@ -645,8 +687,8 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| "missing".to_string())
         }
-        fn id_exists(&self, _: &str) -> Option<bool> {
-            None
+        fn id_file(&self, _: &str) -> super::super::IdFile {
+            super::super::IdFile::NoIndex
         }
     }
 
@@ -667,7 +709,7 @@ mod tests {
                 .map(|(p, t)| (p.to_string(), t.to_string()))
                 .collect(),
         ));
-        let keywords = vec!["TODO".to_string(), "DONE".to_string()];
+        let keywords = vec!["TODO DONE".to_string()];
         let mut run = match Run::new(
             1,
             request.clone(),
@@ -675,6 +717,7 @@ mod tests {
             keywords,
             When { local_secs: 0 },
             host,
+            Stylesheet::None,
         ) {
             Ok(run) => run,
             Err(effects) => return (effects, 0),
@@ -723,12 +766,7 @@ mod tests {
         };
         assert!(matches!(w.anchor, FileAnchor::Whole) && w.save);
         assert_eq!(w.path, "/notes/plan.html");
-        assert!(
-            w.text
-                .contains("headline 1 @0 [&quot;One &lt;&amp;&gt;&quot;]"),
-            "{}",
-            w.text
-        );
+        assert!(w.text.contains("One &lt;&amp;&gt;</h2>"), "{}", w.text);
         assert!(w.text.contains("<title>plan</title>"), "{}", w.text);
     }
 
@@ -864,9 +902,7 @@ mod tests {
         r.body_only = true;
         let (effects, steps) = run_counting(&r, Some(text.clone()));
         assert!(steps > 3, "{steps} steps");
-        let ctx = Context {
-            todo_keywords: vec!["TODO".to_string(), "DONE".to_string()],
-        };
+        let ctx = Context::for_file("", vec!["TODO DONE".to_string()]);
         let whole = filtered_dump(&text, &ctx);
         assert_eq!(written(&effects).1, format!("```\n{whole}```\n"));
     }
@@ -881,7 +917,7 @@ mod tests {
         r.body_only = true;
         for name in ["headlines", "lists", "blocks", "misc", "objects"] {
             let text = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus");
-            let ctx = Context::for_file(&text, vec!["TODO".to_string(), "DONE".to_string()]);
+            let ctx = Context::for_file(&text, vec!["TODO DONE".to_string()]);
             let whole = filtered_dump(&text, &ctx);
             assert_eq!(
                 written(&run(&r, Some(text))).1,

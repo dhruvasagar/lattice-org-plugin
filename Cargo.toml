@@ -97,6 +97,9 @@ lattice-wit = "0.7.0"
 # now — but TOML is still the nicest way to WRITE a fixture, and the alternative
 # is pages of nested `Value::record([...])` in which a test's intent disappears.
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+# A strict XML reader, so the HTML tests check the output is well-formed
+# rather than only that it matches a golden.
+quick-xml = "0.38"
 
 [profile.release]
 opt-level = "s"

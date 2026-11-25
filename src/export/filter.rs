@@ -89,6 +89,12 @@ impl View {
         &self.targets
     }
 
+    /// What the export asks of the editor, for the backends' own questions
+    /// (which file an id lives in).
+    pub(crate) fn host(&self) -> &dyn Host {
+        &*self.host
+    }
+
     /// Why the export cannot go on: an undefined macro, or one that expands
     /// into itself. The first such, once set.
     pub(crate) fn error(&self) -> Option<&str> {

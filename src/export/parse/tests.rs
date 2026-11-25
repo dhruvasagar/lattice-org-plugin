@@ -4,6 +4,7 @@ use super::*;
 fn ctx() -> Context {
     Context {
         todo_keywords: ["TODO", "NEXT", "DONE"].map(String::from).to_vec(),
+        done_keywords: vec!["DONE".to_string()],
     }
 }
 
@@ -12,7 +13,10 @@ fn ctx() -> Context {
 fn golden(name: &str) {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export/parse/testdata");
     let org = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus file");
-    let got = dump(&parse(&org, &Context::for_file(&org, ctx().todo_keywords)));
+    let got = dump(&parse(
+        &org,
+        &Context::for_file(&org, vec!["TODO NEXT | DONE".to_string()]),
+    ));
     let ir = dir.join(format!("{name}.ir"));
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::write(&ir, &got).expect("write golden");
@@ -54,7 +58,10 @@ fn golden_objects() {
 #[test]
 fn the_files_todo_line_replaces_the_configured_keywords() {
     let text = "#+TODO: PROPOSED | ACCEPTED\n* PROPOSED a\n* TODO b\n";
-    let doc = parse(text, &Context::for_file(text, ctx().todo_keywords));
+    let doc = parse(
+        text,
+        &Context::for_file(text, vec!["TODO NEXT | DONE".to_string()]),
+    );
     assert_eq!(doc.headlines[0].todo.as_deref(), Some("PROPOSED"));
     assert_eq!(doc.headlines[1].todo, None);
     assert_eq!(doc.headlines[1].raw_title, "TODO b");

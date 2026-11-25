@@ -249,12 +249,16 @@ pub(crate) enum Align {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Context {
     pub(crate) todo_keywords: Vec<String>,
+    /// The keywords among those that mark a headline done.
+    pub(crate) done_keywords: Vec<String>,
 }
 
 impl Context {
     /// The keywords in effect for `lines`: the file's own `#+TODO:` /
     /// `#+SEQ_TODO:` / `#+TYP_TODO:` lines when it has any (they replace the
-    /// configured set for that file, as in emacs), else `configured`.
+    /// configured set for that file, as in emacs), else `configured`. Both
+    /// are keyword sequences as written (`TODO NEXT | DONE`), one per line,
+    /// so which keywords are done is known.
     pub(crate) fn for_file(text: &str, configured: Vec<String>) -> Self {
         let mut own = Vec::new();
         for line in text.lines() {
@@ -262,11 +266,14 @@ impl Context {
                 continue;
             };
             if matches!(key.as_str(), "TODO" | "SEQ_TODO" | "TYP_TODO") {
-                own.extend(crate::todo::parse_keywords(value));
+                own.push(value.to_string());
             }
         }
+        let lines = if own.is_empty() { configured } else { own };
+        let keywords = crate::todo::parse_todo_keywords(&lines.join("\n"));
         Self {
-            todo_keywords: if own.is_empty() { configured } else { own },
+            todo_keywords: keywords.names(),
+            done_keywords: keywords.split().1,
         }
     }
 }

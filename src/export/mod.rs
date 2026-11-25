@@ -11,6 +11,7 @@
 //! seam ([`pipeline`]), and its result is posted back.
 
 pub(crate) mod filter;
+pub(crate) mod html;
 pub(crate) mod include;
 pub(crate) mod macros;
 pub(crate) mod options;
@@ -40,9 +41,19 @@ pub(crate) trait Host {
     /// Read a file, as `#+INCLUDE:` does: the host's `read-file`, which only
     /// reads what the plugin's grant covers.
     fn read_file(&self, path: &str) -> Result<String, String>;
-    /// Whether some file has a node with this org id; `None` when there is
-    /// no index to ask.
-    fn id_exists(&self, id: &str) -> Option<bool>;
+    /// The file that holds the node with this org id.
+    fn id_file(&self, id: &str) -> IdFile;
+}
+
+/// Where an org id lives, as the roam index knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdFile {
+    /// In this file.
+    In(String),
+    /// Nowhere the index knows.
+    Unknown,
+    /// There is no index to ask.
+    NoIndex,
 }
 
 /// The host the guest runs in.
@@ -53,8 +64,14 @@ impl Host for Guest {
         crate::lattice::plugin_host::host_services::read_file(path)
     }
 
-    fn id_exists(&self, id: &str) -> Option<bool> {
-        (!crate::roam_index::is_empty()).then(|| crate::roam_index::node(id).is_some())
+    fn id_file(&self, id: &str) -> IdFile {
+        if crate::roam_index::is_empty() {
+            return IdFile::NoIndex;
+        }
+        match crate::roam_index::node(id) {
+            Some(node) => IdFile::In(node.file),
+            None => IdFile::Unknown,
+        }
     }
 }
 
@@ -170,6 +187,15 @@ pub(crate) fn register_options() {
         "Directories an export may write into, besides `org.directory` and \
          `org.roam-directory`. Empty by default, so a project's README.org \
          exports once its directory is listed here.",
+    );
+    let _ = register_option(
+        "export.html-stylesheet",
+        OptionType::String,
+        "default",
+        "The stylesheet an HTML export uses: `default` inlines org's own, \
+         `none` leaves style to the reader, and anything else is a URL or \
+         path the page links to. ox-html's class names are kept, so a \
+         stylesheet written for emacs's output styles this one.",
     );
 }
 

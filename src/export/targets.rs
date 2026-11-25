@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::parse::objects::Object;
 use super::parse::{Element, ElementKind, FlatSection, Row};
-use super::Host;
+use super::{Host, IdFile};
 
 /// What a link path names.
 #[derive(Debug, PartialEq, Eq)]
@@ -223,9 +223,9 @@ impl Targets {
                 // Another file's node is external; one no index knows is
                 // broken. With no index to ask there is no telling, and the
                 // link is let through.
-                return match host.id_exists(rest) {
-                    Some(false) => Resolution::Broken,
-                    _ => Resolution::External,
+                return match host.id_file(rest) {
+                    IdFile::Unknown => Resolution::Broken,
+                    IdFile::In(_) | IdFile::NoIndex => Resolution::External,
                 };
             }
             if super::parse::objects::is_link_scheme(scheme) {
@@ -260,8 +260,12 @@ pub(crate) mod tests {
         fn read_file(&self, path: &str) -> Result<String, String> {
             Err(format!("no {path}"))
         }
-        fn id_exists(&self, id: &str) -> Option<bool> {
-            self.0.as_ref().map(|ids| ids.contains(&id))
+        fn id_file(&self, id: &str) -> IdFile {
+            match &self.0 {
+                None => IdFile::NoIndex,
+                Some(ids) if ids.contains(&id) => IdFile::In(format!("/notes/{id}.org")),
+                Some(_) => IdFile::Unknown,
+            }
         }
     }
 

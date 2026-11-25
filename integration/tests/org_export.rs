@@ -404,6 +404,11 @@ async fn an_export_lands_on_disk_without_a_further_keypress() {
     let written = std::fs::read_to_string(&html).unwrap();
     assert!(written.contains("<title>Plan</title>"), "{written}");
     assert!(written.contains("first &lt;b&gt;"), "{written}");
+    // The transcoder's document, with the default stylesheet inline.
+    assert!(
+        written.contains("<h2 id=\"") && written.contains("<style>\n:root"),
+        "{written}"
+    );
     settle(&mut editor, |e| {
         last_echo(e).as_deref() == Some("Exported notes.html")
     })

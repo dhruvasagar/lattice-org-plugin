@@ -25,13 +25,14 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
-use super::filter::{self, Selection};
+use super::filter::{self, Selection, View};
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     EchoLevel, EchoPayload, Effect, FileAnchor, WriteToFilePayload,
 };
+use crate::time_format::When;
 
 /// The plugin event carrying a [`Request`] from the command to the events
 /// seam.
@@ -138,7 +139,10 @@ pub(crate) fn on_requested(payload: &[u8]) {
         n.set(id + 1);
         id
     });
-    match Run::new(id, request, text, crate::todo_keywords()) {
+    let now = When {
+        local_secs: crate::local_now_secs(),
+    };
+    match Run::new(id, request, text, crate::todo_keywords(), now) {
         Ok(run) => {
             RUNS.with(|runs| {
                 let mut runs = runs.borrow_mut();
@@ -204,6 +208,8 @@ pub(crate) struct Run {
     sections: Vec<FlatSection>,
     /// The file's keywords, in order, gathered as the chunks are parsed.
     keywords: Vec<(String, String)>,
+    /// When the export was asked for: `{{{time}}}` reads it.
+    now: When,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -212,7 +218,7 @@ pub(crate) struct Run {
 /// output so far.
 struct Render {
     doc: Doc,
-    options: Options,
+    view: View,
     selection: Selection,
     /// The next headline to visit, as indices from `doc.headlines` down
     /// through `children`; empty once the walk is over.
@@ -233,6 +239,7 @@ impl Run {
         request: Request,
         text: Option<String>,
         configured_keywords: Vec<String>,
+        now: When,
     ) -> Result<Self, Vec<Effect>> {
         let Some(text) = text else {
             return Err(vec![echo(
@@ -253,6 +260,7 @@ impl Run {
             next: 0,
             sections: Vec::new(),
             keywords: Vec::new(),
+            now,
             render: None,
             text,
         })
@@ -289,12 +297,16 @@ impl Run {
             let mut body = String::new();
             while !render.next.is_empty() && body.len() < STEP_BYTES {
                 let h = at(&render.doc, &render.next);
-                let visit = filter::visits(h, &render.selection, &render.options);
+                let visit = filter::visits(h, &render.selection, &render.view.options);
                 if visit {
                     let depth = render.next.len() - 1;
-                    parse::dump::headline(&mut body, &filter::own(h, &render.options), depth);
+                    let own = filter::own(h, &mut render.view);
+                    parse::dump::headline(&mut body, &own, depth);
                 }
                 advance(&render.doc, &mut render.next, visit);
+            }
+            if let Some(why) = render.view.error() {
+                return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
             }
             escape_into(backend, &body, &mut render.out);
             if !render.next.is_empty() {
@@ -304,14 +316,15 @@ impl Run {
         let mut output = std::mem::take(&mut render.out);
         output.push_str(shell_tail(backend, self.request.body_only));
         let target = file_name(&self.request.target);
-        let done = if render.options.ignored.is_empty() {
+        let ignored = &render.view.options.ignored;
+        let done = if ignored.is_empty() {
             echo(EchoLevel::Info, format!("Exported {target}"))
         } else {
             echo(
                 EchoLevel::Warn,
                 format!(
                     "Exported {target}; not supported, so left out: {}",
-                    render.options.ignored.join(", ")
+                    ignored.join(", ")
                 ),
             )
         };
@@ -338,7 +351,6 @@ impl Run {
     fn prepare(&mut self) -> Result<Render, Vec<Effect>> {
         let mut doc = parse::assemble(std::mem::take(&mut self.sections));
         let name = file_name(&self.request.source);
-        let stem = name.strip_suffix(".org").unwrap_or(name);
         let options = if self.request.subtree {
             let Some(headline) = take_subtree(&mut doc, self.request.line) else {
                 return Err(vec![echo(
@@ -349,7 +361,7 @@ impl Run {
             let options = Options::resolve(
                 &self.keywords,
                 Some((&headline.raw_title, &headline.properties)),
-                stem,
+                name,
             );
             doc = Doc {
                 preamble: Vec::new(),
@@ -357,17 +369,20 @@ impl Run {
             };
             options
         } else {
-            Options::resolve(&self.keywords, None, stem)
+            Options::resolve(&self.keywords, None, name)
         };
         let selection = filter::selection(&doc, &options);
+        let mut view = View::new(options, self.keywords.clone(), self.now);
         let backend = self.request.backend;
-        let mut out = shell_head(
-            backend,
-            &filter::plain(&options.title),
-            self.request.body_only,
-        );
-        let mut body = parse::dump::options(&options);
-        parse::dump::preamble(&mut body, &filter::elements(&doc.preamble, &options));
+        let title = view.options.title.clone();
+        let title = filter::plain(&filter::objects(&title, &mut view));
+        let mut out = shell_head(backend, &title, self.request.body_only);
+        let mut body = parse::dump::options(&view.options);
+        let preamble = filter::elements(&doc.preamble, &mut view);
+        parse::dump::preamble(&mut body, &preamble);
+        if let Some(why) = view.error() {
+            return Err(vec![echo(EchoLevel::Error, why.to_string())]);
+        }
         escape_into(backend, &body, &mut out);
         let next = if doc.headlines.is_empty() {
             Vec::new()
@@ -376,7 +391,7 @@ impl Run {
         };
         Ok(Render {
             doc,
-            options,
+            view,
             selection,
             next,
             out,
@@ -544,7 +559,7 @@ mod tests {
     /// Run `request` over `text` to the end, and the steps it took.
     fn run_counting(request: &Request, text: Option<String>) -> (Vec<Effect>, usize) {
         let keywords = vec!["TODO".to_string(), "DONE".to_string()];
-        let mut run = match Run::new(1, request.clone(), text, keywords) {
+        let mut run = match Run::new(1, request.clone(), text, keywords, When { local_secs: 0 }) {
             Ok(run) => run,
             Err(effects) => return (effects, 0),
         };
@@ -690,19 +705,22 @@ mod tests {
                 keywords.push((key.clone(), value.clone()));
             }
         }
-        let o = Options::resolve(&keywords, None, "plan");
+        let o = Options::resolve(&keywords, None, "plan.org");
         let sel = filter::selection(&doc, &o);
         let mut out = parse::dump::options(&o);
-        parse::dump::preamble(&mut out, &filter::elements(&doc.preamble, &o));
-        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, o: &Options) {
+        let mut v = View::new(o, keywords, When { local_secs: 0 });
+        let preamble = filter::elements(&doc.preamble, &mut v);
+        parse::dump::preamble(&mut out, &preamble);
+        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, v: &mut View) {
             for h in hs {
-                if filter::visits(h, sel, o) {
-                    parse::dump::headline(out, &filter::own(h, o), depth);
-                    walk(out, &h.children, depth + 1, sel, o);
+                if filter::visits(h, sel, &v.options) {
+                    let own = filter::own(h, v);
+                    parse::dump::headline(out, &own, depth);
+                    walk(out, &h.children, depth + 1, sel, v);
                 }
             }
         }
-        walk(&mut out, &doc.headlines, 0, &sel, &o);
+        walk(&mut out, &doc.headlines, 0, &sel, &mut v);
         out
     }
 
@@ -741,6 +759,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A macro that is not defined fails the export, in the title or in the
+    /// body, and nothing is written.
+    #[test]
+    fn an_undefined_macro_fails_the_export() {
+        for text in ["#+TITLE: {{{nope}}}\n* A\n", "* A\n** B\n{{{nope}}}\n"] {
+            let effects = run(&request(Backend::Html), Some(text.to_string()));
+            assert!(
+                matches!(&effects[..], [Effect::Echo(e)] if e.text == "org: {{{nope}}} is not defined"),
+                "{text}: {effects:?}"
+            );
+        }
+        let effects = run(
+            &request(Backend::Markdown),
+            Some("#+MACRO: who Ada\n#+TITLE: By {{{who}}}\n".to_string()),
+        );
+        assert!(written(&effects).1.starts_with("# By Ada\n"));
     }
 
     #[test]

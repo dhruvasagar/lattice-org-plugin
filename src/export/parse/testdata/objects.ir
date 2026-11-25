@@ -9,3 +9,4 @@ headline 1 @0 ["A " italic["title"] " with " verbatim("code") " and a " link("ht
       paragraph @20 "the " italic["definition"]
   paragraph @21 link("file:img.png")
     with caption=["A " bold["bold"] " caption"]
+  keyword MACRO @23 "kbd @@html:<kbd>@@$1@@html:</kbd>@@"

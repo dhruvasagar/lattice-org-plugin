@@ -5179,7 +5179,7 @@ fn epoch_day_from_local_secs(local_secs: i64) -> i64 {
 /// The three correct siblings each carried a comment warning about exactly
 /// this bug while the fourth quietly had it, which is the argument for one
 /// function over four careful ones.
-fn local_now_secs() -> i64 {
+pub(crate) fn local_now_secs() -> i64 {
     let utc = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

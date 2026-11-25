@@ -21,3 +21,4 @@ No close: *not bold * here.
 - *term* :: the /definition/
 #+CAPTION: A *bold* caption
 [[file:img.png]]
+#+MACRO: kbd @@html:<kbd>@@$1@@html:</kbd>@@

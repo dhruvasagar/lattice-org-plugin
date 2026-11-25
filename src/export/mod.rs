@@ -11,6 +11,7 @@
 //! seam ([`pipeline`]), and its result is posted back.
 
 pub(crate) mod filter;
+pub(crate) mod macros;
 pub(crate) mod options;
 pub(crate) mod parse;
 pub(crate) mod pipeline;

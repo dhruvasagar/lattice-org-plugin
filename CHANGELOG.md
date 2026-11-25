@@ -21,7 +21,10 @@ the lattice release that carries it.
   `#+SELECT_TAGS:` / `#+EXCLUDE_TAGS:`, `COMMENT` headlines and a subtree's
   `EXPORT_*` properties decide what is exported, with emacs's defaults; what
   the file asks for and the export does not do (`#+SETUPFILE`, an unknown
-  option) is named when the export finishes. The output is a placeholder for now
+  option) is named when the export finishes. `{{{macros}}}` expand: `#+MACRO:`
+  definitions with `$1`… arguments, and emacs's built-ins (`title`, `author`,
+  `date`, `time`, `property`, `keyword`, `n`, `input-file`); an undefined one
+  stops the export, naming it. The output is a placeholder for now
   (the options, then the parsed outline, elements and inline markup, verbatim, in the format's
   document) until the real HTML, Markdown and LaTeX writers land.
 

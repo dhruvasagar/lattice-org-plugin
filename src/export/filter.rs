@@ -15,11 +15,53 @@
 //!   `^:`, `*:` and `e:` turn off is put back as the text it was written as:
 //!   the parse reads every script, emphasis and entity, because the
 //!   `#+OPTIONS:` line that governs them may come after them.
+//! - **Macros** expand here too, as the walk reaches them (see
+//!   [`super::macros`]), so a [`View`] carries the macro state with the
+//!   options.
 
 use std::collections::HashSet;
 
+use super::macros::{Expansion, Macros};
 use super::options::{Options, SubSuperscripts, Tex, Timestamps};
-use super::parse::objects::{Emphasis, Object};
+use super::parse::objects::{self as parse_objects, Emphasis, Object};
+use crate::time_format::When;
+
+/// How deep a macro may expand into macros before it is taken to expand
+/// into itself.
+const MAX_MACRO_DEPTH: usize = 16;
+
+/// The export as the render sees it: the options, and the macro state that
+/// changes as the walk goes (`n`'s counters, the headline whose properties
+/// `property` reads).
+pub(crate) struct View {
+    pub(crate) options: Options,
+    macros: Macros,
+    /// The properties of the headline being rendered.
+    properties: Vec<(String, String)>,
+    depth: usize,
+    error: Option<String>,
+}
+
+impl View {
+    /// A view of `options`, for a file whose keywords are `keywords`,
+    /// exported at `now`.
+    pub(crate) fn new(options: Options, keywords: Vec<(String, String)>, now: When) -> Self {
+        let macros = Macros::new(options.macros.clone(), keywords, now);
+        View {
+            options,
+            macros,
+            properties: Vec::new(),
+            depth: 0,
+            error: None,
+        }
+    }
+
+    /// Why the export cannot go on: an undefined macro, or one that expands
+    /// into itself. The first such, once set.
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+}
 use super::parse::{Block, BlockKind, Doc, Element, ElementKind, Headline, Item, List, Row, Table};
 
 /// Which headlines a select tag keeps, by line; `None` when no headline
@@ -76,51 +118,62 @@ pub(crate) fn visits(h: &Headline, selection: &Selection, o: &Options) -> bool {
 
 /// `h`'s own parts as the export shows them: no children (the walk visits
 /// those), and the planning, properties and section filtered.
-pub(crate) fn own(h: &Headline, o: &Options) -> Headline {
+pub(crate) fn own(h: &Headline, v: &mut View) -> Headline {
+    v.properties.clone_from(&h.properties);
+    let o = &v.options;
+    let planning = if o.planning {
+        h.planning.clone()
+    } else {
+        Default::default()
+    };
+    let properties = if o.properties {
+        h.properties.clone()
+    } else {
+        Vec::new()
+    };
     Headline {
         line: h.line,
         level: h.level,
         todo: h.todo.clone(),
         priority: h.priority,
-        title: objects(&h.title, o),
+        title: objects(&h.title, v),
         raw_title: h.raw_title.clone(),
         tags: h.tags.clone(),
         commented: h.commented,
-        planning: if o.planning {
-            h.planning.clone()
-        } else {
-            Default::default()
-        },
-        properties: if o.properties {
-            h.properties.clone()
-        } else {
-            Vec::new()
-        },
-        section: elements(&h.section, o),
+        planning,
+        properties,
+        section: elements(&h.section, v),
         children: Vec::new(),
     }
 }
 
 /// `list` with what the options leave out taken out, inside nested
 /// elements too.
-pub(crate) fn elements(list: &[Element], o: &Options) -> Vec<Element> {
-    list.iter().filter_map(|e| element(e, o)).collect()
+pub(crate) fn elements(list: &[Element], v: &mut View) -> Vec<Element> {
+    list.iter().filter_map(|e| element(e, v)).collect()
 }
 
-fn element(e: &Element, o: &Options) -> Option<Element> {
-    let kind = match &e.kind {
-        ElementKind::Comment(_) => return None,
-        ElementKind::Clock(_) if !o.clocks => return None,
-        ElementKind::FixedWidth(_) if !o.fixed_width => return None,
-        ElementKind::Table(_) | ElementKind::TableEl(_) if !o.tables => return None,
-        ElementKind::FootnoteDefinition { .. } if !o.footnotes => return None,
-        ElementKind::LatexEnvironment(_) if o.tex == Tex::Off => return None,
-        ElementKind::Drawer { name, .. } if !o.drawers.keeps(name) => return None,
+fn element(e: &Element, v: &mut View) -> Option<Element> {
+    let o = &v.options;
+    let dropped = match &e.kind {
+        ElementKind::Comment(_) => true,
+        ElementKind::Clock(_) if !o.clocks => true,
+        ElementKind::FixedWidth(_) if !o.fixed_width => true,
+        ElementKind::Table(_) | ElementKind::TableEl(_) if !o.tables => true,
+        ElementKind::FootnoteDefinition { .. } if !o.footnotes => true,
+        ElementKind::LatexEnvironment(_) if o.tex == Tex::Off => true,
+        ElementKind::Drawer { name, .. } if !o.drawers.keeps(name) => true,
         ElementKind::Block(Block {
             kind: BlockKind::Comment,
             ..
-        }) => return None,
-        ElementKind::Paragraph(objs) => ElementKind::Paragraph(objects(objs, o)),
+        }) => true,
+        _ => false,
+    };
+    if dropped {
+        return None;
+    }
+    let kind = match &e.kind {
+        ElementKind::Paragraph(objs) => ElementKind::Paragraph(objects(objs, v)),
         ElementKind::PlainList(list) => ElementKind::PlainList(List {
             kind: list.kind,
             items: list
@@ -131,8 +184,8 @@ fn element(e: &Element, o: &Options) -> Option<Element> {
                     bullet: item.bullet.clone(),
                     counter: item.counter,
                     checkbox: item.checkbox,
-                    tag: item.tag.as_ref().map(|t| objects(t, o)),
-                    contents: elements(&item.contents, o),
+                    tag: item.tag.as_ref().map(|t| objects(t, v)),
+                    contents: elements(&item.contents, v),
                 })
                 .collect(),
         }),
@@ -142,7 +195,7 @@ fn element(e: &Element, o: &Options) -> Option<Element> {
                 .iter()
                 .map(|r| match r {
                     Row::Rule => Row::Rule,
-                    Row::Cells(cells) => Row::Cells(cells.iter().map(|c| objects(c, o)).collect()),
+                    Row::Cells(cells) => Row::Cells(cells.iter().map(|c| objects(c, v)).collect()),
                 })
                 .collect(),
             align: t.align.clone(),
@@ -152,20 +205,20 @@ fn element(e: &Element, o: &Options) -> Option<Element> {
             kind: b.kind.clone(),
             parameters: b.parameters.clone(),
             body: b.body.clone(),
-            contents: elements(&b.contents, o),
+            contents: elements(&b.contents, v),
         }),
         ElementKind::Drawer { name, contents } => ElementKind::Drawer {
             name: name.clone(),
-            contents: elements(contents, o),
+            contents: elements(contents, v),
         },
         ElementKind::FootnoteDefinition { label, contents } => ElementKind::FootnoteDefinition {
             label: label.clone(),
-            contents: elements(contents, o),
+            contents: elements(contents, v),
         },
         other => other.clone(),
     };
     let mut affiliated = e.affiliated.clone();
-    affiliated.caption = affiliated.caption.iter().map(|c| objects(c, o)).collect();
+    affiliated.caption = affiliated.caption.iter().map(|c| objects(c, v)).collect();
     Some(Element {
         line: e.line,
         affiliated,
@@ -175,10 +228,10 @@ fn element(e: &Element, o: &Options) -> Option<Element> {
 
 /// `list` with what the options leave out taken out, and what they turn off
 /// put back as text. Adjacent text is joined.
-pub(crate) fn objects(list: &[Object], o: &Options) -> Vec<Object> {
+pub(crate) fn objects(list: &[Object], v: &mut View) -> Vec<Object> {
     let mut out = Vec::new();
     for obj in list {
-        object(obj, o, &mut out);
+        object(obj, v, &mut out);
     }
     out
 }
@@ -191,8 +244,10 @@ fn push_text(out: &mut Vec<Object>, text: &str) {
     }
 }
 
-fn object(obj: &Object, o: &Options, out: &mut Vec<Object>) {
-    let keep_script = |braced: bool| match o.subsup {
+fn object(obj: &Object, v: &mut View, out: &mut Vec<Object>) {
+    let o = &v.options;
+    let subsup = o.subsup;
+    let keep_script = |braced: bool| match subsup {
         SubSuperscripts::All => true,
         SubSuperscripts::Braced => braced,
         SubSuperscripts::None => false,
@@ -223,7 +278,7 @@ fn object(obj: &Object, o: &Options, out: &mut Vec<Object>) {
             };
             push_text(out, marker);
             for c in contents {
-                object(c, o, out);
+                object(c, v, out);
             }
             push_text(out, marker);
         }
@@ -243,7 +298,7 @@ fn object(obj: &Object, o: &Options, out: &mut Vec<Object>) {
                 push_text(out, "{");
             }
             for c in contents {
-                object(c, o, out);
+                object(c, v, out);
             }
             if *braced {
                 push_text(out, "}");
@@ -251,26 +306,53 @@ fn object(obj: &Object, o: &Options, out: &mut Vec<Object>) {
         }
         Object::Emphasis { kind, contents } => out.push(Object::Emphasis {
             kind: *kind,
-            contents: objects(contents, o),
+            contents: objects(contents, v),
         }),
         Object::Link { path, description } => out.push(Object::Link {
             path: path.clone(),
-            description: objects(description, o),
+            description: objects(description, v),
         }),
         Object::FootnoteReference { label, definition } => out.push(Object::FootnoteReference {
             label: label.clone(),
-            definition: objects(definition, o),
+            definition: objects(definition, v),
         }),
         Object::Subscript { braced, contents } => out.push(Object::Subscript {
             braced: *braced,
-            contents: objects(contents, o),
+            contents: objects(contents, v),
         }),
         Object::Superscript { braced, contents } => out.push(Object::Superscript {
             braced: *braced,
-            contents: objects(contents, o),
+            contents: objects(contents, v),
         }),
-        Object::RadioTarget(contents) => out.push(Object::RadioTarget(objects(contents, o))),
+        Object::RadioTarget(contents) => out.push(Object::RadioTarget(objects(contents, v))),
+        Object::Macro { name, args } => expand(name, args, v, out),
         other => out.push(other.clone()),
+    }
+}
+
+/// `{{{name(args)}}}`, expanded and parsed in place, with the options
+/// applied to what it expands to.
+fn expand(name: &str, args: &[String], v: &mut View, out: &mut Vec<Object>) {
+    if v.error.is_some() {
+        return;
+    }
+    if v.depth >= MAX_MACRO_DEPTH {
+        v.error = Some(format!("org: {{{{{{{name}}}}}}} expands into itself"));
+        return;
+    }
+    let properties = std::mem::take(&mut v.properties);
+    let expansion = v.macros.expand(name, args, &properties);
+    v.properties = properties;
+    match expansion {
+        Ok(Expansion::Text(text)) => {
+            v.depth += 1;
+            for obj in &parse_objects::parse(&text) {
+                object(obj, v, out);
+            }
+            v.depth -= 1;
+        }
+        Ok(Expansion::Unsupported(what)) => v.options.ignore(what),
+        Err(why) => v.error = Some(why),
     }
 }
 
@@ -318,22 +400,80 @@ mod tests {
     fn filtered(text: &str, o: &Options) -> String {
         let doc = parse::parse(text, &Context::for_file(text, Vec::new()));
         let sel = selection(&doc, o);
+        let mut v = view(o.clone());
         let mut out = String::new();
-        dump::preamble(&mut out, &elements(&doc.preamble, o));
-        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, o: &Options) {
+        let preamble = elements(&doc.preamble, &mut v);
+        dump::preamble(&mut out, &preamble);
+        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, v: &mut View) {
             for h in hs {
-                if visits(h, sel, o) {
-                    dump::headline(out, &own(h, o), depth);
-                    walk(out, &h.children, depth + 1, sel, o);
+                if visits(h, sel, &v.options) {
+                    let own = own(h, v);
+                    dump::headline(out, &own, depth);
+                    walk(out, &h.children, depth + 1, sel, v);
                 }
             }
         }
-        walk(&mut out, &doc.headlines, 0, &sel, o);
+        walk(&mut out, &doc.headlines, 0, &sel, &mut v);
         out
     }
 
+    fn view(o: Options) -> View {
+        View::new(o, Vec::new(), When { local_secs: 0 })
+    }
+
     fn objs(text: &str, options: &str) -> String {
-        dump::objects(&objects(&parse::objects::parse(text), &opts(options)))
+        dump::objects(&objects(
+            &parse::objects::parse(text),
+            &mut view(opts(options)),
+        ))
+    }
+
+    /// `text` in a file whose keywords are `keywords`, its macros expanded.
+    fn expanded(text: &str, keywords: &[(&str, &str)]) -> (String, View) {
+        let keywords: Vec<(String, String)> = keywords
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut v = view(Options::resolve(&keywords, None, "notes.org"));
+        let got = dump::objects(&objects(&parse::objects::parse(text), &mut v));
+        (got, v)
+    }
+
+    /// A macro's expansion is parsed, may hold macros, and is filtered like
+    /// the text around it.
+    #[test]
+    fn macros_expand_in_place_and_their_expansion_is_markup() {
+        let keywords = [
+            ("MACRO", "strong *$1*"),
+            ("MACRO", "twice {{{strong($1)}}} {{{strong($1)}}}"),
+            ("OPTIONS", "*:nil"),
+            ("TITLE", "Plan"),
+        ];
+        let (got, v) = expanded(
+            "a {{{twice(x)}}} in {{{input-file}}}, {{{title}}}",
+            &keywords,
+        );
+        assert_eq!(got, r#""a *x* *x* in notes.org, Plan""#);
+        assert!(v.error().is_none());
+        let (got, _) = expanded("{{{strong(y)}}}", &[("MACRO", "strong *$1*")]);
+        assert_eq!(got, r#"bold["y"]"#);
+    }
+
+    #[test]
+    fn a_property_macro_reads_the_headline_being_rendered() {
+        let text =
+            "#+MACRO: x unused\n* H\n:PROPERTIES:\n:OWNER: Ada\n:END:\nBy {{{property(OWNER)}}}.\n";
+        assert!(filtered(text, &Options::default()).contains(r#""By Ada.""#));
+    }
+
+    #[test]
+    fn a_macro_that_is_undefined_or_expands_into_itself_stops_the_export() {
+        let (_, v) = expanded("{{{nope}}}", &[]);
+        assert_eq!(v.error(), Some("org: {{{nope}}} is not defined"));
+        let (_, v) = expanded("{{{me}}}", &[("MACRO", "me again {{{me}}}")]);
+        assert_eq!(v.error(), Some("org: {{{me}}} expands into itself"));
+        let (_, v) = expanded("{{{modification-time(%Y)}}}", &[]);
+        assert_eq!(v.options.ignored, ["{{{modification-time}}}"]);
     }
 
     #[test]

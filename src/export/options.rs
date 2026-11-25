@@ -8,6 +8,8 @@
 //! collected in [`Options::ignored`], for the export's echo to name once,
 //! rather than dropped without a word.
 
+use std::collections::BTreeMap;
+
 use super::parse::objects::{self, Object};
 
 /// Which `_` / `^` are sub- and superscripts: `^:`.
@@ -151,6 +153,9 @@ pub(crate) struct Options {
     pub(crate) latex_class: String,
     pub(crate) latex_class_options: String,
     pub(crate) latex_header: Vec<String>,
+    /// Macro templates by name: the keyword built-ins, then `#+MACRO:` lines,
+    /// which win.
+    pub(crate) macros: BTreeMap<String, String>,
 
     /// What the file asked for that this does not do: `#+KEY` and
     /// `OPTIONS key:`, each once, in the order first seen.
@@ -201,6 +206,7 @@ impl Default for Options {
             latex_class: "article".to_string(),
             latex_class_options: String::new(),
             latex_header: Vec::new(),
+            macros: BTreeMap::new(),
             ignored: Vec::new(),
         }
     }
@@ -232,49 +238,78 @@ impl Options {
     pub(crate) fn resolve(
         keywords: &[(String, String)],
         subtree: Option<(&str, &[(String, String)])>,
-        file_stem: &str,
+        file_name: &str,
     ) -> Self {
         let mut o = Options::default();
-        let mut title = None;
+        let mut raw = Raw::default();
         for (key, value) in keywords {
-            o.keyword(key, value, &mut title);
+            o.keyword(key, value, &mut raw);
         }
         if let Some((headline, properties)) = subtree {
             // A subtree's title is its headline unless it names another.
-            title = Some(headline.to_string());
+            raw.title = Some(headline.to_string());
             for (key, value) in properties {
                 let key = key.to_ascii_uppercase();
                 if let Some(k) = key.strip_prefix("EXPORT_") {
                     if k == "TITLE" {
-                        title = Some(value.to_string());
+                        raw.title = Some(value.to_string());
                     } else {
-                        o.keyword(k, value, &mut title);
+                        o.keyword(k, value, &mut raw);
                     }
                 }
             }
         }
-        o.title = objects::parse(title.as_deref().unwrap_or(file_stem));
+        let stem = file_name.strip_suffix(".org").unwrap_or(file_name);
+        let title = raw.title.unwrap_or_else(|| stem.to_string());
+        o.title = objects::parse(&title);
+        o.macros = [
+            ("title", title),
+            ("author", raw.author.unwrap_or_default()),
+            ("date", raw.date.unwrap_or_default()),
+            ("email", o.email.clone()),
+            ("input-file", file_name.to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .chain(raw.macros)
+        .collect();
         o
     }
 
     /// One keyword. Keywords that may repeat accumulate; the rest take the
     /// last value.
-    fn keyword(&mut self, key: &str, value: &str, title: &mut Option<String>) {
+    fn keyword(&mut self, key: &str, value: &str, raw: &mut Raw) {
         let words = |v: &str| v.split_whitespace().map(str::to_string).collect::<Vec<_>>();
         match key {
             "OPTIONS" => self.options_line(value),
-            "TITLE" => match title {
+            "TITLE" => match &mut raw.title {
                 // `#+TITLE:` lines concatenate, as in ox.
                 Some(t) => {
                     t.push(' ');
                     t.push_str(value);
                 }
-                None => *title = Some(value.to_string()),
+                None => raw.title = Some(value.to_string()),
             },
             "SUBTITLE" => self.subtitle = objects::parse(value),
-            "AUTHOR" => self.author = objects::parse(value),
+            "AUTHOR" => {
+                self.author = objects::parse(value);
+                raw.author = Some(value.to_string());
+            }
             "EMAIL" => self.email = value.to_string(),
-            "DATE" => self.date = objects::parse(value),
+            "DATE" => {
+                self.date = objects::parse(value);
+                raw.date = Some(value.to_string());
+            }
+            "MACRO" => {
+                let (name, body) = value
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((value.trim(), ""));
+                if !name.is_empty() {
+                    raw.macros
+                        .insert(name.to_ascii_lowercase(), body.trim().to_string());
+                }
+            }
             "LANGUAGE" => self.language = value.to_string(),
             "SELECT_TAGS" => self.select_tags = words(value),
             "EXCLUDE_TAGS" => self.exclude_tags = words(value),
@@ -294,7 +329,8 @@ impl Options {
         }
     }
 
-    fn ignore(&mut self, what: String) {
+    /// Name `what` in the export's closing echo, once.
+    pub(crate) fn ignore(&mut self, what: String) {
         if !self.ignored.contains(&what) {
             self.ignored.push(what);
         }
@@ -414,6 +450,16 @@ impl Options {
             _ => false,
         }
     }
+}
+
+/// Keyword values kept as written while the keywords are read: the
+/// built-in macros expand to them.
+#[derive(Default)]
+struct Raw {
+    title: Option<String>,
+    author: Option<String>,
+    date: Option<String>,
+    macros: BTreeMap<String, String>,
 }
 
 /// An `#+OPTIONS:` value, as ox reads it.
@@ -577,6 +623,34 @@ mod tests {
         assert_eq!(
             o.ignored,
             ["#+SETUPFILE", "html-postamble:", "arch:", "toc:"]
+        );
+    }
+
+    /// The keyword built-ins follow the keywords' own precedence, and a
+    /// `#+MACRO:` line beats a built-in of the same name.
+    #[test]
+    fn macros_collect_the_built_ins_and_the_files() {
+        let o = Options::resolve(
+            &kw(&[
+                ("TITLE", "Plan"),
+                ("AUTHOR", "Ada"),
+                ("MACRO", "greet Hello, $1"),
+                ("MACRO", "Email someone@example.invalid"),
+                ("MACRO", "greet  Hi, $1 "),
+            ]),
+            Some(("Sub", &kw(&[("EXPORT_AUTHOR", "Grace")]))),
+            "notes.org",
+        );
+        let get = |k: &str| o.macros.get(k).map(String::as_str);
+        assert_eq!(get("title"), Some("Sub"));
+        assert_eq!(get("author"), Some("Grace"));
+        assert_eq!(get("greet"), Some("Hi, $1"));
+        assert_eq!(get("email"), Some("someone@example.invalid"));
+        assert_eq!(get("input-file"), Some("notes.org"));
+        assert_eq!(o.title, objects::parse("Sub"));
+        assert_eq!(
+            Options::resolve(&[], None, "notes.org").title,
+            objects::parse("notes")
         );
     }
 

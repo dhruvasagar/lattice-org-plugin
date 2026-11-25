@@ -26,6 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 
 use super::filter::{self, Selection, View};
+use super::include::Includes;
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
 use crate::lattice::plugin_host::host_services;
@@ -169,7 +170,7 @@ pub(crate) fn on_step(payload: &[u8]) {
         let mut runs = runs.borrow_mut();
         // Absent when a newer export of its target replaced it.
         let at = runs.iter().position(|r| r.id == id)?;
-        match runs[at].step() {
+        match runs[at].step(&host_services::read_file) {
             Step::More => Some(Step::More),
             Step::Done(effects) => {
                 runs.remove(at);
@@ -200,8 +201,15 @@ pub(crate) struct Run {
     /// The buffer's text, as it was when the export was asked for.
     text: String,
     ctx: Context,
+    /// The file's `#+INCLUDE:`s while they are being read; `text` is the
+    /// expanded text once this is `None`.
+    includes: Option<Includes>,
+    /// The cursor's line in `text`: the request's, moved past what the
+    /// includes above it became.
+    line: u32,
     /// What each parse step reads: a byte range of `text`, starting at a
-    /// headline or at the top of the file, and its first line.
+    /// headline or at the top of the file, and its first line. Planned once
+    /// the includes are in.
     chunks: Vec<(Range<usize>, u32)>,
     /// The next chunk to parse.
     next: usize,
@@ -250,12 +258,22 @@ impl Run {
                 ),
             )]);
         };
+        // The file's own `#+TODO:` lines decide its keywords, as in emacs,
+        // where the buffer's settings are read before anything is included.
         let ctx = Context::for_file(&text, configured_keywords);
-        let chunks = chunks(&text, STEP_BYTES);
+        let includes = Includes::new(&text, &request.source, ctx.todo_keywords.clone());
+        let (includes, chunks) = if includes.done() {
+            (None, chunks(&text, STEP_BYTES))
+        } else {
+            (Some(includes), Vec::new())
+        };
+        let line = request.line;
         Ok(Run {
             id,
             request,
             ctx,
+            includes,
+            line,
             chunks,
             next: 0,
             sections: Vec::new(),
@@ -268,7 +286,24 @@ impl Run {
 
     /// One step: parse the next chunk, or prepare the render, or render the
     /// next headlines, or finish the file and write it.
-    pub(crate) fn step(&mut self) -> Step {
+    ///
+    /// `read` reads an included file: the host's `read-file` in the guest.
+    pub(crate) fn step(&mut self, read: &dyn Fn(&str) -> Result<String, String>) -> Step {
+        if let Some(includes) = self.includes.as_mut() {
+            if !includes.done() {
+                if let Err(why) = includes.step(read) {
+                    return Step::Done(vec![echo(EchoLevel::Error, why)]);
+                }
+                return Step::More;
+            }
+            if let Some(includes) = self.includes.take() {
+                let expanded = includes.finish();
+                self.line = expanded.line(self.request.line);
+                self.text = expanded.text;
+                self.chunks = chunks(&self.text, STEP_BYTES);
+            }
+            return Step::More;
+        }
         if let Some((bytes, first_line)) = self.chunks.get(self.next).cloned() {
             let lines: Vec<&str> = self.text[bytes].lines().collect();
             let parsed = parse::parse_chunk(&lines, first_line, &self.ctx);
@@ -352,7 +387,7 @@ impl Run {
         let mut doc = parse::assemble(std::mem::take(&mut self.sections));
         let name = file_name(&self.request.source);
         let options = if self.request.subtree {
-            let Some(headline) = take_subtree(&mut doc, self.request.line) else {
+            let Some(headline) = take_subtree(&mut doc, self.line) else {
                 return Err(vec![echo(
                     EchoLevel::Warn,
                     "org: a subtree export needs the cursor under a headline",
@@ -558,6 +593,20 @@ mod tests {
 
     /// Run `request` over `text` to the end, and the steps it took.
     fn run_counting(request: &Request, text: Option<String>) -> (Vec<Effect>, usize) {
+        run_with_files(request, text, &[])
+    }
+
+    /// [`run_counting`] where an include may read `files`.
+    fn run_with_files(
+        request: &Request,
+        text: Option<String>,
+        files: &[(&str, &str)],
+    ) -> (Vec<Effect>, usize) {
+        let files: std::collections::HashMap<String, String> = files
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        let read = |p: &str| files.get(p).cloned().ok_or_else(|| "missing".to_string());
         let keywords = vec!["TODO".to_string(), "DONE".to_string()];
         let mut run = match Run::new(1, request.clone(), text, keywords, When { local_secs: 0 }) {
             Ok(run) => run,
@@ -566,7 +615,7 @@ mod tests {
         let mut steps = 0;
         loop {
             steps += 1;
-            if let Step::Done(effects) = run.step() {
+            if let Step::Done(effects) = run.step(&read) {
                 return (effects, steps);
             }
         }
@@ -777,6 +826,47 @@ mod tests {
             Some("#+MACRO: who Ada\n#+TITLE: By {{{who}}}\n".to_string()),
         );
         assert!(written(&effects).1.starts_with("# By Ada\n"));
+    }
+
+    /// Includes are read a step each before the parse, their keywords
+    /// apply, and a subtree export under them still finds the cursor's
+    /// headline in the expanded text.
+    #[test]
+    fn includes_are_read_before_the_parse_and_the_cursor_follows() {
+        let text = "#+INCLUDE: \"setup.org\"\n* One\n#+INCLUDE: \"part.org\"\n* Two\ny\n";
+        let files = [
+            (
+                "/notes/setup.org",
+                "#+MACRO: who Ada\n#+TITLE: By {{{who}}}\n",
+            ),
+            ("/notes/part.org", "* A\n* B\n"),
+        ];
+        let mut r = request(Backend::Markdown);
+        let (effects, steps) = run_with_files(&r, Some(text.to_string()), &files);
+        let out = written(&effects).1;
+        assert!(out.starts_with("# By Ada\n"), "{out}");
+        assert!(
+            out.contains("headline 1 @2 [\"One\"]\n  headline 2 @3 [\"A\"]\n  headline 2 @4 [\"B\"]\nheadline 1 @5"),
+            "{out}"
+        );
+        assert!(steps >= 4, "an include a step: {steps}");
+
+        r.subtree = true;
+        r.body_only = true;
+        r.line = 4; // `y`, under Two, past both includes.
+        let (effects, _) = run_with_files(&r, Some(text.to_string()), &files);
+        let out = written(&effects).1;
+        assert!(out.contains("\n  title [\"Two\"]\n"), "{out}");
+        assert!(
+            out.ends_with("\nheadline 1 @5 [\"Two\"]\n  paragraph @6 \"y\"\n```\n"),
+            "{out}"
+        );
+
+        let (effects, _) = run_with_files(&request(Backend::Html), Some(text.to_string()), &[]);
+        assert!(
+            matches!(&effects[..], [Effect::Echo(e)] if e.text == "org: cannot include /notes/setup.org: missing"),
+            "{effects:?}"
+        );
     }
 
     #[test]

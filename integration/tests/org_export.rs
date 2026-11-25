@@ -480,6 +480,45 @@ async fn the_files_options_and_macros_shape_the_export_and_the_unsupported_are_n
     );
 }
 
+/// An include is read through the host's `read-file`: one the grant covers
+/// is spliced in, and one outside it fails the export, naming the path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn includes_read_what_the_grant_allows_and_name_what_it_does_not() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(base.path().join("part.org"), "* Included\nfrom part\n").unwrap();
+    std::fs::write(outside.path().join("secret.org"), "* Secret\n").unwrap();
+    let grant = write_grant(base.path());
+    let doc = "* Top\n#+INCLUDE: \"part.org\"\n";
+    let (mut editor, _loader) = org_editor(base.path(), doc, &grant).await;
+    let md = base.path().join("notes.md");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("Exported"))
+    })
+    .await;
+    let written = std::fs::read_to_string(&md).unwrap();
+    assert!(
+        written.contains("headline 2 @1 [\"Included\"]") && written.contains("\"from part\""),
+        "{written}"
+    );
+
+    let secret = outside.path().join("secret.org");
+    let doc = format!("* Top\n#+INCLUDE: \"{}\"\n", secret.display());
+    let (mut editor, _loader) = org_editor(base.path(), &doc, &grant).await;
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("org: cannot include"))
+    })
+    .await;
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(echo.contains(&secret.display().to_string()), "{echo}");
+}
+
 /// A switch flipped in the dispatcher reaches the command, and is still set
 /// the next time the dispatcher opens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

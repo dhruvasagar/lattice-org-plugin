@@ -24,7 +24,10 @@ the lattice release that carries it.
   option) is named when the export finishes. `{{{macros}}}` expand: `#+MACRO:`
   definitions with `$1`… arguments, and emacs's built-ins (`title`, `author`,
   `date`, `time`, `property`, `keyword`, `n`, `input-file`); an undefined one
-  stops the export, naming it. The output is a placeholder for now
+  stops the export, naming it. `#+INCLUDE:` brings in another file as emacs does,
+  with `:lines`, `:minlevel`, `::*heading` / `::#id`, `:only-contents` and
+  `src` / `example` / `export` wrapping; a file org may not read stops the
+  export, naming it. The output is a placeholder for now
   (the options, then the parsed outline, elements and inline markup, verbatim, in the format's
   document) until the real HTML, Markdown and LaTeX writers land.
 

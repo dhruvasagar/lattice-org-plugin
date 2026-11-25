@@ -255,6 +255,68 @@ pub(crate) fn register_options() {
          path the page links to. ox-html's class names are kept, so a \
          stylesheet written for emacs's output styles this one.",
     );
+    // The contents defaults, each under the file's `#+OPTIONS:` item.
+    for item in options::ITEMS {
+        let kind = match item.kind {
+            options::Kind::Flag => OptionType::Boolean,
+            options::Kind::Text => OptionType::String,
+            options::Kind::Number => OptionType::Integer,
+        };
+        let _ = register_option(
+            &format!("export.{}", item.name),
+            kind,
+            item.default,
+            item.doc,
+        );
+    }
+    for (name, default, doc) in [
+        (
+            "export.author",
+            "",
+            "The author an export names when the file has no `#+AUTHOR:`.",
+        ),
+        (
+            "export.email",
+            "",
+            "The email an export names, with `org.export.with-email`, when \
+             the file has no `#+EMAIL:`.",
+        ),
+        (
+            "export.language",
+            "en",
+            "The language an export declares (`<html lang>`, babel's), when \
+             the file has no `#+LANGUAGE:`.",
+        ),
+    ] {
+        let _ = register_option(name, OptionType::String, default, doc);
+    }
+    for (name, default, doc) in [
+        (
+            "export.select-tags",
+            vec!["export".to_string()],
+            "Tags that select what is exported: when a headline carries one, \
+             only those subtrees are. `#+SELECT_TAGS:` overrides it.",
+        ),
+        (
+            "export.exclude-tags",
+            vec!["noexport".to_string()],
+            "Tags whose subtrees are left out. `#+EXCLUDE_TAGS:` overrides it.",
+        ),
+        (
+            "export.html-head",
+            Vec::new(),
+            "Lines an HTML export puts in its `<head>`. A file's \
+             `#+HTML_HEAD:` lines replace them.",
+        ),
+        (
+            "export.html-head-extra",
+            Vec::new(),
+            "More `<head>` lines, after `org.export.html-head`'s. A file's \
+             `#+HTML_HEAD_EXTRA:` lines replace them.",
+        ),
+    ] {
+        let _ = crate::config_shape::register_option::<Vec<String>>(name, &default, doc);
+    }
     // The LaTeX defaults, each under the file's keyword of the same name.
     for (name, default, doc) in [
         (

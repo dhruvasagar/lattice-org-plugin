@@ -244,6 +244,8 @@ pub(crate) struct Options {
     pub(crate) title: Vec<Object>,
     pub(crate) subtitle: Vec<Object>,
     pub(crate) author: Vec<Object>,
+    /// The author as written, for `{{{author}}}`.
+    pub(crate) author_text: String,
     pub(crate) email: String,
     pub(crate) date: Vec<Object>,
     pub(crate) language: String,
@@ -311,6 +313,7 @@ impl Default for Options {
             title: Vec::new(),
             subtitle: Vec::new(),
             author: Vec::new(),
+            author_text: String::new(),
             email: String::new(),
             date: Vec::new(),
             language: "en".to_string(),
@@ -333,6 +336,81 @@ impl Default for Options {
     }
 }
 
+/// How an `#+OPTIONS:` item's `org.export.*` option is typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A boolean option.
+    Flag,
+    /// A string option in the item's `#+OPTIONS:` spelling, `true` and
+    /// `false` standing for `t` and `nil`.
+    Text,
+    /// An integer option.
+    Number,
+}
+
+/// An `org.export.*` option that is the default of an `#+OPTIONS:` item:
+/// emacs's `org-export-with-*` variable for it.
+#[derive(Debug)]
+pub(crate) struct Item {
+    /// The name after `org.export.`.
+    pub(crate) name: &'static str,
+    /// The `#+OPTIONS:` key it is the default of.
+    pub(crate) key: &'static str,
+    pub(crate) kind: Kind,
+    /// ox's default, in the option's spelling.
+    pub(crate) default: &'static str,
+    /// What it does and the values it takes, for `:describe-option` and
+    /// for the refusal of one it does not.
+    pub(crate) doc: &'static str,
+}
+
+const fn item(
+    name: &'static str,
+    key: &'static str,
+    kind: Kind,
+    default: &'static str,
+    doc: &'static str,
+) -> Item {
+    Item {
+        name,
+        key,
+        kind,
+        default,
+        doc,
+    }
+}
+
+/// Every `#+OPTIONS:` item this export reads, as an option. The file's
+/// `#+OPTIONS:` overrides each.
+pub(crate) const ITEMS: &[Item] = &[
+    item("with-toc", "toc", Kind::Text, "true", "The table of contents (`toc:`): `true`, `false`, or the headline depth it lists."),
+    item("with-section-numbers", "num", Kind::Text, "true", "Section numbers (`num:`): `true`, `false`, or the headline depth numbered."),
+    item("headline-levels", "H", Kind::Number, "3", "How deep headlines are headlines (`H:`); deeper ones are list items."),
+    item("with-author", "author", Kind::Flag, "true", "Whether the author is in the title block (`author:`)."),
+    item("with-email", "email", Kind::Flag, "false", "Whether the email is in the title block (`email:`)."),
+    item("with-date", "date", Kind::Flag, "true", "Whether the date is in the title block (`date:`)."),
+    item("with-title", "title", Kind::Flag, "true", "Whether the title block is written (`title:`)."),
+    item("with-tags", "tags", Kind::Text, "true", "Headline tags (`tags:`): `true`, `false`, or `not-in-toc`."),
+    item("with-todo-keywords", "todo", Kind::Flag, "true", "Whether headlines keep their TODO keywords (`todo:`)."),
+    item("with-priority", "pri", Kind::Flag, "false", "Whether headlines keep their priority cookies (`pri:`)."),
+    item("with-timestamps", "<", Kind::Text, "true", "Timestamps (`<:`): `true`, `false`, `active` or `inactive`."),
+    item("with-planning", "p", Kind::Flag, "false", "Whether SCHEDULED / DEADLINE / CLOSED lines are exported (`p:`)."),
+    item("with-clocks", "c", Kind::Flag, "false", "Whether CLOCK lines are exported (`c:`)."),
+    item("with-properties", "prop", Kind::Flag, "false", "Whether property drawers are exported (`prop:`)."),
+    item("with-drawers", "d", Kind::Text, "(not \"LOGBOOK\")", "Drawers (`d:`), as `#+OPTIONS:` writes it: `true`, `false`, `(\"NAME\" …)` for those only, or `(not \"NAME\" …)` for all but those."),
+    item("with-footnotes", "f", Kind::Flag, "true", "Whether footnotes are exported (`f:`)."),
+    item("with-statistics-cookies", "stat", Kind::Flag, "true", "Whether `[1/3]` / `[33%]` cookies are exported (`stat:`)."),
+    item("with-latex", "tex", Kind::Text, "true", "LaTeX fragments and environments (`tex:`): `true`, `false`, or `verbatim`."),
+    item("with-sub-superscripts", "^", Kind::Text, "true", "Sub- and superscripts (`^:`): `true`, `false`, or `{}` for the braced forms only."),
+    item("with-special-strings", "-", Kind::Flag, "true", "Whether `--`, `---`, `...` and `\\-` are typography (`-:`)."),
+    item("with-emphasize", "*", Kind::Flag, "true", "Whether `*bold*` / `/italic/` markers are emphasis (`*:`)."),
+    item("with-fixed-width", ":", Kind::Flag, "true", "Whether `: ` fixed-width lines are exported (`::`)."),
+    item("with-tables", "|", Kind::Flag, "true", "Whether tables are exported (`|:`)."),
+    item("with-entities", "e", Kind::Flag, "true", "Whether `\\alpha`-style entities are characters (`e:`)."),
+    item("preserve-breaks", "\\n", Kind::Flag, "false", "Whether the source's line breaks are kept (`\\n:`)."),
+    item("broken-links", "broken-links", Kind::Text, "false", "A link to nothing (`broken-links:`): `false` stops the export naming it, `true` drops it, `mark` marks it."),
+];
+
 /// Keywords ox's export reads that this does not, named in the echo when a
 /// file uses one. Keywords export never reads (`#+STARTUP`, `#+TODO`,
 /// `#+PROPERTY`…) are not listed: a file using them loses nothing.
@@ -351,6 +429,25 @@ const UNIMPLEMENTED_KEYWORDS: &[&str] = &[
 ];
 
 impl Options {
+    /// Set `item`'s default to `value`, in its option's spelling. `Err` names
+    /// the option when it does not take the value.
+    pub(crate) fn configure(&mut self, item: &Item, value: &str) -> Result<(), String> {
+        let v = match value.trim() {
+            "true" => "t",
+            "false" => "nil",
+            v => v,
+        };
+        match option_items(&format!("{}:{v}", item.key)).as_slice() {
+            [(key, parsed)] if key == item.key && self.option(key, parsed) => Ok(()),
+            _ => Err(format!(
+                "org: org.export.{} is `{}`, which it does not take. {}",
+                item.name,
+                value.trim(),
+                item.doc
+            )),
+        }
+    }
+
     /// Options for a file whose keywords, in file order, are `keywords`, and,
     /// for a subtree export, whose headline is `subtree` (its raw title and
     /// properties), over `base`: the plugin's options.
@@ -384,7 +481,7 @@ impl Options {
         o.title = objects::parse(&title);
         o.macros = [
             ("title", title),
-            ("author", raw.author.unwrap_or_default()),
+            ("author", o.author_text.clone()),
             ("date", raw.date.unwrap_or_default()),
             ("email", o.email.clone()),
             ("input-file", file_name.to_string()),
@@ -413,7 +510,7 @@ impl Options {
             "SUBTITLE" => self.subtitle = objects::parse(value),
             "AUTHOR" => {
                 self.author = objects::parse(value);
-                raw.author = Some(value.to_string());
+                self.author_text = value.to_string();
             }
             "EMAIL" => self.email = value.to_string(),
             "DATE" => {
@@ -439,8 +536,18 @@ impl Options {
                     .filter(|t| !t.is_empty())
                     .map(str::to_string),
             ),
-            "HTML_HEAD" => self.html_head.push(value.to_string()),
-            "HTML_HEAD_EXTRA" => self.html_head_extra.push(value.to_string()),
+            "HTML_HEAD" => {
+                if !std::mem::replace(&mut raw.html_head, true) {
+                    self.html_head.clear();
+                }
+                self.html_head.push(value.to_string());
+            }
+            "HTML_HEAD_EXTRA" => {
+                if !std::mem::replace(&mut raw.html_head_extra, true) {
+                    self.html_head_extra.clear();
+                }
+                self.html_head_extra.push(value.to_string());
+            }
             "LATEX_CLASS" => self.latex_class = value.to_string(),
             "LATEX_CLASS_OPTIONS" => self.latex_class_options = value.to_string(),
             "LATEX_HEADER" => self.latex_header.push(value.to_string()),
@@ -579,8 +686,11 @@ impl Options {
 #[derive(Default)]
 struct Raw {
     title: Option<String>,
-    author: Option<String>,
     date: Option<String>,
+    /// Whether an `#+HTML_HEAD` / `#+HTML_HEAD_EXTRA` line has been read:
+    /// the first replaces `org.export.html-head`'s lines, as in ox.
+    html_head: bool,
+    html_head_extra: bool,
     macros: BTreeMap<String, String>,
 }
 
@@ -665,6 +775,95 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// Each option's default is ox's: applied to ox's defaults, it changes
+    /// nothing. And each option is an item `#+OPTIONS:` reads.
+    #[test]
+    fn every_items_default_is_the_default() {
+        for item in ITEMS {
+            let mut o = Options::default();
+            o.configure(item, item.default)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(o, Options::default(), "{}", item.name);
+        }
+    }
+
+    /// Every item changes what it names, and a value it does not take is
+    /// refused naming the option.
+    #[test]
+    fn an_item_sets_its_option_and_refuses_what_it_does_not_take() {
+        let find = |name: &str| {
+            ITEMS
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+        };
+        let mut o = Options::default();
+        o.configure(find("with-toc"), "2")
+            .unwrap_or_else(|e| panic!("{e}"));
+        o.configure(find("with-tags"), "not-in-toc")
+            .unwrap_or_else(|e| panic!("{e}"));
+        o.configure(find("with-drawers"), r#"("NOTES")"#)
+            .unwrap_or_else(|e| panic!("{e}"));
+        o.configure(find("preserve-breaks"), "true")
+            .unwrap_or_else(|e| panic!("{e}"));
+        o.configure(find("with-fixed-width"), "false")
+            .unwrap_or_else(|e| panic!("{e}"));
+        o.configure(find("headline-levels"), "5")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(o.toc, Depth::To(2));
+        assert_eq!(o.tags, Tags::NotInToc);
+        assert_eq!(o.drawers, Drawers::Only(vec!["NOTES".to_string()]));
+        assert!(o.preserve_breaks && !o.fixed_width);
+        assert_eq!(o.headline_levels, 5);
+        let err = o.configure(find("with-tags"), "sometimes").unwrap_err();
+        assert!(
+            err.starts_with("org: org.export.with-tags is `sometimes`, which it does not take.")
+                && err.contains("`not-in-toc`"),
+            "{err}"
+        );
+        assert!(o.configure(find("with-toc"), "x:y").is_err());
+    }
+
+    /// The options are the lowest layer: `#+OPTIONS:` and the keywords
+    /// override them, `{{{author}}}` reads the option's author, and the
+    /// file's first `#+HTML_HEAD` replaces the option's lines.
+    #[test]
+    fn the_file_overrides_the_options() {
+        let mut base = Options::default();
+        base.configure(
+            ITEMS
+                .iter()
+                .find(|i| i.name == "with-toc")
+                .unwrap_or_else(|| panic!()),
+            "false",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        base.author = objects::parse("Ada");
+        base.author_text = "Ada".to_string();
+        base.html_head = vec!["<meta a>".to_string()];
+        let o = Options::resolve(&base, &[], None, "x");
+        assert_eq!(o.toc, Depth::Off);
+        assert_eq!(o.macros["author"], "Ada");
+        assert_eq!(o.html_head, vec!["<meta a>".to_string()]);
+        let o = Options::resolve(
+            &base,
+            &kw(&[
+                ("OPTIONS", "toc:t"),
+                ("AUTHOR", "Grace"),
+                ("HTML_HEAD", "<meta b>"),
+                ("HTML_HEAD", "<meta c>"),
+            ]),
+            None,
+            "x",
+        );
+        assert_eq!(o.toc, Depth::On);
+        assert_eq!(o.macros["author"], "Grace");
+        assert_eq!(
+            o.html_head,
+            vec!["<meta b>".to_string(), "<meta c>".to_string()]
+        );
     }
 
     #[test]

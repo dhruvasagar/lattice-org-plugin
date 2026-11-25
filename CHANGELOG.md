@@ -71,6 +71,13 @@ the lattice release that carries it.
   sizes an image (`:width`, `:height`, `:options`) and picks a table's
   `:environment` (`longtable`, `tabularx`…) and `:align`, and
   `org.export.latex-image-width` is the default width.
+  Every export default is an option, set once rather than in every file and
+  overridden by the file: each `#+OPTIONS:` item as emacs's variable for it
+  (`org.export.with-toc`, `-section-numbers`, `headline-levels`, `with-tags`,
+  `with-drawers`, `with-latex`, `broken-links` and the rest), and
+  `org.export.author`, `email`, `language`, `select-tags`, `exclude-tags`,
+  `html-head` and `html-head-extra`. A value an option does not take stops
+  the export, naming the option and the values it does take.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

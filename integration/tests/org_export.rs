@@ -446,6 +446,43 @@ async fn a_latex_export_writes_the_document() {
     assert!(written.ends_with("\\end{document}\n"), "{written}");
 }
 
+/// The contents options are the export's defaults, and one set to a value
+/// it does not take stops the export, naming it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_export_defaults_are_options() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    for spec in [
+        "org.export.with-toc=false",
+        "org.export.author=Ada Lovelace",
+    ] {
+        editor.handle_effect(lattice_grammar::Effect::SetOption {
+            spec: spec.to_string(),
+        });
+    }
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "hh");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Exported notes.html")
+    })
+    .await;
+    let written = std::fs::read_to_string(base.path().join("notes.html")).unwrap();
+    assert!(!written.contains("id=\"table-of-contents\""), "{written}");
+    assert!(written.contains("Ada Lovelace"), "{written}");
+
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.export.with-tags=sometimes".to_string(),
+    });
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "hh");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("org: org.export.with-tags is `sometimes`"))
+    })
+    .await;
+}
+
 /// The `org.export.latex-*` options reach the export: a compiler, a
 /// source-block backend and a declared class, the file naming the class.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

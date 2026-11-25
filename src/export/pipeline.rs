@@ -129,10 +129,10 @@ pub(crate) struct Configured {
     pub(crate) stylesheet: Stylesheet,
 }
 
-/// The `org.export.*` options as they are now. A value an export cannot use
-/// (an unknown compiler) is kept as written, for the export it would change
-/// to refuse, naming it.
-fn configured() -> Configured {
+/// The `org.export.*` options as they are now; `Err` names one whose value
+/// it does not take. A LaTeX value a LaTeX export cannot use (an unknown
+/// compiler) is kept as written, for that export to refuse, naming it.
+fn configured() -> Result<Configured, String> {
     use super::options::{DeclaredClass, LatexClass};
     let mut options = Options::default();
     let string = |name: &str, field: &mut String| *field = crate::option_or(name, field);
@@ -155,10 +155,25 @@ fn configured() -> Configured {
     {
         options.add_classes(classes.into_iter().map(LatexClass::from));
     }
-    Configured {
+    for item in super::options::ITEMS {
+        let name = format!("export.{}", item.name);
+        options.configure(item, &crate::option_or(&name, item.default))?;
+    }
+    let author = crate::option_or("export.author", "");
+    if !author.trim().is_empty() {
+        options.author = super::parse::objects::parse(&author);
+        options.author_text = author;
+    }
+    string("export.email", &mut options.email);
+    string("export.language", &mut options.language);
+    options.select_tags = crate::string_list("export.select-tags");
+    options.exclude_tags = crate::string_list("export.exclude-tags");
+    options.html_head = crate::string_list("export.html-head");
+    options.html_head_extra = crate::string_list("export.html-head-extra");
+    Ok(Configured {
         options,
         stylesheet: Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
-    }
+    })
 }
 
 /// The last component of `path`, for the echo area.
@@ -192,6 +207,13 @@ pub(crate) fn on_requested(payload: &[u8]) {
         )]);
         return;
     };
+    let configured = match configured() {
+        Ok(c) => c,
+        Err(why) => {
+            post(vec![echo(EchoLevel::Error, why)]);
+            return;
+        }
+    };
     let text = host_services::buffer_text(request.buffer);
     let id = NEXT_RUN.with(|n| {
         let id = n.get();
@@ -208,7 +230,7 @@ pub(crate) fn on_requested(payload: &[u8]) {
         crate::todo_keyword_lines(),
         now,
         Rc::new(super::Guest),
-        configured(),
+        configured,
     ) {
         Ok(run) => {
             RUNS.with(|runs| {

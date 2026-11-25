@@ -78,6 +78,17 @@ the lattice release that carries it.
   `org.export.author`, `email`, `language`, `select-tags`, `exclude-tags`,
   `html-head` and `html-head-extra`. A value an option does not take stops
   the export, naming the option and the values it does take.
+  **PDF.** `l p` (`:org-export-pdf`) writes the `.tex` and compiles it with
+  `org.export.latex-pdf-process`, emacs's `org-latex-pdf-process`: steps of a
+  `command` and `args`, run in the file's directory, each after the last
+  succeeds, with `%f`, `%b`, `%o` and `%latex` filled in. `l o`
+  (`:org-export-pdf-open`) then opens the PDF, which reloads in place when it
+  is already open. The compile runs in the background; its output is in
+  `*org-export*` (`:org-export-log`), whose headerline says what is running
+  and how it ended, and a failing step stops the rest, naming the log. No
+  compiler runs until your config file names one (a value set with `:set` is
+  not granted), and until then `l p` writes the `.tex` and says how.
+  `:org-export-cancel` stops a running export and its compile.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

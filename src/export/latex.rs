@@ -1371,6 +1371,7 @@ mod tests {
             Configured {
                 options,
                 stylesheet: Stylesheet::None,
+                ..Configured::default()
             },
         )
         .map_err(|e| format!("{e:?}"))?;

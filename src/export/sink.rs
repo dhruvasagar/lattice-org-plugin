@@ -51,6 +51,9 @@ pub(crate) enum Sink {
     /// Beside the source, then opened (`h o`): in lattice, or by the system
     /// when `org.export.open-with` is `system`.
     Open { system: bool },
+    /// LaTeX beside the source, then compiled to PDF (`l p`), and the PDF
+    /// opened as [`Sink::Open`] when `open` is set (`l o`).
+    Pdf { open: Option<bool> },
 }
 
 /// `org.export.open-with` as a sink, or why the value is not one.
@@ -120,11 +123,14 @@ pub(crate) fn effects(
                         force: false,
                     }));
                 }
-                Sink::File | Sink::Buffer => {}
+                Sink::File | Sink::Buffer | Sink::Pdf { .. } => {}
             }
             out.push(done);
             out
         }
+        // The `.tex` must be on disk before the compiler starts, which this
+        // effect cannot promise; `pdf::begin` writes it.
+        Sink::Pdf { .. } => vec![done],
         Sink::Buffer => {
             let mut out = Vec::new();
             if let Some((id, current)) = host.output_buffer(backend) {
@@ -166,7 +172,7 @@ fn end_of(text: &str) -> Position {
 pub(crate) fn target_label(sink: Sink, backend: Backend, target: &str) -> &str {
     match sink {
         Sink::Buffer => buffer_name(backend),
-        Sink::File | Sink::Open { .. } => file_name(target),
+        Sink::File | Sink::Open { .. } | Sink::Pdf { .. } => file_name(target),
     }
 }
 

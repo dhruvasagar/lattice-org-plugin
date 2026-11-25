@@ -19,6 +19,7 @@ pub(crate) mod macros;
 pub(crate) mod markdown;
 pub(crate) mod options;
 pub(crate) mod parse;
+pub(crate) mod pdf;
 pub(crate) mod pipeline;
 pub(crate) mod sink;
 pub(crate) mod targets;
@@ -36,8 +37,8 @@ use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
 use crate::lattice::plugin_host::types::{
     ActionContext, ActionSpec, ArgDefault, ArgKind, ArgSpec, ArgValue, Args, EchoLevel,
     EchoPayload, Effect, Event, EventFilter, EventKind, ExCommandContext, ExCommandSpec,
-    LatencyClass, OpenTransientPayload, SurfaceForm, TransientAction, TransientFlag,
-    TransientGroup, TransientItem, TransientItemKind, TransientSpec,
+    LatencyClass, OpenSyntheticBufferPayload, OpenTransientPayload, SurfaceForm, TransientAction,
+    TransientFlag, TransientGroup, TransientItem, TransientItemKind, TransientSpec,
 };
 
 /// What an export asks the host for while it runs, behind a trait so the
@@ -66,6 +67,34 @@ pub(crate) enum IdFile {
 
 /// The host the guest runs in.
 pub(crate) struct Guest;
+
+impl pdf::Runner for Guest {
+    fn write_file(&self, path: &str, text: &str) -> Result<(), String> {
+        host_services::write_file(path, text)
+    }
+    fn spawn(&self, command: &str, args: &[String], cwd: &str) -> Result<u64, String> {
+        host_services::spawn_process(command, args, cwd)
+    }
+    fn cancel_job(&self, id: u64) {
+        host_services::cancel_job(id);
+    }
+    // The log is a convenience: a compile that could not write it still
+    // runs, and its echo still says how it ended.
+    fn log_reset(&self) {
+        let _ = host_services::output_reset(pdf::LOG_BUFFER);
+    }
+    fn log(&self, lines: &[String]) {
+        let _ = host_services::output_append(pdf::LOG_BUFFER, lines);
+    }
+    fn log_status(&self, state: pdf::LogState, text: &str) {
+        let state = match state {
+            pdf::LogState::Running => host_services::OutputState::Running,
+            pdf::LogState::Succeeded => host_services::OutputState::Succeeded,
+            pdf::LogState::Failed => host_services::OutputState::Failed,
+        };
+        let _ = host_services::output_status(pdf::LOG_BUFFER, state, text);
+    }
+}
 
 impl Host for Guest {
     fn read_file(&self, path: &str) -> Result<String, String> {
@@ -115,12 +144,24 @@ const TO_MARKDOWN_BUFFER: u32 = 306;
 const TO_MARKDOWN_OPEN: u32 = 307;
 /// `:org-export-latex-buffer`.
 const TO_LATEX_BUFFER: u32 = 308;
+/// `:org-export-pdf`.
+const TO_PDF: u32 = 309;
+/// `:org-export-pdf-open`.
+const TO_PDF_OPEN: u32 = 310;
+/// `:org-export-cancel`.
+const CANCEL: u32 = 311;
+/// `:org-export-log`.
+const LOG: u32 = 312;
 
 /// The events handler for an output buffer's minor going on.
 pub(crate) const ON_OUTPUT_MODE: u32 = 300;
+/// The events handler for a PDF compile's `job-output` and `job-finished`.
+pub(crate) const ON_PDF_JOB: u32 = 301;
 
 /// The `:` line parse every export command shares: `--subtree`, `--body-only`.
 const SWITCHES_PARSE: u32 = 320;
+/// The `:` line parse of a command that takes nothing.
+const NO_ARGS_PARSE: u32 = 321;
 
 /// What the dispatcher is opened FOR, on org's one transient source.
 pub(crate) const TRANSIENT_KEY: &str = "export";
@@ -185,7 +226,7 @@ pub(crate) fn is_action(callback: u32) -> bool {
 
 /// Whether `callback` is one of export's ex-command ids.
 pub(crate) fn is_ex_command(callback: u32) -> bool {
-    command(callback).is_some()
+    command(callback).is_some() || callback == CANCEL || callback == LOG
 }
 
 /// What an ex-command id exports, and where to.
@@ -199,6 +240,8 @@ fn command(callback: u32) -> Option<(Backend, SinkKind)> {
         TO_LATEX_BUFFER => (Backend::Latex, SinkKind::Buffer),
         TO_HTML_OPEN => (Backend::Html, SinkKind::Open),
         TO_MARKDOWN_OPEN => (Backend::Markdown, SinkKind::Open),
+        TO_PDF => (Backend::Latex, SinkKind::Pdf),
+        TO_PDF_OPEN => (Backend::Latex, SinkKind::PdfOpen),
         _ => return None,
     })
 }
@@ -209,11 +252,13 @@ enum SinkKind {
     File,
     Buffer,
     Open,
+    Pdf,
+    PdfOpen,
 }
 
 /// Whether `callback` is one of export's `:` line parse ids.
 pub(crate) fn is_ex_parse(callback: u32) -> bool {
-    callback == SWITCHES_PARSE
+    callback == SWITCHES_PARSE || callback == NO_ARGS_PARSE
 }
 
 /// Every export option, `org.export.*`. Each is registered by the code that
@@ -359,6 +404,20 @@ pub(crate) fn register_options() {
     ] {
         let _ = register_option(name, OptionType::String, default, doc);
     }
+    let _ = crate::config_shape::register_option::<Vec<pdf::ProcessStep>>(
+        "export.latex-pdf-process",
+        &Vec::new(),
+        "How `l p` makes a PDF from the `.tex`, emacs's `org-latex-pdf-process`: \
+         one `[[org.export.latex-pdf-process]]` per step, a `command` and its \
+         `args`, run in the file's directory, each after the last succeeds. In \
+         an argument `%f` is the `.tex` file, `%b` its name without `.tex`, \
+         `%o` its directory and `%latex` the file's compiler. Empty, so no \
+         compiler runs until one is named here, in your config file: a value \
+         set with `:set` is not granted. For example \
+         `command = \"latexmk\"`, `args = [\"-pdf\", \"-pdflatex=%latex\", \
+         \"-interaction=nonstopmode\", \"-output-directory=%o\", \"%f\"]`. \
+         The output is in `*org-export*` (`:org-export-log`).",
+    );
     let _ = crate::config_shape::register_option::<Vec<String>>(
         "export.latex-header",
         &Vec::new(),
@@ -491,8 +550,38 @@ pub(crate) fn register_grammar() {
              `org.export.open-with` says.",
             TO_MARKDOWN_OPEN,
         ),
+        (
+            "org-export-pdf",
+            "Export the buffer to LaTeX beside the file, then compile it to PDF \
+             with `org.export.latex-pdf-process`.",
+            TO_PDF,
+        ),
+        (
+            "org-export-pdf-open",
+            "Export the buffer to PDF, then open it as `org.export.open-with` \
+             says; a PDF already open reloads in place.",
+            TO_PDF_OPEN,
+        ),
     ] {
         register_ex_command(name, doc, &spec(), SWITCHES_PARSE, id);
+    }
+    let bare = ExCommandSpec {
+        args_schema: Vec::new(),
+        ..spec()
+    };
+    for (name, doc, id) in [
+        (
+            "org-export-cancel",
+            "Stop the exports running, and the PDF compiles with them.",
+            CANCEL,
+        ),
+        (
+            "org-export-log",
+            "Show `*org-export*`, the output of the last PDF compile.",
+            LOG,
+        ),
+    ] {
+        register_ex_command(name, doc, &bare, NO_ARGS_PARSE, id);
     }
 }
 
@@ -511,6 +600,29 @@ pub(crate) fn register_events() {
         },
         ON_OUTPUT_MODE,
     );
+    events::subscribe(
+        &EventFilter {
+            kinds: Some(vec![EventKind::JobOutput, EventKind::JobFinished]),
+            path_globs: None,
+            major_modes: None,
+            minor_modes: None,
+        },
+        ON_PDF_JOB,
+    );
+}
+
+/// `on-event` for [`ON_PDF_JOB`]: a compile's output and its end. Babel
+/// hears the same events and keeps its own jobs; each ignores the other's.
+pub(crate) fn on_job_event(ev: &Event) {
+    match ev {
+        Event::JobOutput(o) => pdf::on_output(o.id, &o.lines, &Guest),
+        Event::JobFinished(f) => {
+            if let Some(effects) = pdf::on_finished(f.id, f.outcome.clone(), &Guest) {
+                pipeline::post(effects);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `on-event` for [`ON_OUTPUT_MODE`].
@@ -548,6 +660,12 @@ pub(crate) fn apply_action(
 /// `parse-ex-args` for export's commands: `--subtree` and `--body-only`, in
 /// any order.
 pub(crate) fn parse_ex_args(callback: u32, rest: &str) -> Result<Args, String> {
+    if callback == NO_ARGS_PARSE {
+        return match rest.trim() {
+            "" => Ok(Args::None),
+            _ => Err("org: this command takes no arguments".to_string()),
+        };
+    }
     if callback != SWITCHES_PARSE {
         return Err(format!("org: unknown export parse callback {callback}"));
     }
@@ -574,6 +692,23 @@ pub(crate) fn apply_ex_command(
     doc: &Document,
     _tree: Option<&TreeSnapshot>,
 ) -> Result<Vec<Effect>, String> {
+    if callback == CANCEL {
+        // The runs and their compiles live in the events seam, which says
+        // what it stopped.
+        pipeline::request_cancel();
+        return Ok(Vec::new());
+    }
+    if callback == LOG {
+        return Ok(vec![Effect::OpenSyntheticBuffer(
+            OpenSyntheticBufferPayload {
+                name: pdf::LOG_BUFFER.to_string(),
+                mode_id: "plugin-output-mode".to_string(),
+                content: None,
+                cursor: None,
+                activate_minor: None,
+            },
+        )]);
+    }
     // A command is registered whatever the mode's state, so `:` reaches it
     // with export switched off; say so rather than export.
     if !crate::option_or("export.enabled", "true").eq_ignore_ascii_case("true") {
@@ -594,6 +729,13 @@ pub(crate) fn apply_ex_command(
             Ok(sink) => sink,
             Err(why) => return Ok(echo(EchoLevel::Error, why)),
         },
+        SinkKind::Pdf => Sink::Pdf { open: None },
+        SinkKind::PdfOpen => match sink::open_sink(&crate::option_or("export.open-with", "editor"))
+        {
+            Ok(Sink::Open { system }) => Sink::Pdf { open: Some(system) },
+            Ok(other) => other,
+            Err(why) => return Ok(echo(EchoLevel::Error, why)),
+        },
     };
     let switches = Switches::from_args(&ctx.args);
     switches.remember();
@@ -607,7 +749,9 @@ pub(crate) fn apply_ex_command(
     };
     let target = match sink {
         Sink::Buffer => sink::buffer_name(backend).to_string(),
-        Sink::File | Sink::Open { .. } => pipeline::target_path(&source, backend),
+        Sink::File | Sink::Open { .. } | Sink::Pdf { .. } => {
+            pipeline::target_path(&source, backend)
+        }
     };
     // Before anything runs, as capture checks its target before a word is
     // typed: a refusal found after a parse (or a babel run) wastes the work
@@ -699,6 +843,8 @@ pub(crate) fn dispatcher_menu() -> Result<TransientSpec, String> {
                 items: vec![
                     row("ll", "to file", to("org-export-latex")),
                     row("lL", "to buffer", to("org-export-latex-buffer")),
+                    row("lp", "to PDF", to("org-export-pdf")),
+                    row("lo", "to PDF and open", to("org-export-pdf-open")),
                 ],
             },
             TransientGroup {

@@ -50,6 +50,9 @@ pub(crate) const EV_REQUESTED: &str = "org/export-requested";
 /// payload is the run's id.
 pub(crate) const EV_STEP: &str = "org/export-step";
 
+/// `:org-export-cancel`, from the grammar seam, where the runs are not.
+pub(crate) const EV_CANCEL: &str = "org/export-cancel";
+
 /// How much one step does: the source a parse step reads, and the output a
 /// render step writes. A parse chunk ends at the first headline past this,
 /// and a render step at the first headline past it, so one section larger
@@ -127,6 +130,8 @@ pub(crate) fn target_path(source: &str, backend: Backend) -> String {
 pub(crate) struct Configured {
     pub(crate) options: Options,
     pub(crate) stylesheet: Stylesheet,
+    /// `org.export.latex-pdf-process`, for a PDF export.
+    pub(crate) pdf_process: Vec<super::pdf::ProcessStep>,
 }
 
 /// The `org.export.*` options as they are now; `Err` names one whose value
@@ -170,9 +175,15 @@ fn configured() -> Result<Configured, String> {
     options.exclude_tags = crate::string_list("export.exclude-tags");
     options.html_head = crate::string_list("export.html-head");
     options.html_head_extra = crate::string_list("export.html-head-extra");
+    let pdf_process = crate::config_shape::read_option::<Vec<super::pdf::ProcessStep>>(
+        "export.latex-pdf-process",
+    )
+    .and_then(Result::ok)
+    .unwrap_or_default();
     Ok(Configured {
         options,
         stylesheet: Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
+        pdf_process,
     })
 }
 
@@ -262,18 +273,34 @@ pub(crate) fn on_step(payload: &[u8]) {
         let mut runs = runs.borrow_mut();
         // Absent when a newer export of its target replaced it.
         let at = runs.iter().position(|r| r.id == id)?;
-        match runs[at].step() {
-            Step::More => Some(Step::More),
-            Step::Done(effects) => {
-                runs.remove(at);
-                Some(Step::Done(effects))
-            }
+        let step = runs[at].step();
+        if !matches!(step, Step::More) {
+            runs.remove(at);
         }
+        Some(step)
     });
     match step {
         Some(Step::More) => host_services::emit_event(EV_STEP, payload),
         Some(Step::Done(effects)) => post(effects),
+        Some(Step::Compile(compile)) => post(super::pdf::begin(compile, &super::Guest)),
         None => {}
+    }
+}
+
+/// Ask the events seam to stop every export, for `:org-export-cancel`.
+pub(crate) fn request_cancel() {
+    host_services::emit_event(EV_CANCEL, &[]);
+}
+
+/// `on-event` for [`EV_CANCEL`]: drop the runs, stop the compiles, and say
+/// so. A compile says it was cancelled when its job ends.
+pub(crate) fn on_cancel() {
+    let runs = RUNS.with(|runs| std::mem::take(&mut *runs.borrow_mut()).len());
+    let compiles = super::pdf::cancel(&super::Guest);
+    if runs > 0 {
+        post(vec![echo(EchoLevel::Info, "org: the export was cancelled")]);
+    } else if compiles == 0 {
+        post(vec![echo(EchoLevel::Info, "org: no export is running")]);
     }
 }
 
@@ -284,6 +311,8 @@ pub(crate) enum Step {
     More,
     /// The run is over; post these.
     Done(Vec<Effect>),
+    /// The LaTeX is written; compile it to PDF.
+    Compile(super::pdf::Compile),
 }
 
 /// One export in flight.
@@ -575,6 +604,16 @@ impl Run {
             return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
         }
         let output = std::mem::take(&mut render.out);
+        if let Sink::Pdf { open } = self.request.sink {
+            return Step::Compile(super::pdf::Compile {
+                tex: self.request.target.clone(),
+                output,
+                steps: self.configured.pdf_process.clone(),
+                compiler: render.view.options.latex_compiler.trim().to_string(),
+                open,
+                left_out: render.view.options.ignored.clone(),
+            });
+        }
         let target = sink::target_label(self.request.sink, backend, &self.request.target);
         let ignored = &render.view.options.ignored;
         let done = if ignored.is_empty() {
@@ -730,7 +769,7 @@ fn echo(level: EchoLevel, text: impl Into<String>) -> Effect {
     })
 }
 
-fn post(effects: Vec<Effect>) {
+pub(crate) fn post(effects: Vec<Effect>) {
     // `err` only when the editor wired nowhere to post to; then there is no
     // one to tell, and the guest has no log of its own to write it to.
     let _ = host_services::post_effects(&effects);
@@ -828,6 +867,49 @@ mod tests {
                 _ => None,
             })
             .expect("a write")
+    }
+
+    /// A PDF export ends in its compile, not a write: the `.tex` path and
+    /// text, the configured process, and the file's own compiler.
+    #[test]
+    fn a_pdf_export_ends_in_its_compile() {
+        let request = Request {
+            sink: Sink::Pdf { open: Some(false) },
+            ..request(Backend::Latex)
+        };
+        let process = vec![super::super::pdf::ProcessStep {
+            command: "latexmk".to_string(),
+            args: Some(vec!["%f".to_string()]),
+        }];
+        let mut run = Run::new(
+            1,
+            request,
+            Some("#+LATEX_COMPILER: lualatex\n#+BIND: x 1\n* A\n".to_string()),
+            Vec::new(),
+            When { local_secs: 0 },
+            Rc::new(Files(Default::default())),
+            Configured {
+                pdf_process: process.clone(),
+                ..Configured::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        let compile = loop {
+            match run.step() {
+                Step::More => {}
+                Step::Compile(c) => break c,
+                Step::Done(effects) => panic!("{effects:?}"),
+            }
+        };
+        assert_eq!(compile.tex, "/notes/plan.tex");
+        assert!(compile
+            .output
+            .starts_with("% Intended LaTeX compiler: lualatex\n"));
+        assert!(compile.output.contains("\\section{A}"));
+        assert_eq!(compile.steps, process);
+        assert_eq!(compile.compiler, "lualatex");
+        assert_eq!(compile.open, Some(false));
+        assert_eq!(compile.left_out, vec!["#+BIND".to_string()]);
     }
 
     #[test]

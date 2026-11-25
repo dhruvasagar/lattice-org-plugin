@@ -150,6 +150,18 @@ async fn org_editor(
     text: &str,
     capabilities: &[String],
 ) -> (Editor, Arc<PluginLoader>) {
+    org_editor_holding(base, text, capabilities, None).await
+}
+
+/// [`org_editor`] with `org.export.latex-pdf-process` as the user's config
+/// file holds it: before the plugin loads, since the process grant is
+/// resolved at load from what the user wrote.
+async fn org_editor_holding(
+    base: &std::path::Path,
+    text: &str,
+    capabilities: &[String],
+    pdf_process: Option<lattice_config::ConfigValue>,
+) -> (Editor, Arc<PluginLoader>) {
     let plugins_dir = base.join("plugins");
     let dir = plugins_dir.join("org");
     std::fs::create_dir_all(&dir).unwrap();
@@ -168,6 +180,13 @@ async fn org_editor(
     .unwrap();
 
     let mut editor = boot_sealed_editor();
+    if let Some(value) = pdf_process {
+        editor.config.hold_tree(
+            "org.export.latex-pdf-process",
+            value,
+            lattice_config::HeldSource::ConfigFile,
+        );
+    }
     let loader = Arc::new(loader_over_editor(&editor, base));
     loader.subscribe_mode_gates();
     let loaded = loader
@@ -524,6 +543,178 @@ async fn the_latex_options_shape_the_export() {
             && written.contains("\\begin{lstlisting}[language={Python}]\nx = 1\n\\end{lstlisting}"),
         "{written}"
     );
+}
+
+/// The manifest's process grant, which resolves from the option.
+const PDF_GRANT: &str = "proc:spawn:{org.export.latex-pdf-process:command}";
+
+/// `org.export.latex-pdf-process` of `steps`, each a command and its args.
+fn pdf_process(steps: &[(&str, &[&str])]) -> lattice_config::ConfigValue {
+    use lattice_config::ConfigValue;
+    ConfigValue::List(
+        steps
+            .iter()
+            .map(|(command, args)| {
+                ConfigValue::Record(
+                    [
+                        ("command".to_string(), ConfigValue::Str(command.to_string())),
+                        (
+                            "args".to_string(),
+                            ConfigValue::List(
+                                args.iter()
+                                    .map(|a| ConfigValue::Str(a.to_string()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// A compiler that makes `%b.pdf` in `%o`, but only from a `.tex` whose
+/// end is already on disk when it starts.
+const FAKE_COMPILER: (&str, &[&str]) = (
+    "sh",
+    &[
+        "-c",
+        "grep -q 'end{document}' \"$1\" && printf '%%PDF-1.4\\n' > \"$2/$3.pdf\"",
+        "fake",
+        "%f",
+        "%o",
+        "%b",
+    ],
+);
+
+async fn pdf_editor(
+    base: &std::path::Path,
+    steps: &[(&str, &[&str])],
+) -> (Editor, Arc<PluginLoader>) {
+    let mut grant = write_grant(base);
+    grant.push(PDF_GRANT.to_string());
+    org_editor_holding(base, DOC, &grant, Some(pdf_process(steps))).await
+}
+
+/// `l p` writes the `.tex`, complete, before the compiler starts, and the
+/// compiler makes the PDF beside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pdf_export_compiles_the_written_tex() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = pdf_editor(base.path(), &[FAKE_COMPILER]).await;
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "lp");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Exported notes.pdf")
+    })
+    .await;
+    let pdf = std::fs::read_to_string(base.path().join("notes.pdf")).unwrap();
+    assert!(pdf.starts_with("%PDF-1.4"), "{pdf}");
+    let tex = std::fs::read_to_string(base.path().join("notes.tex")).unwrap();
+    assert!(tex.ends_with("\\end{document}\n"), "{tex}");
+}
+
+/// A failing step stops the list, and the echo names the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_step_stops_the_pdf_process() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = pdf_editor(
+        base.path(),
+        &[("sh", &["-c", "exit 3"]), ("sh", &["-c", "touch never"])],
+    )
+    .await;
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "lp");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("org: notes.pdf was not made: `sh` failed"))
+    })
+    .await;
+    assert!(
+        last_echo(&editor).is_some_and(|m| m.ends_with(":org-export-log shows its output")),
+        "{:?}",
+        last_echo(&editor)
+    );
+    assert!(!base.path().join("never").exists());
+}
+
+/// The process runs only from a value the user's config file wrote: one
+/// set with `:set` is not granted, and the echo says where it must be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pdf_process_set_at_runtime_is_not_granted() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let mut grant = write_grant(base.path());
+    grant.push(PDF_GRANT.to_string());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: "org.export.latex-pdf-process=[[step]]\ncommand = \"sh\"\nargs = [\"-c\", \"touch ran\"]\n"
+            .to_string(),
+    });
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "lp");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| m.starts_with("org: could not start `sh`"))
+    })
+    .await;
+    assert!(!base.path().join("ran").exists());
+}
+
+/// `l o` opens the PDF, and again opens the same buffer, not a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_the_pdf_again_reuses_its_buffer() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = pdf_editor(base.path(), &[FAKE_COMPILER]).await;
+    let pdf = base.path().join("notes.pdf");
+    let showing_pdf =
+        |e: &Editor| buffers(e).path_for(e.document_buffer_id).as_deref() == Some(pdf.as_path());
+    for _ in 0..2 {
+        assert!(open_dispatcher(&mut editor).await.is_some() || showing_pdf(&editor));
+        if showing_pdf(&editor) {
+            // Back to the org file for the second export.
+            editor.do_edit(Some(base.path().join("notes.org")), false);
+            editor.run_tick_pending();
+            assert!(open_dispatcher(&mut editor).await.is_some());
+        }
+        press(&mut editor, "lo");
+        settle(&mut editor, |e| showing_pdf(e)).await;
+    }
+    let with_pdf = editor
+        .buffers
+        .listed_ids_sorted()
+        .into_iter()
+        .filter(|id| buffers(&editor).path_for(*id).as_deref() == Some(pdf.as_path()))
+        .count();
+    assert_eq!(with_pdf, 1);
+}
+
+/// `:org-export-cancel` stops a running compile, and the echo says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_stops_a_running_compile() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) =
+        pdf_editor(base.path(), &[("sh", &["-c", "sleep 30; touch late"])]).await;
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "lp");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Compiling notes.pdf…")
+    })
+    .await;
+    ex(&mut editor, "org-export-cancel");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("org: the export to notes.pdf was cancelled")
+    })
+    .await;
+    ex(&mut editor, "org-export-cancel");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("org: no export is running")
+    })
+    .await;
 }
 
 fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {

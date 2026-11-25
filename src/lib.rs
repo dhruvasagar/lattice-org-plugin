@@ -77,6 +77,7 @@ capabilities = [
     "fs:write:{org.babel.tangle-directories}",
     "fs:write:{org.export.directories}",
     "proc:spawn:{org.babel.languages:command}",
+    "proc:spawn:{org.export.latex-pdf-process:command}",
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
@@ -2173,6 +2174,10 @@ impl Guest for Component {
             export::on_event(&ev);
             return;
         }
+        if handler == export::ON_PDF_JOB {
+            export::on_job_event(&ev);
+            return;
+        }
         // OR.4: a batch of changed paths. Re-indexing happens HERE, on the
         // event actor's own task, so it reaches the store with no keystroke
         // involved — which is the property the whole watcher exists for.
@@ -2321,6 +2326,7 @@ impl Guest for Component {
             babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
             export::pipeline::EV_REQUESTED => export::pipeline::on_requested(&p.payload),
             export::pipeline::EV_STEP => export::pipeline::on_step(&p.payload),
+            export::pipeline::EV_CANCEL => export::pipeline::on_cancel(),
             _ => {}
         }
     }

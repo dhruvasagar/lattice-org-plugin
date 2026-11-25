@@ -18,12 +18,19 @@
 //! - **Macros** expand here too, as the walk reaches them (see
 //!   [`super::macros`]), so a [`View`] carries the macro state with the
 //!   options.
+//! - **Links** are resolved here (see [`super::targets`]): an internal one
+//!   gets its anchor, a broken one fails the export or is dropped or marked
+//!   as `broken-links:` says, and text naming a radio target becomes a link
+//!   to it.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use super::macros::{Expansion, Macros};
-use super::options::{Options, SubSuperscripts, Tex, Timestamps};
+use super::options::{BrokenLinks, Options, SubSuperscripts, Tex, Timestamps};
 use super::parse::objects::{self as parse_objects, Emphasis, Object};
+use super::targets::{Resolution, Targets};
+use super::Host;
 use crate::time_format::When;
 
 /// How deep a macro may expand into macros before it is taken to expand
@@ -40,20 +47,46 @@ pub(crate) struct View {
     properties: Vec<(String, String)>,
     depth: usize,
     error: Option<String>,
+    targets: Targets,
+    /// The live radio targets, `(normalised text, anchor)`.
+    radios: Vec<(String, String)>,
+    /// Inside a link's description or a radio target, where text is not
+    /// made a radio link.
+    in_link: bool,
+    host: Rc<dyn Host>,
 }
 
 impl View {
     /// A view of `options`, for a file whose keywords are `keywords`,
     /// exported at `now`.
-    pub(crate) fn new(options: Options, keywords: Vec<(String, String)>, now: When) -> Self {
+    ///
+    /// `targets` must know what is exported (`Targets::set_live`) before the
+    /// view is made: the radio targets are taken from it here.
+    pub(crate) fn new(
+        options: Options,
+        keywords: Vec<(String, String)>,
+        now: When,
+        targets: Targets,
+        host: Rc<dyn Host>,
+    ) -> Self {
         let macros = Macros::new(options.macros.clone(), keywords, now);
+        let radios = targets.radios();
         View {
             options,
             macros,
             properties: Vec::new(),
             depth: 0,
             error: None,
+            targets,
+            radios,
+            in_link: false,
+            host,
         }
+    }
+
+    /// The link targets, for the anchors a backend writes.
+    pub(crate) fn targets(&self) -> &Targets {
+        &self.targets
     }
 
     /// Why the export cannot go on: an undefined macro, or one that expands
@@ -114,6 +147,20 @@ pub(crate) fn visits(h: &Headline, selection: &Selection, o: &Options) -> bool {
         && !h.tags.iter().any(excluded)
         && !o.file_tags.iter().any(excluded)
         && selection.kept.as_ref().is_none_or(|k| k.contains(&h.line))
+}
+
+/// The lines of every headline the walk renders: those it visits, under
+/// ancestors it visits.
+pub(crate) fn live(doc: &Doc, selection: &Selection, o: &Options) -> HashSet<u32> {
+    let mut live = HashSet::new();
+    let mut stack: Vec<&Headline> = doc.headlines.iter().collect();
+    while let Some(h) = stack.pop() {
+        if visits(h, selection, o) {
+            live.insert(h.line);
+            stack.extend(h.children.iter());
+        }
+    }
+    live
 }
 
 /// `h`'s own parts as the export shows them: no children (the walk visits
@@ -253,6 +300,7 @@ fn object(obj: &Object, v: &mut View, out: &mut Vec<Object>) {
         SubSuperscripts::None => false,
     };
     match obj {
+        Object::Text(t) if !v.in_link && !v.radios.is_empty() => radio_links(t, v, out),
         Object::Text(t) => push_text(out, t),
         Object::Timestamp(t) => {
             let active = t.starts_with('<');
@@ -308,10 +356,9 @@ fn object(obj: &Object, v: &mut View, out: &mut Vec<Object>) {
             kind: *kind,
             contents: objects(contents, v),
         }),
-        Object::Link { path, description } => out.push(Object::Link {
-            path: path.clone(),
-            description: objects(description, v),
-        }),
+        Object::Link {
+            path, description, ..
+        } => link(path, description, v, out),
         Object::FootnoteReference { label, definition } => out.push(Object::FootnoteReference {
             label: label.clone(),
             definition: objects(definition, v),
@@ -324,9 +371,95 @@ fn object(obj: &Object, v: &mut View, out: &mut Vec<Object>) {
             braced: *braced,
             contents: objects(contents, v),
         }),
-        Object::RadioTarget(contents) => out.push(Object::RadioTarget(objects(contents, v))),
+        Object::RadioTarget(contents) => {
+            let outer = std::mem::replace(&mut v.in_link, true);
+            let contents = objects(contents, v);
+            v.in_link = outer;
+            out.push(Object::RadioTarget(contents));
+        }
         Object::Macro { name, args } => expand(name, args, v, out),
         other => out.push(other.clone()),
+    }
+}
+
+/// A link, resolved: an internal one carries its anchor, an external one
+/// none, and a broken one goes as `broken-links:` says.
+fn link(path: &str, description: &[Object], v: &mut View, out: &mut Vec<Object>) {
+    let target = match v.targets.resolve(path, &*v.host) {
+        Resolution::Internal(anchor) => Some(anchor),
+        Resolution::External => None,
+        Resolution::Unsupported(what) => {
+            v.options.ignore(what);
+            None
+        }
+        Resolution::Broken => {
+            match v.options.broken_links {
+                BrokenLinks::Error => {
+                    if v.error.is_none() {
+                        v.error = Some(format!(
+                            "org: [[{path}]] links to nothing in the export \
+                             (#+OPTIONS: broken-links:mark exports it marked)"
+                        ));
+                    }
+                }
+                // ox drops it, description and all.
+                BrokenLinks::Ignore => {}
+                BrokenLinks::Mark => push_text(out, &format!("[BROKEN LINK: {path}]")),
+            }
+            return;
+        }
+    };
+    let outer = std::mem::replace(&mut v.in_link, true);
+    let description = objects(description, v);
+    v.in_link = outer;
+    out.push(Object::Link {
+        path: path.to_string(),
+        description,
+        target,
+    });
+}
+
+/// `text`, with each occurrence of a radio target's text (whole words,
+/// ASCII case aside) made a link to it.
+fn radio_links(text: &str, v: &mut View, out: &mut Vec<Object>) {
+    let lower = text.to_ascii_lowercase();
+    let bounded = |at: usize, len: usize| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + len..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    };
+    let mut from = 0;
+    loop {
+        // The earliest match of any radio target from `from`, the longest
+        // on a tie.
+        let mut best: Option<(usize, usize, String)> = None;
+        for (name, anchor) in &v.radios {
+            let mut search = from;
+            while let Some(i) = lower[search..].find(name.as_str()) {
+                let at = search + i;
+                if bounded(at, name.len()) {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(b, l, _)| at < *b || (at == *b && name.len() > *l))
+                    {
+                        best = Some((at, name.len(), anchor.clone()));
+                    }
+                    break;
+                }
+                search = at + name.len().max(1);
+            }
+        }
+        let Some((at, len, anchor)) = best else {
+            push_text(out, &text[from..]);
+            return;
+        };
+        push_text(out, &text[from..at]);
+        out.push(Object::Link {
+            path: text[at..at + len].to_string(),
+            description: vec![Object::Text(text[at..at + len].to_string())],
+            target: Some(anchor),
+        });
+        from = at + len;
     }
 }
 
@@ -371,7 +504,9 @@ pub(crate) fn plain(list: &[Object]) -> String {
                 | Object::Subscript { contents, .. }
                 | Object::Superscript { contents, .. }
                 | Object::RadioTarget(contents) => walk(contents, out),
-                Object::Link { path, description } => {
+                Object::Link {
+                    path, description, ..
+                } => {
                     if description.is_empty() {
                         out.push_str(path);
                     } else {
@@ -418,7 +553,13 @@ mod tests {
     }
 
     fn view(o: Options) -> View {
-        View::new(o, Vec::new(), When { local_secs: 0 })
+        View::new(
+            o,
+            Vec::new(),
+            When { local_secs: 0 },
+            Targets::default(),
+            Rc::new(super::super::targets::tests::Ids(None)),
+        )
     }
 
     fn objs(text: &str, options: &str) -> String {
@@ -540,6 +681,87 @@ mod tests {
             objs(text, "^:nil *:nil e:nil <:active f:nil tex:nil stat:nil"),
             r#""a_b c_{d} *e* \\alpha{} " timestamp("<2026-01-05 Mon>") "    ""#
         );
+    }
+
+    /// `text` exported with its own targets: the filtered dump, links
+    /// resolved, or the error that stops it.
+    fn linked(text: &str) -> Result<String, String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let sections = parse::parse_chunk(&lines, 0, &Context::for_file(text, Vec::new()));
+        let mut targets = Targets::default();
+        let mut keywords = Vec::new();
+        for section in &sections {
+            targets.collect(section);
+            for e in &section.elements {
+                if let ElementKind::Keyword { key, value } = &e.kind {
+                    keywords.push((key.clone(), value.clone()));
+                }
+            }
+        }
+        let doc = parse::assemble(sections);
+        let o = Options::resolve(&keywords, None, "x.org");
+        let sel = selection(&doc, &o);
+        targets.set_live(live(&doc, &sel, &o), true);
+        let mut v = View::new(
+            o,
+            keywords,
+            When { local_secs: 0 },
+            targets,
+            Rc::new(super::super::targets::tests::Ids(None)),
+        );
+        let mut out = String::new();
+        let mut stack: Vec<&Headline> = doc.headlines.iter().rev().collect();
+        while let Some(h) = stack.pop() {
+            if visits(h, &sel, &v.options) {
+                let own = own(h, &mut v);
+                dump::headline(&mut out, &own, 0);
+                stack.extend(h.children.iter().rev());
+            }
+        }
+        match v.error() {
+            Some(why) => Err(why.to_string()),
+            None => Ok(out),
+        }
+    }
+
+    #[test]
+    fn links_resolve_and_broken_ones_go_as_the_option_says() {
+        let file = "* A\n:PROPERTIES:\n:CUSTOM_ID: a\n:END:\nSee [[#a][here]] and [[nowhere]].\n";
+        let err = linked(file).err().unwrap_or_default();
+        assert!(
+            err.contains("[[nowhere]]") && err.contains("broken-links:mark"),
+            "{err}"
+        );
+        let marked = linked(&format!("#+OPTIONS: broken-links:mark\n{file}")).unwrap_or_else(|e| e);
+        assert!(
+            marked.contains(r##""See " link("#a" -> a)["here"] " and [BROKEN LINK: nowhere].""##),
+            "{marked}"
+        );
+        let dropped = linked(&format!("#+OPTIONS: broken-links:t\n{file}")).unwrap_or_else(|e| e);
+        assert!(dropped.contains(r#"["here"] " and .""#), "{dropped}");
+    }
+
+    /// A target in a subtree the export leaves out is no target.
+    #[test]
+    fn a_link_into_what_is_left_out_is_broken() {
+        let err = linked("* A :noexport:\n<<t>>\n* B\n[[t]]\n").err();
+        assert!(err.is_some_and(|e| e.contains("[[t]]")));
+        assert!(linked("* A\n<<t>>\n* B\n[[t]]\n").is_ok_and(|o| o.contains("link(\"t\" -> org")));
+    }
+
+    /// Text naming a radio target, as a whole word, links to it; text in a
+    /// link or in the radio target itself does not.
+    #[test]
+    fn radio_targets_link_their_text() {
+        let got = linked("* A\nThe <<<Lattice>>> editor.\n* B\nUse LATTICE, not lattices, [[https://x][lattice]].\n")
+            .unwrap_or_else(|e| e);
+        let radio = r#"link("LATTICE" -> org"#;
+        assert_eq!(got.matches(radio).count(), 1, "{got}");
+        assert!(
+            got.contains(r#"", not lattices, " link("https://x")["lattice"]"#),
+            "{got}"
+        );
+        assert!(got.contains(r#"radio["Lattice"]"#), "{got}");
     }
 
     #[test]

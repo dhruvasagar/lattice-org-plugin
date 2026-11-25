@@ -16,7 +16,7 @@ No close: *not bold * here.
 
 | *head* | =v= |
 |--------+-----|
-| [[x]]  | $y$ |
+| [[anchor]] | $y$ |
 
 - *term* :: the /definition/
 #+CAPTION: A *bold* caption

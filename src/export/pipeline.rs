@@ -29,11 +29,14 @@ use super::filter::{self, Selection, View};
 use super::include::Includes;
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
+use super::targets::Targets;
+use super::Host;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     EchoLevel, EchoPayload, Effect, FileAnchor, WriteToFilePayload,
 };
 use crate::time_format::When;
+use std::rc::Rc;
 
 /// The plugin event carrying a [`Request`] from the command to the events
 /// seam.
@@ -143,7 +146,14 @@ pub(crate) fn on_requested(payload: &[u8]) {
     let now = When {
         local_secs: crate::local_now_secs(),
     };
-    match Run::new(id, request, text, crate::todo_keywords(), now) {
+    match Run::new(
+        id,
+        request,
+        text,
+        crate::todo_keywords(),
+        now,
+        Rc::new(super::Guest),
+    ) {
         Ok(run) => {
             RUNS.with(|runs| {
                 let mut runs = runs.borrow_mut();
@@ -170,7 +180,7 @@ pub(crate) fn on_step(payload: &[u8]) {
         let mut runs = runs.borrow_mut();
         // Absent when a newer export of its target replaced it.
         let at = runs.iter().position(|r| r.id == id)?;
-        match runs[at].step(&host_services::read_file) {
+        match runs[at].step() {
             Step::More => Some(Step::More),
             Step::Done(effects) => {
                 runs.remove(at);
@@ -218,6 +228,9 @@ pub(crate) struct Run {
     keywords: Vec<(String, String)>,
     /// When the export was asked for: `{{{time}}}` reads it.
     now: When,
+    /// The link targets, gathered as the chunks are parsed.
+    targets: Targets,
+    host: Rc<dyn Host>,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -248,6 +261,7 @@ impl Run {
         text: Option<String>,
         configured_keywords: Vec<String>,
         now: When,
+        host: Rc<dyn Host>,
     ) -> Result<Self, Vec<Effect>> {
         let Some(text) = text else {
             return Err(vec![echo(
@@ -279,6 +293,8 @@ impl Run {
             sections: Vec::new(),
             keywords: Vec::new(),
             now,
+            targets: Targets::default(),
+            host,
             render: None,
             text,
         })
@@ -286,12 +302,11 @@ impl Run {
 
     /// One step: parse the next chunk, or prepare the render, or render the
     /// next headlines, or finish the file and write it.
-    ///
-    /// `read` reads an included file: the host's `read-file` in the guest.
-    pub(crate) fn step(&mut self, read: &dyn Fn(&str) -> Result<String, String>) -> Step {
+    pub(crate) fn step(&mut self) -> Step {
         if let Some(includes) = self.includes.as_mut() {
             if !includes.done() {
-                if let Err(why) = includes.step(read) {
+                let host = Rc::clone(&self.host);
+                if let Err(why) = includes.step(&|path| host.read_file(path)) {
                     return Step::Done(vec![echo(EchoLevel::Error, why)]);
                 }
                 return Step::More;
@@ -308,6 +323,7 @@ impl Run {
             let lines: Vec<&str> = self.text[bytes].lines().collect();
             let parsed = parse::parse_chunk(&lines, first_line, &self.ctx);
             for section in &parsed {
+                self.targets.collect(section);
                 self.keywords
                     .extend(section.elements.iter().filter_map(|e| match &e.kind {
                         ElementKind::Keyword { key, value } => Some((key.clone(), value.clone())),
@@ -336,6 +352,7 @@ impl Run {
                 if visit {
                     let depth = render.next.len() - 1;
                     let own = filter::own(h, &mut render.view);
+                    anchor_line(&mut body, &render.view, h.line, depth);
                     parse::dump::headline(&mut body, &own, depth);
                 }
                 advance(&render.doc, &mut render.next, visit);
@@ -407,7 +424,18 @@ impl Run {
             Options::resolve(&self.keywords, None, name)
         };
         let selection = filter::selection(&doc, &options);
-        let mut view = View::new(options, self.keywords.clone(), self.now);
+        let mut targets = std::mem::take(&mut self.targets);
+        targets.set_live(
+            filter::live(&doc, &selection, &options),
+            !self.request.subtree,
+        );
+        let mut view = View::new(
+            options,
+            self.keywords.clone(),
+            self.now,
+            targets,
+            Rc::clone(&self.host),
+        );
         let backend = self.request.backend;
         let title = view.options.title.clone();
         let title = filter::plain(&filter::objects(&title, &mut view));
@@ -432,6 +460,14 @@ impl Run {
             out,
         })
     }
+}
+
+/// The placeholder's line naming the anchor a headline's links go to.
+fn anchor_line(out: &mut String, view: &View, line: u32, depth: usize) {
+    out.push_str(&"  ".repeat(depth));
+    out.push_str("anchor ");
+    out.push_str(&view.targets().headline_anchor(line));
+    out.push('\n');
 }
 
 /// Take out of `doc` the innermost headline whose subtree holds `line`.
@@ -591,6 +627,29 @@ mod tests {
         }
     }
 
+    /// `text` without the placeholder's anchor lines, for tests about which
+    /// headlines are exported rather than what they are called.
+    fn without_anchors(text: &str) -> String {
+        text.split_inclusive('\n')
+            .filter(|l| !l.trim_start().starts_with("anchor "))
+            .collect()
+    }
+
+    /// A host over an in-memory file system, with no roam index.
+    struct Files(std::collections::HashMap<String, String>);
+
+    impl Host for Files {
+        fn read_file(&self, path: &str) -> Result<String, String> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| "missing".to_string())
+        }
+        fn id_exists(&self, _: &str) -> Option<bool> {
+            None
+        }
+    }
+
     /// Run `request` over `text` to the end, and the steps it took.
     fn run_counting(request: &Request, text: Option<String>) -> (Vec<Effect>, usize) {
         run_with_files(request, text, &[])
@@ -602,20 +661,28 @@ mod tests {
         text: Option<String>,
         files: &[(&str, &str)],
     ) -> (Vec<Effect>, usize) {
-        let files: std::collections::HashMap<String, String> = files
-            .iter()
-            .map(|(p, t)| (p.to_string(), t.to_string()))
-            .collect();
-        let read = |p: &str| files.get(p).cloned().ok_or_else(|| "missing".to_string());
+        let host = Rc::new(Files(
+            files
+                .iter()
+                .map(|(p, t)| (p.to_string(), t.to_string()))
+                .collect(),
+        ));
         let keywords = vec!["TODO".to_string(), "DONE".to_string()];
-        let mut run = match Run::new(1, request.clone(), text, keywords, When { local_secs: 0 }) {
+        let mut run = match Run::new(
+            1,
+            request.clone(),
+            text,
+            keywords,
+            When { local_secs: 0 },
+            host,
+        ) {
             Ok(run) => run,
             Err(effects) => return (effects, 0),
         };
         let mut steps = 0;
         loop {
             steps += 1;
-            if let Step::Done(effects) = run.step(&read) {
+            if let Step::Done(effects) = run.step() {
                 return (effects, steps);
             }
         }
@@ -695,7 +762,7 @@ mod tests {
             &r,
             Some("* One\nx\n* Two\ny\n** Deep\n* Three\n".to_string()),
         );
-        let text = written(&effects).1;
+        let text = without_anchors(written(&effects).1);
         assert!(
             text.contains("\n  title [\"Two\"]\n"),
             "the headline titles it: {text}"
@@ -709,7 +776,7 @@ mod tests {
         // In the section of a nested headline, the innermost one.
         r.line = 5;
         let effects = run(&r, Some("* One\nx\n* Two\ny\n** Deep\nz\n".to_string()));
-        let deep = written(&effects).1;
+        let deep = without_anchors(written(&effects).1);
         assert!(
             deep.ends_with("\nheadline 2 @4 [\"Deep\"]\n  paragraph @5 \"z\"\n```\n"),
             "{deep}"
@@ -740,7 +807,13 @@ mod tests {
     /// What the stepped walk should produce, computed in one go: the options
     /// header, then the whole tree's filtered dump, by plain recursion.
     fn filtered_dump(text: &str, ctx: &Context) -> String {
-        let doc = parse::parse(text, ctx);
+        let lines: Vec<&str> = text.lines().collect();
+        let sections = parse::parse_chunk(&lines, 0, ctx);
+        let mut targets = Targets::default();
+        for section in &sections {
+            targets.collect(section);
+        }
+        let doc = parse::assemble(sections);
         // Keywords count wherever they are, as in ox.
         let mut keywords = Vec::new();
         let mut sections = vec![&doc.preamble];
@@ -757,13 +830,21 @@ mod tests {
         let o = Options::resolve(&keywords, None, "plan.org");
         let sel = filter::selection(&doc, &o);
         let mut out = parse::dump::options(&o);
-        let mut v = View::new(o, keywords, When { local_secs: 0 });
+        targets.set_live(filter::live(&doc, &sel, &o), true);
+        let mut v = View::new(
+            o,
+            keywords,
+            When { local_secs: 0 },
+            targets,
+            Rc::new(Files(Default::default())),
+        );
         let preamble = filter::elements(&doc.preamble, &mut v);
         parse::dump::preamble(&mut out, &preamble);
         fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, v: &mut View) {
             for h in hs {
                 if filter::visits(h, sel, &v.options) {
                     let own = filter::own(h, v);
+                    anchor_line(out, v, h.line, depth);
                     parse::dump::headline(out, &own, depth);
                     walk(out, &h.children, depth + 1, sel, v);
                 }
@@ -843,7 +924,7 @@ mod tests {
         ];
         let mut r = request(Backend::Markdown);
         let (effects, steps) = run_with_files(&r, Some(text.to_string()), &files);
-        let out = written(&effects).1;
+        let out = without_anchors(written(&effects).1);
         assert!(out.starts_with("# By Ada\n"), "{out}");
         assert!(
             out.contains("headline 1 @2 [\"One\"]\n  headline 2 @3 [\"A\"]\n  headline 2 @4 [\"B\"]\nheadline 1 @5"),
@@ -855,7 +936,7 @@ mod tests {
         r.body_only = true;
         r.line = 4; // `y`, under Two, past both includes.
         let (effects, _) = run_with_files(&r, Some(text.to_string()), &files);
-        let out = written(&effects).1;
+        let out = without_anchors(written(&effects).1);
         assert!(out.contains("\n  title [\"Two\"]\n"), "{out}");
         assert!(
             out.ends_with("\nheadline 1 @5 [\"Two\"]\n  paragraph @6 \"y\"\n```\n"),

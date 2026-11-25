@@ -45,6 +45,9 @@ pub(crate) enum Object {
         path: String,
         /// Empty when the link has none.
         description: Vec<Object>,
+        /// The anchor an internal link resolves to. The parse leaves it
+        /// `None`; the export's filter sets it.
+        target: Option<String>,
     },
     /// `[fn:LABEL]`, `[fn:LABEL:DEF]` or `[fn::DEF]`.
     FootnoteReference {
@@ -251,6 +254,7 @@ impl Parser {
                         Object::Link {
                             path: link.path,
                             description,
+                            target: None,
                         },
                         link.len,
                     ));
@@ -525,9 +529,16 @@ fn angle_link(rest: &str) -> Option<(Object, usize)> {
         Object::Link {
             path: path.to_string(),
             description: Vec::new(),
+            target: None,
         },
         1 + end + 1,
     ))
+}
+
+/// Whether `scheme` is one a link may have: such a link goes outside the
+/// file, and any other `word:` path is a name, as in org.
+pub(crate) fn is_link_scheme(scheme: &str) -> bool {
+    SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme))
 }
 
 /// The scheme `s` starts with, if it is one a link may have.
@@ -571,6 +582,7 @@ fn plain_link(rest: &str) -> Option<(Object, usize)> {
         Object::Link {
             path: path.to_string(),
             description: Vec::new(),
+            target: None,
         },
         end,
     ))

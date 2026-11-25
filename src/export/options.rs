@@ -90,7 +90,7 @@ pub(crate) enum Tex {
 pub(crate) enum BrokenLinks {
     /// The export fails, naming the link.
     Error,
-    /// The link is dropped, its description kept.
+    /// The link is dropped, description and all, as in ox.
     Ignore,
     /// The link is replaced by a `[BROKEN LINK: …]` marker.
     Mark,

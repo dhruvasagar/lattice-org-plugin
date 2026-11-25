@@ -519,6 +519,29 @@ async fn includes_read_what_the_grant_allows_and_name_what_it_does_not() {
     assert!(echo.contains(&secret.display().to_string()), "{echo}");
 }
 
+/// A link to nothing stops the export by default, as in emacs, and says how
+/// to export it anyway; nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_internal_link_stops_the_export() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let doc = "* One\nSee [[Two]] and [[Three]].\n* Two\n";
+    let (mut editor, _loader) = org_editor(base.path(), doc, &grant).await;
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|m| !m.starts_with("Exporting"))
+    })
+    .await;
+    let echo = last_echo(&editor).unwrap_or_default();
+    assert!(
+        echo.contains("[[Three]]") && echo.contains("broken-links"),
+        "{echo}"
+    );
+    assert!(!base.path().join("notes.md").exists());
+}
+
 /// A switch flipped in the dispatcher reaches the command, and is still set
 /// the next time the dispatcher opens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

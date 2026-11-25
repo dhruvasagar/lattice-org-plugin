@@ -258,8 +258,19 @@ fn object(out: &mut String, o: &Object) {
         Object::Code(t) => {
             let _ = write!(out, "code({t:?})");
         }
-        Object::Link { path, description } => {
-            let _ = write!(out, "link({path:?})");
+        Object::Link {
+            path,
+            description,
+            target,
+        } => {
+            match target {
+                Some(t) => {
+                    let _ = write!(out, "link({path:?} -> {t})");
+                }
+                None => {
+                    let _ = write!(out, "link({path:?})");
+                }
+            }
             if !description.is_empty() {
                 nested(out, "", description);
             }

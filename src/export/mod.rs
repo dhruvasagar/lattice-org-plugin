@@ -16,6 +16,7 @@ pub(crate) mod macros;
 pub(crate) mod options;
 pub(crate) mod parse;
 pub(crate) mod pipeline;
+pub(crate) mod targets;
 
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::config::{register_option, OptionType};
@@ -32,6 +33,30 @@ use crate::lattice::plugin_host::types::{
     SurfaceForm, TransientAction, TransientFlag, TransientGroup, TransientItem, TransientItemKind,
     TransientSpec,
 };
+
+/// What an export asks the host for while it runs, behind a trait so the
+/// pipeline's tests can stand in for it.
+pub(crate) trait Host {
+    /// Read a file, as `#+INCLUDE:` does: the host's `read-file`, which only
+    /// reads what the plugin's grant covers.
+    fn read_file(&self, path: &str) -> Result<String, String>;
+    /// Whether some file has a node with this org id; `None` when there is
+    /// no index to ask.
+    fn id_exists(&self, id: &str) -> Option<bool>;
+}
+
+/// The host the guest runs in.
+pub(crate) struct Guest;
+
+impl Host for Guest {
+    fn read_file(&self, path: &str) -> Result<String, String> {
+        crate::lattice::plugin_host::host_services::read_file(path)
+    }
+
+    fn id_exists(&self, id: &str) -> Option<bool> {
+        (!crate::roam_index::is_empty()).then(|| crate::roam_index::node(id).is_some())
+    }
+}
 
 pub(crate) use pipeline::Backend;
 

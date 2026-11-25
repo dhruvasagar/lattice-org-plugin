@@ -3,7 +3,7 @@ headline 1 @0 ["A " italic["title"] " with " verbatim("code") " and a " link("ht
   table @16
     row [bold["head"]] [verbatim("v")]
     rule
-    row [link("x")] [latex("$y$")]
+    row [link("anchor")] [latex("$y$")]
   list Descriptive @20
     item "-" @20 tag=[bold["term"]]
       paragraph @20 "the " italic["definition"]

@@ -27,7 +27,9 @@ the lattice release that carries it.
   stops the export, naming it. `#+INCLUDE:` brings in another file as emacs does,
   with `:lines`, `:minlevel`, `::*heading` / `::#id`, `:only-contents` and
   `src` / `example` / `export` wrapping; a file org may not read stops the
-  export, naming it. The output is a placeholder for now
+  export, naming it. Internal links resolve as emacs's do (`#custom-id`,
+  `*Heading`, `id:`, targets, names, headline text, radio targets), and a link
+  to nothing stops the export unless `#+OPTIONS: broken-links:mark` or `t`. The output is a placeholder for now
   (the options, then the parsed outline, elements and inline markup, verbatim, in the format's
   document) until the real HTML, Markdown and LaTeX writers land.
 

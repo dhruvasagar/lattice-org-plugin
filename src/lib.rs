@@ -2169,6 +2169,10 @@ impl Guest for Component {
     /// the bytes without reading them — so it is a tab-separated string rather
     /// than MessagePack, which would have cost a dependency for two fields.
     fn on_event(handler: u32, ev: Event) {
+        if handler == export::ON_OUTPUT_MODE {
+            export::on_event(&ev);
+            return;
+        }
         // OR.4: a batch of changed paths. Re-indexing happens HERE, on the
         // event actor's own task, so it reaches the store with no keystroke
         // involved — which is the property the whole watcher exists for.

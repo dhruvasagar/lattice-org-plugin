@@ -267,6 +267,9 @@ pub(crate) mod tests {
                 Some(_) => IdFile::Unknown,
             }
         }
+        fn output_buffer(&self, _: super::super::Backend) -> Option<(u32, String)> {
+            None
+        }
     }
 
     fn targets(text: &str) -> Targets {

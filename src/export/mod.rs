@@ -17,10 +17,12 @@ pub(crate) mod macros;
 pub(crate) mod options;
 pub(crate) mod parse;
 pub(crate) mod pipeline;
+pub(crate) mod sink;
 pub(crate) mod targets;
 
 use crate::lattice::plugin_host::buffer::Document;
 use crate::lattice::plugin_host::config::{register_option, OptionType};
+use crate::lattice::plugin_host::events;
 use crate::lattice::plugin_host::grammar::{register_action, register_ex_command};
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::modes::{
@@ -30,9 +32,9 @@ use crate::lattice::plugin_host::modes::{
 use crate::lattice::plugin_host::tree_sitter::TreeSnapshot;
 use crate::lattice::plugin_host::types::{
     ActionContext, ActionSpec, ArgDefault, ArgKind, ArgSpec, ArgValue, Args, EchoLevel,
-    EchoPayload, Effect, ExCommandContext, ExCommandSpec, LatencyClass, OpenTransientPayload,
-    SurfaceForm, TransientAction, TransientFlag, TransientGroup, TransientItem, TransientItemKind,
-    TransientSpec,
+    EchoPayload, Effect, Event, EventFilter, EventKind, ExCommandContext, ExCommandSpec,
+    LatencyClass, OpenTransientPayload, SurfaceForm, TransientAction, TransientFlag,
+    TransientGroup, TransientItem, TransientItemKind, TransientSpec,
 };
 
 /// What an export asks the host for while it runs, behind a trait so the
@@ -43,6 +45,9 @@ pub(crate) trait Host {
     fn read_file(&self, path: &str) -> Result<String, String>;
     /// The file that holds the node with this org id.
     fn id_file(&self, id: &str) -> IdFile;
+    /// The buffer the last export to a buffer for `backend` made, and its
+    /// text, while it is open.
+    fn output_buffer(&self, backend: Backend) -> Option<(u32, String)>;
 }
 
 /// Where an org id lives, as the roam index knows it.
@@ -73,9 +78,14 @@ impl Host for Guest {
             None => IdFile::Unknown,
         }
     }
+
+    fn output_buffer(&self, backend: Backend) -> Option<(u32, String)> {
+        sink::guest_output_buffer(backend)
+    }
 }
 
 pub(crate) use pipeline::Backend;
+use sink::Sink;
 
 /// The mode's id, also the name `mode_gates` ties to `org.export.enabled`.
 pub(crate) const MODE: &str = "org-export-mode";
@@ -92,6 +102,19 @@ const TO_HTML: u32 = 301;
 const TO_MARKDOWN: u32 = 302;
 /// `:org-export-latex`.
 const TO_LATEX: u32 = 303;
+/// `:org-export-html-buffer`.
+const TO_HTML_BUFFER: u32 = 304;
+/// `:org-export-html-open`.
+const TO_HTML_OPEN: u32 = 305;
+/// `:org-export-markdown-buffer`.
+const TO_MARKDOWN_BUFFER: u32 = 306;
+/// `:org-export-markdown-open`.
+const TO_MARKDOWN_OPEN: u32 = 307;
+/// `:org-export-latex-buffer`.
+const TO_LATEX_BUFFER: u32 = 308;
+
+/// The events handler for an output buffer's minor going on.
+pub(crate) const ON_OUTPUT_MODE: u32 = 300;
 
 /// The `:` line parse every export command shares: `--subtree`, `--body-only`.
 const SWITCHES_PARSE: u32 = 320;
@@ -159,7 +182,30 @@ pub(crate) fn is_action(callback: u32) -> bool {
 
 /// Whether `callback` is one of export's ex-command ids.
 pub(crate) fn is_ex_command(callback: u32) -> bool {
-    matches!(callback, TO_HTML | TO_MARKDOWN | TO_LATEX)
+    command(callback).is_some()
+}
+
+/// What an ex-command id exports, and where to.
+fn command(callback: u32) -> Option<(Backend, SinkKind)> {
+    Some(match callback {
+        TO_HTML => (Backend::Html, SinkKind::File),
+        TO_MARKDOWN => (Backend::Markdown, SinkKind::File),
+        TO_LATEX => (Backend::Latex, SinkKind::File),
+        TO_HTML_BUFFER => (Backend::Html, SinkKind::Buffer),
+        TO_MARKDOWN_BUFFER => (Backend::Markdown, SinkKind::Buffer),
+        TO_LATEX_BUFFER => (Backend::Latex, SinkKind::Buffer),
+        TO_HTML_OPEN => (Backend::Html, SinkKind::Open),
+        TO_MARKDOWN_OPEN => (Backend::Markdown, SinkKind::Open),
+        _ => return None,
+    })
+}
+
+/// A command's sink before `org.export.open-with` is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkKind {
+    File,
+    Buffer,
+    Open,
 }
 
 /// Whether `callback` is one of export's `:` line parse ids.
@@ -189,6 +235,15 @@ pub(crate) fn register_options() {
          exports once its directory is listed here.",
     );
     let _ = register_option(
+        "export.open-with",
+        OptionType::String,
+        "editor",
+        "How `h o` / `m o` open the file they write: `editor` in lattice \
+         (a PDF in pdf-mode in the GUI), `system` with the system's handler \
+         for the file, a browser for HTML. In the TUI, where a PDF page is \
+         alt text, `system` is the better choice for PDF.",
+    );
+    let _ = register_option(
         "export.html-stylesheet",
         OptionType::String,
         "default",
@@ -215,6 +270,20 @@ pub(crate) fn register() {
         target_language: None,
         options: vec![],
     });
+    // One per backend, on the buffer an export writes into, so its
+    // activation hands the plugin that buffer's id (see `sink`). Only an
+    // export turns one on.
+    for backend in sink::BACKENDS {
+        register_mode(&ModeDeclaration {
+            id: sink::output_mode(backend).to_string(),
+            kind: ModeKind::Minor,
+            activation_policy: ActivationPolicy::Manual,
+            capabilities: ModeCapabilities::empty(),
+            keymap: vec![],
+            target_language: None,
+            options: vec![],
+        });
+    }
 }
 
 fn switch_arg(name: &str, doc: &str) -> ArgSpec {
@@ -268,14 +337,63 @@ pub(crate) fn register_grammar() {
             "Export the buffer to LaTeX, beside the file.",
             TO_LATEX,
         ),
+        (
+            "org-export-html-buffer",
+            "Export the buffer to HTML into `*Org HTML Export*`; exporting \
+             again replaces its text.",
+            TO_HTML_BUFFER,
+        ),
+        (
+            "org-export-markdown-buffer",
+            "Export the buffer to Markdown into `*Org MD Export*`.",
+            TO_MARKDOWN_BUFFER,
+        ),
+        (
+            "org-export-latex-buffer",
+            "Export the buffer to LaTeX into `*Org LATEX Export*`.",
+            TO_LATEX_BUFFER,
+        ),
+        (
+            "org-export-html-open",
+            "Export the buffer to HTML beside the file, then open it as \
+             `org.export.open-with` says.",
+            TO_HTML_OPEN,
+        ),
+        (
+            "org-export-markdown-open",
+            "Export the buffer to Markdown beside the file, then open it as \
+             `org.export.open-with` says.",
+            TO_MARKDOWN_OPEN,
+        ),
     ] {
         register_ex_command(name, doc, &spec(), SWITCHES_PARSE, id);
     }
 }
 
-/// `register-events`: a session starts with the switches off.
+/// `register-events`: a session starts with the switches off, and the
+/// output buffers' activations are heard.
 pub(crate) fn register_events() {
     let _ = host_services::store_delete(SWITCHES_KEY);
+    // Every minor's lifecycle is delivered (the filter has no mode field);
+    // `on_event` keeps the output buffers' minors.
+    events::subscribe(
+        &EventFilter {
+            kinds: Some(vec![EventKind::MinorActivated]),
+            path_globs: None,
+            major_modes: None,
+            minor_modes: None,
+        },
+        ON_OUTPUT_MODE,
+    );
+}
+
+/// `on-event` for [`ON_OUTPUT_MODE`].
+pub(crate) fn on_event(ev: &Event) {
+    if let Event::MinorActivated(m) = ev {
+        if let Some(backend) = sink::output_backend(&m.mode) {
+            sink::on_output_mode(backend, m.buffer as u32);
+        }
+    }
 }
 
 fn echo(level: EchoLevel, text: impl Into<String>) -> Vec<Effect> {
@@ -338,25 +456,37 @@ pub(crate) fn apply_ex_command(
             "org: export is off — set org.export.enabled to use it",
         ));
     }
-    let backend = match callback {
-        TO_HTML => Backend::Html,
-        TO_MARKDOWN => Backend::Markdown,
-        TO_LATEX => Backend::Latex,
-        other => return Err(format!("org: unknown export ex-command callback {other}")),
+    let Some((backend, kind)) = command(callback) else {
+        return Err(format!(
+            "org: unknown export ex-command callback {callback}"
+        ));
+    };
+    let sink = match kind {
+        SinkKind::File => Sink::File,
+        SinkKind::Buffer => Sink::Buffer,
+        SinkKind::Open => match sink::open_sink(&crate::option_or("export.open-with", "editor")) {
+            Ok(sink) => sink,
+            Err(why) => return Ok(echo(EchoLevel::Error, why)),
+        },
     };
     let switches = Switches::from_args(&ctx.args);
     switches.remember();
+    // A buffer export needs the file too: its name is the title's fallback,
+    // and includes and links are relative to it.
     let Some(source) = doc.path() else {
         return Ok(echo(
             EchoLevel::Warn,
-            "org: export writes beside the file — save the buffer first",
+            "org: export works from the buffer's file — save the buffer first",
         ));
     };
-    let target = pipeline::target_path(&source, backend);
+    let target = match sink {
+        Sink::Buffer => sink::buffer_name(backend).to_string(),
+        Sink::File | Sink::Open { .. } => pipeline::target_path(&source, backend),
+    };
     // Before anything runs, as capture checks its target before a word is
     // typed: a refusal found after a parse (or a babel run) wastes the work
     // and reads as a failed export rather than a missing grant.
-    if host_services::can_write_file(&target).is_err() {
+    if sink != Sink::Buffer && host_services::can_write_file(&target).is_err() {
         return Ok(echo(
             EchoLevel::Error,
             format!(
@@ -373,6 +503,7 @@ pub(crate) fn apply_ex_command(
         subtree: switches.subtree,
         body_only: switches.body_only,
         line: ctx.cursor.line,
+        sink,
     }) {
         return Ok(echo(EchoLevel::Error, e));
     }
@@ -381,7 +512,7 @@ pub(crate) fn apply_ex_command(
         format!(
             "Exporting {} → {}…",
             pipeline::file_name(&source),
-            pipeline::file_name(&target)
+            sink::target_label(sink, backend, &target)
         ),
     ))
 }
@@ -423,15 +554,26 @@ pub(crate) fn dispatcher_menu() -> Result<TransientSpec, String> {
             },
             TransientGroup {
                 label: "HTML".to_string(),
-                items: vec![row("hh", "to file", to("org-export-html"))],
+                items: vec![
+                    row("hh", "to file", to("org-export-html")),
+                    row("hH", "to buffer", to("org-export-html-buffer")),
+                    row("ho", "to file and open", to("org-export-html-open")),
+                ],
             },
             TransientGroup {
                 label: "Markdown".to_string(),
-                items: vec![row("mm", "to file", to("org-export-markdown"))],
+                items: vec![
+                    row("mm", "to file", to("org-export-markdown")),
+                    row("mM", "to buffer", to("org-export-markdown-buffer")),
+                    row("mo", "to file and open", to("org-export-markdown-open")),
+                ],
             },
             TransientGroup {
                 label: "LaTeX".to_string(),
-                items: vec![row("ll", "to file", to("org-export-latex"))],
+                items: vec![
+                    row("ll", "to file", to("org-export-latex")),
+                    row("lL", "to buffer", to("org-export-latex-buffer")),
+                ],
             },
             TransientGroup {
                 label: String::new(),

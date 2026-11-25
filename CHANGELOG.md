@@ -37,7 +37,12 @@ the lattice release that carries it.
   MathJax when there is any, and an author / date footer. Links to other org
   files go to their HTML, and an `id:` link to the node's file.
   `org.export.html-stylesheet` is `default` (org's own, inline), `none`, or a
-  stylesheet to link. Markdown and LaTeX output is still a placeholder (the
+  stylesheet to link. `h H`, `m M` and `l L` export into `*Org HTML Export*`,
+  `*Org MD Export*` or `*Org LATEX Export*` instead, and exporting again
+  replaces that buffer's text in one undo step; `h o` and `m o` write the
+  file and then open it, in lattice, or with the system's handler when
+  `org.export.open-with` is `system`. Each has a `:` command
+  (`:org-export-html-buffer`, `:org-export-html-open`, …). Markdown and LaTeX output is still a placeholder (the
   parsed outline, verbatim) until their writers land.
 
 ### Fixed

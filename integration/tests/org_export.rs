@@ -415,6 +415,79 @@ async fn an_export_lands_on_disk_without_a_further_keypress() {
     .await;
 }
 
+fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {
+    editor
+        .services
+        .get::<lattice_mode::BufferStoreHandle>()
+        .expect("the buffer store is a service")
+        .clone()
+}
+
+fn buffer_text(editor: &Editor, id: lattice_core::BufferId) -> String {
+    buffers(editor)
+        .handle_for(id)
+        .map(|d| d.snapshot().text().to_string())
+        .unwrap_or_default()
+}
+
+/// `h H` exports into `*Org HTML Export*`; exporting again replaces that
+/// buffer's text in place, which seeding alone would not (a seed is
+/// ignored for a buffer that exists).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_buffer_export_opens_then_replaces_its_buffer() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    let source = base.path().join("notes.org");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "hH");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Exported *Org HTML Export*")
+    })
+    .await;
+    let out = buffers(&editor)
+        .find_by_name("*Org HTML Export*")
+        .expect("the export buffer opened");
+    assert_eq!(editor.document_buffer_id, out, "and has focus");
+    assert!(buffer_text(&editor, out).contains("<title>Plan</title>"));
+    assert!(!base.path().join("notes.html").exists(), "no file is written");
+
+    // Back in the org buffer, change the title and export again.
+    editor.do_edit(Some(source), false);
+    editor.run_tick_pending();
+    ex(&mut editor, "1d");
+    assert!(text(&editor).starts_with("* One"), "{}", text(&editor));
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "hH");
+    settle(&mut editor, |e| buffer_text(e, out).contains("<title>notes</title>")).await;
+    assert_eq!(
+        buffers(&editor).find_by_name("*Org HTML Export*"),
+        Some(out),
+        "the same buffer"
+    );
+    assert!(!buffer_text(&editor, out).contains("<title>Plan</title>"));
+}
+
+/// `h o` writes the file and then opens it, in lattice by default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_export_writes_then_opens_the_file() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    let html = base.path().join("notes.html");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "ho");
+    settle(&mut editor, |e| {
+        buffers(e).path_for(e.document_buffer_id).as_deref() == Some(html.as_path())
+    })
+    .await;
+    assert!(std::fs::read_to_string(&html).unwrap().contains("<title>Plan</title>"));
+}
+
 /// A file whose parse does not fit one call's fuel is exported over several
 /// steps, still with no key pressed, and the whole of it lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

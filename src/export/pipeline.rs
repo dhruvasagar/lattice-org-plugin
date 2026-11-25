@@ -29,12 +29,11 @@ use super::html::{self, Html, Stylesheet};
 use super::include::Includes;
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
+use super::sink::{self, Sink};
 use super::targets::Targets;
 use super::Host;
 use crate::lattice::plugin_host::host_services;
-use crate::lattice::plugin_host::types::{
-    EchoLevel, EchoPayload, Effect, FileAnchor, WriteToFilePayload,
-};
+use crate::lattice::plugin_host::types::{EchoLevel, EchoPayload, Effect};
 use crate::time_format::When;
 use std::rc::Rc;
 
@@ -92,6 +91,8 @@ pub(crate) struct Request {
     pub(crate) body_only: bool,
     /// The cursor's line when the command ran.
     pub(crate) line: u32,
+    /// Where the output goes.
+    pub(crate) sink: Sink,
 }
 
 /// The output's path: the source's, with the backend's extension in place of
@@ -394,7 +395,7 @@ impl Run {
             return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
         }
         let output = std::mem::take(&mut render.out);
-        let target = file_name(&self.request.target);
+        let target = sink::target_label(self.request.sink, backend, &self.request.target);
         let ignored = &render.view.options.ignored;
         let done = if ignored.is_empty() {
             echo(EchoLevel::Info, format!("Exported {target}"))
@@ -407,20 +408,14 @@ impl Run {
                 ),
             )
         };
-        Step::Done(vec![
-            Effect::WriteToFile(WriteToFilePayload {
-                path: self.request.target.clone(),
-                anchor: FileAnchor::Whole,
-                text: output,
-                cut: None,
-                // The output goes beside its source, whose directory exists.
-                create_parents: false,
-                // On disk is the point: a browser, a forge or a compiler reads
-                // it.
-                save: true,
-            }),
+        Step::Done(sink::effects(
+            self.request.sink,
+            backend,
+            &self.request.target,
+            output,
             done,
-        ])
+            &*self.host,
+        ))
     }
 
     /// The step between the parse and the render: build the tree, take the
@@ -656,6 +651,7 @@ fn post(effects: Vec<Effect>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lattice::plugin_host::types::FileAnchor;
 
     fn request(backend: Backend) -> Request {
         Request {
@@ -666,6 +662,7 @@ mod tests {
             subtree: false,
             body_only: false,
             line: 0,
+            sink: Sink::File,
         }
     }
 
@@ -689,6 +686,9 @@ mod tests {
         }
         fn id_file(&self, _: &str) -> super::super::IdFile {
             super::super::IdFile::NoIndex
+        }
+        fn output_buffer(&self, _: Backend) -> Option<(u32, String)> {
+            None
         }
     }
 

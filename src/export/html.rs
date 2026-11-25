@@ -1381,6 +1381,9 @@ mod tests {
                 _ => IdFile::Unknown,
             }
         }
+        fn output_buffer(&self, _: Backend) -> Option<(u32, String)> {
+            None
+        }
     }
 
     /// `text` exported to HTML from `/notes/plan.org`, or the echo that
@@ -1394,6 +1397,7 @@ mod tests {
             subtree: false,
             body_only,
             line: 0,
+            sink: crate::export::sink::Sink::File,
         };
         let mut run = Run::new(
             1,
@@ -1651,6 +1655,9 @@ mod tests {
             fn id_file(&self, _: &str) -> IdFile {
                 IdFile::In("/notes/plan.org".to_string())
             }
+            fn output_buffer(&self, _: Backend) -> Option<(u32, String)> {
+                None
+            }
         }
         let request = Request {
             buffer: 1,
@@ -1660,6 +1667,7 @@ mod tests {
             subtree: false,
             body_only: true,
             line: 0,
+            sink: crate::export::sink::Sink::File,
         };
         let text = "* A
 :PROPERTIES:

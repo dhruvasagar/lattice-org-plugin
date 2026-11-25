@@ -95,6 +95,17 @@ the lattice release that carries it.
   neither. The value is inherited as babel inherits it, from the file's and
   the headlines' `header-args`. Before this, every block and every result
   was exported.
+- **Export runs the blocks whose results it shows**, as emacs's
+  `org-export-use-babel` does: a `results` or `both` block runs through
+  babel, with its languages table, `:var` chains, noweb and sessions, and
+  its fresh result appears in the export. It runs on a copy, so the file's
+  own `#+RESULTS:` are never touched. With `org.babel.confirm` on, the
+  export asks once (`Export runs 2 blocks (sh ×2)? (y/n)`). `:eval
+  no-export` (or `never-export`, `no`, `never`) keeps a block from running
+  for an export, so it shows the result already in the file, as does a
+  block whose language has no `org.babel.languages` entry (the echo names
+  it). With babel off, every block shows the result already in the file.
+  `:org-export-cancel` stops the blocks an export is running.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

@@ -26,6 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ops::Range;
 
+use super::babel::{Planning, Settled};
 use super::common::{advance, at, Outline, OutlineWalk};
 use super::filter::{self, Selection, View};
 use super::html::{self, Html, Stylesheet};
@@ -37,8 +38,13 @@ use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
 use super::sink::{self, Sink};
 use super::targets::Targets;
 use super::Host;
+use crate::babel::block::BlockKey;
+use crate::babel::results::{insertion_edit, Insertion};
+use crate::babel::run::RunRequest;
 use crate::lattice::plugin_host::host_services;
-use crate::lattice::plugin_host::types::{EchoLevel, EchoPayload, Effect};
+use crate::lattice::plugin_host::types::{
+    ArgValue, Args, ConfirmPayload, EchoLevel, EchoPayload, Effect,
+};
 use crate::time_format::When;
 use std::rc::Rc;
 
@@ -52,6 +58,10 @@ pub(crate) const EV_STEP: &str = "org/export-step";
 
 /// `:org-export-cancel`, from the grammar seam, where the runs are not.
 pub(crate) const EV_CANCEL: &str = "org/export-cancel";
+
+/// The `y` to an export's question about running its blocks, from the
+/// grammar seam: the run's id.
+pub(crate) const EV_RUN_BLOCKS: &str = "org/export-run-blocks";
 
 /// How much one step does: the source a parse step reads, and the output a
 /// render step writes. A parse chunk ends at the first headline past this,
@@ -68,6 +78,11 @@ const STEP_BYTES: usize = 64 * 1024;
 /// file's properties are known: each is a header-argument merge of a few
 /// short strings, so this many is a small part of a step's budget.
 const BLOCKS_PER_STEP: usize = 512;
+
+/// About how many lines of reading a step's planning may do: a block's plan
+/// reads the whole file a few times, so a step plans this many lines' worth
+/// of blocks, and always one.
+const PLAN_LINES: usize = 100_000;
 
 /// An output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -137,6 +152,30 @@ pub(crate) struct Configured {
     pub(crate) stylesheet: Stylesheet,
     /// `org.export.latex-pdf-process`, for a PDF export.
     pub(crate) pdf_process: Vec<super::pdf::ProcessStep>,
+    /// Babel's settings, for the blocks an export runs.
+    pub(crate) babel: BabelConfig,
+}
+
+/// The `org.babel.*` settings an export runs the file's blocks with.
+#[derive(Debug, Clone)]
+pub(crate) struct BabelConfig {
+    /// `org.babel.enabled`: off, an export uses the results in the file.
+    pub(crate) enabled: bool,
+    /// `org.babel.confirm`: whether to ask before running.
+    pub(crate) confirm: bool,
+    /// `org.babel.languages`, or why it cannot be read.
+    pub(crate) languages: Result<Vec<crate::babel::Language>, String>,
+}
+
+impl Default for BabelConfig {
+    /// Off, as a run with no editor behind it has no languages to run.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            confirm: true,
+            languages: Ok(Vec::new()),
+        }
+    }
 }
 
 /// The `org.export.*` options as they are now; `Err` names one whose value
@@ -185,10 +224,16 @@ fn configured() -> Result<Configured, String> {
     )
     .and_then(Result::ok)
     .unwrap_or_default();
+    let on = |name: &str| crate::option_or(name, "true").eq_ignore_ascii_case("true");
     Ok(Configured {
         options,
         stylesheet: Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
         pdf_process,
+        babel: BabelConfig {
+            enabled: on("babel.enabled"),
+            confirm: on("babel.confirm"),
+            languages: crate::babel::languages(),
+        },
     })
 }
 
@@ -249,13 +294,22 @@ pub(crate) fn on_requested(payload: &[u8]) {
         configured,
     ) {
         Ok(run) => {
-            RUNS.with(|runs| {
+            let replaced: Vec<u64> = RUNS.with(|runs| {
                 let mut runs = runs.borrow_mut();
                 // A second export to the same file wins: the first would only
                 // write what the second overwrites.
+                let replaced = runs
+                    .iter()
+                    .filter(|r| r.request.target == run.request.target)
+                    .map(|r| r.id)
+                    .collect();
                 runs.retain(|r| r.request.target != run.request.target);
                 runs.push(run);
+                replaced
             });
+            for old in replaced {
+                crate::babel::jobs::cancel_export(old);
+            }
             host_services::emit_event(EV_STEP, id.to_string().as_bytes());
         }
         Err(effects) => post(effects),
@@ -279,16 +333,86 @@ pub(crate) fn on_step(payload: &[u8]) {
         // Absent when a newer export of its target replaced it.
         let at = runs.iter().position(|r| r.id == id)?;
         let step = runs[at].step();
-        if !matches!(step, Step::More) {
-            runs.remove(at);
-        }
-        Some(step)
+        let notes = if matches!(step, Step::Done(_) | Step::Compile(_)) {
+            runs.remove(at).notes
+        } else {
+            Vec::new()
+        };
+        Some((step, notes))
     });
+    let step = step.map(|(step, notes)| {
+        if !notes.is_empty() {
+            post(notes);
+        }
+        step
+    });
+    // Outside the borrow: starting a run can settle a block at once (one
+    // that cannot start), and settling reads the runs.
     match step {
         Some(Step::More) => host_services::emit_event(EV_STEP, payload),
         Some(Step::Done(effects)) => post(effects),
         Some(Step::Compile(compile)) => post(super::pdf::begin(compile, &super::Guest)),
+        Some(Step::Wait(effects)) => {
+            if !effects.is_empty() {
+                post(effects);
+            }
+        }
+        Some(Step::Run(runs)) => crate::babel::jobs::start_next(runs),
         None => {}
+    }
+}
+
+/// Ask the events seam to run the blocks export `id` asked about, for the
+/// `y` to its question.
+pub(crate) fn request_run_blocks(id: u64) {
+    host_services::emit_event(EV_RUN_BLOCKS, id.to_string().as_bytes());
+}
+
+/// `on-event` for [`EV_RUN_BLOCKS`]: start the blocks of the run named,
+/// if it is still waiting for them.
+pub(crate) fn on_run_blocks(payload: &[u8]) {
+    let Some(id) = std::str::from_utf8(payload)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let runs = RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let run = runs.iter_mut().find(|r| r.id == id)?;
+        run.consented()
+    });
+    match runs {
+        Some(runs) => crate::babel::jobs::start_next(runs),
+        // Replaced by a newer export, or cancelled, while the question was
+        // open: what it would have run is not wanted.
+        None => post(vec![echo(
+            EchoLevel::Info,
+            "org: that export is no longer waiting — nothing ran",
+        )]),
+    }
+}
+
+/// One of export `id`'s blocks settled (babel's jobs call this). The last
+/// one resumes the export, over the copy with the results in.
+pub(crate) fn on_block(id: u64, settled: Settled) {
+    let cancelled = matches!(settled, Settled::Cancelled);
+    let resume = RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let at = runs.iter().position(|r| r.id == id)?;
+        if cancelled {
+            runs.remove(at);
+            return Some(false);
+        }
+        Some(runs[at].settle(settled))
+    });
+    match resume {
+        Some(true) => host_services::emit_event(EV_STEP, id.to_string().as_bytes()),
+        Some(false) if cancelled => {
+            crate::babel::jobs::cancel_export(id);
+            post(vec![echo(EchoLevel::Info, "org: the export was cancelled")]);
+        }
+        _ => {}
     }
 }
 
@@ -300,7 +424,16 @@ pub(crate) fn request_cancel() {
 /// `on-event` for [`EV_CANCEL`]: drop the runs, stop the compiles, and say
 /// so. A compile says it was cancelled when its job ends.
 pub(crate) fn on_cancel() {
-    let runs = RUNS.with(|runs| std::mem::take(&mut *runs.borrow_mut()).len());
+    let ids: Vec<u64> = RUNS.with(|runs| {
+        std::mem::take(&mut *runs.borrow_mut())
+            .iter()
+            .map(|r| r.id)
+            .collect()
+    });
+    let runs = ids.len();
+    for id in ids {
+        crate::babel::jobs::cancel_export(id);
+    }
     let compiles = super::pdf::cancel(&super::Guest);
     if runs > 0 {
         post(vec![echo(EchoLevel::Info, "org: the export was cancelled")]);
@@ -318,6 +451,24 @@ pub(crate) enum Step {
     Done(Vec<Effect>),
     /// The LaTeX is written; compile it to PDF.
     Compile(super::pdf::Compile),
+    /// Post these and wait: for the user's answer, or the blocks' results,
+    /// whose arrival resumes the run.
+    Wait(Vec<Effect>),
+    /// Start these runs of the file's blocks and wait for their results.
+    Run(Vec<RunRequest>),
+}
+
+/// Where a run is in running the file's blocks.
+enum Eval {
+    /// Not looked at yet: the parse decides what runs.
+    Unread,
+    Planning(Box<Planning>),
+    /// Asked; waiting for `y`.
+    Asking(Vec<RunRequest>),
+    /// Running; this many blocks have yet to settle.
+    Running(usize),
+    /// Nothing more to run.
+    Done,
 }
 
 /// One export in flight.
@@ -354,6 +505,9 @@ pub(crate) struct Run {
     budget: usize,
     /// What the source blocks' `:exports` leave out, read with the chunks.
     scan: super::babel::Scan,
+    eval: Eval,
+    /// What the user is told when the run ends: why blocks did not run.
+    notes: Vec<Effect>,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -465,6 +619,8 @@ impl Run {
             host,
             configured,
             scan: Default::default(),
+            eval: Eval::Unread,
+            notes: Vec::new(),
             render: None,
             budget: STEP_BYTES,
             text,
@@ -526,6 +682,9 @@ impl Run {
                 .collect();
             if self.scan.resolve(&props, BLOCKS_PER_STEP) {
                 return Step::More;
+            }
+            if let Some(step) = self.evaluate() {
+                return step;
             }
         }
         let Some(render) = self.render.as_mut() else {
@@ -657,6 +816,143 @@ impl Run {
         ))
     }
 
+    /// The blocks the file runs for this export, before its render: `None`
+    /// when the export goes on to render now.
+    fn evaluate(&mut self) -> Option<Step> {
+        match &mut self.eval {
+            Eval::Done => None,
+            Eval::Asking(_) | Eval::Running(_) => Some(Step::Wait(Vec::new())),
+            Eval::Unread => {
+                let lines: Vec<&str> = self.text.lines().collect();
+                let within = if self.request.subtree {
+                    crate::babel::block::subtree_at(&lines, self.line)
+                } else {
+                    None
+                };
+                let runnable = self.scan.runnable(within);
+                if runnable.is_empty() {
+                    self.eval = Eval::Done;
+                    return None;
+                }
+                if !self.configured.babel.enabled {
+                    self.eval = Eval::Done;
+                    self.notes.push(echo(
+                        EchoLevel::Info,
+                        "org: babel is off, so the export uses the results in the file",
+                    ));
+                    return None;
+                }
+                let languages = match &self.configured.babel.languages {
+                    Ok(l) => l.clone(),
+                    Err(why) => return Some(Step::Done(vec![echo(EchoLevel::Error, why.clone())])),
+                };
+                self.eval = Eval::Planning(Box::new(Planning::new(runnable, languages)));
+                Some(Step::More)
+            }
+            Eval::Planning(planning) => {
+                let lines: Vec<&str> = self.text.lines().collect();
+                // Each block's plan reads the file a few times over.
+                let count = (PLAN_LINES / lines.len().max(1)).max(1);
+                let base = self.request.source.rsplit_once('/').map(|(dir, _)| {
+                    if dir.is_empty() {
+                        "/"
+                    } else {
+                        dir
+                    }
+                });
+                match planning.step(&lines, self.request.buffer, self.id, base, count) {
+                    Err(why) => Some(Step::Done(vec![echo(EchoLevel::Error, why)])),
+                    Ok(true) => Some(Step::More),
+                    Ok(false) => {
+                        self.notes.append(&mut planning.notes);
+                        let runs = std::mem::take(&mut planning.runs);
+                        if runs.is_empty() {
+                            self.eval = Eval::Done;
+                            return Some(Step::More);
+                        }
+                        if self.configured.babel.confirm {
+                            let effects = vec![Effect::Confirm(ConfirmPayload {
+                                prompt: planning.prompt(),
+                                yes_action: super::RUN_BLOCKS_NAME.to_string(),
+                                args: Args::List(vec![ArgValue::String(self.id.to_string())]),
+                            })];
+                            self.eval = Eval::Asking(runs);
+                            return Some(Step::Wait(effects));
+                        }
+                        self.eval = Eval::Running(runs.len());
+                        Some(Step::Run(runs))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `y`: the runs to start, if the run is waiting for it.
+    fn consented(&mut self) -> Option<Vec<RunRequest>> {
+        let Eval::Asking(runs) = &mut self.eval else {
+            return None;
+        };
+        let runs = std::mem::take(runs);
+        self.eval = Eval::Running(runs.len());
+        Some(runs)
+    }
+
+    /// One of the run's blocks settled; `true` when it was the last, and the
+    /// run should go on.
+    fn settle(&mut self, settled: Settled) -> bool {
+        let Eval::Running(left) = &mut self.eval else {
+            return false;
+        };
+        *left = left.saturating_sub(1);
+        let last = *left == 0;
+        if let Settled::Ran {
+            key,
+            body,
+            insertion,
+        } = settled
+        {
+            self.splice(&key, &body, insertion);
+        }
+        if last {
+            self.eval = Eval::Done;
+            self.reparse();
+        }
+        last
+    }
+
+    /// Put a block's fresh result into the copy, where babel would put it in
+    /// the file.
+    fn splice(&mut self, key: &str, body: &[String], insertion: Insertion) {
+        let lines: Vec<&str> = self.text.lines().collect();
+        let Some(block) = BlockKey::decode(key).and_then(|k| k.find(&lines)) else {
+            return;
+        };
+        let Some(edit) = insertion_edit(&lines, self.text.ends_with('\n'), &block, body, insertion)
+        else {
+            return;
+        };
+        let start = byte_at(&self.text, edit.start);
+        let end = byte_at(&self.text, edit.end);
+        // The cursor's line, for a subtree export, moves with what changed
+        // above it.
+        if edit.start.0 < self.line {
+            let added = edit.text.matches('\n').count() as i64;
+            let removed = i64::from(edit.end.0 - edit.start.0);
+            self.line = (i64::from(self.line) + added - removed).max(0) as u32;
+        }
+        self.text.replace_range(start..end, &edit.text);
+    }
+
+    /// Parse the copy again, now that it holds the blocks' results.
+    fn reparse(&mut self) {
+        self.chunks = chunks(&self.text, self.budget);
+        self.next = 0;
+        self.sections.clear();
+        self.keywords.clear();
+        self.targets = Targets::default();
+        self.scan = Default::default();
+    }
+
     /// The step between the parse and the render: build the tree, take the
     /// subtree when that is what was asked for, resolve the options, and
     /// start the output. `Err` when a subtree was asked for and the cursor is
@@ -781,6 +1077,17 @@ fn chunks(text: &str, budget: usize) -> Vec<(Range<usize>, u32)> {
     }
     out.push((from..at, first));
     out
+}
+
+/// The byte offset in `text` of `(line, byte)`; the line past the last is
+/// the end of the text.
+fn byte_at(text: &str, (line, byte): (u32, u32)) -> usize {
+    let start = text
+        .split_inclusive('\n')
+        .take(line as usize)
+        .map(str::len)
+        .sum::<usize>();
+    (start + byte as usize).min(text.len())
 }
 
 fn echo(level: EchoLevel, text: impl Into<String>) -> Effect {
@@ -910,6 +1217,111 @@ mod tests {
         assert_eq!(shown(&html(" :exports none")), (false, false));
     }
 
+    /// A run waiting on `n` blocks, over `text`: the parse done, the
+    /// blocks' runs started.
+    fn running(text: &str, n: usize) -> Run {
+        let mut run = Run::new(
+            1,
+            request(Backend::Html),
+            Some(text.to_string()),
+            Vec::new(),
+            When { local_secs: 0 },
+            Rc::new(Files(Default::default())),
+            Configured {
+                stylesheet: Stylesheet::None,
+                ..Configured::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        run.eval = Eval::Running(n);
+        run
+    }
+
+    /// Step `run` to its end, and give what it wrote.
+    fn finish(mut run: Run) -> String {
+        loop {
+            match run.step() {
+                Step::More => {}
+                Step::Done(effects) => return written(&effects).1.to_string(),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// `sh`'s fresh result for the block in `text` named `name`.
+    fn ran(text: &str, name: &str, output: &str) -> Settled {
+        let lines: Vec<&str> = text.lines().collect();
+        let block = crate::babel::block::src_blocks(&lines)
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no block {name}"));
+        let spec =
+            crate::babel::results::ResultsSpec::parse(&[], false).unwrap_or_else(|e| panic!("{e}"));
+        Settled::Ran {
+            key: BlockKey::of(&lines, &block).encode(),
+            body: crate::babel::results::format(&spec, &[output.to_string()], 10, "sh"),
+            insertion: Insertion::Replace,
+        }
+    }
+
+    const RAN: &str = "* A\n#+NAME: one\n#+begin_src sh :exports results\necho x\n#+end_src\n\n\
+                       #+RESULTS: one\n: stale-one\n\n\
+                       #+NAME: two\n#+begin_src sh :exports both\necho y\n#+end_src\n";
+
+    /// A block's fresh result replaces its old one in the export — not in
+    /// the text the run was handed, a copy — and a block that gained its
+    /// first result exports it. The export waits for the last.
+    #[test]
+    fn fresh_results_go_into_the_export_once_all_are_in() {
+        let mut run = running(RAN, 2);
+        assert!(!run.settle(ran(RAN, "one", "fresh-one")));
+        let waits = (0..10).any(|_| matches!(run.step(), Step::Wait(_)));
+        assert!(waits, "waits for the second, rather than writing");
+        assert!(run.settle(ran(RAN, "two", "fresh-two")));
+        let out = finish(run);
+        assert!(
+            out.contains("fresh-one") && out.contains("fresh-two"),
+            "{out}"
+        );
+        assert!(!out.contains("stale-one"), "{out}");
+        assert!(
+            !out.contains("echo x"),
+            "`:exports results` keeps only the result: {out}"
+        );
+        assert!(out.contains("echo y"), "{out}");
+    }
+
+    /// A block that did not run keeps the result in the file.
+    #[test]
+    fn a_block_that_did_not_run_keeps_its_old_result() {
+        let mut run = running(RAN, 2);
+        assert!(!run.settle(Settled::Not));
+        assert!(run.settle(ran(RAN, "two", "fresh-two")));
+        let out = finish(run);
+        assert!(
+            out.contains("stale-one") && out.contains("fresh-two"),
+            "{out}"
+        );
+    }
+
+    /// A result added above the cursor moves it, so a subtree export still
+    /// takes the headline it was asked from.
+    #[test]
+    fn a_result_above_the_cursor_moves_it() {
+        let text = "* A\n#+NAME: one\n#+begin_src sh :exports results\necho x\n#+end_src\n\
+                    * B\nbody of b\n";
+        let mut run = running(text, 1);
+        run.request.subtree = true;
+        run.line = 6;
+        assert!(run.settle(ran(text, "one", "fresh")));
+        assert_eq!(
+            run.line, 9,
+            "a blank line, `#+RESULTS:` and one line went in above"
+        );
+        let out = finish(run);
+        assert!(out.contains("body of b") && !out.contains("fresh"), "{out}");
+    }
+
     /// A PDF export ends in its compile, not a write: the `.tex` path and
     /// text, the configured process, and the file's own compiler.
     #[test]
@@ -939,7 +1351,7 @@ mod tests {
             match run.step() {
                 Step::More => {}
                 Step::Compile(c) => break c,
-                Step::Done(effects) => panic!("{effects:?}"),
+                other => panic!("{other:?}"),
             }
         };
         assert_eq!(compile.tex, "/notes/plan.tex");

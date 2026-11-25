@@ -153,6 +153,10 @@ const TO_PDF_OPEN: u32 = 310;
 const CANCEL: u32 = 311;
 /// `:org-export-log`.
 const LOG: u32 = 312;
+/// The `y` to an export's question about running the file's blocks.
+const RUN_BLOCKS: u32 = 313;
+/// [`RUN_BLOCKS`]'s name, which the question names as its `yes-action`.
+pub(crate) const RUN_BLOCKS_NAME: &str = "org-export-run-blocks";
 
 /// The events handler for an output buffer's minor going on.
 pub(crate) const ON_OUTPUT_MODE: u32 = 300;
@@ -222,7 +226,7 @@ impl Switches {
 
 /// Whether `callback` is one of export's action ids.
 pub(crate) fn is_action(callback: u32) -> bool {
-    callback == DISPATCH
+    callback == DISPATCH || callback == RUN_BLOCKS
 }
 
 /// Whether `callback` is one of export's ex-command ids.
@@ -494,6 +498,22 @@ pub(crate) fn register_grammar() {
         },
         DISPATCH,
     );
+    register_action(
+        RUN_BLOCKS_NAME,
+        "Run the source blocks an export asked about (its `y`)",
+        &ActionSpec {
+            args_schema: vec![ArgSpec {
+                name: "run".to_string(),
+                kind: ArgKind::String,
+                doc: "the export's run".to_string(),
+                prompt: String::new(),
+                default: ArgDefault::None,
+                completion: None,
+                picker: None,
+            }],
+        },
+        RUN_BLOCKS,
+    );
     // Named `subtree` and `body-only`: the dispatcher's flag rows fill the
     // slots by these names.
     let spec = || ExCommandSpec {
@@ -645,7 +665,7 @@ fn echo(level: EchoLevel, text: impl Into<String>) -> Vec<Effect> {
 /// `apply-action` for export's ids.
 pub(crate) fn apply_action(
     callback: u32,
-    _ctx: &ActionContext,
+    ctx: &ActionContext,
     _doc: &Document,
     _tree: Option<&TreeSnapshot>,
 ) -> Result<Vec<Effect>, String> {
@@ -654,6 +674,24 @@ pub(crate) fn apply_action(
             source: crate::CAPTURE_TRANSIENT.to_string(),
             args: Args::String(TRANSIENT_KEY.to_string()),
         })]),
+        RUN_BLOCKS => {
+            let run = match &ctx.args {
+                Args::List(v) => match v.first() {
+                    Some(ArgValue::String(s)) => s.parse::<u64>().ok(),
+                    _ => None,
+                },
+                Args::String(s) => s.parse::<u64>().ok(),
+                _ => None,
+            };
+            match run {
+                // The runs live in the events seam.
+                Some(run) => {
+                    pipeline::request_run_blocks(run);
+                    Ok(Vec::new())
+                }
+                None => Err("org: the export's question named no run".to_string()),
+            }
+        }
         other => Err(format!("org: unknown export action callback {other}")),
     }
 }

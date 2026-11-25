@@ -150,17 +150,17 @@ async fn org_editor(
     text: &str,
     capabilities: &[String],
 ) -> (Editor, Arc<PluginLoader>) {
-    org_editor_holding(base, text, capabilities, None).await
+    org_editor_holding(base, text, capabilities, Vec::new()).await
 }
 
-/// [`org_editor`] with `org.export.latex-pdf-process` as the user's config
-/// file holds it: before the plugin loads, since the process grant is
-/// resolved at load from what the user wrote.
+/// [`org_editor`] with `held` as the user's config file holds it: before the
+/// plugin loads, since a process grant is resolved at load from what the
+/// user wrote.
 async fn org_editor_holding(
     base: &std::path::Path,
     text: &str,
     capabilities: &[String],
-    pdf_process: Option<lattice_config::ConfigValue>,
+    held: Vec<(&str, lattice_config::ConfigValue)>,
 ) -> (Editor, Arc<PluginLoader>) {
     let plugins_dir = base.join("plugins");
     let dir = plugins_dir.join("org");
@@ -180,12 +180,10 @@ async fn org_editor_holding(
     .unwrap();
 
     let mut editor = boot_sealed_editor();
-    if let Some(value) = pdf_process {
-        editor.config.hold_tree(
-            "org.export.latex-pdf-process",
-            value,
-            lattice_config::HeldSource::ConfigFile,
-        );
+    for (name, value) in held {
+        editor
+            .config
+            .hold_tree(name, value, lattice_config::HeldSource::ConfigFile);
     }
     let loader = Arc::new(loader_over_editor(&editor, base));
     loader.subscribe_mode_gates();
@@ -595,7 +593,13 @@ async fn pdf_editor(
 ) -> (Editor, Arc<PluginLoader>) {
     let mut grant = write_grant(base);
     grant.push(PDF_GRANT.to_string());
-    org_editor_holding(base, DOC, &grant, Some(pdf_process(steps))).await
+    org_editor_holding(
+        base,
+        DOC,
+        &grant,
+        vec![("org.export.latex-pdf-process", pdf_process(steps))],
+    )
+    .await
 }
 
 /// `l p` writes the `.tex`, complete, before the compiler starts, and the
@@ -715,6 +719,158 @@ async fn cancel_stops_a_running_compile() {
         last_echo(e).as_deref() == Some("org: no export is running")
     })
     .await;
+}
+
+/// `org.babel.languages` with `sh`, able to take `:var` and run sessions.
+fn sh_language() -> lattice_config::ConfigValue {
+    use lattice_config::ConfigValue;
+    let field = |s: &str| ConfigValue::Str(s.to_string());
+    ConfigValue::List(vec![ConfigValue::Record(
+        [
+            ("name".to_string(), field("sh")),
+            ("command".to_string(), field("sh")),
+            ("value".to_string(), field("sh")),
+            ("session-args".to_string(), ConfigValue::List(Vec::new())),
+        ]
+        .into_iter()
+        .collect(),
+    )])
+}
+
+/// An org editor over `doc` that may write exports and run `sh` blocks,
+/// asking first only when `confirm` is set.
+async fn babel_export_editor(
+    base: &std::path::Path,
+    doc: &str,
+    confirm: bool,
+) -> (Editor, Arc<PluginLoader>) {
+    let mut grant = write_grant(base);
+    grant.push("proc:spawn:{org.babel.languages:command}".to_string());
+    let (mut editor, loader) = org_editor_holding(
+        base,
+        doc,
+        &grant,
+        vec![("org.babel.languages", sh_language())],
+    )
+    .await;
+    if !confirm {
+        set_org_option(&mut editor, "babel.confirm", "false");
+    }
+    (editor, loader)
+}
+
+/// Export `editor`'s file to Markdown from the dispatcher and wait for the
+/// file, or for an echo that says why there is none.
+async fn export_markdown(editor: &mut Editor, md: &std::path::Path) {
+    assert!(open_dispatcher(editor).await.is_some());
+    press(editor, "mm");
+    settle(editor, |e| {
+        md.exists() || last_echo(e).is_some_and(|m| !m.starts_with("Exporting"))
+    })
+    .await;
+}
+
+const RUNS: &str =
+    "* Results\n#+NAME: greet\n#+begin_src sh :exports results\necho fresh-greet\n#+end_src\n\n\
+                    #+RESULTS: greet\n: stale-greet\n\n\
+                    #+begin_src sh :exports results :eval no-export\ntouch ran\n#+end_src\n\n\
+                    #+RESULTS:\n: kept-as-written\n";
+
+/// An export runs the blocks whose results it shows, and shows their fresh
+/// results — in the export only: the file is byte for byte what it was. A
+/// block marked `:eval no-export` does not run, and keeps its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_export_runs_its_blocks_on_a_copy() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = babel_export_editor(base.path(), RUNS, false).await;
+    let md = base.path().join("notes.md");
+    export_markdown(&mut editor, &md).await;
+    let out = std::fs::read_to_string(&md)
+        .unwrap_or_else(|_| panic!("nothing written; the echo is {:?}", last_echo(&editor)));
+    assert!(out.contains("fresh-greet"), "{out}");
+    assert!(!out.contains("stale-greet"), "{out}");
+    assert!(out.contains("kept-as-written"), "{out}");
+    assert!(!out.contains("echo fresh-greet"), "only the result: {out}");
+    assert!(!base.path().join("ran").exists(), "`:eval no-export` ran");
+    assert_eq!(text(&editor), RUNS, "the file is untouched");
+}
+
+/// A `:var` chain and a `:session` block export with fresh results: what
+/// a block needs runs first, even when it exports nothing itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_var_chain_and_a_session_export_fresh_results() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "* Chain\n#+NAME: base\n#+begin_src sh :exports none\necho 40\n#+end_src\n\n\
+               #+begin_src sh :var x=base :exports results\necho $((x + 2))\n#+end_src\n\n\
+               #+begin_src sh :session :exports results :results output\ny=5\necho \"session-$y\"\n#+end_src\n";
+    let (mut editor, _loader) = babel_export_editor(base.path(), doc, false).await;
+    let md = base.path().join("notes.md");
+    export_markdown(&mut editor, &md).await;
+    let out = std::fs::read_to_string(&md)
+        .unwrap_or_else(|_| panic!("nothing written; the echo is {:?}", last_echo(&editor)));
+    assert!(out.contains("42"), "{out}");
+    assert!(!out.contains("40"), "`:exports none` shows nothing: {out}");
+    assert!(out.contains("session-5"), "{out}");
+    assert_eq!(text(&editor), doc, "the file is untouched");
+}
+
+/// With `org.babel.confirm` on, the export asks once, naming what runs,
+/// and writes nothing until `y`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_export_asks_once_before_running() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (mut editor, _loader) = babel_export_editor(base.path(), RUNS, true).await;
+    let md = base.path().join("notes.md");
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    let prompt = "Export runs sh block \"greet\"? (y/n)";
+    settle(&mut editor, |e| menu_title(e).as_deref() == Some(prompt)).await;
+    assert!(!md.exists(), "nothing is written before the answer");
+    press(&mut editor, "y");
+    settle(&mut editor, |e| md.exists()).await;
+    let out = std::fs::read_to_string(&md).unwrap();
+    assert!(out.contains("fresh-greet"), "{out}");
+}
+
+/// Wait for a block's process to make `path`: a process is outside the
+/// editor, so nothing wakes it when the file appears.
+async fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{path:?} never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// A run cancelled while a block runs writes nothing, says so, and stops
+/// the block's process: it never reaches its end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_run_stops_its_block_and_writes_nothing() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let doc = "* Slow\n#+begin_src sh :exports results\ntouch started; sleep 2; touch finished\n#+end_src\n";
+    let (mut editor, _loader) = babel_export_editor(base.path(), doc, false).await;
+    let md = base.path().join("notes.md");
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    wait_for_file(&base.path().join("started")).await;
+    ex(&mut editor, "org-export-cancel");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("org: the export was cancelled")
+    })
+    .await;
+    // Past when the block would have finished.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    editor.run_tick_pending();
+    assert!(!base.path().join("finished").exists(), "the block ran on");
+    assert!(!md.exists(), "a cancelled export wrote");
+    assert_eq!(text(&editor), doc);
 }
 
 fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {

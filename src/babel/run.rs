@@ -79,6 +79,11 @@ pub(crate) struct RunRequest {
     pub(crate) session: Option<String>,
     /// The language's `session-args`, `{driver}` filled in.
     pub(crate) session_args: Vec<String>,
+    /// The export run this block runs for, when an export runs it: its
+    /// result goes to that export's copy of the file, never the buffer, and
+    /// it takes no claim, since the buffer's block is not what runs.
+    #[serde(default)]
+    pub(crate) export: Option<u64>,
 }
 
 /// The whole buffer, in one crossing.
@@ -305,8 +310,14 @@ pub(crate) fn check<'a>(
 /// `Run 4 blocks (sh ×3, python)? (y/n)` for several — a count per language,
 /// in the order they first appear.
 pub(crate) fn prompt(blocks: &[(&SrcBlock, Language)]) -> String {
+    format!("Run {}? (y/n)", tally(blocks))
+}
+
+/// What `blocks` are, for a question about running them: `sh block "disk"`
+/// for one, `4 blocks (sh ×3, python)` for several.
+pub(crate) fn tally(blocks: &[(&SrcBlock, Language)]) -> String {
     if let [(block, _)] = blocks {
-        return format!("Run {}? (y/n)", label(block));
+        return label(block);
     }
     let mut counts: Vec<(&str, usize)> = Vec::new();
     for (b, _) in blocks {
@@ -325,7 +336,7 @@ pub(crate) fn prompt(blocks: &[(&SrcBlock, Language)]) -> String {
             }
         })
         .collect();
-    format!("Run {} blocks ({})? (y/n)", blocks.len(), langs.join(", "))
+    format!("{} blocks ({})", blocks.len(), langs.join(", "))
 }
 
 /// The keys of `blocks`, packed into the confirm's ONE argument: a confirm's
@@ -425,6 +436,68 @@ pub(crate) fn confirm_or_start(
     })]
 }
 
+/// The run of `block`, in `lang`, one of the blocks in `lines`: `scheduled`
+/// names the blocks run before it in the same batch, whose fresh results
+/// its `:var`s take, and gains its name. A note for the user (a `value` run
+/// as output) goes to `notes`; `Err` is why it cannot run.
+pub(crate) fn request(
+    buffer: u32,
+    lines: &[&str],
+    block: &SrcBlock,
+    lang: &Language,
+    base: Option<&str>,
+    scheduled: &mut Vec<String>,
+    notes: &mut Vec<Effect>,
+) -> Result<RunRequest, String> {
+    let Plan {
+        results,
+        wrapper,
+        fell_back,
+        vars,
+        body,
+        session,
+    } = plan(lines, block, lang, scheduled)?;
+    scheduled.extend(block.name.clone());
+    if fell_back && !VALUE_NOTED.with(|n| n.replace(true)) {
+        notes.extend(super::echo(
+            EchoLevel::Info,
+            format!(
+                "org: {} has no value wrapper, so `:results value` runs as output \
+                 — name one in its org.babel.languages entry",
+                lang.name
+            ),
+        ));
+    }
+    let header = super::block::effective_header_args(lines, block);
+    let dir = header
+        .get("dir")
+        .map(|w| w.join(" ").trim_matches('"').to_string());
+    Ok(RunRequest {
+        buffer,
+        key: BlockKey::of(lines, block).encode(),
+        label: label(block),
+        command: lang.command.clone(),
+        args: lang
+            .args
+            .clone()
+            .unwrap_or_else(|| vec!["{file}".to_string()]),
+        ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
+        body,
+        name: block.name.clone(),
+        vars,
+        lang: block.lang.clone(),
+        results,
+        wrapper,
+        dir,
+        base: base.map(str::to_string),
+        min_block: number_option("babel.min-lines-for-block-output", 10),
+        max_lines: number_option("babel.max-output-lines", 10_000),
+        session: session.as_ref().map(|(n, _)| n.clone()),
+        session_args: session.map(|(_, a)| a).unwrap_or_default(),
+        export: None,
+    })
+}
+
 /// Claim each block and ask the events seam to run them, in order, one
 /// after another.
 pub(crate) fn start(
@@ -433,62 +506,14 @@ pub(crate) fn start(
     blocks: &[(&SrcBlock, Language)],
     base: Option<&str>,
 ) -> Vec<Effect> {
-    let min_block = number_option("babel.min-lines-for-block-output", 10);
-    let max_lines = number_option("babel.max-output-lines", 10_000);
     let mut batch = Vec::with_capacity(blocks.len());
     let mut notes = Vec::new();
     let mut scheduled = Vec::new();
     for (block, lang) in blocks {
-        let key = BlockKey::of(lines, block).encode();
-        let Plan {
-            results,
-            wrapper,
-            fell_back,
-            vars,
-            body,
-            session,
-        } = match plan(lines, block, lang, &scheduled) {
-            Ok(p) => p,
+        match request(buffer, lines, block, lang, base, &mut scheduled, &mut notes) {
+            Ok(r) => batch.push(r),
             Err(e) => return super::echo(EchoLevel::Error, e),
-        };
-        scheduled.extend(block.name.clone());
-        if fell_back && !VALUE_NOTED.with(|n| n.replace(true)) {
-            notes.extend(super::echo(
-                EchoLevel::Info,
-                format!(
-                    "org: {} has no value wrapper, so `:results value` runs as output \
-                     — name one in its org.babel.languages entry",
-                    lang.name
-                ),
-            ));
         }
-        let header = super::block::effective_header_args(lines, block);
-        let dir = header
-            .get("dir")
-            .map(|w| w.join(" ").trim_matches('"').to_string());
-        batch.push(RunRequest {
-            buffer,
-            key,
-            label: label(block),
-            command: lang.command.clone(),
-            args: lang
-                .args
-                .clone()
-                .unwrap_or_else(|| vec!["{file}".to_string()]),
-            ext: lang.ext.clone().unwrap_or_else(|| lang.name.clone()),
-            body,
-            name: block.name.clone(),
-            vars,
-            lang: block.lang.clone(),
-            results,
-            wrapper,
-            dir,
-            base: base.map(str::to_string),
-            min_block,
-            max_lines,
-            session: session.as_ref().map(|(n, _)| n.clone()),
-            session_args: session.map(|(_, a)| a).unwrap_or_default(),
-        });
     }
     let bytes = match rmp_serde::to_vec(&batch) {
         Ok(b) => b,

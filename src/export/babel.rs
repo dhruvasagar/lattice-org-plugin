@@ -15,6 +15,14 @@
 //! `#+PROPERTY:` and headline `header-args`, the block's own), so a block
 //! exports as it runs.
 //!
+//! **A block exporting its result runs**, as `org-export-use-babel` runs it:
+//! through babel's own runner, so only a configured language runs, with the
+//! same header-argument merge, `:var` chains, noweb and sessions. It runs on
+//! the export's copy of the file — its result goes into that copy and the
+//! file's `#+RESULTS:` is never touched. `:eval no-export` / `never-export`
+//! (and `no` / `never`) keep a block from running during an export, which
+//! then uses the result already in the file.
+//!
 //! **It is read in steps.** A whole-file pass in one call would exceed what
 //! one guest call may spend on a large file, so [`Scan`] reads each chunk as
 //! the parse does, carrying the headlines open across chunks; a chunk starts
@@ -22,11 +30,18 @@
 //! that names no `:exports` of its own waits for the file's `#+PROPERTY:`
 //! lines, which may come after it, and is resolved once the parse is done.
 
+use std::collections::{HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::rc::Rc;
 
-use crate::babel::block::{drawer_properties, headline_level, inherit, src_blocks};
+use crate::babel::block::{
+    drawer_properties, effective_header_args, headline_level, inherit, src_blocks, SrcBlock,
+};
 use crate::babel::header_args::HeaderArgs;
+use crate::babel::results::Insertion;
+use crate::babel::run::RunRequest;
+use crate::babel::Language;
+use crate::lattice::plugin_host::types::{EchoLevel, EchoPayload, Effect};
 
 /// What a block's `:exports` asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,17 +79,26 @@ impl Kept {
 /// The `header-args` properties above a point, outermost first.
 type Above = Rc<[(String, String)]>;
 
+/// Whether a block whose header arguments are `header` may run during an
+/// export: not when its `:eval` is `no` / `never`, or `no-export` /
+/// `never-export`, which say so for exports alone.
+pub(crate) fn evaluates_in_export(header: &HeaderArgs) -> bool {
+    let word = header
+        .get("eval")
+        .and_then(|w| w.first())
+        .map(|w| w.to_ascii_lowercase());
+    !matches!(
+        word.as_deref(),
+        Some("no" | "never" | "no-export" | "never-export")
+    )
+}
+
 /// One block found, with what decides its `:exports`.
 struct Found {
-    /// Its first line (its `#+NAME:` / `#+HEADER:` when it has them) to its
-    /// `#+end_src`.
-    block: RangeInclusive<u32>,
-    results: Option<RangeInclusive<u32>>,
-    /// `None` until resolved: a block naming its own `:exports` is resolved
-    /// when found, since its own header arguments win.
-    kept: Option<Kept>,
-    lang: String,
-    own: HeaderArgs,
+    /// The block, its lines the file's.
+    src: SrcBlock,
+    /// What `:exports` keeps and whether it runs; `None` until resolved.
+    kept: Option<(Kept, bool)>,
     above: Above,
 }
 
@@ -101,18 +125,17 @@ impl Scan {
                 self.enter(level, lines, i);
             }
             while blocks.peek().is_some_and(|b| b.first_line as usize == i) {
-                let Some(b) = blocks.next() else { break };
-                let shift = |l: u32| l + first_line;
-                let kept = b.header.get("exports").map(|w| Kept::parse(Some(w)));
+                let Some(mut src) = blocks.next() else { break };
+                src.first_line += first_line;
+                src.begin_line += first_line;
+                src.end_line += first_line;
+                if let Some(r) = src.results.as_mut() {
+                    r.keyword_line += first_line;
+                    r.end_line += first_line;
+                }
                 self.found.push(Found {
-                    block: shift(b.first_line)..=shift(b.end_line),
-                    results: b
-                        .results
-                        .as_ref()
-                        .map(|r| shift(r.keyword_line)..=shift(r.end_line)),
-                    kept,
-                    lang: b.lang,
-                    own: b.header,
+                    src,
+                    kept: None,
                     above: Rc::clone(&self.above),
                 });
             }
@@ -160,18 +183,28 @@ impl Scan {
             if done == count {
                 break;
             }
-            if found.kept.is_none() {
-                let levels = props
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), *v))
-                    .chain(found.above.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-                let header = inherit(levels, &found.lang, &found.own);
-                found.kept = Some(Kept::parse(header.get("exports")));
-                done += 1;
-            }
+            let levels = props
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .chain(found.above.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            let header = inherit(levels, &found.src.lang, &found.src.header);
+            let kept = Kept::parse(header.get("exports"));
+            found.kept = Some((kept, kept.keeps_results() && evaluates_in_export(&header)));
+            done += 1;
             self.next += 1;
         }
         self.next > start
+    }
+
+    /// The blocks whose result the export shows and that may run for it,
+    /// in order; within `lines` (a subtree's) when given.
+    pub(crate) fn runnable(&self, lines: Option<(u32, u32)>) -> Vec<SrcBlock> {
+        self.found
+            .iter()
+            .filter(|f| f.kept.is_some_and(|(_, runs)| runs))
+            .filter(|f| lines.is_none_or(|(from, to)| (from..to).contains(&f.src.begin_line)))
+            .map(|f| f.src.clone())
+            .collect()
     }
 
     /// What the scan found to leave out. Blocks not resolved keep `code`,
@@ -179,15 +212,142 @@ impl Scan {
     pub(crate) fn finish(self) -> Exports {
         let mut left_out = Vec::new();
         for found in self.found {
-            let kept = found.kept.unwrap_or(Kept::Code);
+            let kept = found.kept.map_or(Kept::Code, |(k, _)| k);
             if !kept.keeps_code() {
-                left_out.push(found.block);
+                left_out.push(found.src.first_line..=found.src.end_line);
             }
-            if let Some(results) = found.results.filter(|_| !kept.keeps_results()) {
-                left_out.push(results);
+            if let Some(r) = found.src.results.filter(|_| !kept.keeps_results()) {
+                left_out.push(r.keyword_line..=r.end_line);
             }
         }
         Exports { left_out }
+    }
+}
+
+/// How one of an export's blocks ended, as babel's jobs tell the export.
+#[derive(Debug)]
+pub(crate) enum Settled {
+    /// It ran: its result, formatted as `#+RESULTS:` would hold it, and how
+    /// that goes in.
+    Ran {
+        key: String,
+        body: Vec<String>,
+        insertion: Insertion,
+    },
+    /// It will not run: it could not start, what it needed failed, or its
+    /// batch was stopped. The copy keeps the result it had.
+    Not,
+    /// It was cancelled, and the export with it.
+    Cancelled,
+}
+
+/// The runs an export plans, a few blocks a step: each plan reads the
+/// whole file more than once (header arguments, `:var`, noweb), so a
+/// file's every block in one call could exceed a call's budget.
+pub(crate) struct Planning {
+    /// The blocks the export shows the results of, still to plan.
+    queue: VecDeque<SrcBlock>,
+    languages: Vec<Language>,
+    /// The blocks planned, by `#+begin_src` line, each once.
+    planned: HashSet<u32>,
+    /// The names of the blocks planned, for the `:var`s of later ones.
+    scheduled: Vec<String>,
+    pub(crate) runs: Vec<RunRequest>,
+    /// What runs, for the question.
+    chosen: Vec<(SrcBlock, Language)>,
+    /// The languages with no `org.babel.languages` entry, once each.
+    unconfigured: Vec<String>,
+    pub(crate) notes: Vec<Effect>,
+}
+
+impl Planning {
+    /// The plan for `blocks`, the ones a scan found runnable, in `languages`.
+    pub(crate) fn new(blocks: Vec<SrcBlock>, languages: Vec<Language>) -> Self {
+        Self {
+            queue: blocks.into(),
+            languages,
+            planned: HashSet::new(),
+            scheduled: Vec::new(),
+            runs: Vec::new(),
+            chosen: Vec::new(),
+            unconfigured: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Plan up to `count` more of the blocks, and what each needs run first
+    /// (babel's `:var` chain). `Ok(true)` while blocks are left; `Err` is
+    /// why the export cannot run them, as babel refuses such a run.
+    pub(crate) fn step(
+        &mut self,
+        lines: &[&str],
+        buffer: u32,
+        export: u64,
+        base: Option<&str>,
+        count: usize,
+    ) -> Result<bool, String> {
+        for _ in 0..count {
+            let Some(root) = self.queue.pop_front() else {
+                break;
+            };
+            let root_line = root.begin_line;
+            for block in crate::babel::run::expand(lines, std::slice::from_ref(&root))? {
+                if !self.planned.insert(block.begin_line) {
+                    continue;
+                }
+                // What a chained `:var` needs runs only as the root would:
+                // its own `:eval` may keep it from running for an export.
+                if block.begin_line != root_line
+                    && !evaluates_in_export(&effective_header_args(lines, &block))
+                {
+                    continue;
+                }
+                let Some(lang) = self.languages.iter().find(|l| l.name == block.lang) else {
+                    if !self.unconfigured.contains(&block.lang) {
+                        self.unconfigured.push(block.lang.clone());
+                    }
+                    continue;
+                };
+                let mut run = crate::babel::run::request(
+                    buffer,
+                    lines,
+                    &block,
+                    lang,
+                    base,
+                    &mut self.scheduled,
+                    &mut self.notes,
+                )?;
+                run.export = Some(export);
+                self.runs.push(run);
+                self.chosen.push((block, lang.clone()));
+            }
+        }
+        if !self.queue.is_empty() {
+            return Ok(true);
+        }
+        if !self.unconfigured.is_empty() {
+            self.notes.push(Effect::Echo(EchoPayload {
+                level: EchoLevel::Info,
+                text: format!(
+                    "org: the export uses the results in the file for {} — no \
+                     org.babel.languages entry runs {}",
+                    self.unconfigured.join(", "),
+                    if self.unconfigured.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    }
+                ),
+            }));
+        }
+        Ok(false)
+    }
+
+    /// The question asked before the runs start.
+    pub(crate) fn prompt(&self) -> String {
+        let chosen: Vec<(&SrcBlock, Language)> =
+            self.chosen.iter().map(|(b, l)| (b, l.clone())).collect();
+        format!("Export runs {}? (y/n)", crate::babel::run::tally(&chosen))
     }
 }
 

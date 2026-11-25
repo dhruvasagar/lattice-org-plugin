@@ -100,6 +100,12 @@ impl View {
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+
+    /// Stop the export for `why`, unless something already has: the first
+    /// reason is the one the user is told.
+    pub(crate) fn fail(&mut self, why: String) {
+        self.error.get_or_insert(why);
+    }
 }
 use super::parse::{Block, BlockKind, Doc, Element, ElementKind, Headline, Item, List, Row, Table};
 

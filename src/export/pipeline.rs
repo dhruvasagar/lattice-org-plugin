@@ -7,27 +7,30 @@
 //! arrives: an export sees the buffer as it was then, unsaved edits
 //! included, as emacs's does, and edits made while it runs do not reach it.
 //!
-//! **Stepped.** One events-seam call has a fuel budget, and parsing a large
-//! file does not fit in it, nor does rendering one (lattice's
-//! `org-export.md` §7). So a [`Run`] does about [`STEP_BYTES`] of work per
-//! call and emits [`EV_STEP`] to itself for the next, the way the roam scan
-//! walks a corpus: first the parse, a chunk of source per step, then the
-//! render, a run of headlines per step.
-//! Chunks are cut at headlines, where no org element can continue, so the
-//! chunked parse is the whole-file parse. Runs live in guest memory between steps: a new export of the same
+//! **Stepped.** One events-seam call has a fuel budget, and nothing done
+//! over the whole of a large file fits in it (lattice's `org-export.md`
+//! §7). So a [`Run`] does about [`STEP_BYTES`] of work per call and emits
+//! [`EV_STEP`] to itself for the next, the way the roam scan walks a corpus:
+//! the includes, the parse a chunk of source per step, then three walks over
+//! the headlines a run at a time ([`Phase`]): numbering the outline, the
+//! writer's pass before the body, and the body. Chunks are cut at headlines,
+//! where no org element can continue, so the chunked parse is the whole-file
+//! parse. Runs live in guest memory between steps: a new export of the same
 //! target replaces the one in flight, and an export of another runs beside
 //! it.
 //!
-//! HTML is written by its transcoder ([`super::html`]). Markdown and LaTeX
-//! are placeholders still: the parse tree, in the format's document shell.
+//! The writers are [`super::html`], [`super::markdown`] and
+//! [`super::latex`], each told the outline and then each headline in turn.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ops::Range;
 
+use super::common::{advance, at, Outline, OutlineWalk};
 use super::filter::{self, Selection, View};
 use super::html::{self, Html, Stylesheet};
 use super::include::Includes;
+use super::latex::{self, Latex};
 use super::markdown::{self, Markdown};
 use super::options::Options;
 use super::parse::{self, Context, Doc, ElementKind, FlatSection, Headline};
@@ -237,6 +240,9 @@ pub(crate) struct Run {
     host: Rc<dyn Host>,
     /// `org.export.html-stylesheet`, read when the export was asked for.
     stylesheet: Stylesheet,
+    /// About how many bytes a step parses or writes: [`STEP_BYTES`], or
+    /// another size in tests, which check that the steps change nothing.
+    budget: usize,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -247,19 +253,54 @@ struct Render {
     doc: Doc,
     view: View,
     selection: Selection,
+    phase: Phase,
     /// The next headline to visit, as indices from `doc.headlines` down
     /// through `children`; empty once the walk is over.
     next: Vec<usize>,
     out: String,
-    writer: Writer,
+}
+
+/// Where a render is. Each phase is a walk taken a budget at a time, so no
+/// call does work in proportion to the whole file.
+enum Phase {
+    /// Numbering the headlines. The writer is made from `settings` when the
+    /// outline is whole, since every backend reads it from the first byte.
+    Outline {
+        outline: Box<Outline>,
+        walk: OutlineWalk,
+        settings: Option<Settings>,
+    },
+    /// Writing. While `index` is `Some` it is the writer's pass before the
+    /// body (its table of contents, LaTeX's footnote definitions), and what
+    /// that has written so far; then the body, the headlines from `next` on.
+    Write {
+        writer: Writer,
+        index: Option<String>,
+    },
+}
+
+/// What a writer is made from, besides the outline.
+enum Settings {
+    Html(html::Settings),
+    Markdown(markdown::Settings),
+    Latex(latex::Settings),
 }
 
 /// What writes the output.
 enum Writer {
     Html(Box<Html>),
     Markdown(Box<Markdown>),
-    /// The placeholder: the filtered tree, dumped.
-    Dump,
+    Latex(Box<Latex>),
+}
+
+impl Writer {
+    fn new(settings: Settings, outline: Outline, view: &mut View) -> Writer {
+        match settings {
+            Settings::Html(s) => Writer::Html(Box::new(Html::new(outline, s))),
+            Settings::Markdown(s) => Writer::Markdown(Box::new(Markdown::new(outline, s))),
+            Settings::Latex(s) => Writer::Latex(Box::new(Latex::new(outline, s, view))),
+        }
+    }
 }
 
 impl Run {
@@ -313,8 +354,19 @@ impl Run {
             host,
             stylesheet,
             render: None,
+            budget: STEP_BYTES,
             text,
         })
+    }
+
+    /// The same run in steps of about `budget` bytes.
+    #[cfg(test)]
+    pub(crate) fn with_budget(mut self, budget: usize) -> Self {
+        self.budget = budget;
+        if self.includes.is_none() {
+            self.chunks = chunks(&self.text, budget);
+        }
+        self
     }
 
     /// One step: parse the next chunk, or prepare the render, or render the
@@ -332,7 +384,7 @@ impl Run {
                 let expanded = includes.finish();
                 self.line = expanded.line(self.request.line);
                 self.text = expanded.text;
-                self.chunks = chunks(&self.text, STEP_BYTES);
+                self.chunks = chunks(&self.text, self.budget);
             }
             return Step::More;
         }
@@ -361,22 +413,73 @@ impl Run {
                 Err(effects) => Step::Done(effects),
             };
         };
+        let (doc, view, out) = (&render.doc, &mut render.view, &mut render.out);
+        match &mut render.phase {
+            Phase::Outline {
+                outline,
+                walk,
+                settings,
+            } => {
+                if outline.step(walk, doc, &render.selection, view, self.budget) {
+                    let Some(settings) = settings.take() else {
+                        return Step::Done(vec![echo(
+                            EchoLevel::Error,
+                            "org: the export lost its settings",
+                        )]);
+                    };
+                    let writer = Writer::new(settings, std::mem::take(&mut **outline), view);
+                    render.phase = Phase::Write {
+                        writer,
+                        index: Some(String::new()),
+                    };
+                }
+                return match view.error() {
+                    Some(why) => Step::Done(vec![echo(EchoLevel::Error, why.to_string())]),
+                    None => Step::More,
+                };
+            }
+            Phase::Write {
+                writer,
+                index: index @ Some(_),
+            } => {
+                let Some(toc) = index.as_mut() else {
+                    return Step::More;
+                };
+                let done = match writer {
+                    Writer::Html(w) => w.index(view, toc, self.budget),
+                    Writer::Markdown(w) => w.index(view, toc, self.budget),
+                    Writer::Latex(w) => w.index(doc, self.budget),
+                };
+                if done {
+                    let toc = index.take().unwrap_or_default();
+                    match writer {
+                        Writer::Html(w) => w.begin(doc, view, toc, out),
+                        Writer::Markdown(w) => w.begin(doc, view, toc, out),
+                        Writer::Latex(w) => w.begin(doc, view, out),
+                    }
+                }
+                return match view.error() {
+                    Some(why) => Step::Done(vec![echo(EchoLevel::Error, why.to_string())]),
+                    None => Step::More,
+                };
+            }
+            Phase::Write { index: None, .. } => {}
+        }
+        let Phase::Write { writer, .. } = &mut render.phase else {
+            return Step::More;
+        };
         if !render.next.is_empty() {
-            let mut body = String::new();
             let from = render.out.len();
-            while !render.next.is_empty() && body.len() + render.out.len() - from < STEP_BYTES {
+            while !render.next.is_empty() && render.out.len() - from < self.budget {
                 let h = at(&render.doc, &render.next);
                 let visit = filter::visits(h, &render.selection, &render.view.options);
                 if visit {
-                    let depth = render.next.len() - 1;
                     let own = filter::own(h, &mut render.view);
-                    match &mut render.writer {
-                        Writer::Html(w) => w.headline(&own, &mut render.view, &mut render.out),
-                        Writer::Markdown(w) => w.headline(&own, &mut render.view, &mut render.out),
-                        Writer::Dump => {
-                            anchor_line(&mut body, &render.view, h.line, depth);
-                            parse::dump::headline(&mut body, &own, depth);
-                        }
+                    let (view, out) = (&mut render.view, &mut render.out);
+                    match writer {
+                        Writer::Html(w) => w.headline(&own, view, out),
+                        Writer::Markdown(w) => w.headline(&own, view, out),
+                        Writer::Latex(w) => w.headline(&own, view, out),
                     }
                 }
                 advance(&render.doc, &mut render.next, visit);
@@ -384,15 +487,14 @@ impl Run {
             if let Some(why) = render.view.error() {
                 return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
             }
-            render.out.push_str(&body);
             if !render.next.is_empty() {
                 return Step::More;
             }
         }
-        match &mut render.writer {
+        match writer {
             Writer::Html(w) => w.finish(&mut render.view, &mut render.out),
             Writer::Markdown(w) => w.finish(&mut render.view, &mut render.out),
-            Writer::Dump => render.out.push_str(shell_tail(self.request.body_only)),
+            Writer::Latex(w) => w.finish(&mut render.out),
         }
         if let Some(why) = render.view.error() {
             return Step::Done(vec![echo(EchoLevel::Error, why.to_string())]);
@@ -459,47 +561,30 @@ impl Run {
         } else {
             HashSet::new()
         };
-        let mut view = View::new(
+        let view = View::new(
             options,
             self.keywords.clone(),
             self.now,
             targets,
             Rc::clone(&self.host),
         );
-        let backend = self.request.backend;
-        let mut out = String::new();
-        let writer = if backend == Backend::Html {
-            let settings = html::Settings {
+        let settings = match self.request.backend {
+            Backend::Html => Settings::Html(html::Settings {
                 done: self.ctx.done_keywords.clone(),
                 source: self.request.source.clone(),
                 body_only: self.request.body_only,
                 stylesheet: self.stylesheet.clone(),
-            };
-            Writer::Html(Box::new(Html::start(
-                &doc, &selection, &mut view, settings, &mut out,
-            )))
-        } else if backend == Backend::Markdown {
-            let settings = markdown::Settings {
+            }),
+            Backend::Markdown => Settings::Markdown(markdown::Settings {
                 source: self.request.source.clone(),
                 body_only: self.request.body_only,
                 referred,
-            };
-            Writer::Markdown(Box::new(Markdown::start(
-                &doc, &selection, &mut view, settings, &mut out,
-            )))
-        } else {
-            let title = view.options.title.clone();
-            let title = filter::plain(&filter::objects(&title, &mut view));
-            out = shell_head(&title, self.request.body_only);
-            let mut body = parse::dump::options(&view.options);
-            let preamble = filter::elements(&doc.preamble, &mut view);
-            parse::dump::preamble(&mut body, &preamble);
-            out.push_str(&body);
-            Writer::Dump
+            }),
+            Backend::Latex => Settings::Latex(latex::Settings {
+                body_only: self.request.body_only,
+            }),
         };
-        if let Some(why) = view.error() {
-            return Err(vec![echo(EchoLevel::Error, why.to_string())]);
-        }
+        let (outline, walk) = Outline::begin(&doc, &view);
         let next = if doc.headlines.is_empty() {
             Vec::new()
         } else {
@@ -509,19 +594,15 @@ impl Run {
             doc,
             view,
             selection,
+            phase: Phase::Outline {
+                outline: Box::new(outline),
+                walk,
+                settings: Some(settings),
+            },
             next,
-            out,
-            writer,
+            out: String::new(),
         })
     }
-}
-
-/// The placeholder's line naming the anchor a headline's links go to.
-fn anchor_line(out: &mut String, view: &View, line: u32, depth: usize) {
-    out.push_str(&"  ".repeat(depth));
-    out.push_str("anchor ");
-    out.push_str(&view.targets().headline_anchor(line));
-    out.push('\n');
 }
 
 /// Take out of `doc` the innermost headline whose subtree holds `line`.
@@ -546,36 +627,6 @@ fn take_subtree(doc: &mut Doc, line: u32) -> Option<Headline> {
     Some(siblings.remove(last))
 }
 
-/// The headline at `path`, which [`advance`] keeps valid.
-fn at<'d>(doc: &'d Doc, path: &[usize]) -> &'d Headline {
-    let mut h = &doc.headlines[path[0]];
-    for &i in &path[1..] {
-        h = &h.children[i];
-    }
-    h
-}
-
-/// Move `path` to the next headline in document order: the first child when
-/// `descend` and there is one, else the next sibling of the nearest ancestor
-/// that has one. Empty at the end.
-fn advance(doc: &Doc, path: &mut Vec<usize>, descend: bool) {
-    if descend && !at(doc, path).children.is_empty() {
-        path.push(0);
-        return;
-    }
-    while let Some(i) = path.pop() {
-        let siblings = if path.is_empty() {
-            doc.headlines.len()
-        } else {
-            at(doc, path).children.len()
-        };
-        if i + 1 < siblings {
-            path.push(i + 1);
-            return;
-        }
-    }
-}
-
 /// Cut `text` into chunks of about `budget` bytes, each starting at a
 /// headline (or at the top of the file), as `(bytes, first line)`. One pass;
 /// an empty text is one empty chunk, so a run always takes a step.
@@ -594,27 +645,6 @@ fn chunks(text: &str, budget: usize) -> Vec<(Range<usize>, u32)> {
     }
     out.push((from..at, first));
     out
-}
-
-/// The placeholder LaTeX renderer: the parse tree, verbatim inside the
-/// document's shell, written in three parts.
-fn shell_head(title: &str, body_only: bool) -> String {
-    if body_only {
-        "\\begin{verbatim}\n".to_string()
-    } else {
-        format!(
-            "\\documentclass{{article}}\n\\title{{{title}}}\n\\begin{{document}}\n\
-             \\maketitle\n\\begin{{verbatim}}\n"
-        )
-    }
-}
-
-fn shell_tail(body_only: bool) -> &'static str {
-    if body_only {
-        "\\end{verbatim}\n"
-    } else {
-        "\\end{verbatim}\n\\end{document}\n"
-    }
 }
 
 fn echo(level: EchoLevel, text: impl Into<String>) -> Effect {
@@ -648,14 +678,6 @@ mod tests {
         }
     }
 
-    /// `text` without the placeholder's anchor lines, for tests about which
-    /// headlines are exported rather than what they are called.
-    fn without_anchors(text: &str) -> String {
-        text.split_inclusive('\n')
-            .filter(|l| !l.trim_start().starts_with("anchor "))
-            .collect()
-    }
-
     /// A host over an in-memory file system, with no roam index.
     struct Files(std::collections::HashMap<String, String>);
 
@@ -676,14 +698,16 @@ mod tests {
 
     /// Run `request` over `text` to the end, and the steps it took.
     fn run_counting(request: &Request, text: Option<String>) -> (Vec<Effect>, usize) {
-        run_with_files(request, text, &[])
+        run_with_files(request, text, &[], STEP_BYTES)
     }
 
-    /// [`run_counting`] where an include may read `files`.
+    /// [`run_counting`] where an include may read `files`, in steps of about
+    /// `budget` bytes.
     fn run_with_files(
         request: &Request,
         text: Option<String>,
         files: &[(&str, &str)],
+        budget: usize,
     ) -> (Vec<Effect>, usize) {
         let host = Rc::new(Files(
             files
@@ -701,7 +725,7 @@ mod tests {
             host,
             Stylesheet::None,
         ) {
-            Ok(run) => run,
+            Ok(run) => run.with_budget(budget),
             Err(effects) => return (effects, 0),
         };
         let mut steps = 0;
@@ -767,39 +791,45 @@ mod tests {
         r.body_only = true;
         let effects = run(&r, Some("* One\n".to_string()));
         let text = written(&effects).1;
-        assert!(text.starts_with("\\begin{verbatim}\noptions\n"), "{text}");
-        assert!(text.contains("\nheadline 1 @0"), "{text}");
-        assert!(!text.contains("documentclass"));
+        assert!(text.starts_with("\\section{One}\n"), "{text}");
+        assert!(
+            !text.contains("documentclass") && !text.contains("\\end{document}"),
+            "{text}"
+        );
+    }
+
+    /// The body of `text`'s export to Markdown, the plainest view of which
+    /// headlines it holds; for a subtree export when `line` is given.
+    fn markdown_body(text: &str, line: Option<u32>, files: &[(&str, &str)]) -> String {
+        let mut r = request(Backend::Markdown);
+        r.body_only = true;
+        if let Some(line) = line {
+            r.subtree = true;
+            r.line = line;
+        }
+        let (effects, _) = run_with_files(&r, Some(text.to_string()), files, STEP_BYTES);
+        written(&effects).1.to_string()
     }
 
     #[test]
     fn a_subtree_export_takes_the_headline_around_the_cursor() {
+        let text = "* One\nx\n* Two\ny\n** Deep\n* Three\n";
+        assert_eq!(
+            markdown_body(text, Some(2), &[]),
+            "# 1. Two\n\ny\n\n## 1.1. Deep\n"
+        );
         let mut r = request(Backend::Latex);
         r.subtree = true;
-        r.body_only = true;
         r.line = 2;
-        let effects = run(
-            &r,
-            Some("* One\nx\n* Two\ny\n** Deep\n* Three\n".to_string()),
-        );
-        let text = without_anchors(written(&effects).1);
+        let effects = run(&r, Some(text.to_string()));
         assert!(
-            text.contains("\n  title [\"Two\"]\n"),
-            "the headline titles it: {text}"
-        );
-        assert!(
-            text.ends_with(
-                "\nheadline 1 @2 [\"Two\"]\n  paragraph @3 \"y\"\n  headline 2 @4 [\"Deep\"]\n\\end{verbatim}\n"
-            ),
-            "{text}"
+            written(&effects).1.contains("\\title{Two}\n"),
+            "the headline titles it"
         );
         // In the section of a nested headline, the innermost one.
-        r.line = 5;
-        let effects = run(&r, Some("* One\nx\n* Two\ny\n** Deep\nz\n".to_string()));
-        let deep = without_anchors(written(&effects).1);
-        assert!(
-            deep.ends_with("\nheadline 2 @4 [\"Deep\"]\n  paragraph @5 \"z\"\n\\end{verbatim}\n"),
-            "{deep}"
+        assert_eq!(
+            markdown_body("* One\nx\n* Two\ny\n** Deep\nz\n", Some(5), &[]),
+            "# 1. Deep\n\nz\n"
         );
         r.line = 0;
         let outside = run(&r, Some("text\n* One\n".to_string()));
@@ -824,91 +854,54 @@ mod tests {
         assert_eq!(chunks("a\r\n* b\r\n", 1), vec![(0..3, 0), (3..8, 1)]);
     }
 
-    /// What the stepped walk should produce, computed in one go: the options
-    /// header, then the whole tree's filtered dump, by plain recursion.
-    fn filtered_dump(text: &str, ctx: &Context) -> String {
-        let lines: Vec<&str> = text.lines().collect();
-        let sections = parse::parse_chunk(&lines, 0, ctx);
-        let mut targets = Targets::default();
-        for section in &sections {
-            targets.collect(section);
-        }
-        let doc = parse::assemble(sections);
-        // Keywords count wherever they are, as in ox.
-        let mut keywords = Vec::new();
-        let mut sections = vec![&doc.preamble];
-        let mut stack: Vec<&Headline> = doc.headlines.iter().rev().collect();
-        while let Some(h) = stack.pop() {
-            sections.push(&h.section);
-            stack.extend(h.children.iter().rev());
-        }
-        for e in sections.into_iter().flatten() {
-            if let ElementKind::Keyword { key, value } = &e.kind {
-                keywords.push((key.clone(), value.clone()));
-            }
-        }
-        let o = Options::resolve(&keywords, None, "plan.org");
-        let sel = filter::selection(&doc, &o);
-        let mut out = parse::dump::options(&o);
-        targets.set_live(filter::live(&doc, &sel, &o), true);
-        let mut v = View::new(
-            o,
-            keywords,
-            When { local_secs: 0 },
-            targets,
-            Rc::new(Files(Default::default())),
+    /// Export `text` in steps of about `budget` bytes and in one step, check
+    /// the two are the same, and give the steps the first took.
+    fn steps_change_nothing(r: &Request, text: &str, budget: usize) -> usize {
+        let (stepped, steps) = run_with_files(r, Some(text.to_string()), &[], budget);
+        let (whole, one) = run_with_files(r, Some(text.to_string()), &[], usize::MAX);
+        assert!(
+            one <= 5,
+            "parse, prepare, outline, index, and the body with its finish: {one}"
         );
-        let preamble = filter::elements(&doc.preamble, &mut v);
-        parse::dump::preamble(&mut out, &preamble);
-        fn walk(out: &mut String, hs: &[Headline], depth: usize, sel: &Selection, v: &mut View) {
-            for h in hs {
-                if filter::visits(h, sel, &v.options) {
-                    let own = filter::own(h, v);
-                    anchor_line(out, v, h.line, depth);
-                    parse::dump::headline(out, &own, depth);
-                    walk(out, &h.children, depth + 1, sel, v);
-                }
-            }
-        }
-        walk(&mut out, &doc.headlines, 0, &sel, &mut v);
-        out
+        assert!(
+            written(&stepped).1 == written(&whole).1,
+            "{:?} in steps of {budget} differs from the export in one",
+            r.backend
+        );
+        steps
     }
 
-    /// A file larger than a step is parsed over several, and the tree is the
-    /// one parsing it whole gives.
+    /// A file larger than a step is parsed and written over several, and the
+    /// output is the one exporting it whole gives, for every backend.
     #[test]
-    fn a_large_file_is_parsed_in_steps_into_the_whole_files_tree() {
-        let section = format!("* TODO Heading\n{}\n", "- item\n  text\n".repeat(200));
+    fn a_large_file_is_exported_in_steps_into_the_whole_files_output() {
+        let section = format!(
+            "* TODO Heading\n{}\nSee [[*Heading]].\n",
+            "- item\n  text\n".repeat(200)
+        );
         let text = section.repeat(1 + 3 * STEP_BYTES / section.len());
-        let mut r = request(Backend::Latex);
-        r.body_only = true;
-        let (effects, steps) = run_counting(&r, Some(text.clone()));
-        assert!(steps > 3, "{steps} steps");
-        let ctx = Context::for_file("", vec!["TODO DONE".to_string()]);
-        let whole = filtered_dump(&text, &ctx);
-        assert_eq!(
-            written(&effects).1,
-            format!("\\begin{{verbatim}}\n{whole}\\end{{verbatim}}\n")
-        );
+        for backend in [Backend::Html, Backend::Markdown, Backend::Latex] {
+            let mut r = request(backend);
+            r.body_only = true;
+            let steps = steps_change_nothing(&r, &text, STEP_BYTES);
+            assert!(
+                steps > 6,
+                "{backend:?}: parse and render both step: {steps}"
+            );
+        }
     }
 
-    /// The render walks the outline in document order: nested, sibling and
-    /// level-skipping headlines come out as the whole tree's dump has them.
+    /// The walk is the same however it is cut: each corpus file, exported a
+    /// headline a step, is the export done in one, for every backend.
     #[test]
-    fn the_render_walks_every_headline_in_order() {
+    fn steps_of_any_size_give_the_same_export() {
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/export/parse/testdata");
-        let mut r = request(Backend::Latex);
-        r.body_only = true;
         for name in ["headlines", "lists", "blocks", "misc", "objects"] {
             let text = std::fs::read_to_string(dir.join(format!("{name}.org"))).expect("corpus");
-            let ctx = Context::for_file(&text, vec!["TODO DONE".to_string()]);
-            let whole = filtered_dump(&text, &ctx);
-            assert_eq!(
-                written(&run(&r, Some(text))).1,
-                format!("\\begin{{verbatim}}\n{whole}\\end{{verbatim}}\n"),
-                "{name}"
-            );
+            for backend in [Backend::Html, Backend::Markdown, Backend::Latex] {
+                steps_change_nothing(&request(backend), &text, 1);
+            }
         }
     }
 
@@ -943,28 +936,23 @@ mod tests {
             ),
             ("/notes/part.org", "* A\n* B\n"),
         ];
-        let mut r = request(Backend::Latex);
-        let (effects, steps) = run_with_files(&r, Some(text.to_string()), &files);
-        let out = without_anchors(written(&effects).1);
-        assert!(out.contains("\\title{By Ada}\n"), "{out}");
-        assert!(
-            out.contains("headline 1 @2 [\"One\"]\n  headline 2 @3 [\"A\"]\n  headline 2 @4 [\"B\"]\nheadline 1 @5"),
-            "{out}"
-        );
+        let r = request(Backend::Latex);
+        let (effects, steps) = run_with_files(&r, Some(text.to_string()), &files, STEP_BYTES);
+        assert!(written(&effects).1.contains("\\title{By Ada}\n"));
         assert!(steps >= 4, "an include a step: {steps}");
-
-        r.subtree = true;
-        r.body_only = true;
-        r.line = 4; // `y`, under Two, past both includes.
-        let (effects, _) = run_with_files(&r, Some(text.to_string()), &files);
-        let out = without_anchors(written(&effects).1);
-        assert!(out.contains("\n  title [\"Two\"]\n"), "{out}");
-        assert!(
-            out.ends_with("\nheadline 1 @5 [\"Two\"]\n  paragraph @6 \"y\"\n\\end{verbatim}\n"),
-            "{out}"
+        assert_eq!(
+            markdown_body(text, None, &files),
+            "# 1. One\n\n## 1.1. A\n\n## 1.2. B\n\n# 2. Two\n\ny\n"
         );
+        // `y`, under Two, past both includes.
+        assert_eq!(markdown_body(text, Some(4), &files), "# 1. Two\n\ny\n");
 
-        let (effects, _) = run_with_files(&request(Backend::Html), Some(text.to_string()), &[]);
+        let (effects, _) = run_with_files(
+            &request(Backend::Html),
+            Some(text.to_string()),
+            &[],
+            STEP_BYTES,
+        );
         assert!(
             matches!(&effects[..], [Effect::Echo(e)] if e.text == "org: cannot include /notes/setup.org: missing"),
             "{effects:?}"

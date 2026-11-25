@@ -284,7 +284,8 @@ async fn settle(editor: &mut Editor, done: impl Fn(&Editor) -> bool) {
         let woke = tokio::time::timeout_at(deadline, landed.notified()).await;
         assert!(
             woke.is_ok(),
-            "did not settle; the buffer is:\n{}",
+            "did not settle; echo {:?}; the buffer is:\n{}",
+            last_echo(editor),
             text(editor)
         );
         editor.run_tick_pending();
@@ -413,6 +414,36 @@ async fn an_export_lands_on_disk_without_a_further_keypress() {
         last_echo(e).as_deref() == Some("Exported notes.html")
     })
     .await;
+}
+
+/// `l l` writes ox-latex's document beside the file: the preamble, a
+/// labelled section a headline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_latex_export_writes_the_document() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    let tex = base.path().join("notes.tex");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "ll");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Exported notes.tex")
+    })
+    .await;
+    let written = std::fs::read_to_string(&tex).unwrap();
+    assert!(
+        written
+            .starts_with("% Intended LaTeX compiler: pdflatex\n\\documentclass[11pt]{article}\n"),
+        "{written}"
+    );
+    assert!(written.contains("\\title{Plan}\n"), "{written}");
+    assert!(
+        written.contains("\\section{One}\n\\label{") && written.contains("first <b>\n"),
+        "{written}"
+    );
+    assert!(written.ends_with("\\end{document}\n"), "{written}");
 }
 
 fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {

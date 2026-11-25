@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use super::common::{self, Definition, Footnotes, Outline};
-use super::filter::{self, Selection, View};
+use super::filter::{self, View};
 use super::options::{Options, Tags, Tex};
 use super::parse::objects::{Emphasis, Object};
 use super::parse::{
@@ -47,6 +47,9 @@ pub(crate) struct Markdown {
     /// next one: its nesting is how many are, not its level, since levels
     /// may skip and an indent with no item above it is a code block.
     deep: Vec<usize>,
+    body_only: bool,
+    /// The next contents entry [`Markdown::index`] writes.
+    toc_next: usize,
 }
 
 /// `text` with every line after the first indented by `width` spaces, as a
@@ -223,14 +226,8 @@ fn is_raw_backend(backend: &str) -> bool {
 }
 
 impl Markdown {
-    /// Number the headlines, write the contents and the preamble.
-    pub(crate) fn start(
-        doc: &Doc,
-        selection: &Selection,
-        view: &mut View,
-        settings: Settings,
-        out: &mut String,
-    ) -> Markdown {
+    /// The writer for a numbered outline.
+    pub(crate) fn new(outline: Outline, settings: Settings) -> Markdown {
         let Settings {
             source,
             body_only,
@@ -240,57 +237,64 @@ impl Markdown {
             .parent()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
-        let outline = Outline::new(doc, selection, view);
-        let mut anchored = referred;
-        if !body_only {
-            anchored.extend(outline.toc.iter().map(|e| e.anchor.clone()));
-        }
-        let mut md = Markdown {
+        Markdown {
             outline,
             footnotes: Footnotes::default(),
-            anchored,
+            anchored: referred,
             dir,
             deep: Vec::new(),
-        };
-        if !body_only {
-            let toc = md.toc(view);
-            push_block(out, &toc);
+            body_only,
+            toc_next: 0,
         }
-        let preamble = filter::elements(&doc.preamble, view);
-        let body = md.blocks(&preamble, view);
-        push_block(out, &body);
-        md
     }
 
-    /// The contents: a nested list of links, four spaces a level.
-    fn toc(&mut self, view: &mut View) -> String {
-        let toc = std::mem::take(&mut self.outline.toc);
-        let top = toc.iter().map(|e| e.level).min().unwrap_or(1);
-        let mut out = String::new();
-        for e in &toc {
+    /// Write the next contents entries, about `budget` bytes of them, into
+    /// `toc`: `true` once all are. A nested list of links, four spaces a
+    /// level; a numbered entry is an ordered item numbered as its headline,
+    /// so the nested lists read as the outline's numbers (ox-md's shape).
+    /// Every listed heading is anchored, since the contents links to it.
+    pub(crate) fn index(&mut self, view: &mut View, toc: &mut String, budget: usize) -> bool {
+        if self.body_only {
+            return true;
+        }
+        let from = toc.len();
+        let top = self.outline.toc_top;
+        // Out of the outline while `self` writes, and back after.
+        let entries = std::mem::take(&mut self.outline.toc);
+        while self.toc_next < entries.len() && toc.len() - from < budget {
+            let e = &entries[self.toc_next];
+            self.toc_next += 1;
             let mut title = String::new();
             self.plain_objects(&e.title, view, &mut title);
-            // A numbered entry is an ordered item numbered as its headline,
-            // so the nested lists read as the outline's numbers; ox-md's
-            // shape.
             let bullet = match e.number.as_deref().and_then(|n| n.rsplit('.').next()) {
                 Some(last) => format!("{last}."),
                 None => "-".to_string(),
             };
-            if !out.is_empty() {
-                out.push('\n');
+            if !toc.is_empty() {
+                toc.push('\n');
             }
-            out.push_str(&format!(
+            toc.push_str(&format!(
                 "{}{bullet} [{}](#{})",
                 " ".repeat(4 * (e.level - top)),
                 title.trim(),
                 e.anchor
             ));
             if !e.tags.is_empty() {
-                out.push_str(&format!("   `:{}:`", e.tags.join(":")));
+                toc.push_str(&format!("   `:{}:`", e.tags.join(":")));
             }
+            self.anchored.insert(e.anchor.clone());
         }
-        out
+        let done = self.toc_next == entries.len();
+        self.outline.toc = entries;
+        done
+    }
+
+    /// Write the contents and the text before the first headline.
+    pub(crate) fn begin(&mut self, doc: &Doc, view: &mut View, toc: String, out: &mut String) {
+        push_block(out, &toc);
+        let preamble = filter::elements(&doc.preamble, view);
+        let body = self.blocks(&preamble, view);
+        push_block(out, &body);
     }
 
     /// One visited headline, already filtered (`filter::own`).

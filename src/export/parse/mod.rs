@@ -19,6 +19,8 @@
 //! lookup per line, not a scan to the end of the section per line. Nesting
 //! deeper than [`MAX_DEPTH`] is read as text rather than recursed into.
 
+/// The tree as text, for the parser's and filter's golden tests.
+#[cfg(test)]
 pub(crate) mod dump;
 mod element;
 pub(crate) mod objects;
@@ -102,6 +104,7 @@ pub(crate) struct Affiliated {
 }
 
 impl Affiliated {
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }

@@ -18,7 +18,7 @@
 use std::fmt::Write as _;
 
 use super::common::{self, Definition, Footnotes, Outline};
-use super::filter::{self, Selection, View};
+use super::filter::{self, View};
 use super::options::{Options, Tags, Tex};
 use super::parse::objects::{Emphasis, Object};
 use super::parse::{
@@ -87,6 +87,11 @@ pub(crate) struct Html {
     source: String,
     dir: String,
     body_only: bool,
+    stylesheet: Stylesheet,
+    /// The next contents entry [`Html::index`] writes, and how deep the
+    /// lists it has open are.
+    toc_next: usize,
+    toc_depth: usize,
     footnotes: Footnotes,
     figures: usize,
     tables: usize,
@@ -141,15 +146,8 @@ fn attributes(element: &Element, skip: &[&str]) -> String {
 }
 
 impl Html {
-    /// Number the headlines, write everything before the first headline, and
-    /// keep what the rest of the walk needs.
-    pub(crate) fn start(
-        doc: &Doc,
-        selection: &Selection,
-        view: &mut View,
-        settings: Settings,
-        out: &mut String,
-    ) -> Html {
+    /// The writer for a numbered outline.
+    pub(crate) fn new(outline: Outline, settings: Settings) -> Html {
         let Settings {
             done,
             source,
@@ -160,35 +158,35 @@ impl Html {
             .parent()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
-        let mut html = Html {
+        Html {
             open: Vec::new(),
-            outline: Outline::new(doc, selection, view),
+            outline,
             done,
             dir,
             source,
             body_only,
+            stylesheet,
+            toc_next: 0,
+            toc_depth: 0,
             footnotes: Footnotes::default(),
             figures: 0,
             tables: 0,
             listings: 0,
             mathjax: false,
             head_end: None,
-        };
-        let toc = html.toc(view);
-        if !body_only {
-            html.head(view, &stylesheet, out);
         }
-        out.push_str(&toc);
-        let preamble = filter::elements(&doc.preamble, view);
-        html.elements(&preamble, view, out);
-        html
     }
 
-    /// The table of contents, from the outline's entries.
-    fn toc(&mut self, view: &mut View) -> String {
-        let toc = std::mem::take(&mut self.outline.toc);
-        let mut entries: Vec<(usize, &str, String)> = Vec::new();
-        for e in &toc {
+    /// Write the next table-of-contents entries, about `budget` bytes of
+    /// them, into `toc`: `true` once all are, and the table closed.
+    pub(crate) fn index(&mut self, view: &mut View, toc: &mut String, budget: usize) -> bool {
+        let from = toc.len();
+        // Out of the outline while `self` writes, and back after.
+        let entries = std::mem::take(&mut self.outline.toc);
+        while self.toc_next < entries.len() && toc.len() - from < budget {
+            let e = &entries[self.toc_next];
+            let first = self.toc_next == 0;
+            self.toc_next += 1;
             let mut entry = String::new();
             if let Some(n) = &e.number {
                 let _ = write!(entry, "{n}. ");
@@ -197,41 +195,55 @@ impl Html {
             if !e.tags.is_empty() {
                 self.tags(&e.tags, &mut entry);
             }
-            entries.push((e.level, &e.anchor, entry));
-        }
-        if entries.is_empty() {
-            return String::new();
-        }
-        let mut toc = String::from(
-            "<div id=\"table-of-contents\" role=\"doc-toc\">\n<h2>Table of Contents</h2>\n\
-             <div id=\"text-table-of-contents\" role=\"doc-toc\">\n",
-        );
-        let mut depth = 0;
-        for (i, (level, anchor, entry)) in entries.iter().enumerate() {
-            if i == 0 || *level > depth {
-                while depth < *level {
+            if first {
+                toc.push_str(
+                    "<div id=\"table-of-contents\" role=\"doc-toc\">\n<h2>Table of Contents</h2>\n\
+                     <div id=\"text-table-of-contents\" role=\"doc-toc\">\n",
+                );
+            }
+            let level = e.level;
+            if first || level > self.toc_depth {
+                while self.toc_depth < level {
                     toc.push_str("<ul>\n");
-                    depth += 1;
-                    if depth < *level {
+                    self.toc_depth += 1;
+                    if self.toc_depth < level {
                         toc.push_str("<li>");
                     }
                 }
             } else {
                 toc.push_str("</li>\n");
-                while depth > *level {
+                while self.toc_depth > level {
                     toc.push_str("</ul>\n</li>\n");
-                    depth -= 1;
+                    self.toc_depth -= 1;
                 }
             }
-            let _ = write!(toc, "<li><a href=\"#{}\">{entry}</a>", escaped(anchor));
+            let _ = write!(toc, "<li><a href=\"#{}\">{entry}</a>", escaped(&e.anchor));
         }
-        toc.push_str("</li>\n");
-        while depth > 1 {
-            toc.push_str("</ul>\n</li>\n");
-            depth -= 1;
+        let done = self.toc_next == entries.len();
+        if done && !entries.is_empty() && self.toc_depth > 0 {
+            toc.push_str("</li>\n");
+            while self.toc_depth > 1 {
+                toc.push_str("</ul>\n</li>\n");
+                self.toc_depth -= 1;
+            }
+            toc.push_str("</ul>\n</div>\n</div>\n");
+            // Closed: a later call writes nothing.
+            self.toc_depth = 0;
         }
-        toc.push_str("</ul>\n</div>\n</div>\n");
-        toc
+        self.outline.toc = entries;
+        done
+    }
+
+    /// Write the head, the table of contents and the text before the first
+    /// headline.
+    pub(crate) fn begin(&mut self, doc: &Doc, view: &mut View, toc: String, out: &mut String) {
+        if !self.body_only {
+            let stylesheet = self.stylesheet.clone();
+            self.head(view, &stylesheet, out);
+        }
+        out.push_str(&toc);
+        let preamble = filter::elements(&doc.preamble, view);
+        self.elements(&preamble, view, out);
     }
 
     fn head(&mut self, view: &mut View, stylesheet: &Stylesheet, out: &mut String) {
@@ -668,7 +680,7 @@ impl Html {
                 Some(Align::Left) => "org-left",
                 Some(Align::Center) => "org-center",
                 Some(Align::Right) => "org-right",
-                None if numeric_column(t, i) => "org-right",
+                None if common::numeric_column(t, i) => "org-right",
                 None => "org-left",
             })
             .collect();
@@ -1095,35 +1107,6 @@ impl Html {
         }
         out.push_str("\n</div>\n</div>\n");
     }
-}
-
-/// Whether most of a column's non-empty cells are numbers: such a column is
-/// right-aligned, as org's `org-table-number-fraction` has it.
-fn numeric_column(t: &Table, column: usize) -> bool {
-    let (mut numbers, mut filled) = (0, 0);
-    for r in &t.rows {
-        let Row::Cells(cells) = r else { continue };
-        let Some(cell) = cells.get(column) else {
-            continue;
-        };
-        let text = filter::plain(cell);
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        filled += 1;
-        let number = text
-            .trim_start_matches(['+', '-'])
-            .replace([',', '.'], "")
-            .trim_end_matches('%')
-            .chars()
-            .all(|c| c.is_ascii_digit())
-            && text.chars().any(|c| c.is_ascii_digit());
-        if number {
-            numbers += 1;
-        }
-    }
-    filled > 0 && numbers * 2 >= filled
 }
 
 /// Text: escaped, `--`/`---`/`...`/`\-` as typography when `-:` is on, and

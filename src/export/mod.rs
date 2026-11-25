@@ -14,6 +14,7 @@ pub(crate) mod common;
 pub(crate) mod filter;
 pub(crate) mod html;
 pub(crate) mod include;
+pub(crate) mod latex;
 pub(crate) mod macros;
 pub(crate) mod markdown;
 pub(crate) mod options;

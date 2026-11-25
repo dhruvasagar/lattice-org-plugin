@@ -49,9 +49,16 @@ the lattice release that carries it.
   its language, task-list checkboxes, autolinks, `$…$` math, and raw
   `#+begin_export markdown` / `@@md:…@@`. A heading carries an anchor only
   when something links to it, and text that Markdown would read as markup
-  stays text. `\vert` puts a `|` in a table cell, as in emacs. LaTeX output
-  is still a placeholder (the parsed outline, verbatim) until its writer
-  lands.
+  stays text. `\vert` puts a `|` in a table cell, as in emacs.
+  LaTeX is written in emacs's `ox-latex` shape, so a `#+LATEX_HEADER` written
+  for emacs works here: its preamble and default packages, `#+LATEX_CLASS`
+  (`article`, `report` or `book`, with their sectioning; another class stops
+  the export, naming it), `#+LATEX_CLASS_OPTIONS`, `\hypersetup`, the title
+  block and table of contents, headlines below `H:` as list items, `\label` on
+  every headline so internal links are `\ref` / `\hyperref`, footnotes at
+  their first reference, `tabular` tables, `verbatim` source, figures with
+  captions, the ten specials escaped, and raw `#+begin_export latex` /
+  `@@latex:…@@` / `#+LATEX:` passed through.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

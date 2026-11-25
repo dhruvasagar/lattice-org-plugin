@@ -26,6 +26,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use super::babel::Exports;
 use super::macros::{Expansion, Macros};
 use super::options::{BrokenLinks, Options, SubSuperscripts, Tex, Timestamps};
 use super::parse::objects::{self as parse_objects, Emphasis, Object};
@@ -54,6 +55,8 @@ pub(crate) struct View {
     /// made a radio link.
     in_link: bool,
     host: Rc<dyn Host>,
+    /// What the source blocks' `:exports` leave out.
+    exports: Exports,
 }
 
 impl View {
@@ -81,7 +84,13 @@ impl View {
             radios,
             in_link: false,
             host,
+            exports: Exports::default(),
         }
+    }
+
+    /// This view, leaving out what `exports` says.
+    pub(crate) fn leaving_out(self, exports: Exports) -> Self {
+        Self { exports, ..self }
     }
 
     /// The link targets, for the anchors a backend writes.
@@ -213,6 +222,9 @@ pub(crate) fn elements(list: &[Element], v: &mut View) -> Vec<Element> {
 }
 
 fn element(e: &Element, v: &mut View) -> Option<Element> {
+    if v.exports.leaves_out(e.line) {
+        return None;
+    }
     let o = &v.options;
     let dropped = match &e.kind {
         ElementKind::Comment(_) => true,

@@ -10,6 +10,7 @@
 //! `org/export-requested` and returns; the export itself happens on the events
 //! seam ([`pipeline`]), and its result is posted back.
 
+pub(crate) mod babel;
 pub(crate) mod common;
 pub(crate) mod filter;
 pub(crate) mod html;

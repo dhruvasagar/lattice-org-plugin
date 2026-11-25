@@ -89,6 +89,12 @@ the lattice release that carries it.
   compiler runs until your config file names one (a value set with `:set` is
   not granted), and until then `l p` writes the `.tex` and says how.
   `:org-export-cancel` stops a running export and its compile.
+- **Export honours `:exports`.** A source block exports as emacs exports
+  it: `code` (the default) shows the block and leaves its `#+RESULTS:` out,
+  `results` shows only the result, `both` shows both, and `none` shows
+  neither. The value is inherited as babel inherits it, from the file's and
+  the headlines' `header-args`. Before this, every block and every result
+  was exported.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

@@ -64,6 +64,11 @@ pub(crate) const EV_CANCEL: &str = "org/export-cancel";
 /// budget at that rate, leaving room for denser text.
 const STEP_BYTES: usize = 64 * 1024;
 
+/// How many source blocks a step resolves the `:exports` of, once the
+/// file's properties are known: each is a header-argument merge of a few
+/// short strings, so this many is a small part of a step's budget.
+const BLOCKS_PER_STEP: usize = 512;
+
 /// An output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Backend {
@@ -347,6 +352,8 @@ pub(crate) struct Run {
     /// About how many bytes a step parses or writes: [`STEP_BYTES`], or
     /// another size in tests, which check that the steps change nothing.
     budget: usize,
+    /// What the source blocks' `:exports` leave out, read with the chunks.
+    scan: super::babel::Scan,
     /// Set once the parse is done.
     render: Option<Render>,
 }
@@ -457,6 +464,7 @@ impl Run {
             targets: Targets::default(),
             host,
             configured,
+            scan: Default::default(),
             render: None,
             budget: STEP_BYTES,
             text,
@@ -495,6 +503,7 @@ impl Run {
         if let Some((bytes, first_line)) = self.chunks.get(self.next).cloned() {
             let lines: Vec<&str> = self.text[bytes].lines().collect();
             let parsed = parse::parse_chunk(&lines, first_line, &self.ctx);
+            self.scan.chunk(&lines, first_line);
             for section in &parsed {
                 self.targets.collect(section);
                 self.keywords
@@ -508,6 +517,17 @@ impl Run {
             return Step::More;
         }
         let backend = self.request.backend;
+        if self.render.is_none() {
+            let props: Vec<&str> = self
+                .keywords
+                .iter()
+                .filter(|(k, _)| k == "PROPERTY")
+                .map(|(_, v)| v.as_str())
+                .collect();
+            if self.scan.resolve(&props, BLOCKS_PER_STEP) {
+                return Step::More;
+            }
+        }
         let Some(render) = self.render.as_mut() else {
             return match self.prepare() {
                 Ok(render) => {
@@ -682,7 +702,8 @@ impl Run {
             self.now,
             targets,
             Rc::clone(&self.host),
-        );
+        )
+        .leaving_out(std::mem::take(&mut self.scan).finish());
         let settings = match self.request.backend {
             Backend::Html => Settings::Html(html::Settings {
                 done: self.ctx.done_keywords.clone(),
@@ -869,6 +890,26 @@ mod tests {
             .expect("a write")
     }
 
+    /// A block's `:exports` decides what of it reaches the output, the
+    /// default keeping the code and leaving the result out.
+    #[test]
+    fn exports_decides_what_of_a_block_is_exported() {
+        let doc = |header: &str| {
+            format!(
+                "* A\n#+begin_src sh{header}\necho the-code\n#+end_src\n\n#+RESULTS:\n: the-result\n"
+            )
+        };
+        let html = |header: &str| {
+            let effects = run(&request(Backend::Html), Some(doc(header)));
+            written(&effects).1.to_string()
+        };
+        let shown = |out: &str| (out.contains("the-code"), out.contains("the-result"));
+        assert_eq!(shown(&html("")), (true, false));
+        assert_eq!(shown(&html(" :exports results")), (false, true));
+        assert_eq!(shown(&html(" :exports both")), (true, true));
+        assert_eq!(shown(&html(" :exports none")), (false, false));
+    }
+
     /// A PDF export ends in its compile, not a write: the `.tex` path and
     /// text, the configured process, and the file's own compiler.
     #[test]
@@ -1026,8 +1067,9 @@ mod tests {
         let (stepped, steps) = run_with_files(r, Some(text.to_string()), &[], budget);
         let (whole, one) = run_with_files(r, Some(text.to_string()), &[], usize::MAX);
         assert!(
-            one <= 5,
-            "parse, prepare, outline, index, and the body with its finish: {one}"
+            one <= 6,
+            "parse, resolve the blocks' `:exports`, prepare, outline, index, and the body \
+             with its finish: {one}"
         );
         assert!(
             written(&stepped).1 == written(&whole).1,

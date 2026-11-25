@@ -897,7 +897,7 @@ mod tests {
     use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options as Gfm, Parser, Tag};
 
     use super::super::html::Stylesheet;
-    use super::super::pipeline::{Backend, Request, Run, Step};
+    use super::super::pipeline::{Backend, Configured, Request, Run, Step};
     use super::super::{Host, IdFile};
     use crate::lattice::plugin_host::types::Effect;
     use crate::time_format::When;
@@ -939,7 +939,10 @@ mod tests {
             vec!["TODO NEXT | DONE".to_string()],
             When { local_secs: 0 },
             Rc::new(Notes),
-            Stylesheet::None,
+            Configured {
+                stylesheet: Stylesheet::None,
+                ..Configured::default()
+            },
         )
         .unwrap_or_else(|e| panic!("{e:?}"));
         loop {

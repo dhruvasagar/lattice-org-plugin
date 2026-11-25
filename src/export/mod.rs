@@ -255,6 +255,67 @@ pub(crate) fn register_options() {
          path the page links to. ox-html's class names are kept, so a \
          stylesheet written for emacs's output styles this one.",
     );
+    // The LaTeX defaults, each under the file's keyword of the same name.
+    for (name, default, doc) in [
+        (
+            "export.latex-compiler",
+            "pdflatex",
+            "The compiler a LaTeX export is written for, and a PDF export \
+             runs: `pdflatex`, `xelatex` or `lualatex`. It picks the default \
+             packages: `inputenc`/`fontenc` for pdflatex, `fontspec` (Unicode \
+             text, system fonts) for the other two. `#+LATEX_COMPILER:` \
+             overrides it.",
+        ),
+        (
+            "export.latex-class",
+            "article",
+            "The LaTeX class an export uses: `article`, `report`, `book`, or one \
+             of `org.export.latex-classes`. `#+LATEX_CLASS:` overrides it.",
+        ),
+        (
+            "export.latex-class-options",
+            "",
+            "Options for the class's `\\documentclass`, brackets included \
+             (`[a4paper,12pt]`); empty keeps the class's own. \
+             `#+LATEX_CLASS_OPTIONS:` overrides it.",
+        ),
+        (
+            "export.latex-src-block-backend",
+            "verbatim",
+            "How a LaTeX export writes source blocks: `verbatim`; `listings`, \
+             highlighted by the listings package; or `minted`, highlighted by \
+             Pygments, which needs the compiler run with `-shell-escape`. The \
+             package is added to the preamble.",
+        ),
+        (
+            "export.latex-image-width",
+            ".9\\linewidth",
+            "The width a LaTeX export draws an image at when its \
+             `#+ATTR_LATEX:` gives no `:width` or `:height`. Empty draws it at \
+             its own size.",
+        ),
+    ] {
+        let _ = register_option(name, OptionType::String, default, doc);
+    }
+    let _ = crate::config_shape::register_option::<Vec<String>>(
+        "export.latex-header",
+        &Vec::new(),
+        "Preamble lines every LaTeX export carries, after the default \
+         packages and before the file's `#+LATEX_HEADER:` lines.",
+    );
+    let _ = crate::config_shape::register_option::<Vec<options::DeclaredClass>>(
+        "export.latex-classes",
+        &Vec::new(),
+        "More LaTeX classes, emacs's `org-latex-classes`: one \
+         `[[org.export.latex-classes]]` per class with a `name`, its \
+         `sections` a headline level each (`[\"chapter\", \"section\"]`), and \
+         optionally a `header`, the `\\documentclass` line and whatever the \
+         class needs (default `\\documentclass[11pt]{<name>}`). A header \
+         may place the preamble with `[DEFAULT-PACKAGES]`, `[PACKAGES]` and \
+         `[EXTRA]`, or leave a part out with `[NO-DEFAULT-PACKAGES]` and its \
+         peers. A class named `article`, `report` or `book` replaces the \
+         built-in one.",
+    );
 }
 
 /// The mode: a minor on org's major, whose layer holds export's prefix alone.

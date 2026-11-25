@@ -418,3 +418,34 @@ pub(crate) fn advance(doc: &Doc, path: &mut Vec<usize>, descend: bool) {
         }
     }
 }
+
+/// `#+ATTR_<backend>: :key value :key2 value…` as `(key, value)` pairs, in
+/// order, every such line of the element's; `backend` is lowercase. A value
+/// runs to the next ` :`.
+pub(crate) fn attributes<'a>(element: &'a Element, backend: &str) -> Vec<(&'a str, &'a str)> {
+    let mut out = Vec::new();
+    for (b, value) in &element.affiliated.attr {
+        if b != backend {
+            continue;
+        }
+        let mut rest = value.trim();
+        while let Some(after) = rest.strip_prefix(':') {
+            let key_end = after.find(char::is_whitespace).unwrap_or(after.len());
+            let key = &after[..key_end];
+            let tail = after[key_end..].trim_start();
+            let value_end = tail.find(" :").unwrap_or(tail.len());
+            out.push((key, tail[..value_end].trim()));
+            rest = tail[value_end..].trim_start();
+        }
+    }
+    out
+}
+
+/// The last `:key`'s value among `attributes`.
+pub(crate) fn attribute<'a>(attributes: &[(&str, &'a str)], key: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| *v)
+}

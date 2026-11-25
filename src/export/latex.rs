@@ -14,7 +14,7 @@
 
 use super::common::{self, Definition, Footnotes, Outline};
 use super::filter::{self, View};
-use super::options::{Depth, Options, Tags, Tex};
+use super::options::{builtin_classes, Depth, LatexClass, Options, SrcBackend, Tags, Tex};
 use super::parse::objects::{Emphasis, Object};
 use super::parse::{
     Align, Block, BlockKind, Checkbox, Doc, Element, ElementKind, Headline, Item, ListKind, Row,
@@ -28,48 +28,170 @@ pub(crate) struct Settings {
     pub(crate) body_only: bool,
 }
 
-/// A built-in class: its name and its sectioning commands, a level each, as
-/// ox-latex's `org-latex-classes`.
-struct Class {
-    name: &'static str,
-    sections: &'static [&'static str],
+/// The compilers a LaTeX export is written for: `#+LATEX_COMPILER`'s and
+/// `org.export.latex-compiler`'s values.
+const COMPILERS: &[&str] = &["pdflatex", "xelatex", "lualatex"];
+
+/// ox-latex's default packages, in its order. Under pdflatex, `inputenc` and
+/// `fontenc` read UTF-8 and give T1 fonts; xelatex and lualatex read UTF-8
+/// themselves and take system fonts through `fontspec`.
+fn default_packages(compiler: &str) -> String {
+    let encoding = if compiler == "pdflatex" {
+        "\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n"
+    } else {
+        "\\usepackage{fontspec}\n"
+    };
+    format!(
+        "{encoding}\\usepackage{{graphicx}}\n\\usepackage{{longtable}}\n\\usepackage{{wrapfig}}\n\
+         \\usepackage{{rotating}}\n\\usepackage[normalem]{{ulem}}\n\\usepackage{{amsmath}}\n\
+         \\usepackage{{amssymb}}\n\\usepackage{{capt-of}}\n\\usepackage{{hyperref}}\n"
+    )
 }
 
-const CLASSES: &[Class] = &[
-    Class {
-        name: "article",
-        sections: &[
-            "section",
-            "subsection",
-            "subsubsection",
-            "paragraph",
-            "subparagraph",
-        ],
-    },
-    Class {
-        name: "report",
-        sections: &["part", "chapter", "section", "subsection", "subsubsection"],
-    },
-    Class {
-        name: "book",
-        sections: &["part", "chapter", "section", "subsection", "subsubsection"],
-    },
+/// The language names listings knows, lowercased, against the spelling it
+/// takes: org's names for them first, as ox-latex's `org-latex-listings-langs`.
+/// A language not here gets no `language=`, since listings stops the build on
+/// one it does not know.
+const LISTINGS_LANGUAGES: &[(&str, &str)] = &[
+    ("emacs-lisp", "Lisp"),
+    ("elisp", "Lisp"),
+    ("lisp", "Lisp"),
+    ("clojure", "Lisp"),
+    ("scheme", "Lisp"),
+    ("cc", "C++"),
+    ("cpp", "C++"),
+    ("c++", "C++"),
+    ("cperl", "Perl"),
+    ("latex", "[LaTeX]TeX"),
+    ("shell-script", "bash"),
+    ("shell", "bash"),
+    ("sh", "bash"),
+    ("bash", "bash"),
+    ("zsh", "bash"),
+    ("ocaml", "[Objective]Caml"),
+    ("caml", "Caml"),
+    ("sqlite", "SQL"),
+    ("makefile", "make"),
+    ("js", "Java"),
+    ("ada", "Ada"),
+    ("awk", "Awk"),
+    ("c", "C"),
+    ("cobol", "Cobol"),
+    ("csh", "csh"),
+    ("delphi", "Delphi"),
+    ("eiffel", "Eiffel"),
+    ("erlang", "erlang"),
+    ("fortran", "Fortran"),
+    ("gnuplot", "Gnuplot"),
+    ("haskell", "Haskell"),
+    ("html", "HTML"),
+    ("java", "Java"),
+    ("ksh", "ksh"),
+    ("make", "make"),
+    ("mathematica", "Mathematica"),
+    ("matlab", "Matlab"),
+    ("ml", "ML"),
+    ("octave", "Octave"),
+    ("pascal", "Pascal"),
+    ("perl", "Perl"),
+    ("php", "PHP"),
+    ("postscript", "PostScript"),
+    ("prolog", "Prolog"),
+    ("python", "Python"),
+    ("r", "R"),
+    ("ruby", "Ruby"),
+    ("sas", "SAS"),
+    ("scilab", "Scilab"),
+    ("sql", "SQL"),
+    ("tcl", "tcl"),
+    ("tex", "TeX"),
+    ("vbscript", "VBScript"),
+    ("verilog", "Verilog"),
+    ("vhdl", "VHDL"),
+    ("xml", "XML"),
+    ("xslt", "XSLT"),
 ];
 
-/// ox-latex's default packages for pdflatex, in its order.
-const PACKAGES: &str = "\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\
-\\usepackage{graphicx}\n\\usepackage{longtable}\n\\usepackage{wrapfig}\n\
-\\usepackage{rotating}\n\\usepackage[normalem]{ulem}\n\\usepackage{amsmath}\n\
-\\usepackage{amssymb}\n\\usepackage{capt-of}\n\\usepackage{hyperref}\n";
+/// org's language names that are not Pygments' lexer names, as ox-latex's
+/// `org-latex-minted-langs`; any other is passed through, Pygments knowing
+/// most.
+const MINTED_LANGUAGES: &[(&str, &str)] = &[
+    ("emacs-lisp", "common-lisp"),
+    ("elisp", "common-lisp"),
+    ("cc", "c++"),
+    ("cperl", "perl"),
+    ("shell-script", "bash"),
+    ("shell", "bash"),
+    ("caml", "ocaml"),
+    ("sqlite", "sql"),
+];
 
-/// The width ox-latex gives an image with none of its own.
-const IMAGE_WIDTH: &str = ".9\\linewidth";
+/// The package a source-block backend needs, which emacs leaves to the
+/// user's packages and a first export then fails without.
+fn src_package(backend: SrcBackend) -> &'static str {
+    match backend {
+        SrcBackend::Verbatim => "",
+        SrcBackend::Listings => "\\usepackage{listings}\n",
+        SrcBackend::Minted => "\\usepackage{minted}\n",
+    }
+}
+
+/// The class's header with `options` in its `\documentclass[…]`, when
+/// given, as `#+LATEX_CLASS_OPTIONS` does in ox-latex.
+fn class_header(header: &str, options: &str) -> String {
+    let options = options.trim();
+    let Some(at) = header.find("\\documentclass") else {
+        return header.to_string();
+    };
+    if options.is_empty() {
+        return header.to_string();
+    }
+    let after = at + "\\documentclass".len();
+    let rest = &header[after..];
+    let keep = match rest.strip_prefix('[').and_then(|r| r.find(']')) {
+        Some(close) => &rest[close + 2..],
+        None => rest,
+    };
+    format!("{}{options}{keep}", &header[..after])
+}
+
+/// The preamble's packages and header lines put in the class's header, as
+/// ox-latex's `org-splice-latex-header`: at its `[DEFAULT-PACKAGES]`,
+/// `[PACKAGES]` and `[EXTRA]` when it has them, left out at its
+/// `[NO-DEFAULT-PACKAGES]`, `[NO-PACKAGES]` and `[NO-EXTRA]`, else after it
+/// in that order.
+fn splice(header: &str, defaults: &str, packages: &str, extra: &str) -> String {
+    let mut out = header.to_string();
+    let mut tail = String::new();
+    for (key, text) in [
+        ("DEFAULT-PACKAGES", defaults),
+        ("PACKAGES", packages),
+        ("EXTRA", extra),
+    ] {
+        let place = format!("[{key}]");
+        let no = format!("[NO-{key}]");
+        if out.contains(&no) {
+            out = out.replace(&format!("{no}\n"), "").replace(&no, "");
+        } else if out.contains(&place) {
+            out = out.replace(&place, text.trim_end_matches('\n'));
+        } else {
+            tail.push_str(text);
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&tail);
+    out
+}
 
 /// The document-wide state of one LaTeX export.
 pub(crate) struct Latex {
     outline: Outline,
     footnotes: Footnotes,
-    class: &'static Class,
+    class: LatexClass,
+    compiler: String,
+    src_backend: SrcBackend,
     /// The list-item headlines (below `H:`) open around the next one: their
     /// level and whether the list is `enumerate`.
     deep: Vec<(usize, bool)>,
@@ -258,6 +380,15 @@ fn entity(name: &str, utf8: &str) -> String {
     }
 }
 
+/// `\includegraphics` of `path` with `options`.
+fn graphic(options: &[String], path: &str) -> String {
+    if options.is_empty() {
+        format!("\\includegraphics{{{}}}", url(path))
+    } else {
+        format!("\\includegraphics[{}]{{{}}}", options.join(","), url(path))
+    }
+}
+
 /// `body` as a `verbatim` environment.
 fn verbatim(body: &str) -> String {
     let body = body.trim_end_matches('\n');
@@ -315,18 +446,48 @@ impl Latex {
     /// The writer for a numbered outline. An unknown `#+LATEX_CLASS` fails
     /// the export, as in emacs.
     pub(crate) fn new(outline: Outline, settings: Settings, view: &mut View) -> Latex {
-        let class_name = view.options.latex_class.trim().to_string();
-        let class = CLASSES.iter().find(|c| c.name == class_name);
-        if class.is_none() {
-            view.fail(format!(
-                "org: no LaTeX class `{class_name}` — use article, report or book"
-            ));
+        let o = &view.options;
+        let class_name = o.latex_class.trim().to_string();
+        let class = o
+            .latex_classes
+            .iter()
+            .find(|c| c.name == class_name)
+            .cloned();
+        let compiler = o.latex_compiler.trim().to_string();
+        let src_backend = SrcBackend::parse(&o.latex_src_backend);
+        let known: Vec<&str> = o.latex_classes.iter().map(|c| c.name.as_str()).collect();
+        let why = match &class {
+            None => Some(format!(
+                "org: no LaTeX class `{class_name}` — use one of {}, or add it to \
+                 org.export.latex-classes",
+                known.join(", ")
+            )),
+            Some(c) if c.sections.is_empty() => Some(format!(
+                "org: LaTeX class `{class_name}` has no sections in \
+                 org.export.latex-classes"
+            )),
+            _ if !COMPILERS.contains(&compiler.as_str()) => Some(format!(
+                "org: no LaTeX compiler `{compiler}` — use pdflatex, xelatex or lualatex"
+            )),
+            _ if src_backend.is_none() => Some(format!(
+                "org: org.export.latex-src-block-backend is `{}` — use verbatim, \
+                 listings or minted",
+                o.latex_src_backend.trim()
+            )),
+            _ => None,
+        };
+        if let Some(why) = why {
+            view.fail(why);
         }
-        let class = class.unwrap_or(&CLASSES[0]);
+        let class = class
+            .filter(|c| !c.sections.is_empty())
+            .unwrap_or_else(|| builtin_classes().swap_remove(0));
         Latex {
             outline,
             footnotes: Footnotes::default(),
             class,
+            compiler,
+            src_backend: src_backend.unwrap_or(SrcBackend::Verbatim),
             deep: Vec::new(),
             enumerate_depth: 0,
             body_only: settings.body_only,
@@ -369,22 +530,19 @@ impl Latex {
 
     /// Everything before the body: ox-latex's preamble and title block.
     fn preamble(&mut self, view: &mut View, out: &mut String) {
-        let class = self.class;
         let o = view.options.clone();
-        let class_options = match o.latex_class_options.trim() {
-            "" => "[11pt]",
-            given => given,
-        };
-        out.push_str("% Intended LaTeX compiler: pdflatex\n");
-        out.push_str(&format!(
-            "\\documentclass{class_options}{{{}}}\n",
-            class.name
-        ));
-        out.push_str(PACKAGES);
-        for line in &o.latex_header {
-            out.push_str(line);
-            out.push('\n');
+        out.push_str(&format!("% Intended LaTeX compiler: {}\n", self.compiler));
+        let mut extra = String::new();
+        for line in o.latex_header.iter().chain(&o.latex_header_extra) {
+            extra.push_str(line);
+            extra.push('\n');
         }
+        out.push_str(&splice(
+            &class_header(&self.class.header, &o.latex_class_options),
+            &default_packages(&self.compiler),
+            src_package(self.src_backend),
+            &extra,
+        ));
         let mut author = String::new();
         if o.with_author {
             let a = filter::objects(&o.author, view);
@@ -517,7 +675,7 @@ impl Latex {
             return;
         }
         self.close_deep(0, out);
-        let command = self.class.sections[level - 1];
+        let command = self.class.sections[level - 1].clone();
         let star = if numbered { "" } else { "*" };
         // The title again for the contents and running heads, without what
         // must be written once (a footnote, a target's label). Braced, so a
@@ -636,6 +794,15 @@ impl Latex {
 
     /// The element's `\caption`, its lines joined, its label inside.
     fn caption(&mut self, e: &Element, view: &mut View) -> Option<String> {
+        let caption = self.caption_text(e, view)?;
+        Some(format!(
+            "\\caption{{{}{caption}}}",
+            Self::label(e, view).unwrap_or_default(),
+        ))
+    }
+
+    /// The element's caption lines, joined and written.
+    fn caption_text(&mut self, e: &Element, view: &mut View) -> Option<String> {
         let mut caption = String::new();
         for (i, c) in e.affiliated.caption.iter().enumerate() {
             if i > 0 {
@@ -647,11 +814,7 @@ impl Latex {
         if caption.trim().is_empty() {
             return None;
         }
-        Some(format!(
-            "\\caption{{{}{}}}",
-            Self::label(e, view).unwrap_or_default(),
-            caption.trim()
-        ))
+        Some(caption.trim().to_string())
     }
 
     /// One element, as a block (no blank lines around it).
@@ -702,8 +865,30 @@ impl Latex {
 
     /// A paragraph that is one image: a `figure` when it has a caption,
     /// else centred, as ox-latex.
+    /// `#+ATTR_LATEX:`'s `:width`, `:height` and `:options` size it; with
+    /// neither size, `org.export.latex-image-width` does.
     fn figure(&mut self, e: &Element, path: &str, view: &mut View) -> String {
-        let image = format!("\\includegraphics[width={IMAGE_WIDTH}]{{{}}}", url(path));
+        let attributes = common::attributes(e, "latex");
+        let width = common::attribute(&attributes, "width");
+        let height = common::attribute(&attributes, "height");
+        let mut options = Vec::new();
+        match (width, height) {
+            (Some(w), _) if !w.is_empty() => options.push(format!("width={w}")),
+            (None, None) => {
+                let w = view.options.latex_image_width.trim();
+                if !w.is_empty() {
+                    options.push(format!("width={w}"));
+                }
+            }
+            _ => {}
+        }
+        if let Some(h) = height.filter(|h| !h.is_empty()) {
+            options.push(format!("height={h}"));
+        }
+        if let Some(more) = common::attribute(&attributes, "options").filter(|o| !o.is_empty()) {
+            options.push(more.to_string());
+        }
+        let image = graphic(&options, path);
         match self.caption(e, view) {
             Some(caption) => {
                 format!("\\begin{{figure}}[htbp]\n\\centering\n{image}\n{caption}\n\\end{{figure}}")
@@ -783,7 +968,12 @@ impl Latex {
         if columns == 0 {
             return String::new();
         }
-        let spec: String = (0..columns)
+        let attributes = common::attributes(e, "latex");
+        let environment = common::attribute(&attributes, "environment")
+            .filter(|v| !v.is_empty())
+            .unwrap_or("tabular")
+            .to_string();
+        let computed: String = (0..columns)
             .map(|i| match t.align.get(i).copied().flatten() {
                 Some(Align::Left) => 'l',
                 Some(Align::Center) => 'c',
@@ -792,7 +982,33 @@ impl Latex {
                 None => 'l',
             })
             .collect();
-        let mut tabular = format!("\\begin{{tabular}}{{{spec}}}\n");
+        let spec = common::attribute(&attributes, "align")
+            .filter(|v| !v.is_empty())
+            .map_or(computed, str::to_string);
+        // The width-taking environments take it before the columns.
+        let width = match environment.as_str() {
+            "tabularx" | "tabulary" | "tabu" | "tabu*" => {
+                let w = common::attribute(&attributes, "width")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("\\linewidth");
+                format!("{{{w}}}")
+            }
+            _ => String::new(),
+        };
+        let longtable = environment == "longtable";
+        let mut tabular = format!("\\begin{{{environment}}}{width}{{{spec}}}\n");
+        if longtable {
+            // A longtable is its own float: the caption, or the label alone,
+            // is its first row.
+            let head = match self.caption(e, view) {
+                Some(caption) => Some(caption),
+                None => Self::label(e, view),
+            };
+            if let Some(head) = head {
+                tabular.push_str(&head);
+                tabular.push_str("\\\\\n");
+            }
+        }
         for r in &t.rows {
             match r {
                 Row::Rule => tabular.push_str("\\hline\n"),
@@ -810,7 +1026,10 @@ impl Latex {
                 }
             }
         }
-        tabular.push_str("\\end{tabular}");
+        tabular.push_str(&format!("\\end{{{environment}}}"));
+        if longtable {
+            return tabular;
+        }
         match self.caption(e, view) {
             Some(caption) => {
                 format!("\\begin{{table}}[htbp]\n{caption}\n\\centering\n{tabular}\n\\end{{table}}")
@@ -824,10 +1043,12 @@ impl Latex {
         }
     }
 
-    fn block(&mut self, e: &Element, b: &Block, view: &mut View) -> String {
-        match &b.kind {
-            BlockKind::Src { .. } => {
-                let code = verbatim(&b.body);
+    /// A source block, as `org.export.latex-src-block-backend` writes one.
+    fn src(&mut self, e: &Element, language: &str, body: &str, view: &mut View) -> String {
+        let lang = language.to_ascii_lowercase();
+        match self.src_backend {
+            SrcBackend::Verbatim => {
+                let code = verbatim(body);
                 match self.caption(e, view) {
                     // A captioned block floats, so the caption has a home.
                     Some(caption) => {
@@ -836,6 +1057,48 @@ impl Latex {
                     None => code,
                 }
             }
+            // The options are the listing's own, not an `\lstset`, which
+            // would carry one block's caption to the next.
+            SrcBackend::Listings => {
+                let body = body.trim_end_matches('\n');
+                let mut options = Vec::new();
+                if let Some((_, name)) = LISTINGS_LANGUAGES.iter().find(|(org, _)| *org == lang) {
+                    options.push(format!("language={{{name}}}"));
+                }
+                if let Some(caption) = self.caption_text(e, view) {
+                    options.push(format!("caption={{{caption}}}"));
+                }
+                if let Some(name) = &e.affiliated.name {
+                    options.push(format!("label={{{}}}", view.targets().name_anchor(name)));
+                }
+                let options = if options.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{}]", options.join(","))
+                };
+                format!("\\begin{{lstlisting}}{options}\n{body}\n\\end{{lstlisting}}")
+            }
+            SrcBackend::Minted => {
+                let body = body.trim_end_matches('\n');
+                let lexer = match MINTED_LANGUAGES.iter().find(|(org, _)| *org == lang) {
+                    Some((_, lexer)) => (*lexer).to_string(),
+                    None if lang.is_empty() => "text".to_string(),
+                    None => lang,
+                };
+                let code = format!("\\begin{{minted}}{{{lexer}}}\n{body}\n\\end{{minted}}");
+                match self.caption(e, view) {
+                    Some(caption) => {
+                        format!("\\begin{{listing}}[htbp]\n{code}\n{caption}\n\\end{{listing}}")
+                    }
+                    None => code,
+                }
+            }
+        }
+    }
+
+    fn block(&mut self, e: &Element, b: &Block, view: &mut View) -> String {
+        match &b.kind {
+            BlockKind::Src { language } => self.src(e, language, &b.body, view),
             BlockKind::Example => verbatim(&b.body),
             BlockKind::Export { backend } if is_raw_backend(backend) => {
                 b.body.trim_end_matches('\n').to_string()
@@ -996,10 +1259,13 @@ impl Latex {
             return;
         }
         if let Some(image) = common::inline_image(path, description) {
-            out.push_str(&format!(
-                "\\includegraphics[width={IMAGE_WIDTH}]{{{}}}",
-                url(image)
-            ));
+            let width = view.options.latex_image_width.trim();
+            let options = if width.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!("width={width}")]
+            };
+            out.push_str(&graphic(&options, image));
             return;
         }
         if let Some(id) = path.strip_prefix("id:") {
@@ -1053,7 +1319,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::super::html::Stylesheet;
-    use super::super::pipeline::{Backend, Request, Run, Step};
+    use super::super::options::{LatexClass, Options};
+    use super::super::pipeline::{Backend, Configured, Request, Run, Step};
     use super::super::{Host, IdFile};
     use crate::lattice::plugin_host::types::Effect;
     use crate::time_format::When;
@@ -1079,6 +1346,11 @@ mod tests {
     /// `text` exported to LaTeX from `/notes/plan.org`, or the echo that
     /// stopped it.
     fn export_with(text: &str, body_only: bool) -> Result<String, String> {
+        configured_export(text, body_only, Options::default())
+    }
+
+    /// `text` exported over `options`, as the plugin's options give them.
+    fn configured_export(text: &str, body_only: bool, options: Options) -> Result<String, String> {
         let request = Request {
             buffer: 1,
             source: "/notes/plan.org".to_string(),
@@ -1096,7 +1368,10 @@ mod tests {
             vec!["TODO NEXT | DONE".to_string()],
             When { local_secs: 0 },
             Rc::new(Notes),
-            Stylesheet::None,
+            Configured {
+                options,
+                stylesheet: Stylesheet::None,
+            },
         )
         .map_err(|e| format!("{e:?}"))?;
         loop {
@@ -1384,6 +1659,261 @@ mod tests {
         );
         assert!(tex.contains("\\begin{quote}\nq\n\\end{quote}"), "{tex}");
         well_formed(&tex);
+    }
+
+    fn with(f: impl FnOnce(&mut Options)) -> Options {
+        let mut o = Options::default();
+        f(&mut o);
+        o
+    }
+
+    fn configured(text: &str, options: Options) -> String {
+        configured_export(text, false, options).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn configured_body(text: &str, options: Options) -> String {
+        configured_export(text, true, options).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// The compiler picks the encoding packages and is named in the file;
+    /// the file's keyword overrides the option, and an unknown one stops the
+    /// export.
+    #[test]
+    fn the_compiler_picks_the_encoding_packages() {
+        let xe = with(|o| o.latex_compiler = "xelatex".to_string());
+        let tex = configured("x\n", xe.clone());
+        assert!(
+            tex.starts_with("% Intended LaTeX compiler: xelatex\n"),
+            "{tex}"
+        );
+        assert!(
+            tex.contains("\\usepackage{fontspec}\n\\usepackage{graphicx}"),
+            "{tex}"
+        );
+        assert!(!tex.contains("inputenc"), "{tex}");
+        let tex = configured("#+LATEX_COMPILER: pdflatex\nx\n", xe);
+        assert!(tex.contains("\\usepackage[utf8]{inputenc}"), "{tex}");
+        let err = export_with("#+LATEX_COMPILER: latex\nx\n", false).unwrap_err();
+        assert!(err.contains("no LaTeX compiler `latex`"), "{err}");
+    }
+
+    /// The option's header lines, then the file's `#+LATEX_HEADER` and
+    /// `#+LATEX_HEADER_EXTRA` lines, after the default packages.
+    #[test]
+    fn header_lines_come_after_the_packages_in_order() {
+        let o = with(|o| o.latex_header = vec!["\\usepackage{a}".to_string()]);
+        let tex = configured(
+            "#+LATEX_HEADER_EXTRA: \\usepackage{c}\n#+LATEX_HEADER: \\usepackage{b}\nx\n",
+            o,
+        );
+        assert!(
+            tex.contains("\\usepackage{hyperref}\n\\usepackage{a}\n\\usepackage{b}\n\\usepackage{c}\n\\author"),
+            "{tex}"
+        );
+    }
+
+    /// A declared class sections as it says, with its header's placeholders
+    /// placing or leaving out the preamble's parts.
+    #[test]
+    fn a_declared_class_sections_and_places_its_preamble() {
+        let mut o = with(|o| o.latex_class = "memoir".to_string());
+        o.add_classes([LatexClass {
+            name: "memoir".to_string(),
+            header:
+                "\\documentclass[10pt]{memoir}\n[NO-DEFAULT-PACKAGES]\n\\usepackage{x}\n[EXTRA]"
+                    .to_string(),
+            sections: vec!["chapter".to_string(), "section".to_string()],
+        }]);
+        let tex = configured(
+            "#+LATEX_CLASS_OPTIONS: [a5paper]\n#+LATEX_HEADER: \\usepackage{y}\n* A\n** B\n",
+            o,
+        );
+        assert!(
+            tex.contains(
+                "\\documentclass[a5paper]{memoir}\n\\usepackage{x}\n\\usepackage{y}\n\\author"
+            ),
+            "{tex}"
+        );
+        assert!(!tex.contains("graphicx"), "{tex}");
+        assert!(
+            tex.contains("\\chapter{A}") && tex.contains("\\section{B}"),
+            "{tex}"
+        );
+        let err = export_with("#+LATEX_CLASS: memoir\nx\n", false).unwrap_err();
+        assert!(err.contains("article, report, book"), "{err}");
+    }
+
+    /// `listings` and `minted` write their environments and add their
+    /// package; a language listings does not know gets none, and a backend
+    /// that is none of the three stops the export, naming the option.
+    #[test]
+    fn source_blocks_follow_the_backend() {
+        let listings = with(|o| o.latex_src_backend = "listings".to_string());
+        let text = "#+NAME: f\n#+CAPTION: Fn\n#+begin_src emacs-lisp\n(f)\n#+end_src\n\n#+begin_src rust\nfn f() {}\n#+end_src\n";
+        let tex = configured(text, listings);
+        assert!(
+            tex.contains("\\usepackage{hyperref}\n\\usepackage{listings}\n"),
+            "{tex}"
+        );
+        assert!(
+            tex.contains("\\begin{lstlisting}[language={Lisp},caption={Fn},label={org")
+                && tex.contains("}]\n(f)\n\\end{lstlisting}"),
+            "{tex}"
+        );
+        assert!(
+            tex.contains("\\begin{lstlisting}\nfn f() {}\n\\end{lstlisting}"),
+            "{tex}"
+        );
+        let minted = with(|o| o.latex_src_backend = "minted".to_string());
+        let tex = configured(text, minted);
+        assert!(tex.contains("\\usepackage{minted}\n"), "{tex}");
+        assert!(
+            tex.contains("\\begin{listing}[htbp]\n\\begin{minted}{common-lisp}\n(f)\n\\end{minted}\n\\caption{\\label{org")
+                && tex.contains("}Fn}\n\\end{listing}"),
+            "{tex}"
+        );
+        assert!(
+            tex.contains("\\begin{minted}{rust}\nfn f() {}\n\\end{minted}"),
+            "{tex}"
+        );
+        let bad = with(|o| o.latex_src_backend = "pygments".to_string());
+        let err = configured_export(text, false, bad).unwrap_err();
+        assert!(
+            err.contains("org.export.latex-src-block-backend is `pygments`"),
+            "{err}"
+        );
+    }
+
+    /// `#+ATTR_LATEX:` sizes an image, and the option's width is the
+    /// default; empty draws it at its own size.
+    #[test]
+    fn attr_latex_and_the_option_size_an_image() {
+        let tex = body("#+ATTR_LATEX: :width 5cm :options angle=90\n[[./a.png]]\n");
+        assert!(
+            tex.contains("\\includegraphics[width=5cm,angle=90]{./a.png}"),
+            "{tex}"
+        );
+        let tex = body("#+ATTR_LATEX: :height 2cm\n[[./a.png]]\n");
+        assert!(
+            tex.contains("\\includegraphics[height=2cm]{./a.png}"),
+            "{tex}"
+        );
+        let natural = with(|o| o.latex_image_width = String::new());
+        let tex = configured_body("[[./a.png]]\n", natural);
+        assert!(tex.contains("\\includegraphics{./a.png}"), "{tex}");
+    }
+
+    /// `#+ATTR_LATEX:` picks a table's environment and alignment; a
+    /// longtable carries its caption as its first row and floats alone.
+    #[test]
+    fn attr_latex_picks_the_table_environment() {
+        let tex =
+            body("#+CAPTION: Big\n#+ATTR_LATEX: :environment longtable :align |l|r|\n| a | 1 |\n");
+        assert_eq!(
+            tex,
+            "\\begin{longtable}{|l|r|}\n\\caption{Big}\\\\\na & 1 \\\\\n\\end{longtable}\n"
+        );
+        let tex = body("#+ATTR_LATEX: :environment tabularx :align lX\n| a | b |\n");
+        assert!(
+            tex.contains("\\begin{tabularx}{\\linewidth}{lX}\n"),
+            "{tex}"
+        );
+    }
+
+    /// A 1x1 grey PNG.
+    const PIXEL: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x3a,
+        0x7e, 0x9b, 0x55, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0x0f, 0x00, 0x01, 0x01, 0x01, 0x00, 0xb1, 0x38, 0xf6, 0x14, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// The goldens, and the source blocks under listings (minted needs a
+    /// shell escape), compile. ox loads `wrapfig` and `capt-of` for what
+    /// this writer never writes, so they are stubbed where they are not
+    /// installed; a file needing another package that is not installed is
+    /// skipped, naming it, as is everything where there is no `latexmk`.
+    #[test]
+    fn the_exports_compile() {
+        let installed = |package: &str| {
+            std::process::Command::new("kpsewhich")
+                .arg(format!("{package}.sty"))
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let latexmk = std::process::Command::new("latexmk").arg("-v").output();
+        if latexmk.is_err() || !installed("hyperref") {
+            eprintln!("SKIP: no latexmk or kpsewhich");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("org-export-compile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let stubbed = ["wrapfig", "capt-of"];
+        for package in stubbed {
+            if !installed(package) {
+                std::fs::write(dir.join(format!("{package}.sty")), "")
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let listings = with(|o| o.latex_src_backend = "listings".to_string());
+        let mut files: Vec<(String, String)> = Vec::new();
+        for name in ["blocks", "headlines", "lists", "misc", "objects"] {
+            let org = std::fs::read_to_string(format!("src/export/parse/testdata/{name}.org"))
+                .unwrap_or_else(|e| panic!("{e}"));
+            // A special block is an environment the user defines, in ox as
+            // here; the corpus's one is defined as a user would.
+            let org = format!("#+LATEX_HEADER: \\newenvironment{{note}}{{}}{{}}\n{org}");
+            files.push((name.to_string(), export(&org)));
+            if name == "blocks" {
+                files.push((
+                    format!("{name}-listings"),
+                    configured(&org, listings.clone()),
+                ));
+            }
+        }
+        for (name, tex) in files {
+            let missing: Vec<&str> = tex
+                .lines()
+                .filter_map(|l| l.strip_prefix("\\usepackage"))
+                .filter_map(|l| l.rsplit_once('{').map(|(_, p)| p.trim_end_matches('}')))
+                .filter(|p| !stubbed.contains(p) && !installed(p))
+                .collect();
+            if !missing.is_empty() {
+                eprintln!("SKIP: {name}.tex needs {}", missing.join(", "));
+                continue;
+            }
+            // The images the file draws, as one pixel each.
+            for image in tex.split("\\includegraphics").skip(1) {
+                let Some(path) = image.split_once('{').and_then(|(_, p)| p.split_once('}')) else {
+                    continue;
+                };
+                if !path.0.starts_with('/') && !path.0.contains("..") {
+                    std::fs::write(dir.join(path.0), PIXEL).unwrap_or_else(|e| panic!("{e}"));
+                }
+            }
+            let path = dir.join(format!("{name}.tex"));
+            std::fs::write(&path, tex).unwrap_or_else(|e| panic!("{e}"));
+            let out = std::process::Command::new("latexmk")
+                .args([
+                    "-pdf",
+                    "-interaction=nonstopmode",
+                    "-halt-on-error",
+                    "-quiet",
+                ])
+                .arg(format!("-outdir={}", dir.display()))
+                .arg(&path)
+                .current_dir(&dir)
+                .output()
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                out.status.success(),
+                "{name}.tex does not compile; see {}",
+                dir.join(format!("{name}.log")).display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `]` in a short title does not end the optional argument, and a

@@ -59,6 +59,18 @@ the lattice release that carries it.
   their first reference, `tabular` tables, `verbatim` source, figures with
   captions, the ten specials escaped, and raw `#+begin_export latex` /
   `@@latex:…@@` / `#+LATEX:` passed through.
+  The LaTeX export is configurable as emacs's is. `org.export.latex-compiler`
+  or `#+LATEX_COMPILER` (`pdflatex`, `xelatex`, `lualatex`) picks the
+  encoding packages, with `fontspec` for Unicode text and system fonts.
+  `org.export.latex-classes` adds classes (`memoir`, a house class), each
+  with its sectioning and a header that may place or leave out the default
+  packages. `org.export.latex-class`, `-class-options` and `-header` set what
+  `#+LATEX_CLASS`, `#+LATEX_CLASS_OPTIONS` and `#+LATEX_HEADER` override, and
+  `#+LATEX_HEADER_EXTRA` is read. `org.export.latex-src-block-backend` writes
+  source blocks as `listings` or `minted` and adds the package. `#+ATTR_LATEX:`
+  sizes an image (`:width`, `:height`, `:options`) and picks a table's
+  `:environment` (`longtable`, `tabularx`…) and `:align`, and
+  `org.export.latex-image-width` is the default width.
 
 ### Fixed
 - A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`

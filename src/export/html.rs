@@ -36,9 +36,10 @@ const MATHJAX: &str = "<script>\nwindow.MathJax = {\n  tex: {\n    inlineMath: [
                        src=\"https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js\"></script>\n";
 
 /// What the head links or inlines for style: `org.export.html-stylesheet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum Stylesheet {
     /// The bundled stylesheet, inline.
+    #[default]
     Default,
     /// None.
     None,
@@ -124,23 +125,11 @@ fn escaped(s: &str) -> String {
 /// `#+ATTR_HTML: :key value :key2 value…` as attributes, each ` key="value"`.
 fn attributes(element: &Element, skip: &[&str]) -> String {
     let mut out = String::new();
-    for (backend, value) in &element.affiliated.attr {
-        if backend != "html" {
+    for (key, value) in common::attributes(element, "html") {
+        if key.is_empty() || skip.contains(&key) {
             continue;
         }
-        let mut rest = value.trim();
-        while let Some(after) = rest.strip_prefix(':') {
-            let key_end = after.find(char::is_whitespace).unwrap_or(after.len());
-            let key = &after[..key_end];
-            let tail = after[key_end..].trim_start();
-            let value_end = tail.find(" :").unwrap_or(tail.len());
-            let value = tail[..value_end].trim();
-            rest = tail[value_end..].trim_start();
-            if key.is_empty() || skip.contains(&key) {
-                continue;
-            }
-            let _ = write!(out, " {}=\"{}\"", escaped(key), escaped(value));
-        }
+        let _ = write!(out, " {}=\"{}\"", escaped(key), escaped(value));
     }
     out
 }
@@ -1149,7 +1138,7 @@ mod tests {
     use std::collections::HashSet;
     use std::rc::Rc;
 
-    use super::super::pipeline::{Backend, Request, Run, Step};
+    use super::super::pipeline::{Backend, Configured, Request, Run, Step};
     use super::super::{Host, IdFile};
     use super::*;
     use crate::lattice::plugin_host::types::Effect;
@@ -1193,7 +1182,10 @@ mod tests {
             vec!["TODO NEXT | DONE".to_string()],
             When { local_secs: 0 },
             Rc::new(Notes),
-            stylesheet,
+            Configured {
+                stylesheet,
+                ..Configured::default()
+            },
         )
         .map_err(|e| format!("{e:?}"))?;
         loop {
@@ -1470,7 +1462,10 @@ mod tests {
             Vec::new(),
             When { local_secs: 0 },
             Rc::new(Here),
-            Stylesheet::None,
+            Configured {
+                stylesheet: Stylesheet::None,
+                ..Configured::default()
+            },
         ) else {
             panic!("no run");
         };

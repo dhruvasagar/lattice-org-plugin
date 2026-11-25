@@ -121,6 +121,46 @@ pub(crate) fn target_path(source: &str, backend: Backend) -> String {
     format!("{base}.{}", backend.extension())
 }
 
+/// What an export takes from the plugin's options: the lowest layer of its
+/// options, under the file's keywords, and HTML's stylesheet.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Configured {
+    pub(crate) options: Options,
+    pub(crate) stylesheet: Stylesheet,
+}
+
+/// The `org.export.*` options as they are now. A value an export cannot use
+/// (an unknown compiler) is kept as written, for the export it would change
+/// to refuse, naming it.
+fn configured() -> Configured {
+    use super::options::{DeclaredClass, LatexClass};
+    let mut options = Options::default();
+    let string = |name: &str, field: &mut String| *field = crate::option_or(name, field);
+    string("export.latex-compiler", &mut options.latex_compiler);
+    string("export.latex-class", &mut options.latex_class);
+    string(
+        "export.latex-class-options",
+        &mut options.latex_class_options,
+    );
+    string("export.latex-image-width", &mut options.latex_image_width);
+    string(
+        "export.latex-src-block-backend",
+        &mut options.latex_src_backend,
+    );
+    options.latex_header = crate::string_list("export.latex-header");
+    // The host validated the value against the shape, so an `Err` is a bug
+    // between the two, and the built-in classes are what is left.
+    if let Some(Ok(classes)) =
+        crate::config_shape::read_option::<Vec<DeclaredClass>>("export.latex-classes")
+    {
+        options.add_classes(classes.into_iter().map(LatexClass::from));
+    }
+    Configured {
+        options,
+        stylesheet: Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
+    }
+}
+
 /// The last component of `path`, for the echo area.
 pub(crate) fn file_name(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
@@ -168,7 +208,7 @@ pub(crate) fn on_requested(payload: &[u8]) {
         crate::todo_keyword_lines(),
         now,
         Rc::new(super::Guest),
-        Stylesheet::from_option(&crate::option_or("export.html-stylesheet", "default")),
+        configured(),
     ) {
         Ok(run) => {
             RUNS.with(|runs| {
@@ -251,8 +291,8 @@ pub(crate) struct Run {
     /// The link targets, gathered as the chunks are parsed.
     targets: Targets,
     host: Rc<dyn Host>,
-    /// `org.export.html-stylesheet`, read when the export was asked for.
-    stylesheet: Stylesheet,
+    /// The `org.export.*` options, read when the export was asked for.
+    configured: Configured,
     /// About how many bytes a step parses or writes: [`STEP_BYTES`], or
     /// another size in tests, which check that the steps change nothing.
     budget: usize,
@@ -331,7 +371,7 @@ impl Run {
         configured_keywords: Vec<String>,
         now: When,
         host: Rc<dyn Host>,
-        stylesheet: Stylesheet,
+        configured: Configured,
     ) -> Result<Self, Vec<Effect>> {
         let Some(text) = text else {
             return Err(vec![echo(
@@ -365,7 +405,7 @@ impl Run {
             now,
             targets: Targets::default(),
             host,
-            stylesheet,
+            configured,
             render: None,
             budget: STEP_BYTES,
             text,
@@ -551,6 +591,7 @@ impl Run {
                 )]);
             };
             let options = Options::resolve(
+                &self.configured.options,
                 &self.keywords,
                 Some((&headline.raw_title, &headline.properties)),
                 name,
@@ -561,7 +602,7 @@ impl Run {
             };
             options
         } else {
-            Options::resolve(&self.keywords, None, name)
+            Options::resolve(&self.configured.options, &self.keywords, None, name)
         };
         let selection = filter::selection(&doc, &options);
         let mut targets = std::mem::take(&mut self.targets);
@@ -586,7 +627,7 @@ impl Run {
                 done: self.ctx.done_keywords.clone(),
                 source: self.request.source.clone(),
                 body_only: self.request.body_only,
-                stylesheet: self.stylesheet.clone(),
+                stylesheet: self.configured.stylesheet.clone(),
             }),
             Backend::Markdown => Settings::Markdown(markdown::Settings {
                 source: self.request.source.clone(),
@@ -736,7 +777,10 @@ mod tests {
             keywords,
             When { local_secs: 0 },
             host,
-            Stylesheet::None,
+            Configured {
+                stylesheet: Stylesheet::None,
+                ..Configured::default()
+            },
         ) {
             Ok(run) => run.with_budget(budget),
             Err(effects) => return (effects, 0),

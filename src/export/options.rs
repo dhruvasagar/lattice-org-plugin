@@ -1,7 +1,8 @@
 //! Export options, resolved in ox's order of precedence (lattice's
-//! `org-export.md` §3.3), later winning: ox's defaults, then the file's
-//! keywords and `#+OPTIONS:` lines in file order, then, for a subtree export,
-//! the headline's `EXPORT_*` properties.
+//! `org-export.md` §3.3), later winning: the plugin's `org.export.*` options
+//! (ox's defaults until a user sets them), then the file's keywords and
+//! `#+OPTIONS:` lines in file order, then, for a subtree export, the
+//! headline's `EXPORT_*` properties.
 //!
 //! Every option here has ox's name and default, so a file written for emacs
 //! exports the same. What a file asks for and this does not implement is
@@ -9,6 +10,8 @@
 //! rather than dropped without a word.
 
 use std::collections::BTreeMap;
+
+use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 use super::parse::objects::{self, Object};
 
@@ -96,6 +99,106 @@ pub(crate) enum BrokenLinks {
     Mark,
 }
 
+/// How a LaTeX export writes source blocks: emacs's
+/// `org-latex-src-block-backend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SrcBackend {
+    Verbatim,
+    Listings,
+    Minted,
+}
+
+impl SrcBackend {
+    /// `verbatim`, `listings` or `minted`; `None` for anything else.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "verbatim" => Some(SrcBackend::Verbatim),
+            "listings" => Some(SrcBackend::Listings),
+            "minted" => Some(SrcBackend::Minted),
+            _ => None,
+        }
+    }
+}
+
+/// One `[[org.export.latex-classes]]` entry as the user writes it.
+#[derive(Debug, Clone, PartialEq, Eq, ConfigShapeDerive)]
+pub(crate) struct DeclaredClass {
+    /// What `#+LATEX_CLASS:` names it by.
+    pub(crate) name: String,
+    /// The `\documentclass` line and anything after it the class needs;
+    /// absent is `\documentclass[11pt]{<name>}`.
+    pub(crate) header: Option<String>,
+    /// The sectioning commands, a headline level each: `["chapter",
+    /// "section"]`.
+    pub(crate) sections: Vec<String>,
+}
+
+impl From<DeclaredClass> for LatexClass {
+    fn from(d: DeclaredClass) -> Self {
+        let name = d.name.trim().to_string();
+        LatexClass {
+            header: d
+                .header
+                .filter(|h| !h.trim().is_empty())
+                .unwrap_or_else(|| format!("\\documentclass[11pt]{{{name}}}")),
+            sections: d
+                .sections
+                .into_iter()
+                .map(|s| s.trim().trim_start_matches('\\').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            name,
+        }
+    }
+}
+
+/// A LaTeX class: its name, its `\documentclass` line (and anything after
+/// it the class needs), and its sectioning commands a level each, as an
+/// entry of emacs's `org-latex-classes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LatexClass {
+    pub(crate) name: String,
+    pub(crate) header: String,
+    pub(crate) sections: Vec<String>,
+}
+
+/// The classes every LaTeX export knows, as ox's defaults.
+pub(crate) fn builtin_classes() -> Vec<LatexClass> {
+    let class = |name: &str, sections: &[&str]| LatexClass {
+        name: name.to_string(),
+        header: format!("\\documentclass[11pt]{{{name}}}"),
+        sections: sections.iter().map(|s| s.to_string()).collect(),
+    };
+    let book = ["part", "chapter", "section", "subsection", "subsubsection"];
+    vec![
+        class(
+            "article",
+            &[
+                "section",
+                "subsection",
+                "subsubsection",
+                "paragraph",
+                "subparagraph",
+            ],
+        ),
+        class("report", &book),
+        class("book", &book),
+    ]
+}
+
+impl Options {
+    /// Add `classes` to the known ones, each replacing a known one of its
+    /// name.
+    pub(crate) fn add_classes(&mut self, classes: impl IntoIterator<Item = LatexClass>) {
+        for class in classes {
+            match self.latex_classes.iter_mut().find(|c| c.name == class.name) {
+                Some(known) => *known = class,
+                None => self.latex_classes.push(class),
+            }
+        }
+    }
+}
+
 /// Everything an export reads from options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Options {
@@ -152,7 +255,20 @@ pub(crate) struct Options {
     pub(crate) html_head_extra: Vec<String>,
     pub(crate) latex_class: String,
     pub(crate) latex_class_options: String,
+    /// `org.export.latex-header`'s lines, then the file's `#+LATEX_HEADER`s.
     pub(crate) latex_header: Vec<String>,
+    pub(crate) latex_header_extra: Vec<String>,
+    /// `pdflatex`, `xelatex` or `lualatex`; anything else stops a LaTeX
+    /// export, naming it.
+    pub(crate) latex_compiler: String,
+    /// The built-in classes, then `org.export.latex-classes`, a later one of
+    /// a name replacing an earlier.
+    pub(crate) latex_classes: Vec<LatexClass>,
+    /// `org.export.latex-src-block-backend`, as written: a LaTeX export
+    /// parses it, and refuses a value that is not a [`SrcBackend`].
+    pub(crate) latex_src_backend: String,
+    /// The width an image with none of its own is drawn at.
+    pub(crate) latex_image_width: String,
     /// Macro templates by name: the keyword built-ins, then `#+MACRO:` lines,
     /// which win.
     pub(crate) macros: BTreeMap<String, String>,
@@ -206,6 +322,11 @@ impl Default for Options {
             latex_class: "article".to_string(),
             latex_class_options: String::new(),
             latex_header: Vec::new(),
+            latex_header_extra: Vec::new(),
+            latex_compiler: "pdflatex".to_string(),
+            latex_classes: builtin_classes(),
+            latex_src_backend: "verbatim".to_string(),
+            latex_image_width: ".9\\linewidth".to_string(),
             macros: BTreeMap::new(),
             ignored: Vec::new(),
         }
@@ -226,21 +347,20 @@ const UNIMPLEMENTED_KEYWORDS: &[&str] = &[
     "HTML_LINK_UP",
     "HTML_MATHJAX",
     "KEYWORDS",
-    "LATEX_COMPILER",
-    "LATEX_HEADER_EXTRA",
     "SETUPFILE",
 ];
 
 impl Options {
     /// Options for a file whose keywords, in file order, are `keywords`, and,
     /// for a subtree export, whose headline is `subtree` (its raw title and
-    /// properties).
+    /// properties), over `base`: the plugin's options.
     pub(crate) fn resolve(
+        base: &Options,
         keywords: &[(String, String)],
         subtree: Option<(&str, &[(String, String)])>,
         file_name: &str,
     ) -> Self {
-        let mut o = Options::default();
+        let mut o = base.clone();
         let mut raw = Raw::default();
         for (key, value) in keywords {
             o.keyword(key, value, &mut raw);
@@ -324,6 +444,8 @@ impl Options {
             "LATEX_CLASS" => self.latex_class = value.to_string(),
             "LATEX_CLASS_OPTIONS" => self.latex_class_options = value.to_string(),
             "LATEX_HEADER" => self.latex_header.push(value.to_string()),
+            "LATEX_HEADER_EXTRA" => self.latex_header_extra.push(value.to_string()),
+            "LATEX_COMPILER" => self.latex_compiler = value.trim().to_string(),
             k if UNIMPLEMENTED_KEYWORDS.contains(&k) => self.ignore(format!("#+{k}")),
             _ => {}
         }
@@ -547,7 +669,7 @@ mod tests {
 
     #[test]
     fn the_defaults_are_oxs() {
-        let o = Options::resolve(&[], None, "notes");
+        let o = Options::resolve(&Options::default(), &[], None, "notes");
         assert_eq!((o.toc, o.num, o.headline_levels), (Depth::On, Depth::On, 3));
         assert!(!o.planning && !o.clocks && !o.properties && !o.priority);
         assert!(o.drawers.keeps("NOTES") && !o.drawers.keeps("logbook"));
@@ -558,6 +680,7 @@ mod tests {
     #[test]
     fn an_options_line_reads_every_spelling() {
         let o = Options::resolve(
+            &Options::default(),
             &kw(&[(
                 "OPTIONS",
                 r#"toc:2 num:nil H:4 ^:{} \n:t <:active ::nil |:nil d:("NOTES" "X") tex:verbatim broken-links:mark *:nil"#,
@@ -575,7 +698,12 @@ mod tests {
         assert_eq!(o.drawers, Drawers::Only(vec!["NOTES".into(), "X".into()]));
         assert_eq!((o.tex, o.broken_links), (Tex::Verbatim, BrokenLinks::Mark));
         assert!(o.ignored.is_empty(), "{:?}", o.ignored);
-        let not = Options::resolve(&kw(&[("OPTIONS", r#"d:(not "LOGBOOK" "X")"#)]), None, "x");
+        let not = Options::resolve(
+            &Options::default(),
+            &kw(&[("OPTIONS", r#"d:(not "LOGBOOK" "X")"#)]),
+            None,
+            "x",
+        );
         assert!(not.drawers.keeps("NOTES") && !not.drawers.keeps("x"));
     }
 
@@ -589,12 +717,17 @@ mod tests {
             ("TITLE", "File"),
             ("OPTIONS", "toc:t"),
         ]);
-        let o = Options::resolve(&keywords, None, "x");
+        let o = Options::resolve(&Options::default(), &keywords, None, "x");
         assert_eq!((o.toc, o.num), (Depth::On, Depth::Off));
         assert_eq!(o.title, objects::parse("The File"));
 
         let props = kw(&[("EXPORT_OPTIONS", "num:t"), ("CUSTOM_ID", "x")]);
-        let sub = Options::resolve(&keywords, Some(("Heading", &props)), "x");
+        let sub = Options::resolve(
+            &Options::default(),
+            &keywords,
+            Some(("Heading", &props)),
+            "x",
+        );
         assert_eq!(sub.num, Depth::On);
         assert_eq!(
             sub.title,
@@ -602,7 +735,12 @@ mod tests {
             "the headline titles a subtree"
         );
         let named = kw(&[("EXPORT_TITLE", "Named")]);
-        let sub = Options::resolve(&keywords, Some(("Heading", &named)), "x");
+        let sub = Options::resolve(
+            &Options::default(),
+            &keywords,
+            Some(("Heading", &named)),
+            "x",
+        );
         assert_eq!(sub.title, objects::parse("Named"));
     }
 
@@ -611,6 +749,7 @@ mod tests {
     #[test]
     fn what_is_not_implemented_is_named_once() {
         let o = Options::resolve(
+            &Options::default(),
             &kw(&[
                 ("SETUPFILE", "x.org"),
                 ("OPTIONS", "html-postamble:nil arch:nil toc:maybe"),
@@ -631,6 +770,7 @@ mod tests {
     #[test]
     fn macros_collect_the_built_ins_and_the_files() {
         let o = Options::resolve(
+            &Options::default(),
             &kw(&[
                 ("TITLE", "Plan"),
                 ("AUTHOR", "Ada"),
@@ -649,14 +789,19 @@ mod tests {
         assert_eq!(get("input-file"), Some("notes.org"));
         assert_eq!(o.title, objects::parse("Sub"));
         assert_eq!(
-            Options::resolve(&[], None, "notes.org").title,
+            Options::resolve(&Options::default(), &[], None, "notes.org").title,
             objects::parse("notes")
         );
     }
 
     #[test]
     fn file_tags_accumulate() {
-        let o = Options::resolve(&kw(&[("FILETAGS", ":a:b:"), ("FILETAGS", "c")]), None, "x");
+        let o = Options::resolve(
+            &Options::default(),
+            &kw(&[("FILETAGS", ":a:b:"), ("FILETAGS", "c")]),
+            None,
+            "x",
+        );
         assert_eq!(o.file_tags, ["a", "b", "c"]);
     }
 }

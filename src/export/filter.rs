@@ -541,7 +541,12 @@ mod tests {
     use super::*;
 
     fn opts(options: &str) -> Options {
-        Options::resolve(&[("OPTIONS".to_string(), options.to_string())], None, "x")
+        Options::resolve(
+            &Options::default(),
+            &[("OPTIONS".to_string(), options.to_string())],
+            None,
+            "x",
+        )
     }
 
     fn filtered(text: &str, o: &Options) -> String {
@@ -587,7 +592,12 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut v = view(Options::resolve(&keywords, None, "notes.org"));
+        let mut v = view(Options::resolve(
+            &Options::default(),
+            &keywords,
+            None,
+            "notes.org",
+        ));
         let got = dump::objects(&objects(&parse::objects::parse(text), &mut v));
         (got, v)
     }
@@ -653,6 +663,7 @@ mod tests {
     #[test]
     fn file_tags_are_every_headlines() {
         let o = Options::resolve(
+            &Options::default(),
             &[("FILETAGS".to_string(), ":noexport:".to_string())],
             None,
             "x",
@@ -711,7 +722,7 @@ mod tests {
             }
         }
         let doc = parse::assemble(sections);
-        let o = Options::resolve(&keywords, None, "x.org");
+        let o = Options::resolve(&Options::default(), &keywords, None, "x.org");
         let sel = selection(&doc, &o);
         targets.set_live(live(&doc, &sel, &o), true);
         let mut v = View::new(

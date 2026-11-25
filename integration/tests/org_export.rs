@@ -446,6 +446,49 @@ async fn a_latex_export_writes_the_document() {
     assert!(written.ends_with("\\end{document}\n"), "{written}");
 }
 
+/// The `org.export.latex-*` options reach the export: a compiler, a
+/// source-block backend and a declared class, the file naming the class.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_latex_options_shape_the_export() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(
+        base.path(),
+        "#+LATEX_CLASS: memoir\n* One\n#+begin_src python\nx = 1\n#+end_src\n",
+        &grant,
+    )
+    .await;
+    for spec in [
+        "org.export.latex-compiler=xelatex",
+        "org.export.latex-src-block-backend=listings",
+        "org.export.latex-classes=[[class]]\nname = \"memoir\"\nsections = [\"chapter\", \"section\"]\n",
+    ] {
+        editor.handle_effect(lattice_grammar::Effect::SetOption {
+            spec: spec.to_string(),
+        });
+    }
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "ll");
+    settle(&mut editor, |e| {
+        last_echo(e).as_deref() == Some("Exported notes.tex")
+    })
+    .await;
+    let written = std::fs::read_to_string(base.path().join("notes.tex")).unwrap();
+    assert!(
+        written.starts_with(
+            "% Intended LaTeX compiler: xelatex\n\\documentclass[11pt]{memoir}\n\\usepackage{fontspec}\n"
+        ),
+        "{written}"
+    );
+    assert!(written.contains("\\usepackage{listings}\n"), "{written}");
+    assert!(
+        written.contains("\\chapter{One}")
+            && written.contains("\\begin{lstlisting}[language={Python}]\nx = 1\n\\end{lstlisting}"),
+        "{written}"
+    );
+}
+
 fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {
     editor
         .services

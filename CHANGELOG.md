@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.0), and so needs
+the lattice release that carries it.
+
 ### Fixed
 - `:help org` no longer lists babel among what the plugin does not do; it
   points to `:help org.babel` instead.

@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-sdk"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "lattice-plugin-sdk-derive",
  "rmp-serde",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-plugin-sdk-derive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-wit"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "leb128fmt"

@@ -410,6 +410,39 @@ async fn an_export_lands_on_disk_without_a_further_keypress() {
     .await;
 }
 
+/// A file whose parse does not fit one call's fuel is exported over several
+/// steps, still with no key pressed, and the whole of it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_too_large_for_one_call_is_exported_in_steps() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let section = "* TODO [#A] A heading :tag:\n\
+                   SCHEDULED: <2026-01-05 Mon>\n\
+                   - [ ] an item\n  continued\n- term :: description\n\
+                   | a | b |\n|---+---|\n| 1 | 2 |\n\
+                   #+begin_src sh\necho x\n#+end_src\n\
+                   A paragraph of text.\n";
+    let mut doc = String::new();
+    for i in 0..4_000 {
+        doc.push_str(&section.replace("A heading", &format!("Heading {i}")));
+    }
+    let (mut editor, _loader) = org_editor(base.path(), &doc, &grant).await;
+    let md = base.path().join("notes.md");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "mm");
+    settle(&mut editor, |e| {
+        md.exists() || last_echo(e).is_some_and(|m| !m.starts_with("Exporting"))
+    })
+    .await;
+    let written = std::fs::read_to_string(&md).unwrap_or_else(|_| {
+        panic!("nothing written; the echo is {:?}", last_echo(&editor))
+    });
+    assert!(written.contains("\"Heading 0\""), "the first section");
+    assert!(written.contains("\"Heading 3999\""), "and the last");
+}
+
 /// A switch flipped in the dispatcher reaches the command, and is still set
 /// the next time the dispatcher opens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -425,7 +458,7 @@ async fn the_switches_reach_the_export_and_stay_set() {
     settle(&mut editor, |_| md.exists()).await;
     let body_only = std::fs::read_to_string(&md).unwrap();
     assert!(
-        body_only.starts_with("```org\n"),
+        body_only.starts_with("```\n") && !body_only.contains("# Plan"),
         "no title heading: {body_only}"
     );
 
@@ -434,5 +467,5 @@ async fn the_switches_reach_the_export_and_stay_set() {
     press(&mut editor, "mm");
     settle(&mut editor, |_| md.exists()).await;
     let again = std::fs::read_to_string(&md).unwrap();
-    assert!(again.starts_with("```org\n"), "still body only: {again}");
+    assert!(again.starts_with("```\n"), "still body only: {again}");
 }

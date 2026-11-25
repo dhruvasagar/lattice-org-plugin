@@ -10,6 +10,7 @@
 //! `org/export-requested` and returns; the export itself happens on the events
 //! seam ([`pipeline`]), and its result is posted back.
 
+pub(crate) mod parse;
 pub(crate) mod pipeline;
 
 use crate::lattice::plugin_host::buffer::Document;

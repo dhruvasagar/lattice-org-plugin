@@ -2316,6 +2316,7 @@ impl Guest for Component {
             babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
             babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
             export::pipeline::EV_REQUESTED => export::pipeline::on_requested(&p.payload),
+            export::pipeline::EV_STEP => export::pipeline::on_step(&p.payload),
             _ => {}
         }
     }

@@ -14,9 +14,12 @@ the lattice release that carries it.
   `:org-export-markdown` and `:org-export-latex` do the same, with
   `--subtree` and `--body-only`. The export runs in the background and writes
   only where org may write: a target outside `org.directory` is refused at once,
-  naming `org.export.directories`, the list that allows more. The output is a
-  placeholder for now (the source, verbatim, in the format's document) until
-  the parser and the real HTML, Markdown and LaTeX writers land.
+  naming `org.export.directories`, the list that allows more. A large file
+  exports in steps, a piece per background call, so no file is too big to
+  export and none holds the plugin up while it runs; a second export of the
+  same file replaces one still running. The output is a placeholder for now
+  (the parsed outline and elements, verbatim, in the format's document) until
+  the real HTML, Markdown and LaTeX writers land.
 
 ### Fixed
 - `:help org` no longer lists babel among what the plugin does not do; it

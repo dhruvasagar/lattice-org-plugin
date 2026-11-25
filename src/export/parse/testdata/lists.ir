@@ -1,0 +1,53 @@
+headline 1 @0 "Lists"
+  list Unordered @1
+    item "-" @1
+      paragraph @1 "one"
+    item "-" @2
+      paragraph @2 "two\ncontinued"
+    item "-" @4 On
+      paragraph @4 "done"
+    item "-" @5 Off
+      paragraph @5 "open"
+    item "-" @6 Partial
+      paragraph @6 "partial"
+    item "-" @7 [@4]
+      paragraph @7 "counter"
+  list Ordered @10
+    item "1." @10
+      paragraph @10 "first"
+    item "2." @11
+      paragraph @11 "second"
+      list Unordered @12
+        item "-" @12
+          paragraph @12 "nested"
+        item "-" @13
+          paragraph @13 "nested two"
+    item "3)" @14
+      paragraph @14 "third"
+  list Descriptive @17
+    item "-" @17 tag="term"
+      paragraph @17 "description"
+    item "-" @18 tag="other term"
+      paragraph @18 "more\nthat goes on"
+  list Unordered @22
+    item "-" @22
+      paragraph @22 "item with a block"
+      block src "sh" @23 "echo in item"
+    item "-" @26
+      paragraph @26 "after the block"
+  list Unordered @29
+    item "-" @29
+      paragraph @29 "one blank line"
+    item "-" @31
+      paragraph @31 "keeps the list"
+  list Unordered @34
+    item "-" @34
+      paragraph @34 "two blank lines end it"
+  paragraph @35 "Text at column 0 ends a list too."
+  list Unordered @36
+    item "-" @36
+      paragraph @36 "a list"
+  paragraph @37 "not a continuation"
+  list Unordered @38
+    item "*" @38
+      paragraph @38 "star bullet indented"

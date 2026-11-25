@@ -1,0 +1,39 @@
+* Lists
+- one
+- two
+  continued
+- [X] done
+- [ ] open
+- [-] partial
+- [@4] counter
+
+
+1. first
+2. second
+   - nested
+   - nested two
+3) third
+
+
+- term :: description
+- other term :: more
+  that goes on
+
+
+- item with a block
+  #+begin_src sh
+  echo in item
+  #+end_src
+- after the block
+
+
+- one blank line
+
+- keeps the list
+
+
+- two blank lines end it
+Text at column 0 ends a list too.
+- a list
+not a continuation
+  * star bullet indented

@@ -1,0 +1,39 @@
+* Blocks
+#+begin_src python :results output :exports both
+    def f():
+        return 1
+,* escaped headline
+,#+begin_src escaped keyword
+#+end_src
+
+#+BEGIN_EXAMPLE
+  example  text
+#+END_EXAMPLE
+
+#+begin_export html
+<div>raw</div>
+#+end_export
+
+#+begin_verse
+  Great clouds overhead
+#+end_verse
+
+#+begin_comment
+not exported
+#+end_comment
+
+#+begin_quote
+A quote with a list:
+- inside
+#+end_quote
+
+#+begin_center
+centered
+#+end_center
+
+#+begin_note :class x
+special block
+#+end_note
+
+#+begin_src sh
+never closed, so a paragraph

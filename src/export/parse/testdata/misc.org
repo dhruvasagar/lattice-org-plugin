@@ -1,0 +1,46 @@
+* Tables
+#+NAME: data
+#+CAPTION: A table
+#+CAPTION: continued
+| <l> | <r> |  |
+| a   | b   | c |
+|-----+-----+---|
+| 1   | 2   | 3 |
+#+TBLFM: $3=$1+$2
+
++---+---+
+| x | y |
++---+---+
+
+* Drawers and keywords
+:LOGBOOK:
+CLOCK: [2026-01-01 Thu 09:00]--[2026-01-01 Thu 10:00] =>  1:00
+:END:
+:NEVER_CLOSED:
+text after an unclosed drawer
+#+ATTR_HTML: :width 300
+[[file:pic.png]]
+
+#+NAME: alone
+
+#+OPTIONS: toc:nil
+* Footnotes and the rest
+Text with a reference[fn:1].
+
+[fn:1] The definition,
+on two lines.
+[fn:two] Second one.
+
+
+After two blank lines.
+: fixed width
+: second line
+:
+# a comment
+#
+-----
+\begin{equation}
+x = 1
+\end{equation}
+#+RESULTS:
+: 42

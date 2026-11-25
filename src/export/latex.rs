@@ -183,9 +183,13 @@ fn entity(name: &str, utf8: &str) -> String {
         | "emptyset" | "equiv" | "exists" | "forall" | "ge" | "geq" | "in" | "infty" | "int"
         | "le" | "leq" | "leftarrow" | "leftrightarrow" | "Leftarrow" | "Leftrightarrow" | "mp"
         | "nabla" | "ne" | "neq" | "ni" | "notin" | "partial" | "pm" | "prime" | "prod"
-        | "prop" | "rightarrow" | "Rightarrow" | "sim" | "sqrt" | "star" | "subset" | "sum"
-        | "supset" | "times" | "to" | "uparrow" | "checkmark" => math(&format!("\\{name}")),
+        | "rightarrow" | "Rightarrow" | "sim" | "star" | "subset" | "sum" | "supset" | "times"
+        | "to" | "uparrow" | "checkmark" => math(&format!("\\{name}")),
         "omicron" => math("o"),
+        "prop" => math("\\propto"),
+        // An argument it takes, and here has none.
+        "sqrt" => math("\\sqrt{}"),
+        "quot" => text_command("\\textquotedbl{}"),
         "infin" => math("\\infty"),
         "darr" => math("\\downarrow"),
         "uarr" => math("\\uparrow"),
@@ -287,6 +291,24 @@ fn language(code: &str) -> &str {
         "sv" => "Swedish",
         other => other,
     }
+}
+
+/// `objects` without what is written once in a document: footnote
+/// references and targets (a radio target keeps its text).
+fn once_only_removed(objects: &[Object]) -> Vec<Object> {
+    let mut out = Vec::with_capacity(objects.len());
+    for o in objects {
+        match o {
+            Object::FootnoteReference { .. } | Object::Target(_) => {}
+            Object::RadioTarget(contents) => out.extend(once_only_removed(contents)),
+            Object::Emphasis { kind, contents } => out.push(Object::Emphasis {
+                kind: *kind,
+                contents: once_only_removed(contents),
+            }),
+            o => out.push(o.clone()),
+        }
+    }
+    out
 }
 
 impl Latex {
@@ -394,9 +416,20 @@ impl Latex {
         out.push_str(&format!(
             "\\author{{{author}}}\n\\date{{{date}}}\n\\title{{{full_title}}}\n"
         ));
+        // The PDF's metadata is text, not markup: what the reader shows in
+        // its document properties.
+        let pdf = |objects: &[Object], view: &mut View| {
+            escaped(&filter::plain(&filter::objects(objects, view)))
+        };
+        let pdf_author = if o.with_author {
+            pdf(&o.author, view)
+        } else {
+            String::new()
+        };
+        let (pdf_title, pdf_subject) = (pdf(&o.title, view), pdf(&o.subtitle, view));
         out.push_str(&format!(
-            "\\hypersetup{{\n pdfauthor={{{author}}},\n pdftitle={{{title}}},\n \
-             pdfkeywords={{}},\n pdfsubject={{{subtitle}}},\n pdfcreator={{lattice}},\n \
+            "\\hypersetup{{\n pdfauthor={{{pdf_author}}},\n pdftitle={{{pdf_title}}},\n \
+             pdfkeywords={{}},\n pdfsubject={{{pdf_subject}}},\n pdfcreator={{lattice}},\n \
              pdflang={{{}}}}}\n",
             language(&o.language)
         ));
@@ -486,17 +519,23 @@ impl Latex {
         self.close_deep(0, out);
         let command = self.class.sections[level - 1];
         let star = if numbered { "" } else { "*" };
-        // A short title for the contents and running heads when the full
-        // one carries a keyword or tags, as ox-latex.
-        let short = if numbered && full != title && !title.is_empty() {
-            format!("[{title}]")
+        // The title again for the contents and running heads, without what
+        // must be written once (a footnote, a target's label). Braced, so a
+        // `]` in it does not end the optional argument.
+        let mut short = String::new();
+        self.objects(&once_only_removed(&h.title), view, &mut short);
+        let short = short.trim_end().to_string();
+        // A short title when the full one carries a keyword or tags, as
+        // ox-latex, or something the contents must not repeat.
+        let optional = if numbered && full != short && !short.is_empty() {
+            format!("[{{{short}}}]")
         } else {
             String::new()
         };
-        let mut heading = format!("\\{command}{star}{short}{{{full}}}\n\\label{{{anchor}}}");
+        let mut heading = format!("\\{command}{star}{optional}{{{full}}}\n\\label{{{anchor}}}");
         if !numbered && self.outline.is_listed(&anchor) {
             heading.push_str(&format!(
-                "\n\\addcontentsline{{toc}}{{{command}}}{{{title}}}"
+                "\n\\addcontentsline{{toc}}{{{command}}}{{{short}}}"
             ));
         }
         push_block(out, &heading);
@@ -1243,7 +1282,7 @@ mod tests {
     fn the_headline_carries_keyword_priority_and_tags_with_a_short_title() {
         let tex = body("#+OPTIONS: pri:t\n* TODO [#A] Ship it :work:\n");
         assert!(
-            tex.starts_with("\\section[Ship it]{{\\bfseries\\sffamily TODO} \\framebox{\\#A} Ship it\\hfill{}\\textsc{work}}\n"),
+            tex.starts_with("\\section[{Ship it}]{{\\bfseries\\sffamily TODO} \\framebox{\\#A} Ship it\\hfill{}\\textsc{work}}\n"),
             "{tex}"
         );
         well_formed(&tex);
@@ -1345,6 +1384,58 @@ mod tests {
         );
         assert!(tex.contains("\\begin{quote}\nq\n\\end{quote}"), "{tex}");
         well_formed(&tex);
+    }
+
+    /// A `]` in a short title does not end the optional argument, and a
+    /// footnote in the title is written once, in the section itself.
+    #[test]
+    fn a_short_title_is_braced_and_holds_no_footnote() {
+        let tex = body("* TODO Fix a[i] indexing\n* Note[fn:: aside] here\n");
+        assert!(
+            tex.contains(
+                "\\section[{Fix a[i] indexing}]{{\\bfseries\\sffamily TODO} Fix a[i] indexing}"
+            ),
+            "{tex}"
+        );
+        assert!(
+            tex.contains("\\section[{Note here}]{Note\\footnote{aside} here}"),
+            "{tex}"
+        );
+        assert_eq!(tex.matches("\\footnote").count(), 1, "{tex}");
+    }
+
+    /// A `CUSTOM_ID` LaTeX could not take as a label is one it can, the same
+    /// at the label and at every reference.
+    #[test]
+    fn an_unsafe_custom_id_is_a_safe_label() {
+        let tex = body(
+            "* A\n:PROPERTIES:\n:CUSTOM_ID: a b%{x}\n:END:\n* B\n[[#a b%{x}][there]] [[#a b%{x}]]\n",
+        );
+        let (labels, refs) = well_formed(&tex);
+        assert_eq!(refs.len(), 2, "{tex}");
+        assert!(refs.iter().all(|r| labels.contains(r)), "{tex}");
+        assert!(!tex.contains("a b%"), "{tex}");
+    }
+
+    /// The PDF's metadata is plain text, not the title block's markup.
+    #[test]
+    fn the_pdf_metadata_is_plain_text() {
+        let tex =
+            export("#+TITLE: The *Plan*\n#+AUTHOR: Ada /L/\n#+EMAIL: a@b.c\n#+OPTIONS: email:t\n");
+        assert!(
+            tex.contains("\\author{Ada \\emph{L}\\thanks{a@b.c}}"),
+            "{tex}"
+        );
+        assert!(
+            tex.contains(" pdfauthor={Ada L},\n pdftitle={The Plan},"),
+            "{tex}"
+        );
+    }
+
+    #[test]
+    fn entities_that_need_more_are_given_it() {
+        let tex = body("\\sqrt \\prop \\quot\n");
+        assert_eq!(tex, "\\(\\sqrt{}\\) \\(\\propto\\) \\textquotedbl{}\n");
     }
 
     #[test]

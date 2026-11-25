@@ -14,7 +14,10 @@
 //!
 //! Anchors are a headline's `CUSTOM_ID` when it has one, else `org` and a
 //! hash of what they name: the same text names the same anchor in every
-//! export, so a link into an exported page survives a re-export.
+//! export, so a link into an exported page survives a re-export. A
+//! `CUSTOM_ID` that would not survive as an HTML id, a URL fragment and a
+//! LaTeX `\label` alike (anything past ASCII letters, digits and `-_.:`) is
+//! hashed too, so no writer has to escape an anchor.
 
 use std::collections::{HashMap, HashSet};
 
@@ -71,6 +74,18 @@ fn norm(s: &str) -> String {
 }
 
 /// `org` and a 32-bit FNV-1a hash of `kind` and `name`.
+/// A `CUSTOM_ID` as an anchor: itself when every backend can write it as is.
+fn custom_anchor(id: &str) -> String {
+    let safe = id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    if safe {
+        id.to_string()
+    } else {
+        hashed("custom", id)
+    }
+}
+
 fn hashed(kind: &str, name: &str) -> String {
     let mut h: u32 = 0x811c_9dc5;
     for b in kind.bytes().chain([0]).chain(name.bytes()) {
@@ -89,7 +104,7 @@ impl Targets {
                 let value = value.trim();
                 if key.eq_ignore_ascii_case("CUSTOM_ID") && !value.is_empty() {
                     self.custom_ids.entry(value.to_string()).or_insert(h.line);
-                    self.anchors.insert(h.line, value.to_string());
+                    self.anchors.insert(h.line, custom_anchor(value));
                 } else if key.eq_ignore_ascii_case("ID") && !value.is_empty() {
                     self.ids.entry(value.to_ascii_lowercase()).or_insert(h.line);
                 }

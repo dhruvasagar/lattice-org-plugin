@@ -348,6 +348,26 @@ async fn the_dispatcher_opens_in_org_buffers_only() {
     );
 }
 
+/// `:help org.export` is the plugin's page, and `:describe-command` on any
+/// export command links to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_export_page_is_in_help_and_linked_from_its_commands() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let (editor, _loader) = org_editor(base.path(), DOC, &[]).await;
+    let topics = editor.help_topics.load();
+    assert!(
+        topics.lookup("org.export").is_some(),
+        "{:?}",
+        topics.names().collect::<Vec<_>>()
+    );
+    let linked: Vec<&str> = topics
+        .topics_for_command("org-export-pdf-open")
+        .map(|t| t.name.as_str())
+        .collect();
+    assert!(linked.contains(&"org.export"), "{linked:?}");
+}
+
 /// Off, the layer goes and the commands say so rather than export; the rest
 /// of org stays on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

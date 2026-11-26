@@ -1229,6 +1229,97 @@ mod tests {
         run_counting(request, text).0
     }
 
+    /// An org file of about `lines` lines shaped like real notes: headlines
+    /// three deep with TODO keywords and tags, prose with emphasis, code,
+    /// links and footnotes, lists with checkboxes, a table and a source block
+    /// with its results in each section.
+    fn representative(lines: usize) -> String {
+        let mut text = String::from("#+TITLE: Notes\n#+AUTHOR: Someone\n#+OPTIONS: toc:2\n\n");
+        let mut n = 0;
+        while text.lines().count() < lines {
+            n += 1;
+            let stars = "*".repeat(1 + n % 3);
+            let todo = ["", "TODO ", "DONE "][n % 3];
+            text.push_str(&format!("{stars} {todo}Section {n} :work:notes:\n"));
+            text.push_str(&format!(
+                "Prose with *bold*, /italic/, =verbatim= and ~code~, a [[https://example.com/{n}][link]] \
+                 and a footnote[fn:{n}]. It runs on long enough to wrap, as notes do, and\n\
+                 carries [[file:other.org::*Section {n}][a link to another file]] and a <<target-{n}>>.\n\n\
+                 - [ ] an open item with ~inline code~\n\
+                 - [X] a done item\n  - nested, with a *bold* word\n\
+                 1. first\n2. second\n\n\
+                 | name | value | note |\n|------+-------+------|\n| a | {n} | /x/ |\n| b | 2 | =y= |\n\n\
+                 #+begin_src rust\nfn f() -> u32 {{\n    {n}\n}}\n#+end_src\n\n\
+                 #+RESULTS:\n: {n}\n\n\
+                 [fn:{n}] The footnote's text.\n\n"
+            ));
+        }
+        text
+    }
+
+    /// What an export costs: parse alone, then each backend end to end, over
+    /// the 2,300-line size the editor's latency is measured on and the
+    /// 20,000 lines the step budget is sized for. A step is what one events
+    /// call pays, so the slowest step is the number that matters to the
+    /// editor; the total is how long the user waits for the file. The crate
+    /// is a cdylib, which `benches/` cannot link, so it is a timing test:
+    /// `cargo test --release export_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run with --release --ignored --nocapture"]
+    fn export_timing() {
+        use std::time::{Duration, Instant};
+        for lines in [2_300, 20_000] {
+            let text = representative(lines);
+            let ctx = parse::Context::for_file(&text, vec!["TODO | DONE".to_string()]);
+            let n = 20;
+            let start = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(parse::parse(&text, &ctx));
+            }
+            println!(
+                "{lines} lines ({} KiB): parse {:?}",
+                text.len() / 1024,
+                start.elapsed() / n
+            );
+            for backend in [Backend::Html, Backend::Markdown, Backend::Latex] {
+                let (mut total, mut slowest, mut steps) = (Duration::ZERO, Duration::ZERO, 0);
+                for _ in 0..n {
+                    let host = Rc::new(Files(Default::default()));
+                    let Ok(mut run) = Run::new(
+                        1,
+                        request(backend),
+                        Some(text.clone()),
+                        vec!["TODO | DONE".to_string()],
+                        When { local_secs: 0 },
+                        host,
+                        Configured {
+                            stylesheet: Stylesheet::None,
+                            ..Configured::default()
+                        },
+                    ) else {
+                        panic!("the run starts");
+                    };
+                    steps = 0;
+                    loop {
+                        steps += 1;
+                        let at = Instant::now();
+                        let done = matches!(run.step(), Step::Done(_));
+                        let took = at.elapsed();
+                        total += took;
+                        slowest = slowest.max(took);
+                        if done {
+                            break;
+                        }
+                    }
+                }
+                println!(
+                    "  {backend:?}: {:?} in {steps} steps, slowest step {slowest:?}",
+                    total / n
+                );
+            }
+        }
+    }
+
     fn written(effects: &[Effect]) -> (&str, &str) {
         effects
             .iter()

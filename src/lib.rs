@@ -4111,6 +4111,12 @@ impl Guest for Component {
             &["org-babel".to_string()],
         );
         let _ = register_topic(
+            "export",
+            "Org export: HTML, Markdown, LaTeX and PDF, from the C-c C-e dispatcher.",
+            include_str!("../doc/export.md"),
+            &["org-export".to_string()],
+        );
+        let _ = register_topic(
             "roam",
             "Org-roam: id-addressed notes, backlinks, dailies and templates.",
             include_str!("../doc/roam.md"),

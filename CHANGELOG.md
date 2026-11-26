@@ -6,7 +6,7 @@ Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.0), and so needs
 the lattice release that carries it.
 
 ### Added
-- **Export: `org-export-mode`** (in progress), on in every org buffer and off
+- **Export: `org-export-mode`**, on in every org buffer and off
   with `:set org.export.enabled=false`. `C-c C-e` opens the dispatcher, emacs's
   `org-export-dispatch`: `h h`, `m m` and `l l` write HTML, Markdown or LaTeX
   beside the file, and `C-s` / `C-b` switch to the subtree at point and to the
@@ -94,6 +94,8 @@ the lattice release that carries it.
   compiler runs until your config file names one (a value set with `:set` is
   not granted), and until then `l p` writes the `.tex` and says how.
   `:org-export-cancel` stops a running export and its compile.
+  `:help org.export` is the whole reference: the dispatcher, what is
+  exported, source blocks, where the output goes, PDF, and every option.
 - **Export honours `:exports`.** A source block exports as emacs exports
   it: `code` (the default) shows the block and leaves its `#+RESULTS:` out,
   `results` shows only the result, `both` shows both, and `none` shows
@@ -106,7 +108,7 @@ the lattice release that carries it.
   its fresh result appears in the export. It runs on a copy, so the file's
   own `#+RESULTS:` are never touched. With `org.babel.confirm` on, the
   export asks once (`Export runs 2 blocks (sh ×2)? (y/n)`). `n` still
-  exports, with the results already in the file; `q` cancels. `:eval
+  exports, with the results already in the file; `q` exports nothing. `:eval
   no-export` (or `never-export`, `no`, `never`) keeps a block from running
   for an export, so it shows the result already in the file, as does a
   block whose language has no `org.babel.languages` entry (the echo names

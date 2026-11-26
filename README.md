@@ -14,9 +14,9 @@ org-roam, shipped as a single WebAssembly component.
 | The API it builds against | [`lattice-wit`](https://crates.io/crates/lattice-wit) · [`lattice-plugin-sdk`](https://crates.io/crates/lattice-plugin-sdk) |
 
 **Contents:** [Installing it](#installing-it) ·
-[Configuring it](#configuring-it) · [What it does](#what-it-does) ·
-[Documentation](#documentation) · [How it is built](#how-it-is-built) ·
-[Developing it](#developing-it)
+[What you can do with it](#what-you-can-do-with-it) ·
+[Configuring it](#configuring-it) · [Documentation](#documentation) ·
+[How it is built](#how-it-is-built) · [Developing it](#developing-it)
 
 ## Installing it
 
@@ -176,6 +176,190 @@ your notes live — see [Where org may write](#where-org-may-write) — and star
 lattice. Discovery finds the directory, reads the manifest, and drains each
 seam.
 
+## What you can do with it
+
+Org-mode as emacs has it, driven by vim's keys. `<leader>o…` is org's prefix
+throughout, and the emacs chords (`C-c C-c`, `C-c C-e`, `C-c n …`) work too.
+Each part below has its own manual inside the plugin, which `:help` opens; the
+same pages are in [`doc/`](doc/).
+
+### Outlines and TODOs
+
+Headlines fold with `<Tab>`, and promote, demote and move as subtrees
+(`<leader>oh` / `<leader>ol`, `<leader>oH` / `<leader>oL`, `<leader>oK` /
+`<leader>oJ`). `]]` and `[[` jump between headlines. `ih` / `ah` select a
+headline and `ir` / `ar` a subtree, so `dar` deletes one and `yar` copies it. `<leader>ot` cycles the
+TODO keyword, `<leader>os` picks one from a menu, `<leader>o,` cycles the
+priority and `<leader>o:` sets tags. Checkboxes, lists, tables (`<Tab>`
+aligns), links (`<CR>` follows) and timestamps (`<C-a>` / `<C-x>` step the
+part under the cursor) all have their own keys.
+
+Your own TODO states, in emacs' syntax, each with a key for the menu:
+
+```toml
+[org]
+todo-keywords = """
+sequence: TODO(t) NEXT(n) | DONE(d)
+sequence: WAITING(w) HOLD(h) | CANCELLED(c)
+"""
+```
+
+`:help org`, or [`doc/org.md`](doc/org.md).
+
+### The agenda
+
+`:org-agenda` (or `<leader>oa`, `C-c a`, from any buffer) gathers every
+scheduled, deadlined and dated headline across your files into one view. Its
+rows are the lines of your files, not copies: editing a row edits the file,
+and `:w` saves it. `<leader>ot` and `<leader>o,` change a row's state and
+priority in place, `m` marks rows and `x` acts on all the marked ones, and `r`
+shows the clock report.
+
+```toml
+[org]
+agenda-files = ["~/notes", "~/work/notes"]   # files or directories; default org.directory
+```
+
+Named agendas (emacs' `org-agenda-custom-commands`) go in
+`org.agenda-custom-commands`, chosen from `<leader>oa`. Repeating tasks
+marked `:STYLE: habit` show a consistency graph under their row. See
+`:help org` (Agenda, and Repeating tasks and habits).
+
+### Capture, refile and archive
+
+`<leader>oc` (from any buffer) opens your capture templates. A capture is a
+draft file of its own, so several can be open at once, `:w` keeps one for
+later and `<leader>oC` brings it back. `C-c C-c` files it, `C-c C-k` throws it
+away. `<leader>or` refiles the subtree at the cursor under a headline you
+pick, and `<leader>o$` archives it into `<file>_archive`.
+
+```toml
+[[org.capture-templates]]
+key = "t"
+description = "todo"
+target = { file = "~/notes/inbox.org", headline = "Tasks" }
+body = """
+* TODO %?
+%U
+"""
+```
+
+Templates can file into a headline, an outline path, today's date tree or a
+table row, and can start a clock. `:help org` (Capturing) has every target
+and placeholder.
+
+### Clocking
+
+`<leader>oxi` clocks in on the entry at the cursor, `<leader>oxo` clocks out
+and writes the elapsed time into its `LOGBOOK`, and the running clock shows in
+your modeline. `<leader>oxj` jumps back to it and `<leader>oxr` resumes the
+last one. `r` in the agenda shows where the time went.
+
+### Org-roam
+
+A Zettelkasten over the org files you already have, addressed by `:ID:` so a
+link survives a rename. It is off until its directory exists:
+
+```toml
+[org]
+roam-directory = "~/notes/roam"
+```
+
+`<leader>onf` (`C-c nf`) finds a note by title or alias and creates it if
+there is none, `C-c n i` in Insert mode links one at the cursor,
+`:org-roam-backlinks` shows what links to the note you are in, and
+`<leader>ondd` opens today's journal. `:help org.roam`, or
+[`doc/roam.md`](doc/roam.md).
+
+### Babel: running source blocks
+
+`C-c C-c` in a `#+begin_src` block runs it in the background and writes its
+output under it as `#+RESULTS:`, byte for byte as emacs writes it. Nothing
+runs until you list a language, and that list is the permission: org may run
+only the programs you name.
+
+```toml
+[[org.babel.languages]]
+name    = "sh"         # the word after #+begin_src
+command = "sh"
+
+[[org.babel.languages]]
+name    = "python"
+command = "python3"
+ext     = "py"
+value   = "python"     # lets :var hand the block values, and :results value work
+```
+
+```org
+#+begin_src sh
+echo hi
+#+end_src
+
+#+RESULTS:
+: hi
+```
+
+`C-c C-v b` runs every block in the buffer and `C-c C-v s` every block under
+the headline. Header arguments work as in emacs: `:var` hands a block values
+(from a table or another block's result), `:noweb` puts one block in another,
+and `:session` keeps an interpreter running between blocks. `C-c C-v t`
+tangles the `:tangle` blocks out to files, which may be written only under
+`org.directory` and `org.babel.tangle-directories`. `org.babel.confirm`
+(on by default) asks before each run. `:help org.babel`, or
+[`doc/babel.md`](doc/babel.md).
+
+### Export: HTML, Markdown, LaTeX and PDF
+
+`C-c C-e` opens emacs' export dispatcher, with the same letters: `h h` writes
+`notes.html` beside the file, `m m` Markdown, `l l` LaTeX and `l p` a PDF;
+`h o` / `l o` export and open the result beside the org file. `C-s` exports
+only the subtree at the cursor, `C-b` only the body. `#+OPTIONS:`, `#+TITLE:`
+and the `:noexport:` / `:export:` tags mean what they mean in emacs. Exports
+run in the background.
+
+An export may write only under `org.directory`, `org.roam-directory` and the
+directories you add. A PDF compile runs only the steps you name:
+
+```toml
+[org.export]
+directories = ["~/src/my-project"]   # e.g. to export a project's README.org
+
+[[org.export.latex-pdf-process]]
+command = "latexmk"
+args    = ["-pdf", "-interaction=nonstopmode", "-output-directory=%o", "%f"]
+```
+
+In the GUI, `l o` opens the PDF in lattice and reloads it in place on each
+export, so it doubles as a live preview. `:help org.export`, or
+[`doc/export.md`](doc/export.md).
+
+### The assistant: org in a language-model chat
+
+Org gives lattice's language models tools over your files: the agenda,
+entries by tag or state, clocked time and roam notes. Changes go through
+org's own commands, and each is shown to you as a diff first. With a model set
+up for lattice's chats, four commands start a workflow:
+
+| Command | Does |
+|---|---|
+| `:org-plan-day`, `:org-plan-week` | plan from what is scheduled, due and overdue |
+| `:org-review` | a weekly review |
+| `:org-report` | a report of what you worked on |
+
+`:llm org-research <topic>` researches into your roam notes. The same tools
+reach Claude Code and other MCP clients while lattice runs:
+
+```toml
+[llm]
+serve_tools = true
+```
+
+```sh
+claude mcp add --scope user lattice -- lattice --mcp
+```
+
+`:help org.assistant`, or [`doc/assistant.md`](doc/assistant.md).
+
 ## Configuring it
 
 **Install and configure in one file.** `[plugins.org]` installs org; `[org]`
@@ -267,7 +451,48 @@ plugin by name.
 the plugin's own manual — which ships *inside* the component, so it is always
 the manual for the version you are running.
 
-## What it does
+## Documentation
+
+The manual ships inside the component, so `:help` always opens the one for
+the version you run. The same pages are in [`doc/`](doc/):
+
+| `:help` | File | Covers |
+|---|---|---|
+| `org` | [`doc/org.md`](doc/org.md) | headlines, TODO states, tags, lists, tables, links, timestamps, images, the clock, archive, refile, capture and its templates, habits, the agenda |
+| `org.roam` | [`doc/roam.md`](doc/roam.md) | notes, links and backlinks, the journal, note templates |
+| `org.babel` | [`doc/babel.md`](doc/babel.md) | running blocks, results, `:var`, noweb, sessions, tangling |
+| `org.export` | [`doc/export.md`](doc/export.md) | the dispatcher, HTML, Markdown, LaTeX and PDF, what is exported, where it goes |
+| `org.assistant` | [`doc/assistant.md`](doc/assistant.md) | the tools, the workflows, Claude Code and other agents |
+
+`:options org.` lists every option with its value and its documentation, and
+`:describe-option org.<name>` gives one in full.
+
+## How it is built
+
+It is the first real consumer of lattice's `language` seam, and by now of
+fifteen others — see [the seams it provides](#the-seams-it-provides), which
+the manifest's `provides` (at the top of `src/lib.rs`) is the source of truth
+for.
+
+Design lives in the lattice tree:
+[`org-mode.md`](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/architecture/org-mode.md),
+plus `org-capture.md`, `org-roam.md` and `org-todo-keywords.md` beside it.
+Sequencing is under
+[`slice-plans/`](https://github.com/dhruvasagar/lattice/tree/main/docs/dev/operations/slice-plans)
+(finished plans move to `slice-plans/archive/`).
+
+**This lives outside the lattice tree, and that is the point.** It is what a
+user's plugin manager downloads, or clones and builds, so it has to work as
+an ordinary external repository rather than as a directory someone remembered to
+exclude. It began as `examples/org-plugin` and moved out at OM.6.
+
+It is not a bundled plugin and never will be: org's grammar is 2.2 MB of
+generated C maintained outside crates.io, and design §1's whole argument is
+that such a grammar is *the plugin's* build artefact, not the editor's.
+Vendoring it would mean every lattice build either carried that weight or
+reached the network.
+
+### The seams it provides
 
 | seam | what org contributes |
 |---|---|
@@ -302,39 +527,6 @@ wants offered, so lattice never learns what a `.org` file is either. It was
 called `agenda-source` until it was pointed out that its record is an excerpt
 plus an ordering plus a group header, with nothing about org, dates or TODOs
 in it.
-
-## Documentation
-
-The manual ships inside the component, so it is always the one for the version
-you run: `:help org`, and `:help org.roam`, `:help org.babel`,
-`:help org.export`, `:help org.assistant`. The same pages are in
-[`doc/`](doc/). `:options org.` lists every option with its value and its
-documentation.
-
-## How it is built
-
-It is the first real consumer of lattice's `language` seam, and by now of
-fifteen others — see the seam table in [What it does](#what-it-does), which
-the manifest's `provides` (at the top of `src/lib.rs`) is the source of truth
-for.
-
-Design lives in the lattice tree:
-[`org-mode.md`](https://github.com/dhruvasagar/lattice/blob/main/docs/dev/architecture/org-mode.md),
-plus `org-capture.md`, `org-roam.md` and `org-todo-keywords.md` beside it.
-Sequencing is under
-[`slice-plans/`](https://github.com/dhruvasagar/lattice/tree/main/docs/dev/operations/slice-plans)
-(finished plans move to `slice-plans/archive/`).
-
-**This lives outside the lattice tree, and that is the point.** It is what a
-user's plugin manager downloads, or clones and builds, so it has to work as
-an ordinary external repository rather than as a directory someone remembered to
-exclude. It began as `examples/org-plugin` and moved out at OM.6.
-
-It is not a bundled plugin and never will be: org's grammar is 2.2 MB of
-generated C maintained outside crates.io, and design §1's whole argument is
-that such a grammar is *the plugin's* build artefact, not the editor's.
-Vendoring it would mean every lattice build either carried that weight or
-reached the network.
 
 ### Sixteen seams from one component
 

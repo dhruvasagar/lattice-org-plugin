@@ -8,6 +8,13 @@
   The simplest install is listed first: a `[plugins.org]` table in
   `lattice.toml`, which needs no Rust toolchain and no `init.rs` (lattice
   after 0.10.3). An example installs and configures org from that one file.
+- **The README shows what org does.** A new "What you can do with it" section
+  covers each part: outlines and TODOs, the agenda, capture, refile and
+  archive, clocking, org-roam, babel, export and the assistant. Each part
+  gives its keys, a minimal `lattice.toml` and the `:help` topic with its
+  whole manual. The seam table moves under "How it is built", and the
+  documentation section is now a table of the manuals.
+- `:help org.roam` shows how to turn roam on from `lattice.toml` too.
 
 ## 0.6.0 — 2026-11-26
 

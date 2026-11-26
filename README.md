@@ -40,21 +40,21 @@ reached the network.
 | seam | what org contributes |
 |---|---|
 | `language` | the `org` language: `.org` / `.org_archive`, the grammar, `queries/highlights.scm` + `queries/folds.scm` |
-| `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-babel-mode`, `org-agenda-mode`, `org-global-mode` |
+| `modes` | `org-mode` (major) plus the minors — `org-todo-mode`, `org-table-mode`, `org-babel-mode`, `org-export-mode`, `org-agenda-mode`, `org-global-mode` |
 | `grammar` | every action, motion and text object the modes bind: promote/demote, subtree move, `]]` / `[[` / `g{`, `ih`/`ah`/`ir`/`ar`, TODO and priority cycling, checkboxes, timestamps, links, table editing, the clock, archive / refile / capture, the agenda's bulk marks, and org-roam's commands |
-| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates`, and babel's `org.babel.*` (`enabled`, `confirm`, `languages`, `tangle-directories`, `min-lines-for-block-output`, `max-output-lines`) |
+| `config` | `org.todo-keywords`, `org.todo-keyword-styles`, `org.highest-priority`, `org.inline-images`, `org.capture-templates`, `org.directory`, `org.capture-drafts-directory`, `org.agenda-files`, `org.roam-directory`, `org.roam-dailies-directory`, `org.roam-capture-templates`, and babel's `org.babel.*` (`enabled`, `confirm`, `languages`, `tangle-directories`, `min-lines-for-block-output`, `max-output-lines`), and export's `org.export.*` (where it may write, how it opens what it made, the `#+OPTIONS:` defaults, the HTML head, the LaTeX class and the PDF steps; `:options org.export.` lists them) |
 | `theme` | one theme element per TODO keyword, so `:colorscheme` recolours your own states |
 | `media` | inline `[[file:diagram.png]]` images, on the GPUI peer |
 | `scanned-excerpt-source` | dated rows for the agenda — what a row is, when it falls, how it sorts, and which files to scan |
 | `multibuffer-view-source` | the agenda **view** itself: its buffer name, reuse policy and input model |
 | `picker-source` | refile targets, capture drafts (`<leader>oC`), and org-roam's find-node, insert-node and backlinks pickers |
 | `completion-source` | org-roam nodes, offered inside an `[[…]]` link |
-| `transient-source` | the capture menu (one key per template), the TODO-state menu, the agenda's `gD` view menu and its `x` bulk menu |
+| `transient-source` | the capture menu (one key per template), the TODO-state menu, the agenda's `gD` view menu and its `x` bulk menu, and export's `C-c C-e` dispatcher with its subtree-only and body-only switches |
 | `signs` | the `>` an agenda row wears when it is marked for a bulk action |
 | `decorations` | which agenda rows carry that mark — re-asked through `refresh-decorations`, because a mark changes no text |
 | `events` | the clock's session, its minute wake and its modeline segment |
 | `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), `org.query` (entries by tags, properties or TODO state), `org.entry` (one entry whole, by its ref or `ID`), `org.clock` (clocked time over a range, per entry, file or tag), `org.notes` (roam notes by title, alias or tag, with backlinks), read through the agenda's own scan so the assistant and `:org-agenda` agree; and `org.change`, which sets an entry's TODO state, schedule, deadline or tags, adds a note to its log or refiles it, or captures something new through one of your capture templates, through the verbs the keys use and hands the edit to lattice's review. Five workflows ride with them as chat profiles (`org`, `org-plan`, `org-review`, `org-report`, `org-research`), opened by `:org-plan-day`, `:org-plan-week`, `:org-review` and `:org-report`. The same tools reach Claude Code and other MCP or ACP agents through `lattice --mcp` (`llm.serve_tools`); see `:help org.assistant` |
-| `help` | `doc/org.md`, `doc/roam.md` and `doc/babel.md`, shipped inside the component; `:help org`, `:help org.roam`, `:help org.babel`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
+| `help` | `doc/org.md`, `doc/roam.md`, `doc/babel.md` and `doc/export.md`, shipped inside the component; `:help org`, `:help org.roam`, `:help org.babel`, `:help org.export`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.
@@ -318,22 +318,29 @@ Where both set an option, `init.rs` wins: it is read after `lattice.toml`.
 
 ### Where org may write
 
-Archive, refile and capture write to files other than the one you are in, and
-lattice checks every such write against org's file grant. That grant **follows
-two of org's own options**:
+Archive, refile, capture, tangle and export write to files other than the one
+you are in, and lattice checks every such write against org's file grant. That
+grant **follows org's own options**:
 
 | Option | Default | Org may write under |
 |---|---|---|
 | `org.directory` | `~/org` | your org directory |
 | `org.roam-directory` | `~/org-roam` | your org-roam notes |
+| `org.babel.tangle-directories` | none | more directories `:org-babel-tangle` may write into |
+| `org.export.directories` | none | more directories an export may write into, such as a project's, to export its `README.org` |
 
-The defaults are emacs's own (`org-directory`, `org-roam-directory`). Setting
-either option — from your `init.rs`, or live with `:set` — is how you
-move the access; there is no separate grant to edit. Org reloads itself when
-the value changes, and `:plugins` shows what is in force
-(`fs:write ~/notes (org.directory)`). A write outside both is refused with a
-message naming the option to change. Org itself cannot change these options:
-only your configuration can.
+The first two defaults are emacs's own (`org-directory`,
+`org-roam-directory`). Setting any of these options — from your `init.rs`, or
+live with `:set` — is how you move the access; there is no separate grant to
+edit. Org reloads itself when the value changes, and `:plugins` shows what is
+in force (`fs:write ~/notes (org.directory)`). A write outside all of them is
+refused with a message naming the option to change. Org itself cannot change
+these options: only your configuration can.
+
+An export to PDF also runs programs: only the commands you name in
+`org.export.latex-pdf-process`, and only when your config file names them. A
+value set with `:set` is not granted. [`doc/export.md`](doc/export.md) has
+the whole of export, and `:help org.export` opens the same page in lattice.
 
 A directory that does not exist is fine: roam stays off until
 `org.roam-directory` exists, and capture drafts fall back as if `org.directory`
@@ -397,12 +404,13 @@ after a restart.
 
 `default_modes` is load-bearing: it is what publishes the enablement request
 for each mode named, and without it a mode registers correctly and simply never
-activates — the chords are silently dead. Four are named because they answer
+activates — the chords are silently dead. Five are named because they answer
 different questions: `org-todo-mode` is keyword cycling *inside org files*,
 `org-table-mode` is table editing in them, `org-babel-mode` is running their
-source blocks (with a switch of its own, `org.babel.enabled`, through the
-manifest's `mode_gates`, because it is the one part of org that runs
-programs), and `org-global-mode` is the
+source blocks and `org-export-mode` is exporting them (each with a switch of
+its own, `org.babel.enabled` and `org.export.enabled`, through the manifest's
+`mode_gates`, because they are the parts of org that run programs), and
+`org-global-mode` is the
 `<leader>o` prefix (capture, agenda, roam) that has to work *wherever you are*.
 It is `<leader>o` and not `<C-x>o`: org's MAJOR keymap binds a TERMINAL `<C-x>`
 (timestamp decrement), so inside an org buffer `<C-x>` fires that and never

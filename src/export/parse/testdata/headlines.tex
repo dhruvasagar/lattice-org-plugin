@@ -1,0 +1,71 @@
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\author{Someone}
+\date{\today}
+\title{Headlines}
+\hypersetup{
+ pdfauthor={Someone},
+ pdftitle={Headlines},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={lattice},
+ pdflang={English}}
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+Text before the first headline.
+
+\section[{A task with everything}]{{\bfseries\sffamily TODO} A task with everything\hfill{}\textsc{work:urgent}}
+\label{task}
+
+The section.
+
+\subsection[{Finished}]{{\bfseries\sffamily DONE} Finished}
+\label{orga5cdd4cd}
+
+\section{{\bfseries\sffamily NEXT}}
+\label{org9ecdc9c8}
+
+\section{Plain heading with a colon: not tags}
+\label{org9fcdcb5b}
+
+\section[{Tags only}]{Tags only\hfill{}\textsc{a}}
+\label{org9ccdc6a2}
+
+\textbf{\textbf{bold}} at the start of a line is not a headline.
+*
+
+\section{A block that crosses a headline}
+\label{org9dcb899e}
+
+\#+begin\textsubscript{src} sh
+echo one
+
+\section{This is a headline, so the block above never closed}
+\label{orga2cb917d}
+
+\#+end\textsubscript{src}
+
+\begin{enumerate}
+
+\item Deep, skipping levels
+\label{orga0cb8e57}
+
+\end{enumerate}
+
+\section{Back to the top}
+\label{org9fcb8cc4}
+\end{document}

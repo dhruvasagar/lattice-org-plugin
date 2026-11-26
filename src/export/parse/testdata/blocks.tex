@@ -1,0 +1,65 @@
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\author{}
+\date{\today}
+\title{plan}
+\hypersetup{
+ pdfauthor={},
+ pdftitle={plan},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={lattice},
+ pdflang={English}}
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\section{Blocks}
+\label{org2f124dc1}
+
+\begin{verbatim}
+    def f():
+        return 1
+* escaped headline
+#+begin_src escaped keyword
+\end{verbatim}
+
+\begin{verbatim}
+example  text
+\end{verbatim}
+
+\begin{verse}
+Great clouds overhead
+\end{verse}
+
+\begin{quote}
+A quote with a list:
+
+\begin{itemize}
+\item inside
+\end{itemize}
+\end{quote}
+
+\begin{center}
+centered
+\end{center}
+
+\begin{note}
+special block
+\end{note}
+
+\#+begin\textsubscript{src} sh
+never closed, so a paragraph
+\end{document}

@@ -355,6 +355,7 @@ fn confirm_in(
             prompt,
             yes_action,
             args,
+            ..
         } => Some((prompt.clone(), yes_action.clone(), args.clone())),
         _ => None,
     })

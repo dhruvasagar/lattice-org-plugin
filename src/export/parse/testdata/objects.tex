@@ -1,0 +1,64 @@
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\author{}
+\date{\today}
+\title{plan}
+\hypersetup{
+ pdfauthor={},
+ pdftitle={plan},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={lattice},
+ pdflang={English}}
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\section[{A \emph{title} with \texttt{code} and a \href{https://example.com}{link}}]{A \emph{title} with \texttt{code} and a \href{https://example.com}{link}\hfill{}\textsc{tag}}
+\label{org2f124dc1}
+
+Some \textbf{bold}, \emph{italic}, \uline{underline}, \sout{strike}, \texttt{verbatim} and \texttt{code}.
+Nested \textbf{\emph{bold italic}} and a bold that runs
+onto the \textbf{next
+line}, but not three lines.
+A footnote\footnote{}, a named one\footnote{}, and an inline one\footnote{with \textbf{markup}}.
+Entities: \(\alpha\), \(\to\)x, 30\textdegree{} and ~; a command \textbf{b} and math $E=mc^2$.
+H\textsubscript{2O}, x\textsuperscript{n+1} and e\textsuperscript{-1} but not a\_ or snake\textsubscript{case}\textsubscript{name}.
+A line break\\
+and a timestamp \textit{<2026-03-01 Sun 09:00>-{}-<2026-03-01 Sun 10:00>}.
+\label{org14307af9} and a \label{org6d196a2b}radio target, a cookie [2/3], a macro C-c, C-e.
+snippet, a plain link \url{https://lattice.dev/docs}. and \url{mailto:a@b.c}.
+Traps: a*b*c, 2*3*4 and price \$5 and \$6.
+Verbatim wins: \texttt{a *b* c}.
+No close: *not bold * here.
+
+\begin{center}
+\begin{tabular}{ll}
+\textbf{head} & \texttt{v} \\
+\hline
+\ref{org14307af9} & $y$ \\
+\end{tabular}
+\end{center}
+
+\begin{description}
+\item[{\textbf{term}}] the \emph{definition}
+\end{description}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=.9\linewidth]{img.png}
+\caption{A \textbf{bold} caption}
+\end{figure}
+\end{document}

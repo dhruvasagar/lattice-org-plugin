@@ -341,7 +341,7 @@ pub(crate) fn src_blocks(lines: &[&str]) -> Vec<SrcBlock> {
 }
 
 /// A headline's level, or `None` for any other line.
-fn headline_level(line: &str) -> Option<usize> {
+pub(crate) fn headline_level(line: &str) -> Option<usize> {
     let stars = line.bytes().take_while(|b| *b == b'*').count();
     (stars > 0 && line[stars..].starts_with(' ')).then_some(stars)
 }
@@ -361,7 +361,7 @@ pub(crate) fn subtree_at(lines: &[&str], at: u32) -> Option<(u32, u32)> {
 }
 
 /// The `:NAME: value` properties in the drawer under the headline on `h`.
-fn drawer_properties<'a>(lines: &[&'a str], h: usize) -> Vec<(String, &'a str)> {
+pub(crate) fn drawer_properties<'a>(lines: &[&'a str], h: usize) -> Vec<(String, &'a str)> {
     let mut i = h + 1;
     // Planning lines sit between a headline and its drawer.
     while lines.get(i).is_some_and(|l| {
@@ -398,19 +398,45 @@ fn drawer_properties<'a>(lines: &[&'a str], h: usize) -> Vec<(String, &'a str)> 
     out
 }
 
-/// One level of inheritance: org's rule for a property, where a plain
-/// `name` replaces what was inherited and `name+` appends to it.
-fn accumulate(acc: &mut String, props: &[(String, &str)], name: &str) {
-    for (k, v) in props {
-        if k == name {
-            *acc = v.to_string();
-        } else if k.strip_suffix('+') == Some(name) {
-            if !acc.is_empty() {
-                acc.push(' ');
-            }
-            acc.push_str(v);
+/// One property of inheritance: org's rule, where a plain `name` replaces
+/// what was inherited and `name+` appends to it.
+fn accumulate(acc: &mut String, key: &str, value: &str, name: &str) {
+    if key == name {
+        *acc = value.to_string();
+    } else if key.strip_suffix('+') == Some(name) {
+        if !acc.is_empty() {
+            acc.push(' ');
         }
+        acc.push_str(value);
     }
+}
+
+/// Babel's defaults, the base every block's header arguments merge onto.
+const DEFAULT_HEADER_ARGS: &str =
+    ":results replace :session none :noweb no :tangle no :cache no :exports code";
+
+/// The header arguments of a `lang` block whose own are `own`, under
+/// `levels`: the properties above it, outermost first — the file's
+/// `#+PROPERTY:` lines, then each headline's drawer down to the block's.
+/// Only `header-args` and `header-args:<lang>` (and their `+` forms) count.
+pub(crate) fn inherit<'a>(
+    levels: impl IntoIterator<Item = (&'a str, &'a str)>,
+    lang: &str,
+    own: &HeaderArgs,
+) -> HeaderArgs {
+    let general = "header-args";
+    let lang = format!("header-args:{}", lang.to_ascii_lowercase());
+    let mut acc_general = String::new();
+    let mut acc_lang = String::new();
+    for (key, value) in levels {
+        accumulate(&mut acc_general, key, value, general);
+        accumulate(&mut acc_lang, key, value, &lang);
+    }
+    let mut args = HeaderArgs::parse(DEFAULT_HEADER_ARGS);
+    args.merge(&HeaderArgs::parse(&acc_general));
+    args.merge(&HeaderArgs::parse(&acc_lang));
+    args.merge(own);
+    args
 }
 
 /// The header arguments `block` runs with, in babel's order, later winning:
@@ -418,9 +444,6 @@ fn accumulate(acc: &mut String, props: &[(String, &str)], name: &str) {
 /// inherited down the headlines above the block, org's property rule) → the
 /// block's own `#+HEADER:` lines and `#+begin_src` line (design §5.1).
 pub(crate) fn effective_header_args(lines: &[&str], block: &SrcBlock) -> HeaderArgs {
-    let general = "header-args".to_string();
-    let lang = format!("header-args:{}", block.lang.to_ascii_lowercase());
-
     // The file is the outermost level: `#+PROPERTY:` lines, wherever they are.
     let file_props: Vec<(String, &str)> = lines
         .iter()
@@ -430,7 +453,10 @@ pub(crate) fn effective_header_args(lines: &[&str], block: &SrcBlock) -> HeaderA
             (k.to_ascii_lowercase(), rest.trim())
         })
         .collect();
+    effective_in(&file_props, lines, block)
+}
 
+fn effective_in(file_props: &[(String, &str)], lines: &[&str], block: &SrcBlock) -> HeaderArgs {
     // The headlines above the block, innermost first: each one shallower
     // than the last one found.
     let mut ancestors = Vec::new();
@@ -447,23 +473,16 @@ pub(crate) fn effective_header_args(lines: &[&str], block: &SrcBlock) -> HeaderA
         }
     }
 
-    let mut acc_general = String::new();
-    let mut acc_lang = String::new();
-    accumulate(&mut acc_general, &file_props, &general);
-    accumulate(&mut acc_lang, &file_props, &lang);
-    for &h in ancestors.iter().rev() {
-        let props = drawer_properties(lines, h);
-        accumulate(&mut acc_general, &props, &general);
-        accumulate(&mut acc_lang, &props, &lang);
-    }
-
-    let mut args = HeaderArgs::parse(
-        ":results replace :session none :noweb no :tangle no :cache no :exports code",
-    );
-    args.merge(&HeaderArgs::parse(&acc_general));
-    args.merge(&HeaderArgs::parse(&acc_lang));
-    args.merge(&block.header);
-    args
+    let drawers: Vec<Vec<(String, &str)>> = ancestors
+        .iter()
+        .rev()
+        .map(|&h| drawer_properties(lines, h))
+        .collect();
+    let levels = file_props
+        .iter()
+        .chain(drawers.iter().flatten())
+        .map(|(k, v)| (k.as_str(), *v));
+    inherit(levels, &block.lang, &block.header)
 }
 
 /// Which block a run belongs to, so its result finds it again after the

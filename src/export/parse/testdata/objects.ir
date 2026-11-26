@@ -1,0 +1,12 @@
+headline 1 @0 ["A " italic["title"] " with " verbatim("code") " and a " link("https://example.com")["link"]] :tag:
+  paragraph @1 "Some " bold["bold"] ", " italic["italic"] ", " underline["underline"] ", " strike["strike"] ", " verbatim("verbatim") " and " code("code") ".\nNested " bold[italic["bold italic"]] " and a bold that runs\nonto the " bold["next\nline"] ", but not three lines.\nA footnote" fn("1") ", a named one" fn("note") ", and an inline one" fn(None)[" with " bold["markup"]] ".\nEntities: " entity(alpha) ", " entity(to{}) "x, 30" entity(deg) " and " entity(nbsp) "; a command " latex("\\textbf{b}") " and math " latex("$E=mc^2$") ".\nH" sub["2O"] ", x" sup{}["n+1"] " and e" sup["-1"] " but not a_ or snake" sub["case"] sub["name"] ".\nA line break" linebreak "\nand a timestamp " timestamp("<2026-03-01 Sun 09:00>--<2026-03-01 Sun 10:00>") ".\n" target("anchor") " and a " radio["radio"] " target, a cookie " cookie("[2/3]") ", a macro " macro(kbd ["C-c, C-e"]) ".\n" snippet(html "<kbd>") "snippet" snippet(html "</kbd>") ", a plain link " link("https://lattice.dev/docs") ". and " link("mailto:a@b.c") ".\nTraps: a*b*c, 2*3*4 and price $5 and $6.\nVerbatim wins: " verbatim("a *b* c") ".\nNo close: *not bold * here."
+  table @16
+    row [bold["head"]] [verbatim("v")]
+    rule
+    row [link("anchor")] [latex("$y$")]
+  list Descriptive @20
+    item "-" @20 tag=[bold["term"]]
+      paragraph @20 "the " italic["definition"]
+  paragraph @21 link("file:img.png")
+    with caption=["A " bold["bold"] " caption"]
+  keyword MACRO @23 "kbd @@html:<kbd>@@$1@@html:</kbd>@@"

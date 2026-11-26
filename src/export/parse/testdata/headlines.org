@@ -1,0 +1,28 @@
+#+TITLE: Headlines
+#+AUTHOR: Someone
+Text before the first headline.
+
+* TODO [#A] A task with everything :work:urgent:
+SCHEDULED: <2026-01-05 Mon> DEADLINE: <2026-01-09 Fri>
+:PROPERTIES:
+:CUSTOM_ID: task
+:EXPORT_FILE_NAME: task-out
+:END:
+The section.
+** DONE Finished
+CLOSED: [2026-01-02 Fri 10:00]
+** COMMENT Not exported
+Hidden.
+*** Child of a comment
+* NEXT
+* Plain heading with a colon: not tags
+* Tags only :a:
+**bold** at the start of a line is not a headline.
+*
+* A block that crosses a headline
+#+begin_src sh
+echo one
+* This is a headline, so the block above never closed
+#+end_src
+***** Deep, skipping levels
+* Back to the top

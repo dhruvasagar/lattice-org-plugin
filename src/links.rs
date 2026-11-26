@@ -435,7 +435,7 @@ mod tests {
     }
 }
 
-// ── OM.10: opening a link at point ──
+// ── Opening a link at point ──
 
 /// What a link points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,19 +478,98 @@ pub struct Link {
 pub fn link_at(line: &str, byte: usize) -> Option<Link> {
     let mut i = 0;
     while let Some(open) = line[i..].find("[[").map(|o| i + o) {
-        let Some(close) = line[open..].find("]]").map(|o| open + o + 2) else {
-            break;
+        let Some(link) = bracket_link(&line[open..]) else {
+            i = open + 2;
+            continue;
         };
+        let close = open + link.len;
         if byte >= open && byte < close {
-            let inner = &line[open + 2..close - 2];
-            let path = inner.split_once("][").map(|(p, _)| p).unwrap_or(inner);
-            return classify(path).map(|target| Link {
+            return classify(&link.path).map(|target| Link {
                 start: open,
                 end: close,
                 target,
             });
         }
         i = close;
+    }
+    None
+}
+
+/// A `[[path]]` or `[[path][description]]` link at the start of `s`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BracketLink<'a> {
+    /// The path, with org's `\]` / `\[` / `\\` escapes taken off.
+    pub path: String,
+    /// The description as written, for the caller to parse.
+    pub description: Option<&'a str>,
+    /// Bytes from the opening `[[` through the closing `]]`.
+    pub len: usize,
+}
+
+/// Parse a bracket link at the start of `s`, by org's rules: the path ends at
+/// the first `]` a backslash does not escape and may hold no unescaped `[`;
+/// the description runs to the first `]]` and may hold single brackets, so
+/// `[[a][see [1] here]]` is one link. Neither part may be empty.
+pub fn bracket_link(s: &str) -> Option<BracketLink<'_>> {
+    let rest = s.strip_prefix("[[")?;
+    let mut path = String::new();
+    let mut chars = rest.char_indices();
+    let close = loop {
+        let (i, c) = chars.next()?;
+        match c {
+            '\\' => match rest[i + 1..].chars().next() {
+                Some(next @ ('[' | ']' | '\\')) => {
+                    path.push(next);
+                    chars.next();
+                }
+                _ => path.push('\\'),
+            },
+            ']' => break i,
+            '[' | '\n' => return None,
+            c => path.push(c),
+        }
+    };
+    if path.trim().is_empty() {
+        return None;
+    }
+    let after = &rest[close + 1..];
+    if after.starts_with(']') {
+        return Some(BracketLink {
+            path,
+            description: None,
+            len: 2 + close + 2,
+        });
+    }
+    let desc = after.strip_prefix('[')?;
+    // A description holds no link, so a `[[` before the `]]` means this one
+    // never closed; stopping there keeps a line of them linear.
+    let end = close_before(desc, "]]", "[[")?;
+    if end == 0 {
+        return None;
+    }
+    Some(BracketLink {
+        path,
+        description: Some(&desc[..end]),
+        len: 2 + close + 1 + 1 + end + 2,
+    })
+}
+
+/// The first `close` in `s`, unless a `stop` comes before it: one forward
+/// scan that ends at whichever it meets first, so an opener that never
+/// closes costs the distance to the next opener, not to the end of the text.
+pub(crate) fn close_before(s: &str, close: &str, stop: &str) -> Option<usize> {
+    let (c0, s0) = (close.as_bytes()[0], stop.as_bytes()[0]);
+    let bytes = s.as_bytes();
+    let mut k = 0;
+    while let Some(o) = bytes[k..].iter().position(|&b| b == c0 || b == s0) {
+        let at = k + o;
+        if bytes[at..].starts_with(close.as_bytes()) {
+            return Some(at);
+        }
+        if bytes[at..].starts_with(stop.as_bytes()) {
+            return None;
+        }
+        k = at + 1;
     }
     None
 }
@@ -647,6 +726,41 @@ mod link_tests {
     /// through to `Target::File`, and opening it reported "no such file:
     /// id:6F39…" — blaming the filesystem for a missing index and
     /// sending the reader after a file that was never meant to exist.
+    #[test]
+    fn a_bracket_link_reads_by_orgs_rules() {
+        let l = bracket_link("[[https://a.b/x][see [1] here]] tail").unwrap();
+        assert_eq!(l.path, "https://a.b/x");
+        assert_eq!(l.description, Some("see [1] here"));
+        assert_eq!(l.len, "[[https://a.b/x][see [1] here]]".len());
+        let l = bracket_link(r"[[file:a\]b.org]]").unwrap();
+        assert_eq!((l.path.as_str(), l.description), ("file:a]b.org", None));
+        assert_eq!(l.len, r"[[file:a\]b.org]]".len());
+        for bad in [
+            "[[]]", "[[a][]]", "[[a[b]]", "[[a", "[[a]", "[[a][b", "[x]]", "[[a\nb]]",
+        ] {
+            assert!(bracket_link(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// `\]` in a path is a bracket, not a backslash and the end of the link.
+    #[test]
+    fn an_escaped_bracket_in_a_link_path_is_part_of_the_path() {
+        assert_eq!(
+            link_at(r"[[file:a\]b.org]]", 4).unwrap().target,
+            Target::File("a]b.org".to_string())
+        );
+    }
+
+    #[test]
+    fn a_link_whose_description_holds_brackets_opens_from_anywhere_in_it() {
+        let line = "x [[*Plan][the [draft] plan]] y";
+        let inside = line.find("plan]]").unwrap();
+        assert_eq!(
+            link_at(line, inside).unwrap().target,
+            Target::Headline("Plan".to_string())
+        );
+    }
+
     #[test]
     fn an_id_link_is_not_a_file() {
         let t = link_at("[[id:6F39]]", 5).unwrap().target;

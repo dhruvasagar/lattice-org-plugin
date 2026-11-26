@@ -68,16 +68,20 @@ provides = [
     "completion-source", "transient-source", "help", "config", "theme", "events",
     "llm-tools",
 ]
-default_modes = ["org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode"]
+default_modes = [
+    "org-todo-mode", "org-global-mode", "org-table-mode", "org-babel-mode", "org-export-mode",
+]
 capabilities = [
     "fs:write:{org.directory|~/org}",
     "fs:write:{org.roam-directory|~/org-roam}",
     "fs:write:{org.babel.tangle-directories}",
+    "fs:write:{org.export.directories}",
     "proc:spawn:{org.babel.languages:command}",
+    "proc:spawn:{org.export.latex-pdf-process:command}",
     "state:write",
 ]
 editor_capabilities = ["tree-sitter"]
-mode_gates = { "org-babel-mode" = "org.babel.enabled" }
+mode_gates = { "org-babel-mode" = "org.babel.enabled", "org-export-mode" = "org.export.enabled" }
 min_lattice = "0.10.3"
 "#
 );
@@ -93,8 +97,8 @@ min_lattice = "0.10.3"
 // both exports. Nothing in lattice changes to allow it.
 //
 // Three details, each of which is a build error if missed:
-//   * `include` needs the VERSION (`@0.6.0`) — the resolver knows
-//     `lattice:plugin-host@0.6.0`, not `lattice:plugin-host`.
+//   * `include` needs the VERSION (`@0.7.0`) — the resolver knows
+//     `lattice:plugin-host@0.7.0`, not `lattice:plugin-host`.
 //   * `generate_all` — without it wit-bindgen demands a `with` mapping for
 //     every interface reached through the include.
 //   * the inline package needs its own name, distinct from lattice's.
@@ -102,17 +106,17 @@ wit_bindgen::generate!({
     inline: r#"
         package lattice:org-plugin@0.1.0;
         world org-plugin {
-            include lattice:plugin-host/language-plugin@0.6.0;
-            include lattice:plugin-host/help-plugin@0.6.0;
-            include lattice:plugin-host/modes-plugin@0.6.0;
-            include lattice:plugin-host/grammar-plugin@0.6.0;
-            include lattice:plugin-host/config-plugin@0.6.0;
-            include lattice:plugin-host/media-plugin@0.6.0;
+            include lattice:plugin-host/language-plugin@0.7.0;
+            include lattice:plugin-host/help-plugin@0.7.0;
+            include lattice:plugin-host/modes-plugin@0.7.0;
+            include lattice:plugin-host/grammar-plugin@0.7.0;
+            include lattice:plugin-host/config-plugin@0.7.0;
+            include lattice:plugin-host/media-plugin@0.7.0;
             // OM.A1: the agenda seam. Its three exports (`extensions` /
             // `begin` / `scan`) sit at WORLD level, so they land on the same
             // `Guest` trait as `register-languages` rather than behind an
             // interface — which is why they read differently below.
-            include lattice:plugin-host/scanned-excerpt-source-plugin@0.6.0;
+            include lattice:plugin-host/scanned-excerpt-source-plugin@0.7.0;
             // OM.11: refile's target list. NOT `include
             // picker-source-plugin` — that world also imports `logging`, and
             // a component's imports must ALL be satisfiable on EVERY seam's
@@ -121,14 +125,14 @@ wit_bindgen::generate!({
             // "no logging reachable from the grammar hot path" invariant is
             // structural rather than a matter of discipline. Declaring only
             // what the source actually uses keeps it that way.
-            import lattice:plugin-host/host-services@0.6.0;
+            import lattice:plugin-host/host-services@0.7.0;
             // TK.3: one theme element per TODO state. NOT `include
             // theme-plugin` — that world imports `logging` too, and this
             // component is instantiated against the grammar seam's sync
             // linker where `logging` is absent. Same scar as the three
             // seams below; the export sits at world level, so it lands on
             // the same `Guest` trait as `register-languages`.
-            import lattice:plugin-host/theme@0.6.0;
+            import lattice:plugin-host/theme@0.7.0;
             export register-theme-elements: func();
             // OA.30: the agenda's bulk marks paint into the gutter. Two
             // seams, both exported BARE for the scar the comments above
@@ -139,16 +143,16 @@ wit_bindgen::generate!({
             // deliberately absent. `signs` declares what a mark looks like,
             // once; `decorations` says which lines carry one, on every
             // refresh.
-            import lattice:plugin-host/signs@0.6.0;
+            import lattice:plugin-host/signs@0.7.0;
             export register-signs: func();
-            export lattice:plugin-host/decorations@0.6.0;
+            export lattice:plugin-host/decorations@0.7.0;
             // OR.5b: the registry a picker plugin declares its sources
             // through. NOT `include picker-source-plugin` — that world also
             // imports `logging`, and this component is instantiated against
             // the grammar seam's sync linker where `logging` is absent. Same
             // scar as the seams below.
-            import lattice:plugin-host/picker-registry@0.6.0;
-            export lattice:plugin-host/picker-source@0.6.0;
+            import lattice:plugin-host/picker-registry@0.7.0;
+            export lattice:plugin-host/picker-source@0.7.0;
             export register-picker-sources: func();
             // MV.3: the agenda is org's view, so org declares it. NOT
             // `include multibuffer-view-plugin` — that world imports
@@ -158,8 +162,8 @@ wit_bindgen::generate!({
             // deliberately absent. Same scar as the seams above: OC.2 added
             // one `logging::log` call and the WHOLE plugin stopped
             // instantiating.
-            import lattice:plugin-host/multibuffer-view-registry@0.6.0;
-            export lattice:plugin-host/multibuffer-view-source@0.6.0;
+            import lattice:plugin-host/multibuffer-view-registry@0.7.0;
+            export lattice:plugin-host/multibuffer-view-source@0.7.0;
             export register-multibuffer-views: func();
             // OR.7: org-roam nodes inside an `[[…]]` link. NOT `include
             // completion-source-plugin` — that world imports `logging` too,
@@ -167,7 +171,7 @@ wit_bindgen::generate!({
             // EVERY linker it is instantiated against, including the grammar
             // seam's sync one where `logging` is deliberately absent. Same
             // scar as `picker-source` and `transient-source` above.
-            export lattice:plugin-host/completion-source@0.6.0;
+            export lattice:plugin-host/completion-source@0.7.0;
             // OC.3: the capture menu. Exported bare for the SAME reason
             // `picker-source` is — `transient-source-plugin` imports
             // `logging` and `project`, and an import a component declares
@@ -177,7 +181,7 @@ wit_bindgen::generate!({
             // constraint: OC.2 added one `logging::log` call, the component
             // started importing `logging`, and the WHOLE plugin stopped
             // instantiating.
-            export lattice:plugin-host/transient-source@0.6.0;
+            export lattice:plugin-host/transient-source@0.7.0;
             // OC.6: the clock's async side. NOT `include events-plugin` — that
             // world also imports `logging` and `project`, and every import a
             // component declares must be satisfiable on EVERY linker it is
@@ -192,10 +196,10 @@ wit_bindgen::generate!({
             // neither a wake nor a modeline context. That is where "the clock's
             // session is off the keystroke path" (design D6) is actually
             // enforced.
-            import lattice:plugin-host/events@0.6.0;
-            import lattice:plugin-host/ui@0.6.0;
-            use lattice:plugin-host/types@0.6.0.{event};
-            use lattice:plugin-host/events@0.6.0.{wake-id};
+            import lattice:plugin-host/events@0.7.0;
+            import lattice:plugin-host/ui@0.7.0;
+            use lattice:plugin-host/types@0.7.0.{event};
+            use lattice:plugin-host/events@0.7.0.{wake-id};
             export register-events: func();
             export on-event: func(handler: u32, ev: event);
             export on-wake: func(id: wake-id);
@@ -203,7 +207,7 @@ wit_bindgen::generate!({
             // call reads through, is imported above; the host makes this
             // seam's store read-only whatever the fs grant says, so a tool
             // proposes edits rather than writing them.
-            export lattice:plugin-host/llm-tools@0.6.0;
+            export lattice:plugin-host/llm-tools@0.7.0;
         }
     "#,
     path: "wit",
@@ -221,6 +225,7 @@ mod agenda_sections;
 mod archive;
 // OB.4: running source blocks — the whole of `org-babel-mode`.
 mod babel;
+// HTML, Markdown and LaTeX export: the whole of `org-export-mode`.
 mod capture;
 mod capture_drafts;
 mod capture_flow;
@@ -231,6 +236,7 @@ mod clock;
 mod clock_scan;
 mod config_shape;
 mod datetree;
+mod export;
 mod habit_graph;
 mod habit_row;
 mod habit_stats;
@@ -1047,7 +1053,7 @@ fn expand_each(paths: Vec<String>) -> Vec<String> {
 /// changed is the container: a list of lines instead of one newline-joined
 /// string, so `:describe-option` says `list<string>` and a TOML array is what
 /// a user writes.
-fn todo_keyword_lines() -> Vec<String> {
+pub(crate) fn todo_keyword_lines() -> Vec<String> {
     let lines = string_list("todo-keywords");
     if lines.is_empty() {
         DEFAULT_TODO_KEYWORDS
@@ -1720,6 +1726,7 @@ impl Guest for Component {
     fn register_options() {
         // OB.4: babel's `org.babel.*`, declared by its own module.
         babel::register_options();
+        export::register_options();
         // TK.2 / TC.7: a LIST of sequence lines, not one newline-joined string.
         //
         // The lines keep emacs' own grammar — that grammar is org's public
@@ -2077,6 +2084,7 @@ impl Guest for Component {
     /// left of `core.position` (10).
     fn register_events() {
         babel::register_events();
+        export::register_events();
         events::subscribe(
             &EventFilter {
                 kinds: Some(vec![EventKind::Plugin]),
@@ -2162,6 +2170,14 @@ impl Guest for Component {
     /// the bytes without reading them — so it is a tab-separated string rather
     /// than MessagePack, which would have cost a dependency for two fields.
     fn on_event(handler: u32, ev: Event) {
+        if handler == export::ON_OUTPUT_MODE {
+            export::on_event(&ev);
+            return;
+        }
+        if handler == export::ON_PDF_JOB {
+            export::on_job_event(&ev);
+            return;
+        }
         // OR.4: a batch of changed paths. Re-indexing happens HERE, on the
         // event actor's own task, so it reaches the store with no keystroke
         // involved — which is the property the whole watcher exists for.
@@ -2308,6 +2324,11 @@ impl Guest for Component {
             // OB.6: a run request from babel's `C-c C-c`.
             babel::run::EV_RUN => babel::jobs::on_run(&p.payload),
             babel::run::EV_CANCEL => babel::jobs::on_cancel(&p.payload),
+            export::pipeline::EV_REQUESTED => export::pipeline::on_requested(&p.payload),
+            export::pipeline::EV_STEP => export::pipeline::on_step(&p.payload),
+            export::pipeline::EV_CANCEL => export::pipeline::on_cancel(),
+            export::pipeline::EV_RUN_BLOCKS => export::pipeline::on_run_blocks(&p.payload),
+            export::pipeline::EV_KEEP_RESULTS => export::pipeline::on_keep_results(&p.payload),
             _ => {}
         }
     }
@@ -2324,6 +2345,7 @@ impl Guest for Component {
     fn register_modes() {
         // OB.4: `org-babel-mode`, declared by its own module.
         babel::register();
+        export::register();
         let bind = |chord: &str, command: &str| ModeKeymapBinding {
             binding_mode: BindingMode::Normal,
             chord: chord.to_string(),
@@ -3207,6 +3229,7 @@ impl Guest for Component {
     fn register_grammar() {
         // OB.4: babel's action and commands, declared by its own module.
         babel::register_grammar();
+        export::register_grammar();
         let spec = || ActionSpec {
             args_schema: Vec::new(),
         };
@@ -4086,6 +4109,12 @@ impl Guest for Component {
             "Org babel: running source blocks and writing their results.",
             include_str!("../doc/babel.md"),
             &["org-babel".to_string()],
+        );
+        let _ = register_topic(
+            "export",
+            "Org export: HTML, Markdown, LaTeX and PDF, from the C-c C-e dispatcher.",
+            include_str!("../doc/export.md"),
+            &["org-export".to_string()],
         );
         let _ = register_topic(
             "roam",
@@ -5168,7 +5197,7 @@ fn epoch_day_from_local_secs(local_secs: i64) -> i64 {
 /// The three correct siblings each carried a comment warning about exactly
 /// this bug while the fourth quietly had it, which is the argument for one
 /// function over four careful ones.
-fn local_now_secs() -> i64 {
+pub(crate) fn local_now_secs() -> i64 {
     let utc = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -9844,6 +9873,7 @@ impl GrammarCallbacks for Component {
             )),
             // OB.4: babel owns its ids; see `babel` for why none is here.
             cb if babel::is_action(cb) => babel::apply_action(cb, &ctx, doc, tree),
+            cb if export::is_action(cb) => export::apply_action(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown action callback {other}")),
         }
     }
@@ -10070,6 +10100,7 @@ impl GrammarCallbacks for Component {
                 })
             }
             cb if babel::is_ex_parse(cb) => babel::parse_ex_args(cb, &rest),
+            cb if export::is_ex_parse(cb) => export::parse_ex_args(cb, &rest),
             other => Err(format!("org: unknown ex-command parse callback {other}")),
         }
     }
@@ -10356,6 +10387,7 @@ impl GrammarCallbacks for Component {
                 },
             ))]),
             cb if babel::is_ex_command(cb) => babel::apply_ex_command(cb, &ctx, doc, tree),
+            cb if export::is_ex_command(cb) => export::apply_ex_command(cb, &ctx, doc, tree),
             other => Err(format!("org: unknown ex-command callback {other}")),
         }
     }
@@ -12436,6 +12468,11 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             }
             if key == ORG_TRANSIENT_AGENDA_BULK_TODO {
                 return agenda_bulk_todo_menu();
+            }
+            // Export's dispatcher, before the capture parse for the same
+            // reason as the menus above.
+            if key == export::TRANSIENT_KEY {
+                return export::dispatcher_menu();
             }
         }
 

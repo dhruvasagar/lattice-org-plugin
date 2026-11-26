@@ -2,7 +2,122 @@
 
 ## Unreleased
 
+Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.0), and so needs
+the lattice release that carries it.
+
+### Added
+- **Export: `org-export-mode`**, on in every org buffer and off
+  with `:set org.export.enabled=false`. `C-c C-e` opens the dispatcher, emacs's
+  `org-export-dispatch`: `h h`, `m m` and `l l` write HTML, Markdown or LaTeX
+  beside the file, and `C-s` / `C-b` switch to the subtree at point and to the
+  body only, and stay set for the next export. `:org-export-html`,
+  `:org-export-markdown` and `:org-export-latex` do the same, with
+  `--subtree` and `--body-only`. The export runs in the background and writes
+  only where org may write: a target outside `org.directory` is refused at once,
+  naming `org.export.directories`, the list that allows more. A large file
+  exports in steps, a piece per background call, so no file is too big to
+  export and none holds the plugin up while it runs; a second export of the
+  same file replaces one still running. The file's `#+OPTIONS:`, `#+TITLE:`,
+  `#+SELECT_TAGS:` / `#+EXCLUDE_TAGS:`, `COMMENT` headlines and a subtree's
+  `EXPORT_*` properties decide what is exported, with emacs's defaults; what
+  the file asks for and the export does not do (`#+SETUPFILE`, an unknown
+  option) is named when the export finishes. `{{{macros}}}` expand: `#+MACRO:`
+  definitions with `$1`… arguments, and emacs's built-ins (`title`, `author`,
+  `date`, `time`, `property`, `keyword`, `n`, `input-file`); an undefined one
+  stops the export, naming it. `#+INCLUDE:` brings in another file as emacs does,
+  with `:lines`, `:minlevel`, `::*heading` / `::#id`, `:only-contents` and
+  `src` / `example` / `export` wrapping; a file org may not read stops the
+  export, naming it. Internal links resolve as emacs's do (`#custom-id`,
+  `*Heading`, `id:`, targets, names, headline text, radio targets), and a link
+  to nothing stops the export unless `#+OPTIONS: broken-links:mark` or `t`.
+  HTML is written in emacs's shape and with its class names, so a stylesheet
+  made for emacs's output styles it: a table of contents, numbered sections,
+  footnotes numbered as referenced, tables with a header and aligned columns,
+  figures and captions, source blocks classed by language, math through
+  MathJax when there is any, and an author / date footer. Links to other org
+  files go to their HTML, and an `id:` link to the node's file.
+  `org.export.html-stylesheet` is `default` (org's own, inline), `none`, or a
+  stylesheet to link. `h H`, `m M` and `l L` export into `*Org HTML Export*`,
+  `*Org MD Export*` or `*Org LATEX Export*` instead, and exporting again
+  replaces that buffer's text in one undo step; `h o` and `m o` write the
+  file and then open it, in lattice, or with the system's handler when
+  `org.export.open-with` is `system`. In lattice an export never takes your
+  window: the file or buffer is shown beside the org file, in a vertical
+  split by default, and the cursor stays where you are typing.
+  `org.export.open-in` is `vsplit`, `split` or `tab` (a new tab you are not
+  switched to), and exporting again refreshes the pane that already shows
+  it. Each has a `:` command
+  (`:org-export-html-buffer`, `:org-export-html-open`, …).
+  Markdown is GitHub-flavoured, in emacs's `ox-md` shape: ATX headings (and
+  numbered list items below `H:`), the table of contents as a nested list,
+  pipe tables with their column alignment, `[^n]` footnotes, fenced code with
+  its language, task-list checkboxes, autolinks, `$…$` math, and raw
+  `#+begin_export markdown` / `@@md:…@@`. A heading carries an anchor only
+  when something links to it, and text that Markdown would read as markup
+  stays text. `\vert` puts a `|` in a table cell, as in emacs.
+  LaTeX is written in emacs's `ox-latex` shape, so a `#+LATEX_HEADER` written
+  for emacs works here: its preamble and default packages, `#+LATEX_CLASS`
+  (`article`, `report` or `book`, with their sectioning; another class stops
+  the export, naming it), `#+LATEX_CLASS_OPTIONS`, `\hypersetup`, the title
+  block and table of contents, headlines below `H:` as list items, `\label` on
+  every headline so internal links are `\ref` / `\hyperref`, footnotes at
+  their first reference, `tabular` tables, `verbatim` source, figures with
+  captions, the ten specials escaped, and raw `#+begin_export latex` /
+  `@@latex:…@@` / `#+LATEX:` passed through.
+  The LaTeX export is configurable as emacs's is. `org.export.latex-compiler`
+  or `#+LATEX_COMPILER` (`pdflatex`, `xelatex`, `lualatex`) picks the
+  encoding packages, with `fontspec` for Unicode text and system fonts.
+  `org.export.latex-classes` adds classes (`memoir`, a house class), each
+  with its sectioning and a header that may place or leave out the default
+  packages. `org.export.latex-class`, `-class-options` and `-header` set what
+  `#+LATEX_CLASS`, `#+LATEX_CLASS_OPTIONS` and `#+LATEX_HEADER` override, and
+  `#+LATEX_HEADER_EXTRA` is read. `org.export.latex-src-block-backend` writes
+  source blocks as `listings` or `minted` and adds the package. `#+ATTR_LATEX:`
+  sizes an image (`:width`, `:height`, `:options`) and picks a table's
+  `:environment` (`longtable`, `tabularx`…) and `:align`, and
+  `org.export.latex-image-width` is the default width.
+  Every export default is an option, set once rather than in every file and
+  overridden by the file: each `#+OPTIONS:` item as emacs's variable for it
+  (`org.export.with-toc`, `-section-numbers`, `headline-levels`, `with-tags`,
+  `with-drawers`, `with-latex`, `broken-links` and the rest), and
+  `org.export.author`, `email`, `language`, `select-tags`, `exclude-tags`,
+  `html-head` and `html-head-extra`. A value an option does not take stops
+  the export, naming the option and the values it does take.
+  **PDF.** `l p` (`:org-export-pdf`) writes the `.tex` and compiles it with
+  `org.export.latex-pdf-process`, emacs's `org-latex-pdf-process`: steps of a
+  `command` and `args`, run in the file's directory, each after the last
+  succeeds, with `%f`, `%b`, `%o` and `%latex` filled in. `l o`
+  (`:org-export-pdf-open`) then opens the PDF, which reloads in place when it
+  is already open. The compile runs in the background; its output is in
+  `*org-export*` (`:org-export-log`), whose headerline says what is running
+  and how it ended, and a failing step stops the rest, naming the log. No
+  compiler runs until your config file names one (a value set with `:set` is
+  not granted), and until then `l p` writes the `.tex` and says how.
+  `:org-export-cancel` stops a running export and its compile.
+  `:help org.export` is the whole reference: the dispatcher, what is
+  exported, source blocks, where the output goes, PDF, and every option.
+- **Export honours `:exports`.** A source block exports as emacs exports
+  it: `code` (the default) shows the block and leaves its `#+RESULTS:` out,
+  `results` shows only the result, `both` shows both, and `none` shows
+  neither. The value is inherited as babel inherits it, from the file's and
+  the headlines' `header-args`. Before this, every block and every result
+  was exported.
+- **Export runs the blocks whose results it shows**, as emacs's
+  `org-export-use-babel` does: a `results` or `both` block runs through
+  babel, with its languages table, `:var` chains, noweb and sessions, and
+  its fresh result appears in the export. It runs on a copy, so the file's
+  own `#+RESULTS:` are never touched. With `org.babel.confirm` on, the
+  export asks once (`Export runs 2 blocks (sh ×2)? (y/n)`). `n` still
+  exports, with the results already in the file; `q` exports nothing. `:eval
+  no-export` (or `never-export`, `no`, `never`) keeps a block from running
+  for an export, so it shows the result already in the file, as does a
+  block whose language has no `org.babel.languages` entry (the echo names
+  it). With babel off, every block shows the result already in the file.
+  `:org-export-cancel` stops the blocks an export is running.
+
 ### Fixed
+- A link whose path escapes a bracket, `[[file:a\]b.org]]`, opens `a]b.org`
+  as in emacs, rather than a file with a backslash in its name.
 - `:help org` no longer lists babel among what the plugin does not do; it
   points to `:help org.babel` instead.
 

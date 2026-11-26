@@ -79,15 +79,17 @@ fn the_component_carries_its_manifest() {
         [
             "org.directory",
             "org.roam-directory",
-            "org.babel.tangle-directories"
+            "org.babel.tangle-directories",
+            "org.export.directories"
         ]
     );
 }
 
-/// OB.4: babel's grants and its switch. What org may RUN follows only the
-/// user's `org.babel.languages` — never unbound `proc:spawn`, which a
-/// user-installed org would be refused anyway, and which would let it run
-/// anything. `org.babel.enabled` is the host's to act on (`mode_gates`).
+/// The process grants and the switches. What org may RUN follows only the
+/// user's `org.babel.languages` and `org.export.latex-pdf-process` — never
+/// unbound `proc:spawn`, which a user-installed org would be refused anyway,
+/// and which would let it run anything. `org.babel.enabled` and
+/// `org.export.enabled` are the host's to act on (`mode_gates`).
 #[test]
 fn the_manifest_declares_babels_grants() {
     let Some(wasm) = org_component() else {
@@ -107,10 +109,16 @@ fn the_manifest_declares_babels_grants() {
         .collect();
     assert_eq!(
         spawn,
-        [(
-            "org.babel.languages".to_string(),
-            Some("command".to_string())
-        )]
+        [
+            (
+                "org.babel.languages".to_string(),
+                Some("command".to_string())
+            ),
+            (
+                "org.export.latex-pdf-process".to_string(),
+                Some("command".to_string())
+            )
+        ]
     );
     assert!(
         !manifest
@@ -124,10 +132,16 @@ fn the_manifest_declares_babels_grants() {
         .contains(&"org-babel-mode".to_string()));
     assert_eq!(
         manifest.mode_gates,
-        [(
-            "org-babel-mode".to_string(),
-            "org.babel.enabled".to_string()
-        )]
+        [
+            (
+                "org-babel-mode".to_string(),
+                "org.babel.enabled".to_string()
+            ),
+            (
+                "org-export-mode".to_string(),
+                "org.export.enabled".to_string()
+            )
+        ]
     );
 }
 

@@ -14,6 +14,7 @@ use super::block::BlockKey;
 use super::results::{format, insertion_edit, Collection, Insertion};
 use super::run::{claim_key, RunRequest, RUN_PREFIX};
 use super::vars::{prelude, value_of_result, Binding, Value};
+use crate::export::babel::Settled;
 use crate::lattice::plugin_host::host_services;
 use crate::lattice::plugin_host::types::{
     ApplyEditPayload, EchoLevel, EchoPayload, Edit, EditKind, Effect, GutterDecoration, GutterSign,
@@ -150,10 +151,36 @@ pub(crate) fn not_started(request: &RunRequest, rest: &[RunRequest], text: Strin
     post(vec![echo(EchoLevel::Error, text)]);
 }
 
-/// Forget the claims of runs that will not start now.
+/// Forget the claims of runs that will not start now. An export's run took
+/// no claim; its export hears that the block will not run.
 pub(crate) fn release(runs: &[RunRequest]) {
     for r in runs {
-        let _ = host_services::store_delete(&claim_key(r.buffer, &r.key));
+        match r.export {
+            Some(run) => crate::export::pipeline::on_block(run, Settled::Not),
+            None => {
+                let _ = host_services::store_delete(&claim_key(r.buffer, &r.key));
+            }
+        }
+    }
+}
+
+/// `:org-export-cancel` or a newer export of the same file: stop the jobs
+/// export `run` started and drop what was queued behind them. A session
+/// block already sent finishes in its session, and its result is dropped
+/// with the run.
+pub(crate) fn cancel_export(run: u64) {
+    let ids: Vec<u64> = JOBS.with(|j| {
+        let mut jobs = j.borrow_mut();
+        jobs.iter_mut()
+            .filter(|(_, job)| job.request.export == Some(run))
+            .map(|(id, job)| {
+                job.rest.clear();
+                *id
+            })
+            .collect()
+    });
+    for id in ids {
+        host_services::cancel_job(id);
     }
 }
 
@@ -354,12 +381,22 @@ pub(crate) struct Finished {
 /// Put a finished run's result back, or say where it went, and start the
 /// rest of its batch.
 pub(crate) fn complete(job: Finished, outcome: Result<(), String>) {
-    let _ = host_services::store_delete(&claim_key(job.request.buffer, &job.request.key));
-    host_services::refresh_decorations();
+    let export = job.request.export;
+    if export.is_none() {
+        let _ = host_services::store_delete(&claim_key(job.request.buffer, &job.request.key));
+        host_services::refresh_decorations();
+    }
 
     let label = job.request.label.clone();
     // Cancelled: the user asked for nothing to happen, so nothing is
     // written — the block keeps the result it had.
+    if let (Some(run), Err(e)) = (export, &outcome) {
+        if e == "cancelled" {
+            release(&job.rest);
+            crate::export::pipeline::on_block(run, Settled::Cancelled);
+            return;
+        }
+    }
     if outcome.as_ref().is_err_and(|e| e == "cancelled") {
         post(vec![echo(
             EchoLevel::Info,
@@ -398,6 +435,22 @@ pub(crate) fn complete(job: Finished, outcome: Result<(), String>) {
         }
     }
     let insertion = job.request.results.insertion;
+    if let Some(run) = export {
+        // Into the export's copy, as the block's result would go into the
+        // file; a `silent` or `none` result goes nowhere there either.
+        let r = &job.request;
+        crate::export::pipeline::on_block(
+            run,
+            Settled::Ran {
+                key: r.key.clone(),
+                body: format(&r.results, &output, r.min_block, &r.lang),
+                insertion,
+            },
+        );
+        post(effects);
+        start_next(rest);
+        return;
+    }
     if matches!(insertion, Insertion::Silent | Insertion::None) {
         // `silent` shows the result in the echo area and `none` nowhere;
         // neither touches the file. A failure's echo, above, stands.

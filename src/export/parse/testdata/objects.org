@@ -1,0 +1,24 @@
+* A /title/ with =code= and a [[https://example.com][link]] :tag:
+Some *bold*, /italic/, _underline_, +strike+, =verbatim= and ~code~.
+Nested */bold italic/* and a bold that runs
+onto the *next
+line*, but not three lines.
+A footnote[fn:1], a named one[fn:note], and an inline one[fn:: with *markup*].
+Entities: \alpha, \to{}x, 30\deg and \nbsp; a command \textbf{b} and math $E=mc^2$.
+H_2O, x^{n+1} and e^-1 but not a_ or snake_case_name.
+A line break\\
+and a timestamp <2026-03-01 Sun 09:00>--<2026-03-01 Sun 10:00>.
+<<anchor>> and a <<<radio>>> target, a cookie [2/3], a macro {{{kbd(C-c\, C-e)}}}.
+@@html:<kbd>@@snippet@@html:</kbd>@@, a plain link https://lattice.dev/docs. and <mailto:a@b.c>.
+Traps: a*b*c, 2*3*4 and price $5 and $6.
+Verbatim wins: =a *b* c=.
+No close: *not bold * here.
+
+| *head* | =v= |
+|--------+-----|
+| [[anchor]] | $y$ |
+
+- *term* :: the /definition/
+#+CAPTION: A *bold* caption
+[[file:img.png]]
+#+MACRO: kbd @@html:<kbd>@@$1@@html:</kbd>@@

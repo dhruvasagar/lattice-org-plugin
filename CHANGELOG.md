@@ -2,12 +2,27 @@
 
 ## Unreleased
 
+### Fixed
+- **The `todo-keywords` examples are lists.** The README and `:help org`
+  wrote `org.todo-keywords` as one multi-line string, which the option
+  refuses ("expected list, got string") and then keeps the default
+  `TODO | DONE`. Each sequence is now an element of a list.
+- **The state menu is `<leader>oS`.** The README and `:help org` said
+  `<leader>os`, which schedules the entry; the menu moved to `<leader>oS`
+  (and `C-c C-t`) when scheduling took `os`. `:help org` now lists
+  `<leader>os` / `<leader>od` for scheduling and deadlines.
+- **The agenda's clock report is `gD r`**, from the view menu, not `r` as
+  the README said.
+- **The version the release routes need**: lattice 0.10.4 for org 0.6.0,
+  which speaks plugin API 0.7, and the release after 0.10.4 for
+  `lattice.toml`.
+
 ### Changed
 - **The README starts with installing.** Installing and configuring now come
   first, and the internals move under "How it is built" and "Developing it".
   The simplest install is listed first: a `[plugins.org]` table in
   `lattice.toml`, which needs no Rust toolchain and no `init.rs` (lattice
-  after 0.10.3). An example installs and configures org from that one file.
+  after 0.10.4). An example installs and configures org from that one file.
 - **The README shows what org does.** A new "What you can do with it" section
   covers each part: outlines and TODOs, the agenda, capture, refile and
   archive, clocking, org-roam, babel, export and the assistant. Each part

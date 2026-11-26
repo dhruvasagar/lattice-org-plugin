@@ -32,7 +32,7 @@ of four routes:
 
 ### In `lattice.toml` — no Rust toolchain, no `init.rs`
 
-Needs **a lattice release later than 0.10.3**. Add a `[plugins.org]` table to
+Needs **a lattice release later than 0.10.4**. Add a `[plugins.org]` table to
 `~/.config/lattice/lattice.toml`:
 
 ```toml
@@ -60,8 +60,8 @@ To install **and configure** org from the one file, see
 
 The same released build, declared in your config's `register_plugins`.
 It needs no Rust beyond the toolchain your `init.rs` already uses, and no
-`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.3 or
-later**.
+`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.4 or
+later**, the release that speaks plugin API 0.7.
 
 Your `init.rs` needs the `plugin-manager` seam. A config scaffolded by lattice 0.9.11 or later has it already:
 `register_plugins` is there, with a commented-out example that installs org.
@@ -109,7 +109,7 @@ starting the editor makes no network request.
 `release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
 you in `org-mode`. If it was refused, it is under the failed loads in
 `:plugins` with the reason — a release with no build for your editor says
-which it has, and an editor older than 0.10.3 says the version org needs.
+which it has, and an editor older than 0.10.4 says the version org needs.
 
 **Updating:** with a tag, change it and `:reload-config`. With `None`,
 `:plugin-update org` (or `u` on its row in `:plugins`) installs a newer
@@ -189,19 +189,21 @@ Headlines fold with `<Tab>`, and promote, demote and move as subtrees
 (`<leader>oh` / `<leader>ol`, `<leader>oH` / `<leader>oL`, `<leader>oK` /
 `<leader>oJ`). `]]` and `[[` jump between headlines. `ih` / `ah` select a
 headline and `ir` / `ar` a subtree, so `dar` deletes one and `yar` copies it. `<leader>ot` cycles the
-TODO keyword, `<leader>os` picks one from a menu, `<leader>o,` cycles the
-priority and `<leader>o:` sets tags. Checkboxes, lists, tables (`<Tab>`
+TODO keyword, `<leader>oS` (`C-c C-t`) picks one from a menu, `<leader>o,`
+cycles the priority and `<leader>o:` sets tags. `<leader>os` schedules an
+entry and `<leader>od` gives it a deadline. Checkboxes, lists, tables (`<Tab>`
 aligns), links (`<CR>` follows) and timestamps (`<C-a>` / `<C-x>` step the
 part under the cursor) all have their own keys.
 
-Your own TODO states, in emacs' syntax, each with a key for the menu:
+Your own TODO states, in emacs' syntax, one sequence per element, each state
+with a key for the menu:
 
 ```toml
 [org]
-todo-keywords = """
-sequence: TODO(t) NEXT(n) | DONE(d)
-sequence: WAITING(w) HOLD(h) | CANCELLED(c)
-"""
+todo-keywords = [
+  "sequence: TODO(t) NEXT(n) | DONE(d)",
+  "sequence: WAITING(w) HOLD(h) | CANCELLED(c)",
+]
 ```
 
 `:help org`, or [`doc/org.md`](doc/org.md).
@@ -212,8 +214,8 @@ sequence: WAITING(w) HOLD(h) | CANCELLED(c)
 scheduled, deadlined and dated headline across your files into one view. Its
 rows are the lines of your files, not copies: editing a row edits the file,
 and `:w` saves it. `<leader>ot` and `<leader>o,` change a row's state and
-priority in place, `m` marks rows and `x` acts on all the marked ones, and `r`
-shows the clock report.
+priority in place, `m` marks rows and `x` acts on all the marked ones, and `gD`
+changes the view: a day, week, month or year, the log, and the clock report.
 
 ```toml
 [org]
@@ -253,7 +255,7 @@ and placeholder.
 `<leader>oxi` clocks in on the entry at the cursor, `<leader>oxo` clocks out
 and writes the elapsed time into its `LOGBOOK`, and the running clock shows in
 your modeline. `<leader>oxj` jumps back to it and `<leader>oxr` resumes the
-last one. `r` in the agenda shows where the time went.
+last one. The agenda's clock report (`gD r`) shows where the time went.
 
 ### Org-roam
 

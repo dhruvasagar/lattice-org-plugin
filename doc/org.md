@@ -657,12 +657,13 @@ off — the outliner above is unaffected either way.
 | | |
 |---|---|
 | `<leader>ot` `<leader>oT` | cycle the TODO keyword forward / back |
-| `<leader>os` | choose a state from a menu |
+| `<leader>oS` `C-c C-t` | choose a state from a menu |
+| `<leader>os` `<leader>od` | schedule, or set a deadline (`C-c C-s` / `C-c C-d`) |
 | `<leader>o,` | cycle the priority |
 | `<leader>o:` | set tags, prompting with the current ones |
 
 Cycling is the faster move when the next state is the one you want; the menu
-is faster when it is not. `<leader>os` lists every configured state under the
+is faster when it is not. `<leader>oS` lists every configured state under the
 key its own declaration gives it, plus a row that clears the state — a menu
 that could set every keyword but never remove one would be a one-way door. A
 state you declared without a key still appears, with one derived from its
@@ -677,21 +678,27 @@ keyword leaves the priority and tags exactly where they were.
 
 ### Declaring your states
 
-`org.todo-keywords` takes emacs' `org-todo-keywords` syntax, one sequence per
-line:
+`org.todo-keywords` takes emacs' `org-todo-keywords` syntax, a list with one
+sequence per element:
 
+```toml
+[org]
+todo-keywords = [
+  "sequence: TODO(t) NEXT(n) | DONE(d)",
+  "sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING",
+  "type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)",
+]
 ```
-sequence: TODO(t) NEXT(n) | DONE(d)
-sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING
-type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)
-```
+
+A single string is refused with "expected list, got string" in `*messages*`,
+and the default keywords stay in force.
 
 | | |
 |---|---|
 | `sequence:` | a workflow, cycled in order |
 | `type:` | a set of alternatives rather than a progression |
 | `\|` | separates not-done from done; a line without one has no done states |
-| `(t)` | the key this state gets in the `<leader>os` menu |
+| `(t)` | the key this state gets in the `<leader>oS` menu |
 | `(@)` `(!)` `(@/!)` | logging specs — **accepted and not yet acted on** |
 
 A bare list with no `sequence:` or `type:` prefix is a sequence, so the old
@@ -736,7 +743,7 @@ are applied above the theme, so they win.
 
 | | |
 |---|---|
-| cycling, and the `<leader>os` menu | follow `:set` immediately |
+| cycling, and the `<leader>oS` menu | follow `:set` immediately |
 | the per-state **colours** | resolve at load |
 
 Colours are fixed at load because the theme elements and the highlight query

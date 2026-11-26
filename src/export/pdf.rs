@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use lattice_plugin_sdk::ConfigShape as ConfigShapeDerive;
 
 use super::pipeline::file_name;
-use crate::lattice::plugin_host::types::{EchoLevel, EchoPayload, Effect, OpenBufferPayload};
+use crate::lattice::plugin_host::types::{EchoLevel, EchoPayload, Effect};
 
 /// The buffer every step's output goes to.
 pub(crate) const LOG_BUFFER: &str = "*org-export*";
@@ -72,7 +72,7 @@ pub(crate) struct Compile {
     /// pdflatex, xelatex and lualatex, which the LaTeX export checked.
     pub(crate) compiler: String,
     /// Then open the PDF: in lattice, or by the system when `true`.
-    pub(crate) open: Option<bool>,
+    pub(crate) open: Option<super::sink::Viewer>,
     /// What the file asked for that the export does not do.
     pub(crate) left_out: Vec<String>,
 }
@@ -85,7 +85,7 @@ struct Job {
     program: String,
     rest: Vec<(String, Vec<String>)>,
     cwd: String,
-    open: Option<bool>,
+    open: Option<super::sink::Viewer>,
 }
 
 thread_local! {
@@ -272,13 +272,8 @@ pub(crate) fn on_finished(
             }
             runner.log_status(LogState::Succeeded, &format!("made {pdf_name}"));
             let mut effects = Vec::new();
-            match job.open {
-                Some(true) => effects.push(Effect::OpenExternalUri(job.pdf.clone())),
-                Some(false) => effects.push(Effect::OpenBuffer(OpenBufferPayload {
-                    path: Some(job.pdf.clone()),
-                    force: false,
-                })),
-                None => {}
+            if let Some(viewer) = job.open {
+                effects.push(super::sink::show(viewer, &job.pdf));
             }
             effects.push(echo(EchoLevel::Info, format!("Exported {pdf_name}")));
             Some(effects)
@@ -308,7 +303,11 @@ fn echo(level: EchoLevel, text: impl Into<String>) -> Effect {
 mod tests {
     use std::cell::{Cell, RefCell};
 
+    use super::super::sink::{Place, Viewer};
     use super::*;
+    use crate::lattice::plugin_host::types::{DisplayBufferPayload, DisplaySource, DisplayTarget};
+
+    const EDITOR: Viewer = Viewer::Editor(Place::Vsplit);
 
     /// A runner that records what it was asked to do.
     #[derive(Default)]
@@ -364,7 +363,7 @@ mod tests {
         }
     }
 
-    fn compile(steps: Vec<ProcessStep>, open: Option<bool>) -> Compile {
+    fn compile(steps: Vec<ProcessStep>, open: Option<Viewer>) -> Compile {
         Compile {
             tex: "/notes/plan.tex".to_string(),
             output: "\\documentclass{article}".to_string(),
@@ -416,7 +415,7 @@ mod tests {
             step("latexmk", &["-pdf", "%f"]),
             step("bibtex", &["%b"]),
         ];
-        let effects = begin(compile(steps, Some(false)), &fake);
+        let effects = begin(compile(steps, Some(EDITOR)), &fake);
         assert_eq!(texts(&effects), vec!["Compiling plan.pdf…".to_string()]);
         assert_eq!(fake.written.borrow().len(), 1);
         // A program is not a placeholder: only arguments are filled in.
@@ -437,7 +436,11 @@ mod tests {
         assert_eq!(fake.spawned.borrow()[2].1, vec!["plan".to_string()]);
         let done = on_finished(1003, Ok(()), &fake).unwrap_or_default();
         assert!(
-            matches!(&done[0], Effect::OpenBuffer(p) if p.path.as_deref() == Some("/notes/plan.pdf"))
+            matches!(&done[0], Effect::DisplayBuffer(DisplayBufferPayload {
+                source: DisplaySource::File(p),
+                target: DisplayTarget::Vsplit,
+            }) if p == "/notes/plan.pdf"),
+            "{done:?}"
         );
         assert_eq!(texts(&done), vec!["Exported plan.pdf".to_string()]);
         assert_eq!(
@@ -458,7 +461,7 @@ mod tests {
         begin(
             compile(
                 vec![step("latexmk", &["%f"]), step("never", &[])],
-                Some(false),
+                Some(EDITOR),
             ),
             &fake,
         );
@@ -473,7 +476,9 @@ mod tests {
             ]
         );
         assert_eq!(fake.spawned.borrow().len(), 1);
-        assert!(!effects.iter().any(|e| matches!(e, Effect::OpenBuffer(_))));
+        assert!(!effects
+            .iter()
+            .any(|e| matches!(e, Effect::DisplayBuffer(_))));
         assert_eq!(
             fake.status.borrow().last().map(|s| s.0),
             Some(LogState::Failed)
@@ -507,7 +512,7 @@ mod tests {
     fn with_no_process_nothing_runs() {
         reset();
         let fake = Fake::default();
-        let effects = begin(compile(vec![step("  ", &[])], Some(false)), &fake);
+        let effects = begin(compile(vec![step("  ", &[])], Some(EDITOR)), &fake);
         assert!(fake.spawned.borrow().is_empty());
         assert_eq!(fake.written.borrow().len(), 1);
         assert!(texts(&effects)[0]

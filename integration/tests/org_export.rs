@@ -667,25 +667,35 @@ async fn a_pdf_process_set_at_runtime_is_not_granted() {
     assert!(!base.path().join("ran").exists());
 }
 
-/// `l o` opens the PDF, and again opens the same buffer, not a second.
+/// `l o` shows the PDF beside the org file, which keeps focus; again, it is
+/// the same buffer in the same pane, not a second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opening_the_pdf_again_reuses_its_buffer() {
     require_component!();
     let base = tempfile::tempdir().unwrap();
     let (mut editor, _loader) = pdf_editor(base.path(), &[FAKE_COMPILER]).await;
     let pdf = base.path().join("notes.pdf");
-    let showing_pdf =
-        |e: &Editor| buffers(e).path_for(e.document_buffer_id).as_deref() == Some(pdf.as_path());
-    for _ in 0..2 {
-        assert!(open_dispatcher(&mut editor).await.is_some() || showing_pdf(&editor));
-        if showing_pdf(&editor) {
-            // Back to the org file for the second export.
-            editor.do_edit(Some(base.path().join("notes.org")), false);
-            editor.run_tick_pending();
-            assert!(open_dispatcher(&mut editor).await.is_some());
-        }
+    let source = base.path().join("notes.org");
+    for round in 0..2 {
+        // The second round's echo is the first's, so wait on the file being
+        // made again rather than on the echo.
+        let _ = std::fs::remove_file(&pdf);
+        assert!(open_dispatcher(&mut editor).await.is_some());
         press(&mut editor, "lo");
-        settle(&mut editor, |e| showing_pdf(e)).await;
+        settle(&mut editor, |e| pdf.exists() && a_pane_shows(e, &pdf)).await;
+        settle(&mut editor, |e| {
+            last_echo(e).as_deref() == Some("Exported notes.pdf")
+        })
+        .await;
+        assert!(
+            focused_on(&editor, &source),
+            "round {round}: the org file keeps focus"
+        );
+        assert_eq!(
+            editor.pane_tree.leaves().len(),
+            2,
+            "round {round}: one pane for it"
+        );
     }
     let with_pdf = editor
         .buffers
@@ -908,6 +918,23 @@ fn buffers(editor: &Editor) -> Arc<lattice_mode::BufferStoreHandle> {
         .clone()
 }
 
+/// Whether a pane of this tab shows the file at `path`.
+fn a_pane_shows(editor: &Editor, path: &std::path::Path) -> bool {
+    editor
+        .pane_tree
+        .leaves()
+        .iter()
+        .any(|p| buffers(editor).path_for(p.buffer_id).as_deref() == Some(path))
+}
+
+/// Whether the buffer with focus is the file at `path`.
+fn focused_on(editor: &Editor, path: &std::path::Path) -> bool {
+    buffers(editor)
+        .path_for(editor.document_buffer_id)
+        .as_deref()
+        == Some(path)
+}
+
 fn buffer_text(editor: &Editor, id: lattice_core::BufferId) -> String {
     buffers(editor)
         .handle_for(id)
@@ -935,16 +962,18 @@ async fn a_buffer_export_opens_then_replaces_its_buffer() {
     let out = buffers(&editor)
         .find_by_name("*Org HTML Export*")
         .expect("the export buffer opened");
-    assert_eq!(editor.document_buffer_id, out, "and has focus");
+    assert!(
+        editor.pane_tree.leaves().iter().any(|p| p.buffer_id == out),
+        "it is shown"
+    );
+    assert!(focused_on(&editor, &source), "and the org file keeps focus");
     assert!(buffer_text(&editor, out).contains("<title>Plan</title>"));
     assert!(
         !base.path().join("notes.html").exists(),
         "no file is written"
     );
 
-    // Back in the org buffer, change the title and export again.
-    editor.do_edit(Some(source), false);
-    editor.run_tick_pending();
+    // Still in the org buffer: change the title and export again.
     ex(&mut editor, "1d");
     assert!(text(&editor).starts_with("* One"), "{}", text(&editor));
     assert!(open_dispatcher(&mut editor).await.is_some());
@@ -959,9 +988,11 @@ async fn a_buffer_export_opens_then_replaces_its_buffer() {
         "the same buffer"
     );
     assert!(!buffer_text(&editor, out).contains("<title>Plan</title>"));
+    assert_eq!(editor.pane_tree.leaves().len(), 2, "in the pane it had");
 }
 
-/// `h o` writes the file and then opens it, in lattice by default.
+/// `h o` writes the file and then shows it beside the org file, in a
+/// vertical split by default; the org file keeps focus.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_open_export_writes_then_opens_the_file() {
     require_component!();
@@ -969,16 +1000,59 @@ async fn an_open_export_writes_then_opens_the_file() {
     let grant = write_grant(base.path());
     let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
     let html = base.path().join("notes.html");
+    let source = base.path().join("notes.org");
 
     assert!(open_dispatcher(&mut editor).await.is_some());
     press(&mut editor, "ho");
-    settle(&mut editor, |e| {
-        buffers(e).path_for(e.document_buffer_id).as_deref() == Some(html.as_path())
-    })
-    .await;
+    settle(&mut editor, |e| a_pane_shows(e, &html)).await;
+    assert!(focused_on(&editor, &source), "the org file keeps focus");
+    assert_eq!(editor.pane_tree.leaves().len(), 2);
     assert!(std::fs::read_to_string(&html)
         .unwrap()
         .contains("<title>Plan</title>"));
+}
+
+/// `org.export.open-in = "tab"` shows it in a new tab, and the user stays
+/// on theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_in_tab_shows_the_export_in_a_tab_left_behind() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    let html = base.path().join("notes.html");
+    let source = base.path().join("notes.org");
+    set_org_option(&mut editor, "export.open-in", "tab");
+
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "ho");
+    settle(&mut editor, |e| e.tabs.len() == 2).await;
+    assert_eq!(editor.active_tab, 0, "not switched to");
+    assert!(focused_on(&editor, &source));
+    assert_eq!(editor.pane_tree.leaves().len(), 1, "no split here");
+    let in_tab = editor.tabs[1]
+        .panes
+        .leaves()
+        .iter()
+        .any(|p| buffers(&editor).path_for(p.buffer_id).as_deref() == Some(html.as_path()));
+    assert!(in_tab, "the new tab shows the export");
+}
+
+/// A value `open-in` does not know is named, and nothing is exported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_open_in_is_named() {
+    require_component!();
+    let base = tempfile::tempdir().unwrap();
+    let grant = write_grant(base.path());
+    let (mut editor, _loader) = org_editor(base.path(), DOC, &grant).await;
+    set_org_option(&mut editor, "export.open-in", "window");
+    assert!(open_dispatcher(&mut editor).await.is_some());
+    press(&mut editor, "ho");
+    settle(&mut editor, |e| {
+        last_echo(e).is_some_and(|t| t.contains("org.export.open-in is `window`"))
+    })
+    .await;
+    assert!(!base.path().join("notes.html").exists());
 }
 
 /// A file whose parse does not fit one call's fuel is exported over several

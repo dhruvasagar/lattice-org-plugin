@@ -13,14 +13,19 @@
 //! buffers it made.
 //!
 //! A buffer the user killed leaves a stale id; its `apply-edit` is dropped
-//! and the `open-synthetic-buffer` after it seeds a new one, so posting both
-//! is right either way.
+//! and the `display-buffer` after it seeds a new one, so posting both is
+//! right either way.
+//!
+//! **An export never takes the window.** It lands seconds after its chord,
+//! a compile much later, and the user is typing elsewhere by then; so every
+//! open in lattice is a `display-buffer` into `org.export.open-in`, and a
+//! pane already showing the output is reused (lattice's `org-export.md` §5).
 
 use super::pipeline::{file_name, Backend};
 use super::Host;
 use crate::lattice::plugin_host::types::{
-    ApplyEditPayload, Edit, EditKind, Effect, FileAnchor, OpenBufferPayload,
-    OpenSyntheticBufferPayload, Position, Range, WriteToFilePayload,
+    ApplyEditPayload, DisplayBufferPayload, DisplaySource, DisplayTarget, Edit, EditKind, Effect,
+    FileAnchor, OpenSyntheticBufferPayload, Position, Range, WriteToFilePayload,
 };
 
 /// Every backend, for the minors registered per backend.
@@ -46,24 +51,74 @@ pub(crate) fn output_backend(mode: &str) -> Option<Backend> {
 pub(crate) enum Sink {
     /// Beside the source (`h h`).
     File,
-    /// Into `*Org HTML Export*` or its peer (`h H`).
-    Buffer,
-    /// Beside the source, then opened (`h o`): in lattice, or by the system
-    /// when `org.export.open-with` is `system`.
-    Open { system: bool },
+    /// Into `*Org HTML Export*` or its peer (`h H`), shown at `place`.
+    Buffer { place: Place },
+    /// Beside the source, then opened (`h o`).
+    Open(Viewer),
     /// LaTeX beside the source, then compiled to PDF (`l p`), and the PDF
     /// opened as [`Sink::Open`] when `open` is set (`l o`).
-    Pdf { open: Option<bool> },
+    Pdf { open: Option<Viewer> },
 }
 
-/// `org.export.open-with` as a sink, or why the value is not one.
-pub(crate) fn open_sink(value: &str) -> Result<Sink, String> {
+/// How an export that opens its output shows it (`org.export.open-with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Viewer {
+    /// The system's handler for the file, a window of its own.
+    System,
+    /// In lattice, beside the source, focus kept.
+    Editor(Place),
+}
+
+/// Where in lattice an export is shown (`org.export.open-in`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Place {
+    Split,
+    Vsplit,
+    Tab,
+}
+
+impl Place {
+    fn target(self) -> DisplayTarget {
+        match self {
+            Place::Split => DisplayTarget::Split,
+            Place::Vsplit => DisplayTarget::Vsplit,
+            Place::Tab => DisplayTarget::Tab,
+        }
+    }
+}
+
+/// `org.export.open-in` as a place, or why the value is not one.
+pub(crate) fn place(value: &str) -> Result<Place, String> {
     match value.trim() {
-        "" | "editor" => Ok(Sink::Open { system: false }),
-        "system" => Ok(Sink::Open { system: true }),
+        "" | "vsplit" => Ok(Place::Vsplit),
+        "split" => Ok(Place::Split),
+        "tab" => Ok(Place::Tab),
+        other => Err(format!(
+            "org: org.export.open-in is `{other}` — use vsplit, split or tab"
+        )),
+    }
+}
+
+/// `org.export.open-with` (and, for the editor, `org.export.open-in`) as a
+/// viewer, or why a value is not one.
+pub(crate) fn viewer(open_with: &str, open_in: &str) -> Result<Viewer, String> {
+    match open_with.trim() {
+        "" | "editor" => Ok(Viewer::Editor(place(open_in)?)),
+        "system" => Ok(Viewer::System),
         other => Err(format!(
             "org: org.export.open-with is `{other}` — use editor or system"
         )),
+    }
+}
+
+/// What shows `path` for `viewer`.
+pub(crate) fn show(viewer: Viewer, path: &str) -> Effect {
+    match viewer {
+        Viewer::System => Effect::OpenExternalUri(path.to_string()),
+        Viewer::Editor(place) => Effect::DisplayBuffer(DisplayBufferPayload {
+            source: DisplaySource::File(path.to_string()),
+            target: place.target(),
+        }),
     }
 }
 
@@ -101,7 +156,7 @@ pub(crate) fn effects(
     host: &dyn Host,
 ) -> Vec<Effect> {
     match sink {
-        Sink::File | Sink::Open { .. } => {
+        Sink::File | Sink::Open(_) => {
             let mut out = vec![Effect::WriteToFile(WriteToFilePayload {
                 path: target.to_string(),
                 anchor: FileAnchor::Whole,
@@ -113,17 +168,8 @@ pub(crate) fn effects(
                 // it.
                 save: true,
             })];
-            match sink {
-                Sink::Open { system: true } => {
-                    out.push(Effect::OpenExternalUri(target.to_string()));
-                }
-                Sink::Open { system: false } => {
-                    out.push(Effect::OpenBuffer(OpenBufferPayload {
-                        path: Some(target.to_string()),
-                        force: false,
-                    }));
-                }
-                Sink::File | Sink::Buffer | Sink::Pdf { .. } => {}
+            if let Sink::Open(viewer) = sink {
+                out.push(show(viewer, target));
             }
             out.push(done);
             out
@@ -131,7 +177,7 @@ pub(crate) fn effects(
         // The `.tex` must be on disk before the compiler starts, which this
         // effect cannot promise; `pdf::begin` writes it.
         Sink::Pdf { .. } => vec![done],
-        Sink::Buffer => {
+        Sink::Buffer { place } => {
             let mut out = Vec::new();
             if let Some((id, current)) = host.output_buffer(backend) {
                 out.push(Effect::ApplyEdit(ApplyEditPayload {
@@ -148,12 +194,15 @@ pub(crate) fn effects(
                     cursor: None,
                 }));
             }
-            out.push(Effect::OpenSyntheticBuffer(OpenSyntheticBufferPayload {
-                name: buffer_name(backend).to_string(),
-                mode_id: buffer_major(backend).to_string(),
-                content: Some(output),
-                cursor: None,
-                activate_minor: Some(output_mode(backend).to_string()),
+            out.push(Effect::DisplayBuffer(DisplayBufferPayload {
+                source: DisplaySource::Synthetic(OpenSyntheticBufferPayload {
+                    name: buffer_name(backend).to_string(),
+                    mode_id: buffer_major(backend).to_string(),
+                    content: Some(output),
+                    cursor: None,
+                    activate_minor: Some(output_mode(backend).to_string()),
+                }),
+                target: place.target(),
             }));
             out.push(done);
             out
@@ -171,8 +220,8 @@ fn end_of(text: &str) -> Position {
 /// The name an export's echo gives its output.
 pub(crate) fn target_label(sink: Sink, backend: Backend, target: &str) -> &str {
     match sink {
-        Sink::Buffer => buffer_name(backend),
-        Sink::File | Sink::Open { .. } | Sink::Pdf { .. } => file_name(target),
+        Sink::Buffer { .. } => buffer_name(backend),
+        Sink::File | Sink::Open(_) | Sink::Pdf { .. } => file_name(target),
     }
 }
 
@@ -243,23 +292,42 @@ mod tests {
     }
 
     #[test]
-    fn open_with_is_editor_or_system() {
-        assert_eq!(open_sink(""), Ok(Sink::Open { system: false }));
-        assert_eq!(open_sink("system"), Ok(Sink::Open { system: true }));
-        assert!(open_sink("browser").unwrap_err().contains("`browser`"));
+    fn open_with_is_editor_or_system_and_open_in_says_where() {
+        assert_eq!(viewer("", ""), Ok(Viewer::Editor(Place::Vsplit)));
+        assert_eq!(viewer("editor", "tab"), Ok(Viewer::Editor(Place::Tab)));
+        assert_eq!(viewer("editor", "split"), Ok(Viewer::Editor(Place::Split)));
+        assert_eq!(viewer("system", "nonsense"), Ok(Viewer::System));
+        assert!(viewer("browser", "").unwrap_err().contains("`browser`"));
+        assert!(viewer("editor", "window").unwrap_err().contains("`window`"));
+    }
+
+    fn displayed_file(e: &Effect) -> Option<(&str, DisplayTarget)> {
+        match e {
+            Effect::DisplayBuffer(DisplayBufferPayload {
+                source: DisplaySource::File(path),
+                target,
+            }) => Some((path, *target)),
+            _ => None,
+        }
     }
 
     #[test]
     fn a_file_sink_writes_and_an_open_sink_then_opens() {
         let out = run(Sink::File, "x", &Output(None));
         assert!(matches!(&out[..], [Effect::WriteToFile(w), Effect::Echo(_)] if w.save));
-        let out = run(Sink::Open { system: false }, "x", &Output(None));
-        assert!(matches!(
-            &out[..],
-            [Effect::WriteToFile(_), Effect::OpenBuffer(o), Effect::Echo(_)]
-                if o.path.as_deref() == Some("/a/b.html") && !o.force
-        ));
-        let out = run(Sink::Open { system: true }, "x", &Output(None));
+        let out = run(
+            Sink::Open(Viewer::Editor(Place::Vsplit)),
+            "x",
+            &Output(None),
+        );
+        let [Effect::WriteToFile(_), shown, Effect::Echo(_)] = &out[..] else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            displayed_file(shown),
+            Some(("/a/b.html", DisplayTarget::Vsplit))
+        );
+        let out = run(Sink::Open(Viewer::System), "x", &Output(None));
         assert!(matches!(&out[1], Effect::OpenExternalUri(u) if u == "/a/b.html"));
     }
 
@@ -267,8 +335,13 @@ mod tests {
     /// replaces its whole text and then shows it.
     #[test]
     fn a_buffer_sink_seeds_then_replaces_in_place() {
-        let out = run(Sink::Buffer, "<p>one</p>\n", &Output(None));
-        let [Effect::OpenSyntheticBuffer(o), Effect::Echo(_)] = &out[..] else {
+        let buffer = Sink::Buffer { place: Place::Tab };
+        let out = run(buffer, "<p>one</p>\n", &Output(None));
+        let [Effect::DisplayBuffer(DisplayBufferPayload {
+            source: DisplaySource::Synthetic(o),
+            target: DisplayTarget::Tab,
+        }), Effect::Echo(_)] = &out[..]
+        else {
             panic!("{out:?}");
         };
         assert_eq!(o.name, "*Org HTML Export*");
@@ -279,9 +352,8 @@ mod tests {
         );
 
         let current = "<p>one</p>\nsecond line".to_string();
-        let out = run(Sink::Buffer, "<p>two</p>\n", &Output(Some((7, current))));
-        let [Effect::ApplyEdit(e), Effect::OpenSyntheticBuffer(_), Effect::Echo(_)] = &out[..]
-        else {
+        let out = run(buffer, "<p>two</p>\n", &Output(Some((7, current))));
+        let [Effect::ApplyEdit(e), Effect::DisplayBuffer(_), Effect::Echo(_)] = &out[..] else {
             panic!("{out:?}");
         };
         assert_eq!(e.target, 7);

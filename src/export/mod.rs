@@ -301,6 +301,15 @@ pub(crate) fn register_options() {
          alt text, `system` is the better choice for PDF.",
     );
     let _ = register_option(
+        "export.open-in",
+        OptionType::String,
+        "vsplit",
+        "Where an export is shown in lattice (`h o`, `l o`, `h H`): \
+         `vsplit` beside the org file, `split` below it, or `tab`, a new tab \
+         you are not switched to. The window you are typing in keeps focus, \
+         and a pane already showing the output is reused.",
+    );
+    let _ = register_option(
         "export.html-stylesheet",
         OptionType::String,
         "default",
@@ -776,20 +785,18 @@ pub(crate) fn apply_ex_command(
             "org: unknown export ex-command callback {callback}"
         ));
     };
+    let open_in = || crate::option_or("export.open-in", "vsplit");
+    let viewer = || sink::viewer(&crate::option_or("export.open-with", "editor"), &open_in());
     let sink = match kind {
-        SinkKind::File => Sink::File,
-        SinkKind::Buffer => Sink::Buffer,
-        SinkKind::Open => match sink::open_sink(&crate::option_or("export.open-with", "editor")) {
-            Ok(sink) => sink,
-            Err(why) => return Ok(echo(EchoLevel::Error, why)),
-        },
-        SinkKind::Pdf => Sink::Pdf { open: None },
-        SinkKind::PdfOpen => match sink::open_sink(&crate::option_or("export.open-with", "editor"))
-        {
-            Ok(Sink::Open { system }) => Sink::Pdf { open: Some(system) },
-            Ok(other) => other,
-            Err(why) => return Ok(echo(EchoLevel::Error, why)),
-        },
+        SinkKind::File => Ok(Sink::File),
+        SinkKind::Buffer => sink::place(&open_in()).map(|place| Sink::Buffer { place }),
+        SinkKind::Open => viewer().map(Sink::Open),
+        SinkKind::Pdf => Ok(Sink::Pdf { open: None }),
+        SinkKind::PdfOpen => viewer().map(|v| Sink::Pdf { open: Some(v) }),
+    };
+    let sink = match sink {
+        Ok(sink) => sink,
+        Err(why) => return Ok(echo(EchoLevel::Error, why)),
     };
     let switches = Switches::from_args(&ctx.args);
     switches.remember();
@@ -802,15 +809,13 @@ pub(crate) fn apply_ex_command(
         ));
     };
     let target = match sink {
-        Sink::Buffer => sink::buffer_name(backend).to_string(),
-        Sink::File | Sink::Open { .. } | Sink::Pdf { .. } => {
-            pipeline::target_path(&source, backend)
-        }
+        Sink::Buffer { .. } => sink::buffer_name(backend).to_string(),
+        Sink::File | Sink::Open(_) | Sink::Pdf { .. } => pipeline::target_path(&source, backend),
     };
     // Before anything runs, as capture checks its target before a word is
     // typed: a refusal found after a parse (or a babel run) wastes the work
     // and reads as a failed export rather than a missing grant.
-    if sink != Sink::Buffer && host_services::can_write_file(&target).is_err() {
+    if !matches!(sink, Sink::Buffer { .. }) && host_services::can_write_file(&target).is_err() {
         return Ok(echo(
             EchoLevel::Error,
             format!(

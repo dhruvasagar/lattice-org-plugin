@@ -1369,7 +1369,11 @@ mod tests {
     #[test]
     fn a_pdf_export_ends_in_its_compile() {
         let request = Request {
-            sink: Sink::Pdf { open: Some(false) },
+            sink: Sink::Pdf {
+                open: Some(super::super::sink::Viewer::Editor(
+                    super::super::sink::Place::Vsplit,
+                )),
+            },
             ..request(Backend::Latex)
         };
         let process = vec![super::super::pdf::ProcessStep {
@@ -1403,7 +1407,12 @@ mod tests {
         assert!(compile.output.contains("\\section{A}"));
         assert_eq!(compile.steps, process);
         assert_eq!(compile.compiler, "lualatex");
-        assert_eq!(compile.open, Some(false));
+        assert_eq!(
+            compile.open,
+            Some(super::super::sink::Viewer::Editor(
+                super::super::sink::Place::Vsplit
+            ))
+        );
         assert_eq!(compile.left_out, vec!["#+BIND".to_string()]);
     }
 

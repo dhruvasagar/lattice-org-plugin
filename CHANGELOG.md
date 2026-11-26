@@ -41,7 +41,12 @@ the lattice release that carries it.
   `*Org MD Export*` or `*Org LATEX Export*` instead, and exporting again
   replaces that buffer's text in one undo step; `h o` and `m o` write the
   file and then open it, in lattice, or with the system's handler when
-  `org.export.open-with` is `system`. Each has a `:` command
+  `org.export.open-with` is `system`. In lattice an export never takes your
+  window: the file or buffer is shown beside the org file, in a vertical
+  split by default, and the cursor stays where you are typing.
+  `org.export.open-in` is `vsplit`, `split` or `tab` (a new tab you are not
+  switched to), and exporting again refreshes the pane that already shows
+  it. Each has a `:` command
   (`:org-export-html-buffer`, `:org-export-html-open`, …).
   Markdown is GitHub-flavoured, in emacs's `ox-md` shape: ATX headings (and
   numbered list items below `H:`), the table of contents as a nested list,

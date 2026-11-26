@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **The README starts with installing.** Installing and configuring now come
+  first, and the internals move under "How it is built" and "Developing it".
+  The simplest install is listed first: a `[plugins.org]` table in
+  `lattice.toml`, which needs no Rust toolchain and no `init.rs` (lattice
+  after 0.10.3). An example installs and configures org from that one file.
+
 ## 0.6.0 — 2026-11-26
 
 Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.0).

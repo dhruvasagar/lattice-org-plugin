@@ -46,6 +46,9 @@
   `lattice.toml`.
 
 ### Changed
+- **Needs lattice 0.10.6 or later.** Org builds against plugin API 0.7.1,
+  which carries the option contributions above; an older editor refuses org
+  and says the version it needs.
 - **The README starts with installing.** Installing and configuring now come
   first, and the internals move under "How it is built" and "Developing it".
   The simplest install is listed first: a `[plugins.org]` table in

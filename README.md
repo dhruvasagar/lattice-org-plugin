@@ -32,7 +32,7 @@ of four routes:
 
 ### In `lattice.toml` — no Rust toolchain, no `init.rs`
 
-Needs **a lattice release later than 0.10.4**. Add a `[plugins.org]` table to
+Needs **lattice 0.10.6 or later**. Add a `[plugins.org]` table to
 `~/.config/lattice/lattice.toml`:
 
 ```toml
@@ -60,8 +60,8 @@ To install **and configure** org from the one file, see
 
 The same released build, declared in your config's `register_plugins`.
 It needs no Rust beyond the toolchain your `init.rs` already uses, and no
-`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.4 or
-later**, the release that speaks plugin API 0.7.
+`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.6 or
+later**, the release that speaks plugin API 0.7.1.
 
 Your `init.rs` needs the `plugin-manager` seam. A config scaffolded by lattice 0.9.11 or later has it already:
 `register_plugins` is there, with a commented-out example that installs org.
@@ -109,7 +109,7 @@ starting the editor makes no network request.
 `release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
 you in `org-mode`. If it was refused, it is under the failed loads in
 `:plugins` with the reason — a release with no build for your editor says
-which it has, and an editor older than 0.10.4 says the version org needs.
+which it has, and an editor older than 0.10.6 says the version org needs.
 
 **Updating:** with a tag, change it and `:reload-config`. With `None`,
 `:plugin-update org` (or `u` on its row in `:plugins`) installs a newer

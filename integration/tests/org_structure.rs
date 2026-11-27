@@ -3381,6 +3381,82 @@ async fn the_capture_menu_opens_on_the_chord_with_a_row_per_template() {
     assert!(labels.contains(&"todo") && labels.contains(&"note"));
 }
 
+/// The menu's rows as `(key, label)`, for the transient that is open now.
+fn menu_rows(editor: &Editor) -> (String, Vec<(String, String)>) {
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "a menu is open; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    let rows = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| (i.key.concat(), i.label.clone()))
+        .collect();
+    (spec.title.clone(), rows)
+}
+
+/// A group row, org's prefix convention, end to end through the chord: the
+/// group's members leave the top menu, `e` opens its sub-menu, and the key
+/// pressed there captures through the member's whole key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_group_opens_a_sub_menu_of_its_members() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let inbox = base.path().join("inbox.org");
+    let acme = base.path().join("acme.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{i}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"e\"\ndescription = \"Engagement\"\n\n\
+             [[template]]\nkey = \"et\"\ndescription = \"Task\"\n\
+             target = {{ file = \"{a}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"en\"\ndescription = \"Note\"\n\
+             target = {{ file = \"{a}\" }}\nbody = \"* NOTE %?\"\n",
+            i = inbox.to_str().unwrap(),
+            a = acme.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture");
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["t", "e", "q"], "the members left the top menu");
+    assert!(rows.contains(&("e".to_string(), "Engagement…".to_string())));
+
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement", "the title names the level");
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["t", "n", "q"],
+        "each member is pressed by the rest of its key"
+    );
+
+    // `n`, the SECOND member, so a first-wins bug cannot pass.
+    press_menu_key(&mut editor, "n").await;
+    assert!(
+        active_capture(&editor).is_some(),
+        "the member's capture opened"
+    );
+    finalize_capture(&mut editor, "kickoff went well").await;
+    assert_eq!(text_of(&editor, &acme), "* NOTE kickoff went well\n");
+    assert!(
+        !inbox.exists(),
+        "the top-level `t` was not the one that fired"
+    );
+}
+
 /// The key you press is what decides the template — the whole point of the
 /// per-row args slot. Two rows fire ONE action; only the argument differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

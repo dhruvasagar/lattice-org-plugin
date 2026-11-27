@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+- **Capture group rows.** A capture template with a `key` and a
+  `description` and no `target` is a group, as in emacs: the templates whose
+  keys start with its key move into a sub-menu that the group's row opens.
+  `:org-capture-menu <key>` opens one directly. A group with nothing under it
+  is named in the menu's footer instead of shown.
+
 ### Fixed
 - **The `todo-keywords` examples are lists.** The README and `:help org`
   wrote `org.todo-keywords` as one multi-line string, which the option

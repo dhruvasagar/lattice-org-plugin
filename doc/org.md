@@ -438,7 +438,7 @@ A template has three independent parts: **where** it lands (`target`),
 |---|---|---|
 | `key` | required | the key that picks it in the menu. Several characters are fine |
 | `description` | | what the menu row says |
-| `target` | required | where it lands. See [Targets](#targets) |
+| `target` | | where it lands. See [Targets](#targets). Leave it out for a [group row](#group-rows) |
 | `body` | | the template text, placeholders and all |
 | `body-file` | | read the template text from this file instead, emacs's `(file "…")`. `~` is expanded |
 | `type` | | `entry` (the default) or `table-line` |
@@ -449,6 +449,40 @@ A template has three independent parts: **where** it lands (`target`),
 
 `body` and `body-file` cannot both be set. A body file that cannot be read
 stops the capture at open, naming the template and the path.
+
+##### Group rows
+
+A template with a `key` and a `description` and no `target` is a **group**,
+org's prefix convention. The templates whose keys start with the group's key
+leave the top menu and appear in the group's sub-menu, pressed by the rest of
+their key:
+
+```toml
+[[org.capture-templates]]
+key = "w"
+description = "Work"
+
+[[org.capture-templates]]
+key = "wt"
+description = "Task"
+target = { kind = "file+headline", file = "~/org/work.org", headline = "Tasks" }
+body = "* TODO %?"
+
+[[org.capture-templates]]
+key = "wm"
+description = "Meeting"
+target = { kind = "file+headline", file = "~/org/work.org", headline = "Meetings" }
+body = "* %^{Meeting}"
+```
+
+`<leader>oc` shows `w  Work…`; `w` opens `Capture · Work` with `t` and `m`.
+`:org-capture-menu w` opens the sub-menu directly. A group can sit inside
+another (`w`, then `wd` with `wda` under it). A template whose prefix names no
+group stays on the top menu under its whole key. A group with no templates
+under it is not shown, and the menu's footer names it.
+
+Group rows are for `org.capture-templates`. A roam template has no group rows;
+one without a `target` is skipped and named.
 
 ##### Targets
 

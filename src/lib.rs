@@ -481,6 +481,10 @@ const ORG_TRANSIENT_AGENDA_BULK: &str = "agenda-bulk";
 /// OA.30 — `x` then `t`, the keyword rows of the bulk TODO verb.
 const ORG_TRANSIENT_AGENDA_BULK_TODO: &str = "agenda-bulk-todo";
 
+/// A capture group's sub-menu, opened FOR the group's key, which travels
+/// beside this discriminator as a list. `org-capture-menu e` opens it.
+const ORG_TRANSIENT_CAPTURE_GROUP: &str = "capture-group";
+
 // TB.2: 21..=31 were `org-table-mode`'s eleven generic table callbacks.
 // They are the host's now — `table-mode` in `lattice-mode` owns pipe-table
 // editing for markdown and org alike (see that mode's docs for why the host
@@ -7261,6 +7265,33 @@ fn park_pending(id: &str, pending: &capture_drafts::Pending) -> Result<(), Strin
     host_services::store_put(&capture_drafts::pending_caller_key(id), &bytes)
 }
 
+/// `org-capture-menu`'s effect: the top menu, or with a group's key as its
+/// argument, that group's sub-menu. A group row fires this, and so can another
+/// plugin's menu that wants to open a group directly.
+fn capture_menu_open(args: &Args) -> Effect {
+    let group = match args {
+        Args::String(key) => Some(key.trim()),
+        Args::List(items) => match items.first() {
+            Some(lattice::plugin_host::types::ArgValue::String(key)) => Some(key.trim()),
+            _ => None,
+        },
+        _ => None,
+    }
+    .filter(|key| !key.is_empty());
+    Effect::OpenTransient(lattice::plugin_host::types::OpenTransientPayload {
+        source: CAPTURE_TRANSIENT.to_string(),
+        args: match group {
+            Some(key) => Args::List(vec![
+                lattice::plugin_host::types::ArgValue::String(
+                    ORG_TRANSIENT_CAPTURE_GROUP.to_string(),
+                ),
+                lattice::plugin_host::types::ArgValue::String(key.to_string()),
+            ]),
+            None => Args::None,
+        },
+    })
+}
+
 /// The roam template chooser for `title`, carrying `id` when a caller is
 /// parked under it.
 fn roam_chooser(title: &str, id: Option<&str>) -> Effect {
@@ -9426,16 +9457,7 @@ impl GrammarCallbacks for Component {
             // OC.3: names the menu the `transient-source` seam registered.
             // The host resolves the name against the registry and calls this
             // plugin's `build` for the place it was opened from.
-            CAPTURE_MENU => Ok(vec![Effect::OpenTransient(
-                lattice::plugin_host::types::OpenTransientPayload {
-                    source: CAPTURE_TRANSIENT.to_string(),
-                    // The template menu is opened for nothing in particular —
-                    // it IS the choice. TR.3a's args carry a subject when a
-                    // menu drills down, which is the roam chooser opened FOR a
-                    // node (OR.11b).
-                    args: Args::None,
-                },
-            )]),
+            CAPTURE_MENU => Ok(vec![capture_menu_open(&ctx.args)]),
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
@@ -12481,12 +12503,16 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // parse below, for TK.6's reason: a user with no `org.capture-templates`
         // must not be told "no capture templates" when they asked to make a
         // roam note.
+        let mut group: Option<String> = None;
         if let Args::List(items) = &ctx.args {
             if let [lattice::plugin_host::types::ArgValue::String(kind), lattice::plugin_host::types::ArgValue::String(title)] =
                 items.as_slice()
             {
                 if kind == ORG_TRANSIENT_ROAM {
                     return roam_template_menu(title, None);
+                }
+                if kind == ORG_TRANSIENT_CAPTURE_GROUP {
+                    group = Some(title.clone());
                 }
             }
             // CD.6: a create-and-insert's chooser also carries the id it
@@ -12543,19 +12569,44 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             Err(capture_templates::TemplateError::Unset) => None,
             Err(e) => return Err(e.message()),
         };
+        // A group's sub-menu names its group in the title, so the user can see
+        // which level they are on. A key that names no group (the option
+        // changed, or another plugin asked for one that is not there) is an
+        // error rather than the top menu, which would look like a group that
+        // forgot its members.
+        let title = match (&group, &set) {
+            (None, _) => "Capture".to_string(),
+            (Some(key), Some(set)) => match set.group(key) {
+                Some(g) => format!("Capture · {}", g.description),
+                None => return Err(format!("org: no capture group `{key}`")),
+            },
+            (Some(key), None) => return Err(format!("org: no capture group `{key}`")),
+        };
 
         let mut items: Vec<TransientItem> = match &set {
             Some(set) => set
-                .templates
-                .iter()
-                .map(|t| TransientItem {
-                    key: vec![t.key.clone()],
-                    label: t.description.clone(),
-                    description: format!("→ {}", t.target.file()),
-                    kind: TransientItemKind::Action(TransientAction {
-                        command: "org-capture".to_string(),
-                        args: WitArgs::String(t.key.clone()),
-                    }),
+                .level(group.as_deref())
+                .into_iter()
+                .map(|(pressed, row)| match row {
+                    capture_templates::MenuRow::Template(t) => TransientItem {
+                        key: vec![pressed],
+                        label: t.description.clone(),
+                        description: format!("→ {}", t.target.file()),
+                        kind: TransientItemKind::Action(TransientAction {
+                            command: "org-capture".to_string(),
+                            args: WitArgs::String(t.key.clone()),
+                        }),
+                    },
+                    // A drill-down: the row reopens this menu for the group.
+                    capture_templates::MenuRow::Group(g) => TransientItem {
+                        key: vec![pressed],
+                        label: format!("{}…", g.description),
+                        description: String::new(),
+                        kind: TransientItemKind::Action(TransientAction {
+                            command: "org-capture-menu".to_string(),
+                            args: WitArgs::String(g.key.clone()),
+                        }),
+                    },
                 })
                 .collect(),
             None => {
@@ -12608,7 +12659,7 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             .map(|s| format!("skipped: {}", s.skipped.join("; ")));
 
         Ok(TransientSpec {
-            title: "Capture".to_string(),
+            title,
             groups: vec![TransientGroup {
                 label: "Templates".to_string(),
                 items,

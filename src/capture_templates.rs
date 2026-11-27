@@ -13,7 +13,7 @@
 //! list<record {
 //!     key:         string,
 //!     description: string?,
-//!     target:      record {
+//!     target:      record {   // absent: a group row (see below)
 //!         kind:      string?,   // file | file+headline | file+olp | file+datetree
 //!         file:      string,
 //!         headline:  string?,
@@ -66,15 +66,17 @@
 //! remains below is the checking a schema has no way to express: a key that is
 //! blank after trimming, and two templates claiming the same key.
 //!
-//! **One behaviour deliberately changed.** Before, a template missing its `key`
-//! or its `target` was SKIPPED and named in `skipped`, on the principle that one
-//! typo should not cost the feature. That principle was compelling when the
-//! alternative was a parser error with no location. It is not compelling
-//! against `[2].key: required field is missing` — a silently absent menu row is
-//! the failure that sends a user looking in the wrong place, and now that the
-//! message says exactly which template and which field, refusing is the kinder
-//! answer. Duplicate keys are still a skip, because there the value IS usable
-//! and the only question is which row wins.
+//! **A missing `key` is refused, not skipped.** The host's message names the
+//! template and the field (`[2].key: required field is missing`), and a
+//! silently absent menu row is the failure that sends a user looking in the
+//! wrong place. Duplicate keys are still a skip, because there the value IS
+//! usable and the only question is which row wins.
+//!
+//! **A template with no `target` is a group row**, org's prefix convention:
+//! `{ key = "e", description = "Engagement" }`. Templates whose keys extend
+//! `e` leave the top menu and appear in its sub-menu, pressed by the rest of
+//! their key; [`ParsedSet::level`] is the rule. A group with no members is
+//! named in `skipped` rather than shown, since it would open an empty menu.
 //!
 //! **Parsed on read, never cached.** `:set org.capture-templates=…` must take
 //! effect on the next capture, and a cache would need an `OptionChanged`
@@ -381,7 +383,12 @@ pub struct RawTemplate {
     /// What the menu row says.
     pub description: Option<String>,
     /// Where the capture lands.
-    pub target: RawTarget,
+    ///
+    /// Absent makes this a **group row**, org's own prefix convention
+    /// (`("e" "Engagement")` in `org-capture-templates`): the templates whose
+    /// keys extend this key leave the top menu and appear beneath it. A group
+    /// needs a `description`, since the row has nothing else to say.
+    pub target: Option<RawTarget>,
     /// The template text, with `%?` / `%U` / `%^{…}` placeholders.
     pub body: Option<String>,
     /// CT.1: the template text read from a FILE instead of inlined — emacs
@@ -627,10 +634,39 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
     }
 
     let mut templates: Vec<Template> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
     for t in raw {
         let key = t.key.trim().to_string();
         let description = t.description.unwrap_or_default().trim().to_string();
+        let taken = templates
+            .iter()
+            .map(|p| (&p.key, &p.description))
+            .chain(groups.iter().map(|g| (&g.key, &g.description)))
+            .find(|(k, _)| **k == key)
+            .map(|(_, d)| d.clone());
+        let Some(raw_target) = t.target else {
+            if key.is_empty() || description.is_empty() {
+                skipped.push(format!(
+                    "`{key}` has no `target` (a group row needs a `key` and a `description`)"
+                ));
+            } else if list == TemplateList::Roam {
+                skipped.push(format!(
+                    "`{key}` has no `target` (roam templates have no group rows)"
+                ));
+            } else if let Some(prior) = taken {
+                skipped.push(format!(
+                    "`{key}` is already taken by \"{prior}\"; skipping \"{description}\""
+                ));
+            } else {
+                groups.push(Group {
+                    key,
+                    description,
+                    before: templates.len(),
+                });
+            }
+            continue;
+        };
         if key.is_empty() {
             // Present but blank — `key = ""` satisfies `required` and means
             // nothing. The schema cannot say "non-empty"; this can.
@@ -644,19 +680,18 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             ));
             continue;
         }
-        let file = t.target.file.trim().to_string();
+        let file = raw_target.file.trim().to_string();
         if file.is_empty() {
             skipped.push(format!("`{key}` has a blank `target.file`"));
             continue;
         }
-        if let Some(prior) = templates.iter().find(|p| p.key == key) {
+        if let Some(prior) = taken {
             skipped.push(format!(
-                "`{key}` is already taken by \"{}\"; skipping \"{description}\"",
-                prior.description,
+                "`{key}` is already taken by \"{prior}\"; skipping \"{description}\""
             ));
             continue;
         }
-        let (target, head) = match resolve_target(&key, list, file, t.target) {
+        let (target, head) = match resolve_target(&key, list, file, raw_target) {
             Ok(resolved) => resolved,
             Err(why) => {
                 skipped.push(why);
@@ -720,11 +755,58 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
         });
     }
     drop_unresolved_seeds(&mut templates, &mut skipped);
+    // A group with nothing beneath it would be a row that opens an empty
+    // menu. Named instead, which is also how a typo in a member's key shows.
+    groups.retain(|g| {
+        let has_members = templates
+            .iter()
+            .any(|t| t.key.len() > g.key.len() && t.key.starts_with(&g.key));
+        if !has_members {
+            skipped.push(format!(
+                "`{}` (\"{}\") is a group with no templates under it",
+                g.key, g.description
+            ));
+        }
+        has_members
+    });
 
     if templates.is_empty() {
         return Err(TemplateError::Empty);
     }
-    Ok(ParsedSet { templates, skipped })
+    Ok(ParsedSet {
+        templates,
+        groups,
+        skipped,
+    })
+}
+
+/// A group row: a key and a label, with the templates whose keys extend the
+/// key beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The full key, as declared (`e`, or `ec` for a group inside `e`).
+    pub key: String,
+    /// What the row says.
+    pub description: String,
+    /// How many templates were declared before this group, so the menu can
+    /// show groups and templates in the order they were written.
+    pub before: usize,
+}
+
+/// One row of a capture menu level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuRow<'a> {
+    Template(&'a Template),
+    Group(&'a Group),
+}
+
+impl MenuRow<'_> {
+    fn key(&self) -> &str {
+        match self {
+            MenuRow::Template(t) => &t.key,
+            MenuRow::Group(g) => &g.key,
+        }
+    }
 }
 
 /// Skip every template whose `seed` does not name a usable template.
@@ -809,6 +891,8 @@ pub fn read_for(list: TemplateList, option: &str) -> Result<ParsedSet, TemplateE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSet {
     pub templates: Vec<Template>,
+    /// The group rows that have at least one template beneath them.
+    pub groups: Vec<Group>,
     pub skipped: Vec<String>,
 }
 
@@ -816,6 +900,53 @@ impl ParsedSet {
     /// The template that key selects.
     pub fn by_key(&self, key: &str) -> Option<&Template> {
         self.templates.iter().find(|t| t.key == key)
+    }
+
+    /// The group that key names.
+    pub fn group(&self, key: &str) -> Option<&Group> {
+        self.groups.iter().find(|g| g.key == key)
+    }
+
+    /// The rows of one menu level, each with the key it is pressed by there:
+    /// the top menu for `None`, a group's sub-menu for `Some(group key)`.
+    ///
+    /// A row belongs to the level of the LONGEST group key its own key
+    /// extends, so `et` sits under `e`, and under `ec` only if `ec` is
+    /// declared. A template whose prefix names no group stays where it is,
+    /// keyed by its whole key, which is how a set without groups has always
+    /// behaved. Groups and templates keep their declaration order.
+    pub fn level(&self, group: Option<&str>) -> Vec<(String, MenuRow<'_>)> {
+        let parent = |key: &str| -> Option<&str> {
+            self.groups
+                .iter()
+                .map(|g| g.key.as_str())
+                .filter(|g| g.len() < key.len() && key.starts_with(g))
+                .max_by_key(|g| g.len())
+        };
+        let mut ordered: Vec<MenuRow<'_>> = Vec::new();
+        for (i, t) in self.templates.iter().enumerate() {
+            ordered.extend(
+                self.groups
+                    .iter()
+                    .filter(|g| g.before == i)
+                    .map(MenuRow::Group),
+            );
+            ordered.push(MenuRow::Template(t));
+        }
+        ordered.extend(
+            self.groups
+                .iter()
+                .filter(|g| g.before >= self.templates.len())
+                .map(MenuRow::Group),
+        );
+        ordered
+            .into_iter()
+            .filter(|row| parent(row.key()) == group)
+            .map(|row| {
+                let pressed = row.key()[group.map_or(0, str::len)..].to_string();
+                (pressed, row)
+            })
+            .collect()
     }
 }
 
@@ -834,11 +965,11 @@ mod tests {
         RawTemplate {
             key: key.to_string(),
             description: Some(description.to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: file.to_string(),
                 headline: headline.map(str::to_string),
                 ..Default::default()
-            },
+            }),
             body: Some(body.to_string()),
             body_file: None,
             clock_in: None,
@@ -900,7 +1031,7 @@ mod tests {
         vec![RawTemplate {
             key: "t".to_string(),
             body: Some("* TODO %?".to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 kind: kind.map(str::to_string),
                 file: "~/org/x.org".to_string(),
                 headline: headline.map(str::to_string),
@@ -908,7 +1039,7 @@ mod tests {
                 tree_type: None,
                 sub_olp: None,
                 head: None,
-            },
+            }),
             ..Default::default()
         }]
     }
@@ -1008,10 +1139,10 @@ mod tests {
         declared.push(RawTemplate {
             key: "ok".to_string(),
             body: Some("* TODO %?".to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/org/x.org".to_string(),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         });
         let set = from_declared(declared).expect("the survivor keeps the set alive");
@@ -1032,10 +1163,10 @@ mod tests {
         declared.push(RawTemplate {
             key: "ok".to_string(),
             body: Some("* TODO %?".to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/org/x.org".to_string(),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         });
         let set = from_declared(declared).expect("the survivor keeps the set alive");
@@ -1080,13 +1211,13 @@ mod tests {
             vec![RawTemplate {
                 key: "k".to_string(),
                 body: Some("x".to_string()),
-                target: RawTarget {
+                target: Some(RawTarget {
                     kind: Some(kind.to_string()),
                     file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
                     head: head.map(str::to_string),
                     olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             }],
         )
@@ -1134,19 +1265,19 @@ mod tests {
 
         let mut declared = vec![RawTemplate {
             key: "k".to_string(),
-            target: RawTarget {
+            target: Some(RawTarget {
                 kind: Some("file+head".to_string()),
                 file: "~/x.org".to_string(),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         }];
         declared.push(RawTemplate {
             key: "ok".to_string(),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/x.org".to_string(),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         });
         let set = from_declared(declared).expect("the survivor keeps the set");
@@ -1162,20 +1293,20 @@ mod tests {
     fn a_head_on_a_headless_kind_is_named() {
         let mut declared = vec![RawTemplate {
             key: "k".to_string(),
-            target: RawTarget {
+            target: Some(RawTarget {
                 kind: Some("file".to_string()),
                 file: "~/x.org".to_string(),
                 head: Some("#+title: x".to_string()),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         }];
         declared.push(RawTemplate {
             key: "ok".to_string(),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/x.org".to_string(),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         });
         let set = from_declared_for(TemplateList::Roam, declared).expect("survivor");
@@ -1255,11 +1386,11 @@ mod tests {
         let set = from_declared(vec![RawTemplate {
             key: "h".to_string(),
             description: Some("habit".to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/org/habit.org".to_string(),
                 headline: None,
                 ..Default::default()
-            },
+            }),
             body: None,
             body_file: Some("~/org/templates/habit.org".to_string()),
             clock_in: None,
@@ -1283,11 +1414,11 @@ mod tests {
             RawTemplate {
                 key: "b".to_string(),
                 description: Some("both".to_string()),
-                target: RawTarget {
+                target: Some(RawTarget {
                     file: "~/org/x.org".to_string(),
                     headline: None,
                     ..Default::default()
-                },
+                }),
                 body: Some("* TODO %?".to_string()),
                 body_file: Some("~/org/t.org".to_string()),
                 clock_in: None,
@@ -1296,11 +1427,11 @@ mod tests {
             RawTemplate {
                 key: "t".to_string(),
                 description: Some("fine".to_string()),
-                target: RawTarget {
+                target: Some(RawTarget {
                     file: "~/org/x.org".to_string(),
                     headline: None,
                     ..Default::default()
-                },
+                }),
                 body: Some("* TODO %?".to_string()),
                 body_file: None,
                 clock_in: None,
@@ -1323,11 +1454,11 @@ mod tests {
         let set = from_declared(vec![RawTemplate {
             key: "n".to_string(),
             description: Some("blank".to_string()),
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/org/x.org".to_string(),
                 headline: None,
                 ..Default::default()
-            },
+            }),
             body: None,
             body_file: None,
             clock_in: None,
@@ -1357,12 +1488,12 @@ mod tests {
     fn dated(key: &str, file: &str, section: Option<&str>, seed: Option<&str>) -> RawTemplate {
         RawTemplate {
             key: key.to_string(),
-            target: RawTarget {
+            target: Some(RawTarget {
                 kind: Some("file+datetree".to_string()),
                 file: file.to_string(),
                 sub_olp: section.map(|s| vec![s.to_string()]),
                 ..Default::default()
-            },
+            }),
             seed: seed.map(str::to_string),
             ..Default::default()
         }
@@ -1463,11 +1594,12 @@ mod tests {
         let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
             required,
-            vec![true, false, true, false, false, false, false, false, false, false],
-            "`key` and `target` are the two a template cannot do without — \
-             CT.1's `body-file` is optional, and so is `body`, because a \
-             template may declare either or neither, and CT.4's three all \
-             default (`type` to `entry`, the placement pair to end-of-table)"
+            vec![true, false, false, false, false, false, false, false, false, false],
+            "`key` is the one field every row needs — a template without a \
+             `target` is a group row, CT.1's `body-file` is optional, and so \
+             is `body`, because a template may declare either or neither, and \
+             CT.4's three all default (`type` to `entry`, the placement pair \
+             to end-of-table)"
         );
 
         // CT.3: and the NESTED target record, which the assertions above do not
@@ -1591,6 +1723,161 @@ mod tests {
         assert!(set.skipped[0].contains("task"), "{:?}", set.skipped);
     }
 
+    /// A template with a key and a description and no target: org's prefix
+    /// row.
+    fn group(key: &str, description: &str) -> RawTemplate {
+        RawTemplate {
+            key: key.to_string(),
+            description: Some(description.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `(pressed key, full key, is a group)` for one menu level.
+    fn rows(set: &ParsedSet, level: Option<&str>) -> Vec<(String, String, bool)> {
+        set.level(level)
+            .into_iter()
+            .map(|(pressed, row)| match row {
+                MenuRow::Template(t) => (pressed, t.key.clone(), false),
+                MenuRow::Group(g) => (pressed, g.key.clone(), true),
+            })
+            .collect()
+    }
+
+    fn row(pressed: &str, key: &str, group: bool) -> (String, String, bool) {
+        (pressed.to_string(), key.to_string(), group)
+    }
+
+    #[test]
+    fn a_group_takes_the_templates_its_key_prefixes_off_the_top_menu() {
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/refile.org", None, "* TODO %?"),
+            group("e", "Engagement"),
+            t("et", "Task", "~/org/clients/acme.org", None, "* TODO %?"),
+            t("en", "Note", "~/org/clients/acme.org", None, "* %?"),
+            t("j", "journal", "~/org/journal.org", None, "* %?"),
+        ])
+        .expect("the set resolves");
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+        assert_eq!(
+            rows(&set, None),
+            vec![
+                row("t", "t", false),
+                row("e", "e", true),
+                row("j", "j", false)
+            ],
+            "the members left the top menu; the group sits where it was declared"
+        );
+        assert_eq!(
+            rows(&set, Some("e")),
+            vec![row("t", "et", false), row("n", "en", false)],
+            "beneath the group each member is pressed by the rest of its key"
+        );
+        assert!(
+            set.by_key("et").is_some() && set.by_key("e").is_none(),
+            "a member still captures by its whole key; the group is not a template"
+        );
+    }
+
+    #[test]
+    fn a_group_inside_a_group_is_a_level_of_its_own() {
+        let set = from_declared(vec![
+            group("e", "Engagement"),
+            t("et", "Task", "~/org/a.org", None, ""),
+            group("ed", "Decisions"),
+            t("eda", "ADR", "~/org/a.org", None, ""),
+        ])
+        .expect("the set resolves");
+        assert_eq!(rows(&set, None), vec![row("e", "e", true)]);
+        assert_eq!(
+            rows(&set, Some("e")),
+            vec![row("t", "et", false), row("d", "ed", true)]
+        );
+        assert_eq!(rows(&set, Some("ed")), vec![row("a", "eda", false)]);
+    }
+
+    #[test]
+    fn a_template_whose_group_is_missing_stays_on_the_top_menu() {
+        // No `e` row was declared, so nothing hides `et`: a set without groups
+        // behaves as it always has, with the whole key on the row.
+        let set = from_declared(vec![t("et", "Task", "~/org/a.org", None, "")])
+            .expect("the set resolves");
+        assert_eq!(rows(&set, None), vec![row("et", "et", false)]);
+    }
+
+    #[test]
+    fn a_group_with_nothing_under_it_is_named_not_shown() {
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/a.org", None, ""),
+            group("e", "Engagement"),
+        ])
+        .expect("the template still resolves");
+        assert_eq!(rows(&set, None), vec![row("t", "t", false)]);
+        assert!(set.group("e").is_none());
+        assert_eq!(set.skipped.len(), 1);
+        assert!(
+            set.skipped[0].contains("`e`") && set.skipped[0].contains("no templates under it"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    #[test]
+    fn a_group_and_a_template_cannot_share_a_key() {
+        let set = from_declared(vec![
+            t("e", "email", "~/org/a.org", None, ""),
+            group("e", "Engagement"),
+            t("et", "Task", "~/org/a.org", None, ""),
+        ])
+        .expect("the set resolves");
+        assert!(set.group("e").is_none(), "the first declaration wins");
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.contains("email") && s.contains("Engagement")),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_target_and_no_description_is_named() {
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/a.org", None, ""),
+            RawTemplate {
+                key: "e".to_string(),
+                ..Default::default()
+            },
+        ])
+        .expect("the template still resolves");
+        assert!(set.groups.is_empty());
+        assert!(
+            set.skipped[0].contains("`e` has no `target`"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
+    #[test]
+    fn roam_templates_have_no_group_rows() {
+        let set = from_declared_for(
+            TemplateList::Roam,
+            vec![
+                t("d", "default", "${slug}.org", None, ""),
+                group("e", "Engagement"),
+            ],
+        )
+        .expect("the template still resolves");
+        assert!(set.groups.is_empty());
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.contains("roam templates have no group rows")),
+            "{:?}",
+            set.skipped
+        );
+    }
+
     #[test]
     fn a_blank_headline_degrades_to_the_plain_file_target() {
         let set = from_declared(vec![t("t", "todo", "~/org/x.org", Some("   "), "")])
@@ -1612,11 +1899,11 @@ mod tests {
         let set = from_declared(vec![RawTemplate {
             key: "t".to_string(),
             description: None,
-            target: RawTarget {
+            target: Some(RawTarget {
                 file: "~/org/x.org".to_string(),
                 headline: None,
                 ..Default::default()
-            },
+            }),
             body: None,
             body_file: None,
             clock_in: None,

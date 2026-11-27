@@ -13,6 +13,13 @@
   `.org` files. The sub-menu guesses it from the buffer's file, then from the
   running clock's, and its title names the guess and where it came from. `c`
   picks another, and with no guess a member asks first.
+- **A custom agenda can choose its file.** `choose = "<folder>"` on an
+  `org.agenda-custom-commands` entry makes opening it ask for one of the
+  folder's `.org` files, the guess first, and show the command's sections
+  filtered to that file.
+- **`org-agenda-command` takes filter terms after the key**, in the agenda's
+  own spelling: `:org-agenda-command e file:acme.org tag:urgent`. It passed
+  only the key before.
 
 ### Fixed
 - **The `todo-keywords` examples are lists.** The README and `:help org`

@@ -1651,6 +1651,7 @@ description = "Refile"
 | `key` | the keystroke that selects it. Required |
 | `description` | the menu row's label. Defaults to the key |
 | `[[command.section]]` | a block, exactly as under `org.agenda-sections` — same keys, same rules |
+| `choose` | a folder: the agenda shows one of its `.org` files at a time. See below |
 
 **`<leader>oa` (or `C-c a`) opens the chooser**, and the built-in agenda is on
 `a`. That is a change: those chords used to open the agenda directly. It is
@@ -1658,6 +1659,17 @@ what emacs does — `C-c a` has always meant "choose an agenda" and `C-c a a` th
 built-in one — so the spelling your fingers already know still works, one
 keystroke longer. `:org-agenda` still opens the default agenda with no menu at
 all.
+
+**A command with `choose` is about one file at a time.** Opening it asks for
+one of the folder's `.org` files, with the guess first (the buffer's file if it
+is in the folder, else the running clock's, as for a [capture
+group](#choosing-the-file)), and shows the command's sections filtered to that
+file. Inside the view, `sf` re-filters to another file as in any agenda. The
+folder's files must also be in `org.agenda-files`.
+
+`:org-agenda-command <key> <terms…>` opens a command with filter terms in the
+agenda's own spelling, so `:org-agenda-command e file:acme.org` opens it on
+`acme.org` directly, and a choosing command named with a file does not ask.
 
 A command's sections are sections: `when`, `days`, `todo-only`,
 `min-priority` and `match` all mean what they mean above, because they are

@@ -108,6 +108,10 @@ pub(crate) struct RawCommand {
     /// error, because a command with no blocks is a mistake a user makes while
     /// editing rather than a malformed file.
     pub(crate) section: Option<Vec<RawSection>>,
+    /// A folder whose `.org` files this agenda is about, one at a time.
+    /// Opening the command asks for one of them (the guess first) and shows
+    /// the command's sections filtered to it, `file:<name>`.
+    pub(crate) choose: Option<String>,
 }
 
 /// The declared shape of `org.agenda-custom-commands`.
@@ -119,6 +123,8 @@ pub struct CustomCommand {
     pub key: String,
     pub description: String,
     pub sections: Vec<Section>,
+    /// The folder the command chooses a file from, as declared.
+    pub choose: Option<String>,
 }
 
 /// A parsed set, plus what was dropped getting there.
@@ -222,10 +228,17 @@ pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands,
             Some(d) if !d.is_empty() => d.to_string(),
             _ => key.clone(),
         };
+        let choose = c
+            .choose
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
         commands.push(CustomCommand {
             key,
             description,
             sections,
+            choose,
         });
     }
 
@@ -294,6 +307,44 @@ pub fn resolve_with(
         },
         Err(e) => with_notice(fallback, e.notice()),
     }
+}
+
+/// What opening a command with `choose` needs, given the args it was fired
+/// with (`[key, terms…]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChosenScan {
+    /// Open the view with these scan args.
+    Open(Vec<String>),
+    /// No file yet: ask for one from this folder.
+    Ask(String),
+}
+
+/// Turn a choosing command's args into its scan args.
+///
+/// A term that is a path to one of the folder's files (what the chooser
+/// appends) becomes `file:<name>`, the agenda's own file filter. A `file:`
+/// term already there is kept, so `["e", "file:acme.org"]` opens directly.
+/// With no file term the command asks.
+pub fn chosen_scan(folder_dir: &str, args: &[String]) -> ChosenScan {
+    let folder = crate::chooser::folder(folder_dir);
+    let terms: Vec<String> = args
+        .iter()
+        .skip(1)
+        .map(|term| {
+            if crate::chooser::is_choice(&folder, term) {
+                let name = term.rsplit('/').next().unwrap_or(term);
+                format!("file:{name}")
+            } else {
+                term.clone()
+            }
+        })
+        .collect();
+    if !terms.iter().any(|t| t.starts_with("file:")) {
+        return ChosenScan::Ask(folder_dir.to_string());
+    }
+    let mut out = vec![args.first().cloned().unwrap_or_default()];
+    out.extend(terms);
+    ChosenScan::Open(out)
 }
 
 /// Prefix `notice` onto the first section's title, or return the set unchanged.
@@ -626,6 +677,74 @@ key = "b"
             sections, defaults,
             "unset is not an error, so there is no notice even here — the \
              fallback IS the answer"
+        );
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn choose_is_read_onto_the_command() {
+        let set = parsedcommands_from(
+            r#"
+[[command]]
+key = "e"
+description = "Engagement"
+choose = "~/org/clients"
+
+  [[command.section]]
+  title = "Next"
+  when = "any"
+"#,
+            SPAN,
+        )
+        .unwrap();
+        assert_eq!(
+            set.by_key("e").unwrap().choose.as_deref(),
+            Some("~/org/clients")
+        );
+        assert_eq!(
+            parsedcommands_from(TWO, SPAN).unwrap().commands[0].choose,
+            None
+        );
+    }
+
+    #[test]
+    fn a_picked_path_becomes_the_agendas_file_filter() {
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "/home/u/org/clients/acme.org"])
+            ),
+            ChosenScan::Open(strings(&["e", "file:acme.org"]))
+        );
+    }
+
+    #[test]
+    fn a_file_term_already_given_opens_directly() {
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "file:acme.org", "tag:urgent"])
+            ),
+            ChosenScan::Open(strings(&["e", "file:acme.org", "tag:urgent"]))
+        );
+    }
+
+    #[test]
+    fn with_no_file_the_command_asks() {
+        assert_eq!(
+            chosen_scan("~/org/clients", &strings(&["e", "tag:urgent"])),
+            ChosenScan::Ask("~/org/clients".to_string())
+        );
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "/home/u/org/elsewhere.org"])
+            ),
+            ChosenScan::Ask("/home/u/org/clients".to_string()),
+            "a path outside the folder is not a choice"
         );
     }
 }

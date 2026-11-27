@@ -5145,7 +5145,7 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
                 Ok(t) => t,
                 Err(effect) => return vec![effect],
             };
-            let template = match apply_choice(template, file.as_deref()) {
+            let template = match apply_choice(template, file.as_deref(), None) {
                 Ok(t) => t,
                 Err(effect) => return vec![effect],
             };
@@ -6243,7 +6243,7 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         .is_some()
         .then(|| args.get(1).cloned())
         .flatten();
-    let template = match apply_choice(template, chosen.as_deref()) {
+    let template = match apply_choice(template, chosen.as_deref(), doc.path()) {
         Ok(t) => t,
         // No usable file yet: the chooser opens, and runs this again with one.
         Err(effect) => return vec![effect],
@@ -7441,16 +7441,29 @@ fn arg_strings(args: &Args) -> Vec<String> {
 
 /// `org-choose-file`'s effect: the picker over `args[0]`, which runs
 /// `args[1]` with the rest of `args` and the picked path.
-fn choose_file_open(args: &[String]) -> Effect {
+///
+/// The guess is computed here, where the buffer is known, and goes first in
+/// the picker so accepting at once takes it. The picker's own args are
+/// `[folder, guess, command, args…]`, an encoding private to this file.
+fn choose_file_open(args: &[String], buffer_path: Option<String>) -> Effect {
     if args.len() < 2 || args[0].trim().is_empty() || args[1].trim().is_empty() {
         return Effect::Echo(EchoPayload {
             level: EchoLevel::Warn,
             text: "org-choose-file: give a folder and the command to run with the file".to_string(),
         });
     }
+    let guess = chooser::guess(
+        &chooser::folder(&args[0]),
+        buffer_path.as_deref(),
+        running_clock_file().as_deref(),
+    )
+    .map(|(path, _)| path)
+    .unwrap_or_default();
+    let mut picker_args = vec![args[0].clone(), guess];
+    picker_args.extend(args[1..].iter().cloned());
     Effect::OpenPicker(lattice::plugin_host::types::OpenPickerPayload {
         source: CHOOSE_FILE_PICKER.to_string(),
-        args: args.to_vec(),
+        args: picker_args,
         root: None,
         fill_action: None,
         query: None,
@@ -7483,6 +7496,7 @@ fn note_clock_stopped() {
 fn apply_choice(
     template: capture_templates::Template,
     chosen: Option<&str>,
+    buffer_path: Option<String>,
 ) -> Result<capture_templates::Template, Effect> {
     let Some(dir) = template.chooses.clone() else {
         return Ok(template);
@@ -7494,11 +7508,10 @@ fn apply_choice(
             template.target = template.target.with_file(file.to_string());
             Ok(template)
         }
-        None => Err(choose_file_open(&[
-            dir,
-            "org-capture".to_string(),
-            template.key.clone(),
-        ])),
+        None => Err(choose_file_open(
+            &[dir, "org-capture".to_string(), template.key.clone()],
+            buffer_path,
+        )),
     }
 }
 
@@ -9668,7 +9681,7 @@ impl GrammarCallbacks for Component {
             // The host resolves the name against the registry and calls this
             // plugin's `build` for the place it was opened from.
             CAPTURE_MENU => Ok(vec![capture_menu_open(&ctx.args, doc.path())]),
-            CHOOSE_FILE => Ok(vec![choose_file_open(&arg_strings(&ctx.args))]),
+            CHOOSE_FILE => Ok(vec![choose_file_open(&arg_strings(&ctx.args), doc.path())]),
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
@@ -9998,10 +10011,29 @@ impl GrammarCallbacks for Component {
                 ))])
             }
             AGENDA_COMMAND => {
-                let key = match &ctx.args {
-                    Args::String(s) => s.trim().to_string(),
-                    _ => String::new(),
-                };
+                // `[key, terms…]`: a custom command's key, then filter terms
+                // in the agenda's own spelling (`file:acme.org`, `tag:work`).
+                let mut scan_args = arg_strings(&ctx.args);
+                if scan_args.is_empty() {
+                    scan_args.push(String::new());
+                }
+                scan_args[0] = scan_args[0].trim().to_string();
+                // A command with `choose` is about one file of its folder;
+                // without one named, the chooser asks.
+                let choose = agenda_custom_commands::read(agenda_span_days())
+                    .ok()
+                    .and_then(|set| set.by_key(&scan_args[0]).and_then(|c| c.choose.clone()));
+                if let Some(dir) = choose {
+                    match agenda_custom_commands::chosen_scan(&dir, &scan_args) {
+                        agenda_custom_commands::ChosenScan::Open(args) => scan_args = args,
+                        agenda_custom_commands::ChosenScan::Ask(dir) => {
+                            return Ok(vec![choose_file_open(
+                                &[dir, "org-agenda-command".to_string(), scan_args[0].clone()],
+                                doc.path(),
+                            )]);
+                        }
+                    }
+                }
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {
                         provider: "agenda".to_string(),
@@ -10016,7 +10048,7 @@ impl GrammarCallbacks for Component {
                         // that makes `gr` a refresh. Sending `[]` for the
                         // built-in row turned `C-c a a` into a refresh of
                         // whatever custom view was already open.
-                        scan_args: vec![key],
+                        scan_args,
                     },
                 ))])
             }
@@ -10678,13 +10710,18 @@ impl MediaProducer for Component {
 fn choose_file_candidates(
     args: &[String],
 ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
-    let [dir, command, rest @ ..] = args else {
+    let [dir, guess, command, rest @ ..] = args else {
         return Err("org-choose-file: give a folder and the command to run".to_string());
     };
     let folder = chooser::folder(dir);
     let walked =
         host_services::walk(&folder).map_err(|e| format!("org: cannot list {dir}: {e}"))?;
-    let files = chooser::choices(&folder, walked);
+    let mut files = chooser::choices(&folder, walked);
+    // The guess first, so `<CR>` takes it.
+    if let Some(at) = files.iter().position(|f| f == guess) {
+        let first = files.remove(at);
+        files.insert(0, first);
+    }
     if files.is_empty() {
         return Err(format!("org: no .org files in {dir}"));
     }
@@ -11684,20 +11721,26 @@ const CAPTURE_TRANSIENT: &str = "org-capture";
 /// states can do nothing at all, whereas an agenda dispatcher with no custom
 /// commands can still open the agenda. A menu that refuses to open when it has
 /// a working row is worse than a short menu.
-fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
-    use lattice::plugin_host::types::{
-        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
-        TransientSpec,
-    };
-
-    let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+/// `org.agenda-span`, falling back to the compiled-in default when unset or
+/// not a number.
+fn agenda_span_days() -> u32 {
+    option_or("agenda-span", DEFAULT_AGENDA_SPAN)
         .trim()
         .parse::<u32>()
         .unwrap_or_else(|_| {
             DEFAULT_AGENDA_SPAN
                 .parse()
                 .expect("the compiled-in default parses")
-        });
+        })
+}
+
+fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let span = agenda_span_days();
     // An unusable set costs the ROWS it describes, never the menu: the built-in
     // agenda is still reachable, and the footer says what went wrong. Erring
     // here would mean a typo in one command's `when` left you unable to open

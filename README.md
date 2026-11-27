@@ -515,6 +515,22 @@ reached the network.
 | `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), `org.query` (entries by tags, properties or TODO state), `org.entry` (one entry whole, by its ref or `ID`), `org.clock` (clocked time over a range, per entry, file or tag), `org.notes` (roam notes by title, alias or tag, with backlinks), read through the agenda's own scan so the assistant and `:org-agenda` agree; and `org.change`, which sets an entry's TODO state, schedule, deadline or tags, adds a note to its log or refiles it, or captures something new through one of your capture templates, through the verbs the keys use and hands the edit to lattice's review. Five workflows ride with them as chat profiles (`org`, `org-plan`, `org-review`, `org-report`, `org-research`), opened by `:org-plan-day`, `:org-plan-week`, `:org-review` and `:org-report`. The same tools reach Claude Code and other MCP or ACP agents through `lattice --mcp` (`llm.serve_tools`); see `:help org.assistant` |
 | `help` | `doc/org.md`, `doc/roam.md`, `doc/babel.md` and `doc/export.md`, shipped inside the component; `:help org`, `:help org.roam`, `:help org.babel`, `:help org.export`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
 
+### Extending it from another plugin
+
+Org is meant to be built on. Another plugin can add to three of its options,
+`org.agenda-files`, `org.capture-templates` and `org.agenda-custom-commands`,
+through lattice's option contributions: the user's own value comes first and
+is never changed, and `:describe-option` lists what each plugin added. And it
+may run two of org's commands from its own actions, picker rows and menus,
+because org's manifest exports them:
+
+| command | what another plugin uses it for |
+|---|---|
+| `org-agenda-command` | open a named agenda, optionally narrowed (`org-agenda-command e file:acme.org`) |
+| `org-capture-menu` | open the capture menu at a group (`capture-group`, the group's key, and optionally the file to capture into) |
+
+Every other org command stays org's own.
+
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.
 

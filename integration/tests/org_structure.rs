@@ -7566,3 +7566,36 @@ async fn a_contributed_capture_group_joins_your_menu() {
     let (title, _) = menu_rows(&editor);
     assert_eq!(title, "Capture · Engagement", "their group drills down");
 }
+
+/// Org's exported commands are the ones another plugin's menu names: the
+/// agenda by key and the capture menu by group. Each must be a command org
+/// registers, because an exported name nothing registers exports nothing,
+/// and a typo there fails silently in the plugin that relies on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_exported_command_is_one_org_registers() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
+    );
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let manifest = lattice_plugin_host::manifest::PluginManifest::from_component_bytes(&bytes)
+        .expect("the embedded manifest parses")
+        .expect("org embeds its manifest");
+    assert_eq!(
+        manifest.exported_commands,
+        vec![
+            "org-agenda-command".to_string(),
+            "org-capture-menu".to_string()
+        ]
+    );
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    for name in &manifest.exported_commands {
+        assert!(
+            editor.registry.load().id_by_name(name).is_some(),
+            "`{name}` is exported but org registers no such command"
+        );
+    }
+}

@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- **Another plugin can open org's agenda and capture menus.** Org exports
+  `org-agenda-command` and `org-capture-menu`, so a plugin built on org can
+  offer "this client's agenda" and "capture for this client" from its own
+  menu. Every other org command stays org's own.
 - **Other plugins can add to your agenda files, capture templates and named
   agendas.** A plugin that extends org contributes to `org.agenda-files`,
   `org.capture-templates` and `org.agenda-custom-commands` instead of setting

@@ -82,6 +82,7 @@ capabilities = [
 ]
 editor_capabilities = ["tree-sitter"]
 mode_gates = { "org-babel-mode" = "org.babel.enabled", "org-export-mode" = "org.export.enabled" }
+exported_commands = ["org-agenda-command", "org-capture-menu"]
 min_lattice = "0.10.3"
 "#
 );

@@ -362,6 +362,15 @@ claude mcp add --scope user lattice -- lattice --mcp
 
 `:help org.assistant`, or [`doc/assistant.md`](doc/assistant.md).
 
+### Plugins built on org
+
+- **[org-clients](https://github.com/dhruvasagar/lattice-org-clients-plugin)**:
+  one org file per client. Every client's tasks join your agenda, the capture
+  menu gains a `Client` group, the agenda dispatcher a per-client dashboard,
+  and `<leader>e` opens a menu to find, onboard and archive clients. It adds
+  to org's options rather than overwriting yours, so your own templates and
+  agendas come first.
+
 ## Configuring it
 
 **Install and configure in one file.** `[plugins.org]` installs org; `[org]`
@@ -527,9 +536,14 @@ because org's manifest exports them:
 | command | what another plugin uses it for |
 |---|---|
 | `org-agenda-command` | open a named agenda, optionally narrowed (`org-agenda-command e file:acme.org`) |
-| `org-capture-menu` | open the capture menu at a group (`capture-group`, the group's key, and optionally the file to capture into) |
+| `org-capture-menu` | open the capture menu at a group: the group's key, and optionally the file to capture into (`org-capture-menu e ~/org/clients/acme.org`) |
 
 Every other org command stays org's own.
+
+[org-clients](https://github.com/dhruvasagar/lattice-org-clients-plugin) is
+built this way, and is the small example to read: it adds a folder of client
+files to the agenda, a `Client` capture group and a per-client dashboard,
+with no agenda or capture code of its own.
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.

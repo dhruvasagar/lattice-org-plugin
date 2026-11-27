@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **`org-capture-menu`'s arguments in the README** are the group's key and,
+  optionally, the file to capture into. The README listed an internal marker
+  first, and a plugin passing it got *no capture group `capture-group`*.
+
+### Changed
+- **The README names org-clients**, under "Plugins built on org", and as the
+  example of extending org from another plugin.
+
 ## 0.6.1 — 2026-11-27
 
 Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.1).

@@ -97,6 +97,32 @@ pub fn read_option<T: ConfigShape>(name: &str) -> Option<Result<T, ShapeError>> 
     Some(unflatten_value(&nodes, raw.root).and_then(|v| T::from_value(&v)))
 }
 
+/// Let other plugins contribute to `name`, one of org's own options. Called
+/// once per load, after the option is registered. `false` when the host
+/// refuses, which leaves the option as the user's alone.
+pub fn accept_contributions(name: &str) -> bool {
+    config::accept_contributions(name)
+}
+
+/// What other plugins contributed to `name`, each rebuilt as `T` and paired
+/// with the contributing plugin's id, in the order they were first made.
+///
+/// The host validated each value against the option's schema when it was
+/// contributed, so an `Err` is the checking a schema cannot express. The
+/// caller skips it and names the plugin; one plugin's bad value must not cost
+/// the user their own.
+pub fn contributions<T: ConfigShape>(name: &str) -> Vec<(String, Result<T, ShapeError>)> {
+    config::option_contributions(name)
+        .into_iter()
+        .map(|c| {
+            let nodes: Vec<shape::ValueNode> =
+                c.value.nodes.iter().map(value_node_from_wit).collect();
+            let value = unflatten_value(&nodes, c.value.root).and_then(|v| T::from_value(&v));
+            (c.plugin, value)
+        })
+        .collect()
+}
+
 /// OC.11c: why `name`'s value is not what the user wrote, if their last
 /// attempt to set it failed.
 ///

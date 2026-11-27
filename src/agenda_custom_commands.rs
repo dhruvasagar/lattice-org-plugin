@@ -253,12 +253,40 @@ pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands,
 /// `args` is what OA.11a carries from the view: empty means the default
 /// agenda, and a first element is a custom command's key. `fallback` is the
 /// Read `org.agenda-custom-commands` and resolve it.
+///
+/// Other plugins' contributed commands follow the user's own, so a key the
+/// user already uses keeps meaning theirs (first wins, the other named).
 pub fn read(default_days: u32) -> Result<ParsedCommands, CommandError> {
-    match crate::config_shape::read_option::<Declared>("agenda-custom-commands") {
-        Some(Ok(raw)) => from_declared(raw, default_days),
-        Some(Err(e)) => Err(CommandError::Malformed(e.to_string())),
-        None => Err(CommandError::Unset),
+    let user = match crate::config_shape::read_option::<Declared>("agenda-custom-commands") {
+        Some(Ok(raw)) => raw,
+        Some(Err(e)) => return Err(CommandError::Malformed(e.to_string())),
+        None => Vec::new(),
+    };
+    let contributed = crate::config_shape::contributions::<Declared>("agenda-custom-commands")
+        .into_iter()
+        .map(|(plugin, value)| (plugin, value.map_err(|e| e.to_string())))
+        .collect();
+    let (raw, notes) = merged(user, contributed);
+    let mut set = from_declared(raw, default_days)?;
+    set.skipped.extend(notes);
+    Ok(set)
+}
+
+/// The user's commands, then each contributing plugin's. A contribution
+/// that does not rebuild is skipped and its plugin named.
+pub(crate) fn merged(
+    user: Declared,
+    contributed: Vec<(String, Result<Declared, String>)>,
+) -> (Declared, Vec<String>) {
+    let mut raw = user;
+    let mut notes = Vec::new();
+    for (plugin, value) in contributed {
+        match value {
+            Ok(commands) => raw.extend(commands),
+            Err(e) => notes.push(format!("`{plugin}`'s commands did not load: {e}")),
+        }
     }
+    (raw, notes)
 }
 
 /// `org.agenda-sections` set the default agenda uses, already resolved.
@@ -682,6 +710,55 @@ key = "b"
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn contributed_commands_follow_the_users_and_lose_a_shared_key() {
+        let user = crate::config_shape::from_toml::<Declared>(TWO, "command");
+        let theirs = crate::config_shape::from_toml::<Declared>(
+            r#"
+[[command]]
+key = "w"
+description = "Theirs"
+
+  [[command.section]]
+  title = "Mine"
+  when = "any"
+
+[[command]]
+key = "e"
+description = "Engagement"
+
+  [[command.section]]
+  title = "Next"
+  when = "any"
+"#,
+            "command",
+        );
+        let (raw, notes) = merged(
+            user,
+            vec![
+                ("acme-ext".to_string(), Ok(theirs)),
+                (
+                    "broken-ext".to_string(),
+                    Err("[0].key: missing".to_string()),
+                ),
+            ],
+        );
+        assert_eq!(
+            notes,
+            vec!["`broken-ext`'s commands did not load: [0].key: missing".to_string()]
+        );
+        let set = from_declared(raw, SPAN).unwrap();
+        assert_eq!(
+            set.by_key("w").unwrap().description,
+            "Waiting and Postponed"
+        );
+        assert!(set.by_key("e").is_some());
+        assert!(set
+            .skipped
+            .iter()
+            .any(|s| s.contains("`w` is defined twice")));
     }
 
     #[test]

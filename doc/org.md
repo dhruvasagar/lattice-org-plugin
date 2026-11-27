@@ -485,6 +485,12 @@ under it is not shown, and the menu's footer names it.
 Group rows are for `org.capture-templates`. A roam template has no group rows;
 one without a `target` is skipped and named.
 
+Another plugin can add templates, a whole group included, to your menu. They
+appear after yours, a key you already use keeps meaning yours (the plugin's is
+named in the footer), and with no templates of your own the default `t Task`
+row stays beside them. `:describe-option org.capture-templates` lists what each
+plugin added.
+
 ##### Choosing the file
 
 A group can name a folder with `choose`. Its members leave `file` out of
@@ -1363,6 +1369,14 @@ still the right one for a repo with org files in it; the option is for the
 agenda that follows you between checkouts, which is what org means by an
 agenda. `:org-agenda ~/notes` overrides the option for one invocation.
 
+**Other plugins can add to it.** A plugin that extends org (one that keeps a
+folder of client files, say) contributes its folder to `org.agenda-files`
+rather than setting it. Your own entries come first and are never changed; the
+plugin's are scanned beside them, and with none of your own the current
+project is still scanned. `:describe-option org.agenda-files` lists every
+contribution by the plugin that made it, and unloading the plugin takes its
+entries away.
+
 ### Sections
 
 The view ships as four blocks, in this order:
@@ -1680,6 +1694,10 @@ leaves you the default agenda and says so; one unusable command is skipped and
 named in the menu's footer while the others still work; and a key that names
 nothing tells you which keys *do* exist. A broken configuration costs you your
 layout, never your rows.
+
+Other plugins can contribute named agendas too. Yours come first, so a key you
+already use keeps meaning yours; the plugin's agenda with the same key is
+skipped and named in the first header.
 
 ### What counts as a row
 

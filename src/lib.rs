@@ -958,6 +958,25 @@ const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
 /// it (TC.5).
 const DEFAULT_CAPTURE_TEMPLATES: [capture_templates::RawTemplate; 0] = [];
 
+/// The default capture row as a template: emacs' `t Task`, filing to
+/// `org.capture-file` with `org.capture-template`. `None` with no capture
+/// file. A capture menu with no templates of the user's own shows it beside
+/// what other plugins contributed.
+fn default_capture_template() -> Option<capture_templates::RawTemplate> {
+    let file = option_or("capture-file", DEFAULT_CAPTURE_FILE);
+    let file = file.trim();
+    (!file.is_empty()).then(|| capture_templates::RawTemplate {
+        key: "t".to_string(),
+        description: Some("Task".to_string()),
+        target: Some(capture_templates::RawTarget {
+            file: Some(file.to_string()),
+            ..Default::default()
+        }),
+        body: Some(option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE)),
+        ..Default::default()
+    })
+}
+
 /// AS.1: how many days past today the dated section spans. A string because it
 /// reaches the option seam alongside its peers and `option_or` is the one
 /// accessor; parsed with a fallback so a typo'd `:set org.agenda-span=soon`
@@ -1054,11 +1073,44 @@ fn string_list(name: &str) -> Vec<String> {
 /// config portable enough to commit to a dotfiles repo — the whole reason to
 /// write `~` — produced an agenda that scanned a directory literally named
 /// `~` and found nothing, with no error to explain it.
-fn agenda_files() -> Vec<String> {
+///
+/// The user's own entries; [`agenda_files_contributed`] are other plugins'.
+fn agenda_files_user() -> Vec<String> {
     expand_each(string_list("agenda-files"))
 }
 
-/// `~`-expand every path in a list. Split out from [`agenda_files`] so the
+/// The paths other plugins contributed to `org.agenda-files`, in the order
+/// they were contributed.
+fn agenda_files_contributed() -> Vec<String> {
+    expand_each(
+        crate::config_shape::contributions::<Vec<String>>("agenda-files")
+            .into_iter()
+            // The host checked each against the option's schema when it was
+            // made, so a value that does not rebuild cannot happen in
+            // practice; one that did would only cost that plugin its paths.
+            .filter_map(|(_, value)| value.ok())
+            .flatten()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+    )
+}
+
+/// What the agenda scans: the user's paths and the contributed ones. With no
+/// user paths but some contributed, the empty entry keeps the project root,
+/// which is what an unset `org.agenda-files` has always meant; a contribution
+/// adds to that default rather than replacing it.
+fn agenda_roots(user: Vec<String>, contributed: Vec<String>) -> Vec<String> {
+    let mut roots = if user.is_empty() && !contributed.is_empty() {
+        vec![String::new()]
+    } else {
+        user
+    };
+    roots.extend(contributed);
+    roots
+}
+
+/// `~`-expand every path in a list. Split out from [`agenda_files_user`] so the
 /// expansion is testable without a host to read the option from.
 fn expand_each(paths: Vec<String>) -> Vec<String> {
     paths
@@ -2050,6 +2102,18 @@ impl Guest for Component {
             "Draw `[[file:…]]` image links inline. Off by default: an org file \
              can reference anything, and only the GPUI peer can draw them.",
         );
+        // Other plugins may add to these three, never replace them: an
+        // extension contributes its folder, its capture group and its
+        // dashboard, and the readers below put the user's own entries first.
+        // The user's value is untouched and `:describe-option` lists each
+        // contribution by plugin.
+        for name in [
+            "agenda-files",
+            "capture-templates",
+            "agenda-custom-commands",
+        ] {
+            let _ = crate::config_shape::accept_contributions(name);
+        }
     }
 
     fn register_languages() {
@@ -4255,7 +4319,7 @@ impl Guest for Component {
     /// `~` is NOT expanded here. The host expands, so one implementation serves
     /// every source and a guest cannot get it wrong per-plugin.
     fn roots() -> Vec<String> {
-        agenda_files()
+        agenda_roots(agenda_files_user(), agenda_files_contributed())
     }
 
     /// OM.A3: the mode the host activates on the agenda view, so org's TODO
@@ -12639,12 +12703,13 @@ fn org_corpus(
     tags_search: bool,
 ) -> (Vec<llm_tools::OrgFile>, Vec<String>) {
     use lattice::plugin_host::{host_services, tree_sitter};
-    let mut roots = agenda_files();
+    let mut roots = agenda_files_user();
     if roots.is_empty() {
         roots.push(crate::roam_scan::expand_tilde(
             option_or("directory", "~/org").trim(),
         ));
     }
+    roots.extend(agenda_files_contributed());
     let mut problems = Vec::new();
     let mut paths = std::collections::BTreeSet::new();
     for root in roots {
@@ -13061,6 +13126,25 @@ mod agenda_files_tests {
     /// `~` — scans a directory literally named `~` and reports an empty agenda
     /// with nothing to say why. Found when a real config moved from an
     /// absolute home path to `~` and the agenda silently emptied.
+    #[test]
+    fn a_contribution_adds_to_the_project_root_when_the_user_set_nothing() {
+        let clients = vec!["/home/u/org/clients".to_string()];
+        assert_eq!(
+            super::agenda_roots(Vec::new(), clients.clone()),
+            vec![String::new(), "/home/u/org/clients".to_string()],
+            "the empty entry is the project root, kept beside the folder"
+        );
+        assert_eq!(
+            super::agenda_roots(vec!["/home/u/org".to_string()], clients.clone()),
+            vec!["/home/u/org".to_string(), "/home/u/org/clients".to_string()],
+            "the user's paths come first, and replace the project root as before"
+        );
+        assert!(
+            super::agenda_roots(Vec::new(), Vec::new()).is_empty(),
+            "nothing anywhere is still no opinion"
+        );
+    }
+
     #[test]
     fn agenda_file_paths_expand_a_leading_tilde() {
         let home = std::env::var("HOME").expect("HOME is set when tests run");

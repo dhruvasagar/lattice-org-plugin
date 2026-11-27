@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- **Other plugins can add to your agenda files, capture templates and named
+  agendas.** A plugin that extends org contributes to `org.agenda-files`,
+  `org.capture-templates` and `org.agenda-custom-commands` instead of setting
+  them. Yours come first and are never changed, a key you already use keeps
+  meaning yours, and `:describe-option` lists each contribution by plugin.
 - **Capture group rows.** A capture template with a `key` and a
   `description` and no `target` is a group, as in emacs: the templates whose
   keys start with its key move into a sub-menu that the group's row opens.

@@ -116,3 +116,10 @@ strip = true
 # resolve stops `cargo build`, and that is what made this repo buildable on
 # exactly one machine.
 exclude = ["integration", "grammar-src"]
+
+# TEMPORARY, until the plugin API carrying option contributions is published:
+# builds org against the local lattice checkout's `lattice-wit`, which has the
+# `accept-contributions` / `option-contributions` calls the crates.io 0.7.0
+# does not. Removed, with the pin bumped, when that version is on crates.io.
+[patch.crates-io]
+lattice-wit = { path = "../lattice/crates/lattice-wit" }

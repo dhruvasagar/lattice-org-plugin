@@ -7500,3 +7500,69 @@ async fn an_unsaved_open_draft_is_listed_as_not_saved() {
         vec!["todo: (not saved)".to_string()]
     );
 }
+
+/// Another plugin's capture templates appear after yours, through the option
+/// contribution seam: the menu shows your `t` and their `e` group, and their
+/// value never touches yours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contributed_capture_group_joins_your_menu() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let inbox = base.path().join("inbox.org");
+    let acme = base.path().join("acme.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            inbox.to_str().unwrap()
+        ),
+    );
+    use lattice_config::ConfigValue as V;
+    let rec = |fields: &[(&str, V)]| {
+        V::Record(
+            fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    };
+    let s = |v: &str| V::Str(v.to_string());
+    let a = acme.to_str().unwrap();
+    let target = rec(&[("file", s(a))]);
+    let value = V::List(vec![
+        rec(&[
+            ("key", s("t")),
+            ("description", s("their todo")),
+            ("target", target.clone()),
+        ]),
+        rec(&[("key", s("e")), ("description", s("Engagement"))]),
+        rec(&[
+            ("key", s("et")),
+            ("description", s("Task")),
+            ("target", target),
+            ("body", s("* TODO %?")),
+        ]),
+    ]);
+    editor
+        .config
+        .contribute("org.capture-templates", "acme-ext", Some(value))
+        .expect("org accepts contributions to its capture templates");
+
+    press_chord(&mut editor, "<leader>oc").await;
+    let (_, rows) = menu_rows(&editor);
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["t", "e", "q"], "yours, then theirs");
+    assert!(
+        rows.contains(&("t".to_string(), "todo".to_string())),
+        "your `t` wins the shared key: {rows:?}"
+    );
+
+    press_menu_key(&mut editor, "e").await;
+    let (title, _) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement", "their group drills down");
+}

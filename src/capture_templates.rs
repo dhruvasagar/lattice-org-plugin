@@ -914,30 +914,72 @@ pub fn read() -> Result<ParsedSet, TemplateError> {
 
 /// CT.8: [`read`] for either list. `option` is the plugin-local name, as
 /// `read_option` takes it.
+///
+/// The capture list also takes other plugins' contributions, after the
+/// user's own (see [`merged`]); the roam list is the user's alone.
 pub fn read_for(list: TemplateList, option: &str) -> Result<ParsedSet, TemplateError> {
-    let out = match crate::config_shape::read_option::<Declared>(option) {
-        Some(Ok(raw)) => from_declared_for(list, raw),
+    let user = match crate::config_shape::read_option::<Declared>(option) {
+        Some(Ok(raw)) => raw,
         // The host validated the write, so this is the residue a schema cannot
         // express. Carry the path it came with rather than flattening it to
         // "malformed" — the location is the whole value of reporting it.
-        Some(Err(e)) => Err(TemplateError::Malformed(e.to_string())),
-        None => Err(TemplateError::Unset),
+        Some(Err(e)) => return Err(TemplateError::Malformed(e.to_string())),
+        None => Vec::new(),
     };
     // OC.11c: an empty read is ambiguous, so ask why it is empty.
     //
     // A failed assignment leaves the option at its registered default, which
-    // for this one is an empty list — and `from_declared` maps empty to
-    // `Unset`. So "the user's templates did not parse" and "the user has no
-    // templates" arrive here identically, and only the host can tell them
-    // apart. Asked ONLY on the empty path: an option that loaded fine has
-    // nothing to explain, and a stale diagnostic cannot exist anyway (the
-    // registry drops it the moment an assignment succeeds).
-    if matches!(out, Err(TemplateError::Unset)) {
+    // for this one is an empty list — so "the user's templates did not parse"
+    // and "the user has no templates" arrive here identically, and only the
+    // host can tell them apart. A user whose set failed has configured
+    // capture, so this refuses even when other plugins contributed: showing
+    // only theirs would hide the user's error behind a working menu.
+    if user.is_empty() {
         if let Some(why) = crate::config_shape::option_failure(option) {
             return Err(TemplateError::NotLoaded(why));
         }
     }
+    let contributed = match list {
+        TemplateList::Capture => crate::config_shape::contributions::<Declared>(option)
+            .into_iter()
+            .map(|(plugin, value)| (plugin, value.map_err(|e| e.to_string())))
+            .collect(),
+        TemplateList::Roam => Vec::new(),
+    };
+    let (raw, notes) = merged(user, contributed, crate::default_capture_template());
+    let mut out = from_declared_for(list, raw);
+    if let Ok(set) = &mut out {
+        set.skipped.extend(notes);
+    }
     out
+}
+
+/// The templates a capture menu reads: the user's, then each contributing
+/// plugin's in turn. First key wins, so the user's own always do.
+///
+/// A user with no templates of their own still has the default row (emacs'
+/// `t Task`, filing to `org.capture-file`) when one is configured, so a
+/// plugin's contribution adds to what they had rather than replacing it.
+/// A contribution that does not rebuild is skipped and its plugin named.
+pub fn merged(
+    user: Declared,
+    contributed: Vec<(String, Result<Declared, String>)>,
+    default: Option<RawTemplate>,
+) -> (Declared, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut extra: Declared = Vec::new();
+    for (plugin, value) in contributed {
+        match value {
+            Ok(templates) => extra.extend(templates),
+            Err(e) => notes.push(format!("`{plugin}`'s templates did not load: {e}")),
+        }
+    }
+    let mut raw = user;
+    if raw.is_empty() && !extra.is_empty() {
+        raw.extend(default);
+    }
+    raw.extend(extra);
+    (raw, notes)
 }
 
 /// A parsed set plus what it could not use. The skips ride along rather than
@@ -1944,6 +1986,58 @@ mod tests {
                 .any(|s| s.contains("roam templates have no group rows")),
             "{:?}",
             set.skipped
+        );
+    }
+
+    #[test]
+    fn contributed_templates_follow_the_users_and_lose_a_shared_key() {
+        let user = vec![t("t", "todo", "~/org/a.org", None, "")];
+        let contributed = vec![(
+            "acme-ext".to_string(),
+            Ok(vec![
+                t("t", "their todo", "~/org/b.org", None, ""),
+                group("e", "Engagement"),
+                t("et", "Task", "~/org/b.org", None, ""),
+            ]),
+        )];
+        let (raw, notes) = merged(user, contributed, None);
+        assert!(notes.is_empty());
+        let set = from_declared(raw).expect("the set resolves");
+        assert_eq!(set.by_key("t").unwrap().description, "todo", "yours win");
+        assert!(set.group("e").is_some() && set.by_key("et").is_some());
+        assert!(
+            set.skipped.iter().any(|s| s.contains("their todo")),
+            "the contributed duplicate is named: {:?}",
+            set.skipped
+        );
+    }
+
+    #[test]
+    fn with_no_templates_of_your_own_the_default_row_stays() {
+        let default = t("t", "Task", "~/org/inbox.org", None, "* TODO %?");
+        let contributed = vec![(
+            "acme-ext".to_string(),
+            Ok(vec![t("n", "note", "~/org/b.org", None, "")]),
+        )];
+        let (raw, _) = merged(Vec::new(), contributed, Some(default.clone()));
+        assert_eq!(raw.first(), Some(&default), "the default row first");
+        assert_eq!(raw.len(), 2);
+        let (raw, _) = merged(Vec::new(), Vec::new(), Some(default));
+        assert!(
+            raw.is_empty(),
+            "with nothing contributed the unset path is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_contribution_that_does_not_load_is_named_by_plugin() {
+        let user = vec![t("t", "todo", "~/org/a.org", None, "")];
+        let contributed = vec![("acme-ext".to_string(), Err("[0].key: missing".to_string()))];
+        let (raw, notes) = merged(user, contributed, None);
+        assert_eq!(raw.len(), 1, "yours are untouched");
+        assert_eq!(
+            notes,
+            vec!["`acme-ext`'s templates did not load: [0].key: missing".to_string()]
         );
     }
 

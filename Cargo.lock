@@ -112,8 +112,6 @@ dependencies = [
 [[package]]
 name = "lattice-wit"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4a2b1cf193e6f6d4f6709b8675eb6ba3dba57568478f954457fa621e647399f"
 
 [[package]]
 name = "leb128fmt"

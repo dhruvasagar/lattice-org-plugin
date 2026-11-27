@@ -16,7 +16,7 @@
 //! **Direct children only.** `<dir>/archive/old.org` is not a choice, which is
 //! what lets a folder keep finished files in a subfolder without a setting.
 //!
-//! Design: `docs/dev/architecture/org-fcto.md` §3 in the lattice repo.
+//! Design: `docs/dev/architecture/org-clients.md` §3 in the lattice repo.
 
 /// Where a guess came from, for the menu title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

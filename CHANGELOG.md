@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-11-27
+
+Builds against `lattice:plugin-host@0.7.x` (lattice-wit 0.7.1).
 
 ### Added
 - **Another plugin can open org's agenda and capture menus.** Org exports

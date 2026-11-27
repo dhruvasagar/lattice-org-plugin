@@ -3457,6 +3457,194 @@ async fn a_capture_group_opens_a_sub_menu_of_its_members() {
     );
 }
 
+/// A choosing group over `dir`: `e` chooses from it, and its one member `t`
+/// files under `* Tasks` in whichever file is chosen.
+fn choosing_group(dir: &std::path::Path) -> String {
+    format!(
+        "[[template]]\nkey = \"e\"\ndescription = \"Engagement\"\nchoose = \"{d}\"\n\n\
+         [[template]]\nkey = \"et\"\ndescription = \"Task\"\n\
+         target = {{ kind = \"file+headline\", headline = \"Tasks\" }}\nbody = \"* TODO %?\"\n",
+        d = dir.to_str().unwrap()
+    )
+}
+
+/// The open picker's rows, once its asynchronous `init` has delivered them.
+async fn settled_picker_rows(editor: &mut Editor) -> Vec<String> {
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        let rows: Vec<String> = editor
+            .picker
+            .as_ref()
+            .filter(|p| p.transient.is_none())
+            .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Vec::new()
+}
+
+/// Wait for the capture draft a picker accept opens: the accept commits
+/// through an asynchronous guest call.
+async fn settled_capture(editor: &mut Editor) -> Option<std::path::PathBuf> {
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if let Some(draft) = active_capture(editor) {
+            return Some(draft);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// With no guess the group says so, and its member asks for the file before
+/// capturing: the picker offers the folder's own `.org` files, not the
+/// archive below it, and the capture files into the one picked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choosing_group_with_no_guess_asks_for_the_file_first() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(clients.join("archive")).unwrap();
+    for name in ["acme", "globex"] {
+        std::fs::write(clients.join(format!("{name}.org")), "* Tasks\n").unwrap();
+    }
+    std::fs::write(clients.join("archive/initech.org"), "* Tasks\n").unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-templates", &choosing_group(&clients));
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(
+        title, "Capture · Engagement · no file chosen",
+        "the buffer is not in the folder and no clock runs, so there is no guess"
+    );
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["t", "c", "q"],
+        "the member, the chooser, a way out"
+    );
+
+    press_menu_key(&mut editor, "t").await;
+    let rows = settled_picker_rows(&mut editor).await;
+    assert_eq!(
+        rows,
+        vec!["acme", "globex"],
+        "the folder's own files; the archive below it is not a choice"
+    );
+    if let Some(picker) = editor.picker.as_mut() {
+        for ch in "glob".chars() {
+            picker.append_query(ch);
+        }
+    }
+    let out = editor.do_picker_accept();
+    apply_renderer_effects(&mut editor, out).await;
+    assert!(
+        settled_capture(&mut editor).await.is_some(),
+        "picking the file opened the capture"
+    );
+    finalize_capture(&mut editor, "send the SOW").await;
+    let globex = std::fs::read_to_string(clients.join("globex.org")).unwrap();
+    assert!(
+        globex.contains("* Tasks\n** TODO send the SOW"),
+        "filed under Tasks in the picked file: {globex:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clients.join("acme.org")).unwrap(),
+        "* Tasks\n"
+    );
+}
+
+/// A buffer visiting a file in the folder is the guess: the title names it
+/// and the member files there without asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_buffers_own_file_is_the_guess_and_the_title_says_so() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // The fixture's buffer is `notes.org` in `base`, so `base` is the folder.
+    let mut editor = org_editor_with_caps(base.path(), "* Tasks\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &choosing_group(base.path()),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement · notes (this buffer)");
+    assert!(
+        rows.contains(&("c".to_string(), "change…".to_string())),
+        "the guess can be changed: {rows:?}"
+    );
+
+    press_menu_key(&mut editor, "t").await;
+    assert!(
+        active_capture(&editor).is_some(),
+        "with a guess the member captures straight away, no picker"
+    );
+    finalize_capture(&mut editor, "review the roadmap").await;
+    assert!(
+        text_of(&editor, &base.path().join("notes.org"))
+            .contains("* Tasks\n** TODO review the roadmap"),
+        "filed into the buffer's own file"
+    );
+}
+
+/// The running clock is the guess when the buffer is elsewhere: clock in to
+/// a client's meeting, go back to other work, and capture lands with that
+/// client. The clock is started in one plugin store and the menu is built in
+/// another, so this is also the test that the record crosses between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_running_clock_is_the_guess_when_the_buffer_is_elsewhere() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(&clients).unwrap();
+    let acme = clients.join("acme.org");
+    std::fs::write(&acme, "* Kickoff\n* Tasks\n").unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-templates", &choosing_group(&clients));
+    let notes = base.path().join("notes.org");
+
+    let _ = editor.open_buffer_at(Some(acme.clone()), Default::default(), false, None, None);
+    let acme_buffer = editor.active_pane_buffer_id();
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if editor
+            .active_modes
+            .get(&acme_buffer)
+            .is_some_and(|m| m.has_minor(ModeId::new("org-global-mode")))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<leader>oxi").await;
+    assert!(
+        text_of(&editor, &acme).contains("CLOCK: ["),
+        "the clock started in acme.org: {:?}",
+        text_of(&editor, &acme)
+    );
+
+    let _ = editor.open_buffer_at(Some(notes), Default::default(), false, None, None);
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, _) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement · acme (clocked in)");
+}
+
 /// The key you press is what decides the template — the whole point of the
 /// per-row args slot. Two rows fire ONE action; only the argument differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

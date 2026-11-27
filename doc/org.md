@@ -446,6 +446,7 @@ A template has three independent parts: **where** it lands (`target`),
 | `prepend` | | `table-line` only: put the row first rather than last |
 | `clock-in` | | start a clock on the captured entry, org's `:clock-in` |
 | `seed` | | the key of the template that creates today's node when it is missing. See [`seed`](#seed) |
+| `choose` | | on a group row: the folder its members pick their file from. See [Choosing the file](#choosing-the-file) |
 
 `body` and `body-file` cannot both be set. A body file that cannot be read
 stops the capture at open, naming the template and the path.
@@ -483,6 +484,43 @@ under it is not shown, and the menu's footer names it.
 
 Group rows are for `org.capture-templates`. A roam template has no group rows;
 one without a `target` is skipped and named.
+
+##### Choosing the file
+
+A group can name a folder with `choose`. Its members leave `file` out of
+their target, and capture into a file chosen from the `.org` files directly
+in that folder:
+
+```toml
+[[org.capture-templates]]
+key = "e"
+description = "Engagement"
+choose = "~/org/clients"
+
+[[org.capture-templates]]
+key = "et"
+description = "Task"
+target = { kind = "file+headline", headline = "Tasks" }
+body = "* TODO %?"
+```
+
+The sub-menu guesses the file each time it opens, and its title says which
+file and why:
+
+1. The buffer's own file, if it is in the folder: `Capture · Engagement · acme (this buffer)`.
+2. The running clock's file, if the clock is in the folder: `· acme (clocked in)`.
+   Clock in to a client's meeting, and a capture from anywhere lands there.
+3. Otherwise `· no file chosen`, and a member asks for the file before it
+   captures.
+
+`c` changes the file (`C` or `,` if a member already uses `c`). Subfolders
+are not choices, so `~/org/clients/archive/` can hold finished files. A
+group inside a choosing group shares its choice unless it has a `choose` of
+its own. Org reads the folder under its own file grant, so the folder has to
+be inside `org.directory` or another path org may read.
+
+`:org-choose-file <folder> <command> <args…>` is the picker on its own: it
+runs `<command>` with `<args…>` and the picked file's path.
 
 ##### Targets
 

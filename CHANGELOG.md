@@ -8,6 +8,11 @@
   keys start with its key move into a sub-menu that the group's row opens.
   `:org-capture-menu <key>` opens one directly. A group with nothing under it
   is named in the menu's footer instead of shown.
+- **A capture group can choose its file.** `choose = "<folder>"` on a group
+  lets its members leave `file` out; they capture into one of the folder's
+  `.org` files. The sub-menu guesses it from the buffer's file, then from the
+  running clock's, and its title names the guess and where it came from. `c`
+  picks another, and with no guess a member asks first.
 
 ### Fixed
 - **The `todo-keywords` examples are lists.** The README and `:help org`

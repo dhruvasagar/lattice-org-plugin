@@ -250,6 +250,10 @@ pub struct Template {
     /// see [`RawTemplate::seed`]. Validated: it names another template in the
     /// same set whose target is a datetree in the same file.
     pub seed: Option<String>,
+    /// The folder this template's file is chosen from, as declared, when its
+    /// target left `file` out and a group above it has `choose`. The target's
+    /// file is empty until a choice fills it ([`Target::with_file`]).
+    pub chooses: Option<String>,
 }
 
 /// Why a template set could not be read.
@@ -334,8 +338,9 @@ pub struct RawTarget {
     /// is worth more than host-side validation of a closed set, so the set is
     /// checked here and an unknown value is a named skip.
     pub kind: Option<String>,
-    /// The file the capture is written to.
-    pub file: String,
+    /// The file the capture is written to. Left out under a group with
+    /// `choose`, where the file is the one chosen for the group.
+    pub file: Option<String>,
     /// Insert under this headline's subtree instead of appending to the file.
     pub headline: Option<String>,
     /// CT.3: the full outline path, for `file+olp` — `["Work", "Inbox"]`.
@@ -419,6 +424,11 @@ pub struct RawTemplate {
     /// nothing to descend into until the day's sheet exists. Org has no
     /// equivalent.
     pub seed: Option<String>,
+    /// On a group row: the folder whose `.org` files the group's members
+    /// choose between. A member whose target leaves out `file` captures into
+    /// the chosen one. The menu guesses it from the buffer's file, then the
+    /// running clock's, and shows the guess.
+    pub choose: Option<String>,
 }
 
 /// The declared shape of `org.capture-templates`, for the registration call.
@@ -645,6 +655,12 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             .chain(groups.iter().map(|g| (&g.key, &g.description)))
             .find(|(k, _)| **k == key)
             .map(|(_, d)| d.clone());
+        let choose = t
+            .choose
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let Some(raw_target) = t.target else {
             if key.is_empty() || description.is_empty() {
                 skipped.push(format!(
@@ -663,6 +679,7 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
                     key,
                     description,
                     before: templates.len(),
+                    choose,
                 });
             }
             continue;
@@ -680,11 +697,20 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             ));
             continue;
         }
-        let file = raw_target.file.trim().to_string();
-        if file.is_empty() {
-            skipped.push(format!("`{key}` has a blank `target.file`"));
+        if choose.is_some() {
+            skipped.push(format!(
+                "`{key}` sets `choose`, which belongs on a group row (one without a `target`)"
+            ));
             continue;
         }
+        // A blank file is resolved after the loop, against the groups: under
+        // a group with `choose` it is the chosen file, elsewhere a skip.
+        let file = raw_target
+            .file
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
         if let Some(prior) = taken {
             skipped.push(format!(
                 "`{key}` is already taken by \"{prior}\"; skipping \"{description}\""
@@ -752,8 +778,35 @@ pub fn from_declared_for(list: TemplateList, raw: Declared) -> Result<ParsedSet,
             head,
             clock_in: t.clock_in.unwrap_or(false),
             seed,
+            chooses: None,
         });
     }
+    // A template with no file takes the folder of the innermost group above
+    // it that has `choose`; with none, it has nowhere to file.
+    templates.retain_mut(|t| {
+        if !t.target.file().is_empty() {
+            return true;
+        }
+        let folder = groups
+            .iter()
+            .filter(|g| g.key.len() < t.key.len() && t.key.starts_with(&g.key))
+            .filter_map(|g| g.choose.as_ref().map(|c| (g.key.len(), c)))
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, c)| c.clone());
+        match folder {
+            Some(folder) => {
+                t.chooses = Some(folder);
+                true
+            }
+            None => {
+                skipped.push(format!(
+                    "`{}` has a blank `target.file` and no group above it with `choose`",
+                    t.key
+                ));
+                false
+            }
+        }
+    });
     drop_unresolved_seeds(&mut templates, &mut skipped);
     // A group with nothing beneath it would be a row that opens an empty
     // menu. Named instead, which is also how a typo in a member's key shows.
@@ -791,6 +844,8 @@ pub struct Group {
     /// How many templates were declared before this group, so the menu can
     /// show groups and templates in the order they were written.
     pub before: usize,
+    /// The folder its members choose a file from, as declared.
+    pub choose: Option<String>,
 }
 
 /// One row of a capture menu level.
@@ -907,6 +962,18 @@ impl ParsedSet {
         self.groups.iter().find(|g| g.key == key)
     }
 
+    /// The folder a menu level chooses its file from: the `choose` of the
+    /// group itself or of the innermost group above it that has one. `None`
+    /// for the top menu and for a level with no chooser.
+    pub fn choose_dir(&self, level: &str) -> Option<&str> {
+        self.groups
+            .iter()
+            .filter(|g| level.starts_with(&g.key))
+            .filter_map(|g| g.choose.as_deref().map(|c| (g.key.len(), c)))
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, c)| c)
+    }
+
     /// The rows of one menu level, each with the key it is pressed by there:
     /// the top menu for `None`, a group's sub-menu for `Some(group key)`.
     ///
@@ -966,7 +1033,7 @@ mod tests {
             key: key.to_string(),
             description: Some(description.to_string()),
             target: Some(RawTarget {
-                file: file.to_string(),
+                file: Some(file.to_string()),
                 headline: headline.map(str::to_string),
                 ..Default::default()
             }),
@@ -1033,7 +1100,7 @@ mod tests {
             body: Some("* TODO %?".to_string()),
             target: Some(RawTarget {
                 kind: kind.map(str::to_string),
-                file: "~/org/x.org".to_string(),
+                file: Some("~/org/x.org".to_string()),
                 headline: headline.map(str::to_string),
                 olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
                 tree_type: None,
@@ -1140,7 +1207,7 @@ mod tests {
             key: "ok".to_string(),
             body: Some("* TODO %?".to_string()),
             target: Some(RawTarget {
-                file: "~/org/x.org".to_string(),
+                file: Some("~/org/x.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1164,7 +1231,7 @@ mod tests {
             key: "ok".to_string(),
             body: Some("* TODO %?".to_string()),
             target: Some(RawTarget {
-                file: "~/org/x.org".to_string(),
+                file: Some("~/org/x.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1213,7 +1280,7 @@ mod tests {
                 body: Some("x".to_string()),
                 target: Some(RawTarget {
                     kind: Some(kind.to_string()),
-                    file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
+                    file: Some("%<%Y%m%d%H%M%S>-${slug}.org".to_string()),
                     head: head.map(str::to_string),
                     olp: olp.map(|v| v.into_iter().map(str::to_string).collect()),
                     ..Default::default()
@@ -1267,7 +1334,7 @@ mod tests {
             key: "k".to_string(),
             target: Some(RawTarget {
                 kind: Some("file+head".to_string()),
-                file: "~/x.org".to_string(),
+                file: Some("~/x.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1275,7 +1342,7 @@ mod tests {
         declared.push(RawTemplate {
             key: "ok".to_string(),
             target: Some(RawTarget {
-                file: "~/x.org".to_string(),
+                file: Some("~/x.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1295,7 +1362,7 @@ mod tests {
             key: "k".to_string(),
             target: Some(RawTarget {
                 kind: Some("file".to_string()),
-                file: "~/x.org".to_string(),
+                file: Some("~/x.org".to_string()),
                 head: Some("#+title: x".to_string()),
                 ..Default::default()
             }),
@@ -1304,7 +1371,7 @@ mod tests {
         declared.push(RawTemplate {
             key: "ok".to_string(),
             target: Some(RawTarget {
-                file: "~/x.org".to_string(),
+                file: Some("~/x.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1387,7 +1454,7 @@ mod tests {
             key: "h".to_string(),
             description: Some("habit".to_string()),
             target: Some(RawTarget {
-                file: "~/org/habit.org".to_string(),
+                file: Some("~/org/habit.org".to_string()),
                 headline: None,
                 ..Default::default()
             }),
@@ -1415,7 +1482,7 @@ mod tests {
                 key: "b".to_string(),
                 description: Some("both".to_string()),
                 target: Some(RawTarget {
-                    file: "~/org/x.org".to_string(),
+                    file: Some("~/org/x.org".to_string()),
                     headline: None,
                     ..Default::default()
                 }),
@@ -1428,7 +1495,7 @@ mod tests {
                 key: "t".to_string(),
                 description: Some("fine".to_string()),
                 target: Some(RawTarget {
-                    file: "~/org/x.org".to_string(),
+                    file: Some("~/org/x.org".to_string()),
                     headline: None,
                     ..Default::default()
                 }),
@@ -1455,7 +1522,7 @@ mod tests {
             key: "n".to_string(),
             description: Some("blank".to_string()),
             target: Some(RawTarget {
-                file: "~/org/x.org".to_string(),
+                file: Some("~/org/x.org".to_string()),
                 headline: None,
                 ..Default::default()
             }),
@@ -1490,7 +1557,7 @@ mod tests {
             key: key.to_string(),
             target: Some(RawTarget {
                 kind: Some("file+datetree".to_string()),
-                file: file.to_string(),
+                file: Some(file.to_string()),
                 sub_olp: section.map(|s| vec![s.to_string()]),
                 ..Default::default()
             }),
@@ -1585,7 +1652,8 @@ mod tests {
                 "table-line-pos",
                 "prepend",
                 "clock-in",
-                "seed"
+                "seed",
+                "choose"
             ],
             "field names cross kebab-cased — `clock-in` and CT.1's `body-file`, \
              matching org's own `:clock-in` rather than a snake-case spelling \
@@ -1594,7 +1662,7 @@ mod tests {
         let required: Vec<bool> = fields.iter().map(|f| f.required).collect();
         assert_eq!(
             required,
-            vec![true, false, false, false, false, false, false, false, false, false],
+            vec![true, false, false, false, false, false, false, false, false, false, false],
             "`key` is the one field every row needs — a template without a \
              `target` is a group row, CT.1's `body-file` is optional, and so \
              is `body`, because a template may declare either or neither, and \
@@ -1631,8 +1699,9 @@ mod tests {
         let target_required: Vec<bool> = target_fields.iter().map(|f| f.required).collect();
         assert_eq!(
             target_required,
-            vec![false, true, false, false, false, false, false],
-            "`file` is the only field every target shape needs — `kind` absent \
+            vec![false, false, false, false, false, false, false],
+            "no target field is required: `file` is left out under a group \
+             with `choose`, and named when nothing supplies it — `kind` absent \
              keeps the pre-CT.3 inference, `headline` / `olp` belong to one \
              kind each, CT.6's `tree-type` defaults to `day`, and CT.7's \
              `sub-olp` is optional (empty means the date node itself)"
@@ -1878,6 +1947,100 @@ mod tests {
         );
     }
 
+    fn choosing(key: &str, description: &str, dir: &str) -> RawTemplate {
+        RawTemplate {
+            choose: Some(dir.to_string()),
+            ..group(key, description)
+        }
+    }
+
+    /// A member whose target leaves out `file`, filing under `headline`.
+    fn chosen_member(key: &str, headline: &str) -> RawTemplate {
+        RawTemplate {
+            key: key.to_string(),
+            description: Some(key.to_string()),
+            target: Some(RawTarget {
+                kind: Some("file+headline".to_string()),
+                headline: Some(headline.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_member_with_no_file_takes_its_groups_folder() {
+        let set = from_declared(vec![
+            choosing("e", "Engagement", "~/org/clients"),
+            chosen_member("et", "Tasks"),
+        ])
+        .expect("the set resolves");
+        assert!(set.skipped.is_empty(), "{:?}", set.skipped);
+        let t = set.by_key("et").expect("the member");
+        assert_eq!(t.chooses.as_deref(), Some("~/org/clients"));
+        assert_eq!(t.target.file(), "", "the file is filled in by the choice");
+        assert_eq!(set.choose_dir("e"), Some("~/org/clients"));
+        assert_eq!(set.choose_dir(""), None);
+    }
+
+    #[test]
+    fn the_innermost_choosing_group_decides_the_folder() {
+        let set = from_declared(vec![
+            choosing("e", "Engagement", "~/org/clients"),
+            group("ed", "Decisions"),
+            chosen_member("eda", "Decisions"),
+            choosing("ep", "Prospects", "~/org/prospects"),
+            chosen_member("epn", "Notes"),
+        ])
+        .expect("the set resolves");
+        assert_eq!(
+            set.by_key("eda").and_then(|t| t.chooses.as_deref()),
+            Some("~/org/clients"),
+            "a group with no `choose` inherits its parent's"
+        );
+        assert_eq!(set.choose_dir("ed"), Some("~/org/clients"));
+        assert_eq!(
+            set.by_key("epn").and_then(|t| t.chooses.as_deref()),
+            Some("~/org/prospects")
+        );
+    }
+
+    #[test]
+    fn a_member_with_no_file_and_no_chooser_is_named() {
+        let set = from_declared(vec![
+            t("t", "todo", "~/org/a.org", None, ""),
+            group("e", "Engagement"),
+            chosen_member("et", "Tasks"),
+        ])
+        .expect("the plain template still resolves");
+        assert!(set.by_key("et").is_none());
+        assert!(
+            set.skipped
+                .iter()
+                .any(|s| s.contains("`et`") && s.contains("no group above it with `choose`")),
+            "{:?}",
+            set.skipped
+        );
+        assert!(
+            set.group("e").is_none(),
+            "and its group, left with nothing under it, is named too"
+        );
+    }
+
+    #[test]
+    fn choose_on_a_template_is_named() {
+        let mut template = t("t", "todo", "~/org/a.org", None, "");
+        template.choose = Some("~/org/clients".to_string());
+        let set = from_declared(vec![template, t("n", "note", "~/org/a.org", None, "")])
+            .expect("the other template resolves");
+        assert!(set.by_key("t").is_none());
+        assert!(
+            set.skipped[0].contains("`choose`, which belongs on a group row"),
+            "{:?}",
+            set.skipped
+        );
+    }
+
     #[test]
     fn a_blank_headline_degrades_to_the_plain_file_target() {
         let set = from_declared(vec![t("t", "todo", "~/org/x.org", Some("   "), "")])
@@ -1900,7 +2063,7 @@ mod tests {
             key: "t".to_string(),
             description: None,
             target: Some(RawTarget {
-                file: "~/org/x.org".to_string(),
+                file: Some("~/org/x.org".to_string()),
                 headline: None,
                 ..Default::default()
             }),

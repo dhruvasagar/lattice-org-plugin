@@ -133,7 +133,7 @@ mod tests {
             body_file: body_file.map(str::to_string),
             target: Some(RawTarget {
                 kind: Some("file".to_string()),
-                file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
+                file: Some("%<%Y%m%d%H%M%S>-${slug}.org".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -326,7 +326,7 @@ mod tests {
                 body: Some("%?".to_string()),
                 target: Some(RawTarget {
                     kind: Some("file+head".to_string()),
-                    file: "${slug}.org".to_string(),
+                    file: Some("${slug}.org".to_string()),
                     head: Some("#+title: ${title}".to_string()),
                     ..Default::default()
                 }),
@@ -354,7 +354,7 @@ mod tests {
                 body: Some("* entry".to_string()),
                 target: Some(RawTarget {
                     kind: Some("file+head".to_string()),
-                    file: "%<%Y-%m-%d>.org".to_string(),
+                    file: Some("%<%Y-%m-%d>.org".to_string()),
                     head: Some("#+title: %<%Y-%m-%d>".to_string()),
                     ..Default::default()
                 }),

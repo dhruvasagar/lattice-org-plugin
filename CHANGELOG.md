@@ -2,12 +2,58 @@
 
 ## Unreleased
 
+### Added
+- **Another plugin can open org's agenda and capture menus.** Org exports
+  `org-agenda-command` and `org-capture-menu`, so a plugin built on org can
+  offer "this client's agenda" and "capture for this client" from its own
+  menu. Every other org command stays org's own.
+- **Other plugins can add to your agenda files, capture templates and named
+  agendas.** A plugin that extends org contributes to `org.agenda-files`,
+  `org.capture-templates` and `org.agenda-custom-commands` instead of setting
+  them. Yours come first and are never changed, a key you already use keeps
+  meaning yours, and `:describe-option` lists each contribution by plugin.
+- **Capture group rows.** A capture template with a `key` and a
+  `description` and no `target` is a group, as in emacs: the templates whose
+  keys start with its key move into a sub-menu that the group's row opens.
+  `:org-capture-menu <key>` opens one directly. A group with nothing under it
+  is named in the menu's footer instead of shown.
+- **A capture group can choose its file.** `choose = "<folder>"` on a group
+  lets its members leave `file` out; they capture into one of the folder's
+  `.org` files. The sub-menu guesses it from the buffer's file, then from the
+  running clock's, and its title names the guess and where it came from. `c`
+  picks another, and with no guess a member asks first.
+- **A custom agenda can choose its file.** `choose = "<folder>"` on an
+  `org.agenda-custom-commands` entry makes opening it ask for one of the
+  folder's `.org` files, the guess first, and show the command's sections
+  filtered to that file.
+- **`org-agenda-command` takes filter terms after the key**, in the agenda's
+  own spelling: `:org-agenda-command e file:acme.org tag:urgent`. It passed
+  only the key before.
+
+### Fixed
+- **The `todo-keywords` examples are lists.** The README and `:help org`
+  wrote `org.todo-keywords` as one multi-line string, which the option
+  refuses ("expected list, got string") and then keeps the default
+  `TODO | DONE`. Each sequence is now an element of a list.
+- **The state menu is `<leader>oS`.** The README and `:help org` said
+  `<leader>os`, which schedules the entry; the menu moved to `<leader>oS`
+  (and `C-c C-t`) when scheduling took `os`. `:help org` now lists
+  `<leader>os` / `<leader>od` for scheduling and deadlines.
+- **The agenda's clock report is `gD r`**, from the view menu, not `r` as
+  the README said.
+- **The version the release routes need**: lattice 0.10.4 for org 0.6.0,
+  which speaks plugin API 0.7, and the release after 0.10.4 for
+  `lattice.toml`.
+
 ### Changed
+- **Needs lattice 0.10.6 or later.** Org builds against plugin API 0.7.1,
+  which carries the option contributions above; an older editor refuses org
+  and says the version it needs.
 - **The README starts with installing.** Installing and configuring now come
   first, and the internals move under "How it is built" and "Developing it".
   The simplest install is listed first: a `[plugins.org]` table in
   `lattice.toml`, which needs no Rust toolchain and no `init.rs` (lattice
-  after 0.10.3). An example installs and configures org from that one file.
+  after 0.10.4). An example installs and configures org from that one file.
 - **The README shows what org does.** A new "What you can do with it" section
   covers each part: outlines and TODOs, the agenda, capture, refile and
   archive, clocking, org-roam, babel, export and the assistant. Each part

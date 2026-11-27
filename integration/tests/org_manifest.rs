@@ -66,9 +66,9 @@ fn the_component_carries_its_manifest() {
     assert_eq!(manifest.id, "org");
     assert_eq!(
         manifest.min_lattice,
-        Some((0, 10, 3)),
-        "babel needs 0.10.3 (option-bound process grants, `post-effects`, \
-         `mode_gates`; `llm-tools` 0.10.1)"
+        Some((0, 10, 6)),
+        "option contributions need 0.10.6 (babel's option-bound process \
+         grants, `post-effects` and `mode_gates` 0.10.3; `llm-tools` 0.10.1)"
     );
     let bound: Vec<String> = option_bound(&manifest)
         .into_iter()

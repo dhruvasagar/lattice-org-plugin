@@ -51,8 +51,10 @@
 // `tree-sitter` every motion, text object and action gets a `none` tree handle
 // and org silently falls back to matching `*` at line starts (OT.4).
 //
-// `min_lattice` — `llm-tools`, the seam the assistant's tools are offered
-// through, is 0.10.1; `ui.notify`, which the roam scan reports through, 0.9.14.
+// `min_lattice` — option contributions (`accept-contributions`), which other
+// plugins add agenda files and templates through, are 0.10.6; `llm-tools`, the
+// seam the assistant's tools are offered through, is 0.10.1; `ui.notify`,
+// which the roam scan reports through, 0.9.14.
 // Embedded manifests and option-bound grants came earlier, in 0.9.11 (0.9.10
 // was never released: the tree carried it, the release skipped it).
 //
@@ -82,7 +84,8 @@ capabilities = [
 ]
 editor_capabilities = ["tree-sitter"]
 mode_gates = { "org-babel-mode" = "org.babel.enabled", "org-export-mode" = "org.export.enabled" }
-min_lattice = "0.10.3"
+exported_commands = ["org-agenda-command", "org-capture-menu"]
+min_lattice = "0.10.6"
 "#
 );
 
@@ -232,6 +235,9 @@ mod capture_flow;
 mod capture_target;
 mod capture_templates;
 mod checkbox;
+// The chooser: one `.org` file in a folder, guessed from the buffer and the
+// running clock, for capture groups with `choose`.
+mod chooser;
 mod clock;
 mod clock_scan;
 mod config_shape;
@@ -481,6 +487,10 @@ const ORG_TRANSIENT_AGENDA_BULK: &str = "agenda-bulk";
 /// OA.30 — `x` then `t`, the keyword rows of the bulk TODO verb.
 const ORG_TRANSIENT_AGENDA_BULK_TODO: &str = "agenda-bulk-todo";
 
+/// A capture group's sub-menu, opened FOR the group's key, which travels
+/// beside this discriminator as a list. `org-capture-menu e` opens it.
+const ORG_TRANSIENT_CAPTURE_GROUP: &str = "capture-group";
+
 // TB.2: 21..=31 were `org-table-mode`'s eleven generic table callbacks.
 // They are the host's now — `table-mode` in `lattice-mode` owns pipe-table
 // editing for markdown and org alike (see that mode's docs for why the host
@@ -519,6 +529,22 @@ const CAPTURE_SUBMIT: u32 = 36;
 /// fire `org-capture` with a key, and one action that sometimes opens a menu
 /// and sometimes captures would make the row's own args ambiguous.
 const CAPTURE_MENU: u32 = 37;
+
+/// `org-choose-file <dir> <command> <args…>`: pick an `.org` file directly in
+/// `<dir>`, then run `<command>` with `<args…>` and the picked path. A capture
+/// group's chooser opens it, and so does a member fired with no guess.
+const CHOOSE_FILE: u32 = 330;
+
+/// The picker source `org-choose-file` opens.
+const CHOOSE_FILE_PICKER: &str = "org-choose-file";
+
+/// The plugin-store key holding the running clock's file.
+///
+/// The clock's session lives in the events store and its jump target in the
+/// grammar store, and neither is visible to the store a menu is built in. The
+/// plugin store is shared by all of them, so clocking in writes the file here
+/// and clocking out deletes it. The capture chooser reads it for its guess.
+const CLOCK_RUNNING_FILE: &str = "clock/running-file";
 
 /// AG.1 — `:org-agenda`, this plugin's first ex-command.
 ///
@@ -935,6 +961,25 @@ const DEFAULT_CAPTURE_TEMPLATE: &str = "* TODO %?\n  %U";
 /// it (TC.5).
 const DEFAULT_CAPTURE_TEMPLATES: [capture_templates::RawTemplate; 0] = [];
 
+/// The default capture row as a template: emacs' `t Task`, filing to
+/// `org.capture-file` with `org.capture-template`. `None` with no capture
+/// file. A capture menu with no templates of the user's own shows it beside
+/// what other plugins contributed.
+fn default_capture_template() -> Option<capture_templates::RawTemplate> {
+    let file = option_or("capture-file", DEFAULT_CAPTURE_FILE);
+    let file = file.trim();
+    (!file.is_empty()).then(|| capture_templates::RawTemplate {
+        key: "t".to_string(),
+        description: Some("Task".to_string()),
+        target: Some(capture_templates::RawTarget {
+            file: Some(file.to_string()),
+            ..Default::default()
+        }),
+        body: Some(option_or("capture-template", DEFAULT_CAPTURE_TEMPLATE)),
+        ..Default::default()
+    })
+}
+
 /// AS.1: how many days past today the dated section spans. A string because it
 /// reaches the option seam alongside its peers and `option_or` is the one
 /// accessor; parsed with a fallback so a typo'd `:set org.agenda-span=soon`
@@ -1031,11 +1076,44 @@ fn string_list(name: &str) -> Vec<String> {
 /// config portable enough to commit to a dotfiles repo — the whole reason to
 /// write `~` — produced an agenda that scanned a directory literally named
 /// `~` and found nothing, with no error to explain it.
-fn agenda_files() -> Vec<String> {
+///
+/// The user's own entries; [`agenda_files_contributed`] are other plugins'.
+fn agenda_files_user() -> Vec<String> {
     expand_each(string_list("agenda-files"))
 }
 
-/// `~`-expand every path in a list. Split out from [`agenda_files`] so the
+/// The paths other plugins contributed to `org.agenda-files`, in the order
+/// they were contributed.
+fn agenda_files_contributed() -> Vec<String> {
+    expand_each(
+        crate::config_shape::contributions::<Vec<String>>("agenda-files")
+            .into_iter()
+            // The host checked each against the option's schema when it was
+            // made, so a value that does not rebuild cannot happen in
+            // practice; one that did would only cost that plugin its paths.
+            .filter_map(|(_, value)| value.ok())
+            .flatten()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect(),
+    )
+}
+
+/// What the agenda scans: the user's paths and the contributed ones. With no
+/// user paths but some contributed, the empty entry keeps the project root,
+/// which is what an unset `org.agenda-files` has always meant; a contribution
+/// adds to that default rather than replacing it.
+fn agenda_roots(user: Vec<String>, contributed: Vec<String>) -> Vec<String> {
+    let mut roots = if user.is_empty() && !contributed.is_empty() {
+        vec![String::new()]
+    } else {
+        user
+    };
+    roots.extend(contributed);
+    roots
+}
+
+/// `~`-expand every path in a list. Split out from [`agenda_files_user`] so the
 /// expansion is testable without a host to read the option from.
 fn expand_each(paths: Vec<String>) -> Vec<String> {
     paths
@@ -1685,6 +1763,27 @@ impl Guest for Component {
         // here and go read it — and a picker is what navigation wants. The
         // read-in-place view is a separate question; see `roam_backlinks`.
         lattice::plugin_host::picker_registry::register_picker_source(&roam_backlinks::spec());
+        // The chooser's files: `.org` files directly in one folder.
+        lattice::plugin_host::picker_registry::register_picker_source(
+            &lattice::plugin_host::types::PickerSourceSpec {
+                id: CHOOSE_FILE_PICKER.to_string(),
+                doc: "The .org files directly in a folder, to capture into or open an agenda for"
+                    .to_string(),
+                args_schema: Vec::new(),
+                args_hint: "<folder> <command> [args…]".to_string(),
+                // Not live: the folder does not change while the picker is
+                // open, and a walk per keystroke would be on the typing path.
+                live: false,
+                // Not rooted: the folder is named by the caller, not by the
+                // project the user is standing in.
+                rooted: false,
+                // No delete verb: removing a file is not tidying a list.
+                delete_command: None,
+                // Making a new file is the onboarding command's job, which
+                // writes the file's skeleton; an empty file would not have one.
+                create_label: None,
+            },
+        );
         // CD.5: the capture drafts in the store.
         lattice::plugin_host::picker_registry::register_picker_source(
             &lattice::plugin_host::types::PickerSourceSpec {
@@ -2006,6 +2105,18 @@ impl Guest for Component {
             "Draw `[[file:…]]` image links inline. Off by default: an org file \
              can reference anything, and only the GPUI peer can draw them.",
         );
+        // Other plugins may add to these three, never replace them: an
+        // extension contributes its folder, its capture group and its
+        // dashboard, and the readers below put the user's own entries first.
+        // The user's value is untouched and `:describe-option` lists each
+        // contribution by plugin.
+        for name in [
+            "agenda-files",
+            "capture-templates",
+            "agenda-custom-commands",
+        ] {
+            let _ = crate::config_shape::accept_contributions(name);
+        }
     }
 
     fn register_languages() {
@@ -3927,6 +4038,13 @@ impl Guest for Component {
             CAPTURE,
         );
         register_action(
+            "org-choose-file",
+            "Pick an .org file directly in a folder, then run a command with it \
+             (args: folder, command, the command's own args)",
+            &spec(),
+            CHOOSE_FILE,
+        );
+        register_action(
             "org-capture-question-submit",
             "Answer one %^{Question} of a sequential capture/roam-create flow \
              (fired by the prompt each question opens)",
@@ -4204,7 +4322,7 @@ impl Guest for Component {
     /// `~` is NOT expanded here. The host expands, so one implementation serves
     /// every source and a guest cannot get it wrong per-plugin.
     fn roots() -> Vec<String> {
-        agenda_files()
+        agenda_roots(agenda_files_user(), agenda_files_contributed())
     }
 
     /// OM.A3: the mode the host activates on the agenda view, so org's TODO
@@ -4880,6 +4998,19 @@ impl CaptureDestination {
     /// has typed anything, rather than at finalize when the capture would have
     /// to be filed without the day it needs.
     fn of(template: &capture_templates::Template) -> Result<Self, Effect> {
+        // A template whose file is chosen, reached without a choice, has
+        // nowhere to file. Every menu path supplies one; this catches a path
+        // that does not, rather than writing to a file named "".
+        if template.target.file().is_empty() {
+            return Err(Effect::Echo(EchoPayload {
+                level: EchoLevel::Warn,
+                text: format!(
+                    "org: `{}` captures into a file chosen from {}; open it from its menu",
+                    template.key,
+                    template.chooses.as_deref().unwrap_or("its group's folder")
+                ),
+            }));
+        }
         let seed = match template.seed.as_deref() {
             None => None,
             Some(key) => {
@@ -4950,7 +5081,11 @@ fn expand_seed(body: &str) -> String {
 /// property every other two-hop action in this file already has.
 enum QuestionFlowKind {
     /// `<leader>oc` chose this template, and it asks questions.
-    Capture { key: String },
+    Capture {
+        key: String,
+        /// The chosen file, for a template whose file is chosen.
+        file: Option<String>,
+    },
     /// `:org-roam-create-node` is making this note, and its template asks
     /// questions. The id is carried rather than re-minted for
     /// [`roam_create_from_template`]'s reason: it must be the same id the
@@ -5068,12 +5203,16 @@ fn capture_question_submit(ctx: &ActionContext) -> Vec<Effect> {
         ..
     } = flow;
     match kind {
-        QuestionFlowKind::Capture { key } => {
+        QuestionFlowKind::Capture { key, file } => {
             // `_note` is always empty on this path: it is reached only with
             // a KEY, which only a configured set can supply. Destructured
             // rather than ignored so a future path that CAN arrive here
             // without one fails to compile instead of dropping the note.
             let (template, _note) = match selected_template(Some(&key)) {
+                Ok(t) => t,
+                Err(effect) => return vec![effect],
+            };
+            let template = match apply_choice(template, file.as_deref(), None) {
                 Ok(t) => t,
                 Err(effect) => return vec![effect],
             };
@@ -5562,6 +5701,7 @@ fn clock_in(
 
     // Remember where to jump back to, and tell the async side to start ticking.
     if let Some(path) = doc.path() {
+        note_clock_running(&path);
         CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = Some((path, headline_line)));
     }
     host_services::emit_event(
@@ -5625,6 +5765,7 @@ fn clock_stop(
     // `org-clock-goto` does (it jumps to the current OR last clocked entry).
     // Whether a clock is *running* is answered by the buffer, as it always was.
     host_services::emit_event(EV_CLOCK_STOPPED, &[]);
+    note_clock_stopped();
 
     if discard {
         let (from, to) = clock::cancel_span(&lb, running);
@@ -5749,6 +5890,7 @@ fn clock_resume(buffer_id: u32, doc: &Document, tree: Option<&TreeSnapshot>) -> 
         .and_then(|(h, _)| hl.text(h))
         .map(|t| clock_title(&t))
         .unwrap_or_default();
+    note_clock_running(&path);
     host_services::emit_event(
         EV_CLOCK_STARTED,
         format!("{}\t{title}", now.epoch_minutes()).as_bytes(),
@@ -6027,6 +6169,7 @@ fn selected_template(
                 // carry a `clock-in` key, so it never clocks.
                 clock_in: false,
                 seed: None,
+                chooses: None,
             },
             vec![note],
         ));
@@ -6151,9 +6294,25 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         on_commit: None,
     });
 
-    let key = submitted_text(&ctx.args).filter(|k| !k.is_empty());
+    // `[key]`, or `[key, file]` for a template whose file is chosen.
+    let args = arg_strings(&ctx.args);
+    let key = match &ctx.args {
+        Args::List(_) => args.first().cloned(),
+        other => submitted_text(other),
+    }
+    .filter(|k| !k.is_empty());
     let (template, note) = match selected_template(key.as_deref()) {
         Ok(t) => t,
+        Err(effect) => return vec![effect],
+    };
+    let chosen = template
+        .chooses
+        .is_some()
+        .then(|| args.get(1).cloned())
+        .flatten();
+    let template = match apply_choice(template, chosen.as_deref(), doc.path()) {
+        Ok(t) => t,
+        // No usable file yet: the chooser opens, and runs this again with one.
         Err(effect) => return vec![effect],
     };
 
@@ -6175,7 +6334,10 @@ fn capture_open(ctx: &ActionContext, doc: &Document) -> Vec<Effect> {
         // practice" is how a message goes missing when the shape changes.
         let mut out = note;
         out.extend(start_question_flow(
-            QuestionFlowKind::Capture { key: template.key },
+            QuestionFlowKind::Capture {
+                key: template.key,
+                file: chosen,
+            },
             questions,
             caller,
         ));
@@ -6473,6 +6635,7 @@ fn capture_origin() -> String {
 /// the buffer.
 fn clock_captured_entry(text: String, path: &str, line: u32, title: &str) -> String {
     let now = clock_now();
+    note_clock_running(path);
     CLOCK_GOTO_TARGET.with(|c| *c.borrow_mut() = Some((path.to_string(), line)));
     host_services::emit_event(
         EV_CLOCK_STARTED,
@@ -7259,6 +7422,164 @@ fn park_pending(id: &str, pending: &capture_drafts::Pending) -> Result<(), Strin
     }
     let bytes = capture_drafts::encode(pending).ok_or_else(|| "could not encode".to_string())?;
     host_services::store_put(&capture_drafts::pending_caller_key(id), &bytes)
+}
+
+/// `org-capture-menu`'s effect: the top menu, or with a group's key as its
+/// argument, that group's sub-menu. A group row fires this, and so can another
+/// plugin's menu that wants to open a group directly.
+///
+/// A group with `choose` gets its file here, where the buffer is still known:
+/// the second argument if it is a file in the folder (a choice made in the
+/// picker, or carried down from a parent group), else the guess. The menu
+/// builder only shows what it is handed.
+fn capture_menu_open(args: &Args, buffer_path: Option<String>) -> Effect {
+    let args = arg_strings(args);
+    let Some(group) = args
+        .first()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+    else {
+        return Effect::OpenTransient(lattice::plugin_host::types::OpenTransientPayload {
+            source: CAPTURE_TRANSIENT.to_string(),
+            args: Args::None,
+        });
+    };
+    let mut payload = vec![ORG_TRANSIENT_CAPTURE_GROUP.to_string(), group.clone()];
+    // A set that does not read opens the menu anyway: the builder reads it
+    // again and reports why.
+    if let Some(dir) = capture_templates::read()
+        .ok()
+        .and_then(|set| set.choose_dir(&group).map(str::to_string))
+    {
+        let folder = chooser::folder(&dir);
+        let picked = match args
+            .get(1)
+            .filter(|f| chooser::is_choice(&folder, f.as_str()))
+        {
+            Some(file) => Some((file.clone(), chooser::Source::Chosen)),
+            None => chooser::guess(
+                &folder,
+                buffer_path.as_deref(),
+                running_clock_file().as_deref(),
+            ),
+        };
+        if let Some((file, source)) = picked {
+            payload.push(file);
+            payload.push(source.as_str().to_string());
+        }
+    }
+    Effect::OpenTransient(lattice::plugin_host::types::OpenTransientPayload {
+        source: CAPTURE_TRANSIENT.to_string(),
+        args: Args::List(
+            payload
+                .into_iter()
+                .map(lattice::plugin_host::types::ArgValue::String)
+                .collect(),
+        ),
+    })
+}
+
+/// `args` as a list of strings.
+fn string_args<'a>(items: impl IntoIterator<Item = &'a str>) -> Args {
+    Args::List(
+        items
+            .into_iter()
+            .map(|s| lattice::plugin_host::types::ArgValue::String(s.to_string()))
+            .collect(),
+    )
+}
+
+/// Every string an `args` carries, in order: one for a string, each string or
+/// raw item for a list, none otherwise.
+fn arg_strings(args: &Args) -> Vec<String> {
+    match args {
+        Args::String(s) => vec![s.clone()],
+        Args::List(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                lattice::plugin_host::types::ArgValue::String(s)
+                | lattice::plugin_host::types::ArgValue::Raw(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `org-choose-file`'s effect: the picker over `args[0]`, which runs
+/// `args[1]` with the rest of `args` and the picked path.
+///
+/// The guess is computed here, where the buffer is known, and goes first in
+/// the picker so accepting at once takes it. The picker's own args are
+/// `[folder, guess, command, args…]`, an encoding private to this file.
+fn choose_file_open(args: &[String], buffer_path: Option<String>) -> Effect {
+    if args.len() < 2 || args[0].trim().is_empty() || args[1].trim().is_empty() {
+        return Effect::Echo(EchoPayload {
+            level: EchoLevel::Warn,
+            text: "org-choose-file: give a folder and the command to run with the file".to_string(),
+        });
+    }
+    let guess = chooser::guess(
+        &chooser::folder(&args[0]),
+        buffer_path.as_deref(),
+        running_clock_file().as_deref(),
+    )
+    .map(|(path, _)| path)
+    .unwrap_or_default();
+    let mut picker_args = vec![args[0].clone(), guess];
+    picker_args.extend(args[1..].iter().cloned());
+    Effect::OpenPicker(lattice::plugin_host::types::OpenPickerPayload {
+        source: CHOOSE_FILE_PICKER.to_string(),
+        args: picker_args,
+        root: None,
+        fill_action: None,
+        query: None,
+    })
+}
+
+/// The running clock's file, if a clock is running.
+fn running_clock_file() -> Option<String> {
+    host_services::store_get(CLOCK_RUNNING_FILE)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|p| !p.is_empty())
+}
+
+/// Record that a clock started in `path`. A failed write only loses the
+/// chooser's clock guess, and the menu shows when there is no guess, so it is
+/// not worth failing the clock over.
+fn note_clock_running(path: &str) {
+    let _ = host_services::store_put(CLOCK_RUNNING_FILE, path.as_bytes());
+}
+
+/// Record that no clock is running.
+fn note_clock_stopped() {
+    let _ = host_services::store_delete(CLOCK_RUNNING_FILE);
+}
+
+/// Put a chosen file into a template whose file is chosen from a folder.
+///
+/// `Err` carries the effect to run instead: the chooser, when there is no
+/// usable choice. A template that chooses nothing is returned as it is.
+fn apply_choice(
+    template: capture_templates::Template,
+    chosen: Option<&str>,
+    buffer_path: Option<String>,
+) -> Result<capture_templates::Template, Effect> {
+    let Some(dir) = template.chooses.clone() else {
+        return Ok(template);
+    };
+    let folder = chooser::folder(&dir);
+    match chosen.filter(|f| chooser::is_choice(&folder, f)) {
+        Some(file) => {
+            let mut template = template;
+            template.target = template.target.with_file(file.to_string());
+            Ok(template)
+        }
+        None => Err(choose_file_open(
+            &[dir, "org-capture".to_string(), template.key.clone()],
+            buffer_path,
+        )),
+    }
 }
 
 /// The roam template chooser for `title`, carrying `id` when a caller is
@@ -9426,16 +9747,8 @@ impl GrammarCallbacks for Component {
             // OC.3: names the menu the `transient-source` seam registered.
             // The host resolves the name against the registry and calls this
             // plugin's `build` for the place it was opened from.
-            CAPTURE_MENU => Ok(vec![Effect::OpenTransient(
-                lattice::plugin_host::types::OpenTransientPayload {
-                    source: CAPTURE_TRANSIENT.to_string(),
-                    // The template menu is opened for nothing in particular —
-                    // it IS the choice. TR.3a's args carry a subject when a
-                    // menu drills down, which is the roam chooser opened FOR a
-                    // node (OR.11b).
-                    args: Args::None,
-                },
-            )]),
+            CAPTURE_MENU => Ok(vec![capture_menu_open(&ctx.args, doc.path())]),
+            CHOOSE_FILE => Ok(vec![choose_file_open(&arg_strings(&ctx.args), doc.path())]),
             CAPTURE => Ok(capture_open(&ctx, doc)),
             CAPTURE_SUBMIT => Ok(capture_submit(&ctx)),
             CAPTURE_QUESTION_SUBMIT => Ok(capture_question_submit(&ctx)),
@@ -9765,10 +10078,29 @@ impl GrammarCallbacks for Component {
                 ))])
             }
             AGENDA_COMMAND => {
-                let key = match &ctx.args {
-                    Args::String(s) => s.trim().to_string(),
-                    _ => String::new(),
-                };
+                // `[key, terms…]`: a custom command's key, then filter terms
+                // in the agenda's own spelling (`file:acme.org`, `tag:work`).
+                let mut scan_args = arg_strings(&ctx.args);
+                if scan_args.is_empty() {
+                    scan_args.push(String::new());
+                }
+                scan_args[0] = scan_args[0].trim().to_string();
+                // A command with `choose` is about one file of its folder;
+                // without one named, the chooser asks.
+                let choose = agenda_custom_commands::read(agenda_span_days())
+                    .ok()
+                    .and_then(|set| set.by_key(&scan_args[0]).and_then(|c| c.choose.clone()));
+                if let Some(dir) = choose {
+                    match agenda_custom_commands::chosen_scan(&dir, &scan_args) {
+                        agenda_custom_commands::ChosenScan::Open(args) => scan_args = args,
+                        agenda_custom_commands::ChosenScan::Ask(dir) => {
+                            return Ok(vec![choose_file_open(
+                                &[dir, "org-agenda-command".to_string(), scan_args[0].clone()],
+                                doc.path(),
+                            )]);
+                        }
+                    }
+                }
                 Ok(vec![Effect::AppAction(AppEffect::OpenProviderView(
                     OpenProviderViewPayload {
                         provider: "agenda".to_string(),
@@ -9783,7 +10115,7 @@ impl GrammarCallbacks for Component {
                         // that makes `gr` a refresh. Sending `[]` for the
                         // built-in row turned `C-c a a` into a refresh of
                         // whatever custom view was already open.
-                        scan_args: vec![key],
+                        scan_args,
                     },
                 ))])
             }
@@ -10440,12 +10772,67 @@ impl MediaProducer for Component {
 /// accepts by OPENING the chosen file. Refile needs the choice routed back
 /// into org's own action, which is what `picker-accept-outcome::invoke-command`
 /// is for.
+/// The chooser picker's rows: one per `.org` file directly in `args[0]`, each
+/// running `args[1]` with `args[2..]` and the file's path.
+fn choose_file_candidates(
+    args: &[String],
+) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
+    let [dir, guess, command, rest @ ..] = args else {
+        return Err("org-choose-file: give a folder and the command to run".to_string());
+    };
+    let folder = chooser::folder(dir);
+    let walked =
+        host_services::walk(&folder).map_err(|e| format!("org: cannot list {dir}: {e}"))?;
+    let mut files = chooser::choices(&folder, walked);
+    // The guess first, so `<CR>` takes it.
+    if let Some(at) = files.iter().position(|f| f == guess) {
+        let first = files.remove(at);
+        files.insert(0, first);
+    }
+    if files.is_empty() {
+        return Err(format!("org: no .org files in {dir}"));
+    }
+    Ok(files
+        .into_iter()
+        .map(|path| {
+            let label = chooser::label(&path).to_string();
+            let mut run_with: Vec<lattice::plugin_host::types::ArgValue> = rest
+                .iter()
+                .cloned()
+                .map(lattice::plugin_host::types::ArgValue::String)
+                .collect();
+            run_with.push(lattice::plugin_host::types::ArgValue::String(path));
+            exports::lattice::plugin_host::picker_source::CandidatePair {
+                candidate: lattice::plugin_host::types::RawCandidate {
+                    insert_text: None,
+                    text: label.clone(),
+                    display: label,
+                    source: Some(CHOOSE_FILE_PICKER.to_string()),
+                    kind: lattice::plugin_host::types::CandidateKind::Plain,
+                    data: lattice::plugin_host::types::CandidateData::Plain,
+                    annotations: Vec::new(),
+                    display_spans: Vec::new(),
+                },
+                routing: lattice::plugin_host::types::RoutingPayload::InvokeCommand(
+                    lattice::plugin_host::types::CommandRef {
+                        id: command.clone(),
+                        args: Args::List(run_with),
+                    },
+                ),
+            }
+        })
+        .collect())
+}
+
 impl PickerSource for Component {
     fn init(
         source: String,
         ctx: lattice::plugin_host::types::PickerContext,
         args: Vec<String>,
     ) -> Result<Vec<exports::lattice::plugin_host::picker_source::CandidatePair>, String> {
+        if source == CHOOSE_FILE_PICKER {
+            return choose_file_candidates(&args);
+        }
         // OR.6/OR.9: three sources now share this body. Route first.
         if source == roam_backlinks::BACKLINKS_PICKER {
             return Ok(roam_backlinks::init(&args)?
@@ -11401,20 +11788,26 @@ const CAPTURE_TRANSIENT: &str = "org-capture";
 /// states can do nothing at all, whereas an agenda dispatcher with no custom
 /// commands can still open the agenda. A menu that refuses to open when it has
 /// a working row is worse than a short menu.
-fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
-    use lattice::plugin_host::types::{
-        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
-        TransientSpec,
-    };
-
-    let span = option_or("agenda-span", DEFAULT_AGENDA_SPAN)
+/// `org.agenda-span`, falling back to the compiled-in default when unset or
+/// not a number.
+fn agenda_span_days() -> u32 {
+    option_or("agenda-span", DEFAULT_AGENDA_SPAN)
         .trim()
         .parse::<u32>()
         .unwrap_or_else(|_| {
             DEFAULT_AGENDA_SPAN
                 .parse()
                 .expect("the compiled-in default parses")
-        });
+        })
+}
+
+fn agenda_menu() -> Result<lattice::plugin_host::types::TransientSpec, String> {
+    use lattice::plugin_host::types::{
+        Args as WitArgs, TransientAction, TransientGroup, TransientItem, TransientItemKind,
+        TransientSpec,
+    };
+
+    let span = agenda_span_days();
     // An unusable set costs the ROWS it describes, never the menu: the built-in
     // agenda is still reachable, and the footer says what went wrong. Erring
     // here would mean a typo in one command's `when` left you unable to open
@@ -12313,12 +12706,13 @@ fn org_corpus(
     tags_search: bool,
 ) -> (Vec<llm_tools::OrgFile>, Vec<String>) {
     use lattice::plugin_host::{host_services, tree_sitter};
-    let mut roots = agenda_files();
+    let mut roots = agenda_files_user();
     if roots.is_empty() {
         roots.push(crate::roam_scan::expand_tilde(
             option_or("directory", "~/org").trim(),
         ));
     }
+    roots.extend(agenda_files_contributed());
     let mut problems = Vec::new();
     let mut paths = std::collections::BTreeSet::new();
     for root in roots {
@@ -12481,12 +12875,28 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
         // parse below, for TK.6's reason: a user with no `org.capture-templates`
         // must not be told "no capture templates" when they asked to make a
         // roam note.
+        let mut group: Option<String> = None;
+        // The file a choosing group's members capture into, and where it came
+        // from. Computed by `org-capture-menu`, which knows the buffer.
+        let mut chosen: Option<(String, chooser::Source)> = None;
         if let Args::List(items) = &ctx.args {
             if let [lattice::plugin_host::types::ArgValue::String(kind), lattice::plugin_host::types::ArgValue::String(title)] =
                 items.as_slice()
             {
                 if kind == ORG_TRANSIENT_ROAM {
                     return roam_template_menu(title, None);
+                }
+            }
+            if let Some((lattice::plugin_host::types::ArgValue::String(kind), rest)) =
+                items.split_first()
+            {
+                if kind == ORG_TRANSIENT_CAPTURE_GROUP {
+                    let text = |i: usize| match rest.get(i) {
+                        Some(lattice::plugin_host::types::ArgValue::String(s)) => Some(s.clone()),
+                        _ => None,
+                    };
+                    group = text(0);
+                    chosen = text(1).zip(text(2).as_deref().and_then(chooser::Source::parse));
                 }
             }
             // CD.6: a create-and-insert's chooser also carries the id it
@@ -12543,19 +12953,91 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             Err(capture_templates::TemplateError::Unset) => None,
             Err(e) => return Err(e.message()),
         };
+        // A group's sub-menu names its group in the title, so the user can see
+        // which level they are on. A key that names no group (the option
+        // changed, or another plugin asked for one that is not there) is an
+        // error rather than the top menu, which would look like a group that
+        // forgot its members.
+        let title = match (&group, &set) {
+            (None, _) => "Capture".to_string(),
+            (Some(key), Some(set)) => match set.group(key) {
+                Some(g) => format!("Capture · {}", g.description),
+                None => return Err(format!("org: no capture group `{key}`")),
+            },
+            (Some(key), None) => return Err(format!("org: no capture group `{key}`")),
+        };
+        // A level whose members choose their file says which file it is, and
+        // where the guess came from, so the guess is never silent.
+        let level_dir: Option<String> = group
+            .as_deref()
+            .zip(set.as_ref())
+            .and_then(|(g, set)| set.choose_dir(g).map(str::to_string));
+        let title = match (&level_dir, &chosen) {
+            (None, _) => title,
+            (Some(_), Some((file, source))) => {
+                format!("{title} · {} ({})", chooser::label(file), source.label())
+            }
+            (Some(_), None) => format!("{title} · no file chosen"),
+        };
 
         let mut items: Vec<TransientItem> = match &set {
             Some(set) => set
-                .templates
-                .iter()
-                .map(|t| TransientItem {
-                    key: vec![t.key.clone()],
-                    label: t.description.clone(),
-                    description: format!("→ {}", t.target.file()),
-                    kind: TransientItemKind::Action(TransientAction {
-                        command: "org-capture".to_string(),
-                        args: WitArgs::String(t.key.clone()),
-                    }),
+                .level(group.as_deref())
+                .into_iter()
+                .map(|(pressed, row)| match row {
+                    capture_templates::MenuRow::Template(t) => {
+                        let (description, action) = match (&t.chooses, &chosen) {
+                            (None, _) => (
+                                format!("→ {}", t.target.file()),
+                                TransientAction {
+                                    command: "org-capture".to_string(),
+                                    args: WitArgs::String(t.key.clone()),
+                                },
+                            ),
+                            (Some(_), Some((file, _))) => (
+                                format!("→ {}", chooser::label(file)),
+                                TransientAction {
+                                    command: "org-capture".to_string(),
+                                    args: string_args([t.key.as_str(), file.as_str()]),
+                                },
+                            ),
+                            // No guess: the member asks for the file first.
+                            (Some(dir), None) => (
+                                format!("→ choose from {dir}"),
+                                TransientAction {
+                                    command: "org-choose-file".to_string(),
+                                    args: string_args([dir.as_str(), "org-capture", &t.key]),
+                                },
+                            ),
+                        };
+                        TransientItem {
+                            key: vec![pressed],
+                            label: t.description.clone(),
+                            description,
+                            kind: TransientItemKind::Action(action),
+                        }
+                    }
+                    // A drill-down: the row reopens this menu for the group.
+                    // A sub-group that chooses from the same folder inherits
+                    // the choice; one with its own `choose` makes its own.
+                    capture_templates::MenuRow::Group(g) => {
+                        let inherits = set.choose_dir(&g.key) == level_dir.as_deref();
+                        let args = match &chosen {
+                            Some((file, _)) if inherits => {
+                                string_args([g.key.as_str(), file.as_str()])
+                            }
+                            _ => WitArgs::String(g.key.clone()),
+                        };
+                        TransientItem {
+                            key: vec![pressed],
+                            label: format!("{}…", g.description),
+                            description: String::new(),
+                            kind: TransientItemKind::Action(TransientAction {
+                                command: "org-capture-menu".to_string(),
+                                args,
+                            }),
+                        }
+                    }
                 })
                 .collect(),
             None => {
@@ -12589,6 +13071,27 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
                 }]
             }
         };
+        // The chooser's own row. `c` unless a member took it, so a set can
+        // never lose a template to it.
+        if let (Some(dir), Some(group)) = (&level_dir, &group) {
+            let taken = |k: &str| items.iter().any(|i| i.key.concat() == k);
+            if let Some(key) = ["c", "C", ","].into_iter().find(|k| !taken(k)) {
+                items.push(TransientItem {
+                    key: vec![key.to_string()],
+                    label: if chosen.is_some() {
+                        "change…"
+                    } else {
+                        "choose…"
+                    }
+                    .to_string(),
+                    description: format!("→ {dir}"),
+                    kind: TransientItemKind::Action(TransientAction {
+                        command: "org-choose-file".to_string(),
+                        args: string_args([dir.as_str(), "org-capture-menu", group.as_str()]),
+                    }),
+                });
+            }
+        }
         // A menu with no way out is a trap. `q` is the transient's own
         // convention and costs nothing.
         items.push(TransientItem {
@@ -12608,7 +13111,7 @@ impl exports::lattice::plugin_host::transient_source::Guest for Component {
             .map(|s| format!("skipped: {}", s.skipped.join("; ")));
 
         Ok(TransientSpec {
-            title: "Capture".to_string(),
+            title,
             groups: vec![TransientGroup {
                 label: "Templates".to_string(),
                 items,
@@ -12626,6 +13129,25 @@ mod agenda_files_tests {
     /// `~` — scans a directory literally named `~` and reports an empty agenda
     /// with nothing to say why. Found when a real config moved from an
     /// absolute home path to `~` and the agenda silently emptied.
+    #[test]
+    fn a_contribution_adds_to_the_project_root_when_the_user_set_nothing() {
+        let clients = vec!["/home/u/org/clients".to_string()];
+        assert_eq!(
+            super::agenda_roots(Vec::new(), clients.clone()),
+            vec![String::new(), "/home/u/org/clients".to_string()],
+            "the empty entry is the project root, kept beside the folder"
+        );
+        assert_eq!(
+            super::agenda_roots(vec!["/home/u/org".to_string()], clients.clone()),
+            vec!["/home/u/org".to_string(), "/home/u/org/clients".to_string()],
+            "the user's paths come first, and replace the project root as before"
+        );
+        assert!(
+            super::agenda_roots(Vec::new(), Vec::new()).is_empty(),
+            "nothing anywhere is still no opinion"
+        );
+    }
+
     #[test]
     fn agenda_file_paths_expand_a_leading_tilde() {
         let home = std::env::var("HOME").expect("HOME is set when tests run");

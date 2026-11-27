@@ -438,7 +438,7 @@ A template has three independent parts: **where** it lands (`target`),
 |---|---|---|
 | `key` | required | the key that picks it in the menu. Several characters are fine |
 | `description` | | what the menu row says |
-| `target` | required | where it lands. See [Targets](#targets) |
+| `target` | | where it lands. See [Targets](#targets). Leave it out for a [group row](#group-rows) |
 | `body` | | the template text, placeholders and all |
 | `body-file` | | read the template text from this file instead, emacs's `(file "…")`. `~` is expanded |
 | `type` | | `entry` (the default) or `table-line` |
@@ -446,9 +446,87 @@ A template has three independent parts: **where** it lands (`target`),
 | `prepend` | | `table-line` only: put the row first rather than last |
 | `clock-in` | | start a clock on the captured entry, org's `:clock-in` |
 | `seed` | | the key of the template that creates today's node when it is missing. See [`seed`](#seed) |
+| `choose` | | on a group row: the folder its members pick their file from. See [Choosing the file](#choosing-the-file) |
 
 `body` and `body-file` cannot both be set. A body file that cannot be read
 stops the capture at open, naming the template and the path.
+
+##### Group rows
+
+A template with a `key` and a `description` and no `target` is a **group**,
+org's prefix convention. The templates whose keys start with the group's key
+leave the top menu and appear in the group's sub-menu, pressed by the rest of
+their key:
+
+```toml
+[[org.capture-templates]]
+key = "w"
+description = "Work"
+
+[[org.capture-templates]]
+key = "wt"
+description = "Task"
+target = { kind = "file+headline", file = "~/org/work.org", headline = "Tasks" }
+body = "* TODO %?"
+
+[[org.capture-templates]]
+key = "wm"
+description = "Meeting"
+target = { kind = "file+headline", file = "~/org/work.org", headline = "Meetings" }
+body = "* %^{Meeting}"
+```
+
+`<leader>oc` shows `w  Work…`; `w` opens `Capture · Work` with `t` and `m`.
+`:org-capture-menu w` opens the sub-menu directly. A group can sit inside
+another (`w`, then `wd` with `wda` under it). A template whose prefix names no
+group stays on the top menu under its whole key. A group with no templates
+under it is not shown, and the menu's footer names it.
+
+Group rows are for `org.capture-templates`. A roam template has no group rows;
+one without a `target` is skipped and named.
+
+Another plugin can add templates, a whole group included, to your menu. They
+appear after yours, a key you already use keeps meaning yours (the plugin's is
+named in the footer), and with no templates of your own the default `t Task`
+row stays beside them. `:describe-option org.capture-templates` lists what each
+plugin added.
+
+##### Choosing the file
+
+A group can name a folder with `choose`. Its members leave `file` out of
+their target, and capture into a file chosen from the `.org` files directly
+in that folder:
+
+```toml
+[[org.capture-templates]]
+key = "e"
+description = "Engagement"
+choose = "~/org/clients"
+
+[[org.capture-templates]]
+key = "et"
+description = "Task"
+target = { kind = "file+headline", headline = "Tasks" }
+body = "* TODO %?"
+```
+
+The sub-menu guesses the file each time it opens, and its title says which
+file and why:
+
+1. The buffer's own file, if it is in the folder: `Capture · Engagement · acme (this buffer)`.
+2. The running clock's file, if the clock is in the folder: `· acme (clocked in)`.
+   Clock in to a client's meeting, and a capture from anywhere lands there.
+3. Otherwise `· no file chosen`, and a member asks for the file before it
+   captures.
+
+`c` changes the file (`C` or `,` if a member already uses `c`). Subfolders
+are not choices, so `~/org/clients/archive/` can hold finished files. A
+group inside a choosing group shares its choice unless it has a `choose` of
+its own. Org reads the folder under its own file grant, so the folder has to
+be inside `org.directory` or another path org may read.
+
+`:org-choose-file <folder> <command> <args…>` is the picker on its own: it
+runs `<command>` with `<args…>` and the picked file's path.
 
 ##### Targets
 
@@ -657,12 +735,13 @@ off — the outliner above is unaffected either way.
 | | |
 |---|---|
 | `<leader>ot` `<leader>oT` | cycle the TODO keyword forward / back |
-| `<leader>os` | choose a state from a menu |
+| `<leader>oS` `C-c C-t` | choose a state from a menu |
+| `<leader>os` `<leader>od` | schedule, or set a deadline (`C-c C-s` / `C-c C-d`) |
 | `<leader>o,` | cycle the priority |
 | `<leader>o:` | set tags, prompting with the current ones |
 
 Cycling is the faster move when the next state is the one you want; the menu
-is faster when it is not. `<leader>os` lists every configured state under the
+is faster when it is not. `<leader>oS` lists every configured state under the
 key its own declaration gives it, plus a row that clears the state — a menu
 that could set every keyword but never remove one would be a one-way door. A
 state you declared without a key still appears, with one derived from its
@@ -677,21 +756,27 @@ keyword leaves the priority and tags exactly where they were.
 
 ### Declaring your states
 
-`org.todo-keywords` takes emacs' `org-todo-keywords` syntax, one sequence per
-line:
+`org.todo-keywords` takes emacs' `org-todo-keywords` syntax, a list with one
+sequence per element:
 
+```toml
+[org]
+todo-keywords = [
+  "sequence: TODO(t) NEXT(n) | DONE(d)",
+  "sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING",
+  "type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)",
+]
 ```
-sequence: TODO(t) NEXT(n) | DONE(d)
-sequence: WAITING(w@/!) HOLD(h@/!) | CANCELLED(c@/!) PHONE MEETING
-type: PROJECT TO-READ READING(!/!) TO-WATCH WATCHING(!/!)
-```
+
+A single string is refused with "expected list, got string" in `*messages*`,
+and the default keywords stay in force.
 
 | | |
 |---|---|
 | `sequence:` | a workflow, cycled in order |
 | `type:` | a set of alternatives rather than a progression |
 | `\|` | separates not-done from done; a line without one has no done states |
-| `(t)` | the key this state gets in the `<leader>os` menu |
+| `(t)` | the key this state gets in the `<leader>oS` menu |
 | `(@)` `(!)` `(@/!)` | logging specs — **accepted and not yet acted on** |
 
 A bare list with no `sequence:` or `type:` prefix is a sequence, so the old
@@ -736,7 +821,7 @@ are applied above the theme, so they win.
 
 | | |
 |---|---|
-| cycling, and the `<leader>os` menu | follow `:set` immediately |
+| cycling, and the `<leader>oS` menu | follow `:set` immediately |
 | the per-state **colours** | resolve at load |
 
 Colours are fixed at load because the theme elements and the highlight query
@@ -1284,6 +1369,14 @@ still the right one for a repo with org files in it; the option is for the
 agenda that follows you between checkouts, which is what org means by an
 agenda. `:org-agenda ~/notes` overrides the option for one invocation.
 
+**Other plugins can add to it.** A plugin that extends org (one that keeps a
+folder of client files, say) contributes its folder to `org.agenda-files`
+rather than setting it. Your own entries come first and are never changed; the
+plugin's are scanned beside them, and with none of your own the current
+project is still scanned. `:describe-option org.agenda-files` lists every
+contribution by the plugin that made it, and unloading the plugin takes its
+entries away.
+
 ### Sections
 
 The view ships as four blocks, in this order:
@@ -1572,6 +1665,7 @@ description = "Refile"
 | `key` | the keystroke that selects it. Required |
 | `description` | the menu row's label. Defaults to the key |
 | `[[command.section]]` | a block, exactly as under `org.agenda-sections` — same keys, same rules |
+| `choose` | a folder: the agenda shows one of its `.org` files at a time. See below |
 
 **`<leader>oa` (or `C-c a`) opens the chooser**, and the built-in agenda is on
 `a`. That is a change: those chords used to open the agenda directly. It is
@@ -1579,6 +1673,17 @@ what emacs does — `C-c a` has always meant "choose an agenda" and `C-c a a` th
 built-in one — so the spelling your fingers already know still works, one
 keystroke longer. `:org-agenda` still opens the default agenda with no menu at
 all.
+
+**A command with `choose` is about one file at a time.** Opening it asks for
+one of the folder's `.org` files, with the guess first (the buffer's file if it
+is in the folder, else the running clock's, as for a [capture
+group](#choosing-the-file)), and shows the command's sections filtered to that
+file. Inside the view, `sf` re-filters to another file as in any agenda. The
+folder's files must also be in `org.agenda-files`.
+
+`:org-agenda-command <key> <terms…>` opens a command with filter terms in the
+agenda's own spelling, so `:org-agenda-command e file:acme.org` opens it on
+`acme.org` directly, and a choosing command named with a file does not ask.
 
 A command's sections are sections: `when`, `days`, `todo-only`,
 `min-priority` and `match` all mean what they mean above, because they are
@@ -1589,6 +1694,10 @@ leaves you the default agenda and says so; one unusable command is skipped and
 named in the menu's footer while the others still work; and a key that names
 nothing tells you which keys *do* exist. A broken configuration costs you your
 layout, never your rows.
+
+Other plugins can contribute named agendas too. Yours come first, so a key you
+already use keeps meaning yours; the plugin's agenda with the same key is
+skipped and named in the first header.
 
 ### What counts as a row
 

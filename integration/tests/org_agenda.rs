@@ -133,6 +133,13 @@ fn loader_over_editor(editor: &Editor, base: &std::path::Path) -> PluginLoader {
                 lattice_mode::MediaSourceRegistry::new(),
             ))),
             agenda_registry: Some(agenda_registry),
+            // The chooser a choosing custom command asks through is a picker
+            // source; the transient registry serves org's menus.
+            picker_registry: Some(editor.picker_registry.clone()),
+            transient_registry: editor
+                .services
+                .get::<lattice_picker::TransientSourceRegistryHandle>()
+                .map(|h| (*h).clone()),
             // MV.3: the agenda is a plugin-owned view now, so the loader
             // needs somewhere to register its opener and somewhere to put its
             // excerpts. Both come off the editor's own service registry —
@@ -2100,5 +2107,209 @@ async fn the_default_agenda_replaces_a_custom_view() {
         settle_row_count(&mb, view, 3).await,
         3,
         "`:org-agenda` shows the default agenda"
+    );
+}
+
+/// A custom command with `choose` is about one file of its folder: filter
+/// terms after the key narrow it, a picked path becomes the agenda's own
+/// `file:` filter, and with no file named it asks through the chooser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choosing_command_shows_one_file_of_its_folder() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(&clients).unwrap();
+    std::fs::write(
+        clients.join("acme.org"),
+        "* TODO Send the SOW\n* TODO Book the kickoff\n",
+    )
+    .unwrap();
+    std::fs::write(clients.join("globex.org"), "* TODO Review the roadmap\n").unwrap();
+    // The chooser is a picker source reading the folder, so this test's org
+    // provides `picker-source` and may read `clients`, as the shipped
+    // manifest does for its own directories.
+    std::fs::write(
+        plugins_dir.join("org/plugin.toml"),
+        format!(
+            "id = \"org\"\nprovides = [\"scanned-excerpt-source\", \"multibuffer-view-source\", \"modes\", \"grammar\", \"language\", \"help\", \"config\", \"media\", \"picker-source\", \"transient-source\", \"events\"]\ndefault_mode = \"org-todo-mode\"\ncapabilities = [\"fs:read:{}\"]\n",
+            clients.display()
+        ),
+    )
+    .unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loader = loader_over_editor(&editor, base.path());
+    let loaded = loader
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(
+        loaded,
+        1,
+        "the org component loads: {:?}",
+        loader.failed_loads()
+    );
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!("org.agenda-files={}", clients.display()),
+    });
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!(
+            "org.agenda-custom-commands=[[command]]\n\
+             key = \"e\"\n\
+             description = \"Engagement\"\n\
+             choose = \"{}\"\n\
+             \n\
+             [[command.section]]\n\
+             title = \"Tasks\"\n\
+             when = \"any\"\n",
+            clients.display()
+        ),
+    });
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+
+    let run = |editor: &mut Editor, args: &[&str]| {
+        let id = editor
+            .registry
+            .load()
+            .id_by_name("org-agenda-command")
+            .expect("`org-agenda-command` is registered");
+        let mut out = lattice_host::dispatch::DispatchOutcome::default();
+        editor.dispatch_invocation(
+            lattice_grammar::CommandInvocation::of(id).with_args(lattice_grammar::Args::List(
+                args.iter()
+                    .map(|a| lattice_grammar::args::ArgValue::String(a.to_string()))
+                    .collect(),
+            )),
+            &mut out,
+        );
+        for effect in out.effects {
+            match effect {
+                // Renderer-applied, as in the real renderer.
+                lattice_grammar::Effect::OpenPicker { source, args, .. } => {
+                    let _ = editor.open_picker(source, args);
+                }
+                other => {
+                    editor.handle_effect(other);
+                }
+            }
+        }
+        editor.run_tick_pending();
+    };
+    let view_of = |editor: &Editor| editor.buffers.by_name("*agenda*");
+
+    // Filter terms after the key, in the agenda's own spelling.
+    run(&mut editor, &["e", "file:globex.org"]);
+    let view = view_of(&editor).expect("the agenda opened");
+    assert_eq!(settle_row_count(&mb, view, 1).await, 1, "globex's one task");
+
+    // A path in the folder, which is what the chooser hands back.
+    let acme = clients.join("acme.org");
+    run(&mut editor, &["e", acme.to_str().unwrap()]);
+    assert_eq!(settle_row_count(&mb, view, 2).await, 2, "acme's two tasks");
+
+    // The key alone asks for the file.
+    run(&mut editor, &["e"]);
+    let mut rows = Vec::new();
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        rows = editor
+            .picker
+            .as_ref()
+            .map(|p| {
+                p.candidates
+                    .iter()
+                    .map(|c| c.raw.display.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rows,
+        vec!["acme", "globex"],
+        "the chooser asks (picker open: {}, last message: {:?})",
+        editor.picker.is_some(),
+        editor.last_message.as_ref().map(|m| m.text.clone())
+    );
+}
+
+/// A folder another plugin contributes to `org.agenda-files` is scanned
+/// beside yours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contributed_agenda_folder_is_scanned_beside_yours() {
+    let Some(wasm) = org_plugin_wasm() else {
+        eprintln!("skipping: component not built (cargo build --release --target wasm32-wasip2)");
+        return;
+    };
+
+    let base = tempfile::tempdir().unwrap();
+    let plugins_dir = base.path().join("plugins");
+    write_org_plugin_dir(&plugins_dir, &wasm);
+    let notes = base.path().join("notes");
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::create_dir_all(&clients).unwrap();
+    std::fs::write(notes.join("work.org"), "* TODO Mine\n").unwrap();
+    std::fs::write(clients.join("acme.org"), "* TODO Theirs\n").unwrap();
+
+    let mut editor = boot_sealed_editor();
+    let loaded = loader_over_editor(&editor, base.path())
+        .discover_and_load(&plugins_dir, TrustTier::Bundled)
+        .await;
+    assert_eq!(loaded, 1, "the org component loads");
+    editor.handle_effect(lattice_grammar::Effect::SetOption {
+        spec: format!("org.agenda-files={}", notes.display()),
+    });
+    editor
+        .config
+        .contribute(
+            "org.agenda-files",
+            "acme-ext",
+            Some(lattice_config::ConfigValue::List(vec![
+                lattice_config::ConfigValue::Str(clients.display().to_string()),
+            ])),
+        )
+        .expect("org accepts contributions to its agenda files");
+    let mb = editor
+        .services
+        .get::<MultibufferRegistryHandle>()
+        .map(|h| (*h).clone())
+        .expect("the multibuffer registry is a boot service");
+
+    let id = editor
+        .registry
+        .load()
+        .id_by_name("org-agenda-command")
+        .expect("`org-agenda-command` is registered");
+    let mut out = lattice_host::dispatch::DispatchOutcome::default();
+    editor.dispatch_invocation(
+        lattice_grammar::CommandInvocation::of(id)
+            .with_args(lattice_grammar::Args::String(String::new())),
+        &mut out,
+    );
+    for effect in out.effects {
+        editor.handle_effect(effect);
+    }
+    editor.run_tick_pending();
+    let view = editor
+        .buffers
+        .by_name("*agenda*")
+        .expect("the agenda opened");
+    assert_eq!(
+        settle_row_count(&mb, view, 2).await,
+        2,
+        "your task and the contributed folder's"
     );
 }

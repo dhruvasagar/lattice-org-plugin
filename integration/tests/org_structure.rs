@@ -3381,6 +3381,270 @@ async fn the_capture_menu_opens_on_the_chord_with_a_row_per_template() {
     assert!(labels.contains(&"todo") && labels.contains(&"note"));
 }
 
+/// The menu's rows as `(key, label)`, for the transient that is open now.
+fn menu_rows(editor: &Editor) -> (String, Vec<(String, String)>) {
+    let picker = editor.picker.as_ref().unwrap_or_else(|| {
+        panic!(
+            "a menu is open; editor said: {:?}",
+            editor.last_message.as_ref().map(|m| m.text.clone())
+        )
+    });
+    let spec = picker.transient.as_ref().expect("in transient mode");
+    let rows = spec.groups[0]
+        .items
+        .iter()
+        .map(|i| (i.key.concat(), i.label.clone()))
+        .collect();
+    (spec.title.clone(), rows)
+}
+
+/// A group row, org's prefix convention, end to end through the chord: the
+/// group's members leave the top menu, `e` opens its sub-menu, and the key
+/// pressed there captures through the member's whole key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_capture_group_opens_a_sub_menu_of_its_members() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let inbox = base.path().join("inbox.org");
+    let acme = base.path().join("acme.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{i}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"e\"\ndescription = \"Engagement\"\n\n\
+             [[template]]\nkey = \"et\"\ndescription = \"Task\"\n\
+             target = {{ file = \"{a}\" }}\nbody = \"* TODO %?\"\n\n\
+             [[template]]\nkey = \"en\"\ndescription = \"Note\"\n\
+             target = {{ file = \"{a}\" }}\nbody = \"* NOTE %?\"\n",
+            i = inbox.to_str().unwrap(),
+            a = acme.to_str().unwrap()
+        ),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture");
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["t", "e", "q"], "the members left the top menu");
+    assert!(rows.contains(&("e".to_string(), "Engagement…".to_string())));
+
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement", "the title names the level");
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["t", "n", "q"],
+        "each member is pressed by the rest of its key"
+    );
+
+    // `n`, the SECOND member, so a first-wins bug cannot pass.
+    press_menu_key(&mut editor, "n").await;
+    assert!(
+        active_capture(&editor).is_some(),
+        "the member's capture opened"
+    );
+    finalize_capture(&mut editor, "kickoff went well").await;
+    assert_eq!(text_of(&editor, &acme), "* NOTE kickoff went well\n");
+    assert!(
+        !inbox.exists(),
+        "the top-level `t` was not the one that fired"
+    );
+}
+
+/// A choosing group over `dir`: `e` chooses from it, and its one member `t`
+/// files under `* Tasks` in whichever file is chosen.
+fn choosing_group(dir: &std::path::Path) -> String {
+    format!(
+        "[[template]]\nkey = \"e\"\ndescription = \"Engagement\"\nchoose = \"{d}\"\n\n\
+         [[template]]\nkey = \"et\"\ndescription = \"Task\"\n\
+         target = {{ kind = \"file+headline\", headline = \"Tasks\" }}\nbody = \"* TODO %?\"\n",
+        d = dir.to_str().unwrap()
+    )
+}
+
+/// The open picker's rows, once its asynchronous `init` has delivered them.
+async fn settled_picker_rows(editor: &mut Editor) -> Vec<String> {
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        let rows: Vec<String> = editor
+            .picker
+            .as_ref()
+            .filter(|p| p.transient.is_none())
+            .map(|p| p.candidates.iter().map(|c| c.raw.display.clone()).collect())
+            .unwrap_or_default();
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Vec::new()
+}
+
+/// Wait for the capture draft a picker accept opens: the accept commits
+/// through an asynchronous guest call.
+async fn settled_capture(editor: &mut Editor) -> Option<std::path::PathBuf> {
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if let Some(draft) = active_capture(editor) {
+            return Some(draft);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// With no guess the group says so, and its member asks for the file before
+/// capturing: the picker offers the folder's own `.org` files, not the
+/// archive below it, and the capture files into the one picked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choosing_group_with_no_guess_asks_for_the_file_first() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(clients.join("archive")).unwrap();
+    for name in ["acme", "globex"] {
+        std::fs::write(clients.join(format!("{name}.org")), "* Tasks\n").unwrap();
+    }
+    std::fs::write(clients.join("archive/initech.org"), "* Tasks\n").unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-templates", &choosing_group(&clients));
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(
+        title, "Capture · Engagement · no file chosen",
+        "the buffer is not in the folder and no clock runs, so there is no guess"
+    );
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["t", "c", "q"],
+        "the member, the chooser, a way out"
+    );
+
+    press_menu_key(&mut editor, "t").await;
+    let rows = settled_picker_rows(&mut editor).await;
+    assert_eq!(
+        rows,
+        vec!["acme", "globex"],
+        "the folder's own files; the archive below it is not a choice"
+    );
+    if let Some(picker) = editor.picker.as_mut() {
+        for ch in "glob".chars() {
+            picker.append_query(ch);
+        }
+    }
+    let out = editor.do_picker_accept();
+    apply_renderer_effects(&mut editor, out).await;
+    assert!(
+        settled_capture(&mut editor).await.is_some(),
+        "picking the file opened the capture"
+    );
+    finalize_capture(&mut editor, "send the SOW").await;
+    let globex = std::fs::read_to_string(clients.join("globex.org")).unwrap();
+    assert!(
+        globex.contains("* Tasks\n** TODO send the SOW"),
+        "filed under Tasks in the picked file: {globex:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clients.join("acme.org")).unwrap(),
+        "* Tasks\n"
+    );
+}
+
+/// A buffer visiting a file in the folder is the guess: the title names it
+/// and the member files there without asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_buffers_own_file_is_the_guess_and_the_title_says_so() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    // The fixture's buffer is `notes.org` in `base`, so `base` is the folder.
+    let mut editor = org_editor_with_caps(base.path(), "* Tasks\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &choosing_group(base.path()),
+    );
+
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, rows) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement · notes (this buffer)");
+    assert!(
+        rows.contains(&("c".to_string(), "change…".to_string())),
+        "the guess can be changed: {rows:?}"
+    );
+
+    press_menu_key(&mut editor, "t").await;
+    assert!(
+        active_capture(&editor).is_some(),
+        "with a guess the member captures straight away, no picker"
+    );
+    finalize_capture(&mut editor, "review the roadmap").await;
+    assert!(
+        text_of(&editor, &base.path().join("notes.org"))
+            .contains("* Tasks\n** TODO review the roadmap"),
+        "filed into the buffer's own file"
+    );
+}
+
+/// The running clock is the guess when the buffer is elsewhere: clock in to
+/// a client's meeting, go back to other work, and capture lands with that
+/// client. The clock is started in one plugin store and the menu is built in
+/// another, so this is also the test that the record crosses between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_running_clock_is_the_guess_when_the_buffer_is_elsewhere() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let clients = base.path().join("clients");
+    std::fs::create_dir_all(&clients).unwrap();
+    let acme = clients.join("acme.org");
+    std::fs::write(&acme, "* Kickoff\n* Tasks\n").unwrap();
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(&mut editor, "capture-templates", &choosing_group(&clients));
+    let notes = base.path().join("notes.org");
+
+    let _ = editor.open_buffer_at(Some(acme.clone()), Default::default(), false, None, None);
+    let acme_buffer = editor.active_pane_buffer_id();
+    for _ in 0..settle_budget(200) {
+        editor.run_tick_pending();
+        if editor
+            .active_modes
+            .get(&acme_buffer)
+            .is_some_and(|m| m.has_minor(ModeId::new("org-global-mode")))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    goto_line(&mut editor, 0);
+    press_chord(&mut editor, "<leader>oxi").await;
+    assert!(
+        text_of(&editor, &acme).contains("CLOCK: ["),
+        "the clock started in acme.org: {:?}",
+        text_of(&editor, &acme)
+    );
+
+    let _ = editor.open_buffer_at(Some(notes), Default::default(), false, None, None);
+    press_chord(&mut editor, "<leader>oc").await;
+    press_menu_key(&mut editor, "e").await;
+    let (title, _) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement · acme (clocked in)");
+}
+
 /// The key you press is what decides the template — the whole point of the
 /// per-row args slot. Two rows fire ONE action; only the argument differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7235,4 +7499,103 @@ async fn an_unsaved_open_draft_is_listed_as_not_saved() {
         picker_labels(&editor),
         vec!["todo: (not saved)".to_string()]
     );
+}
+
+/// Another plugin's capture templates appear after yours, through the option
+/// contribution seam: the menu shows your `t` and their `e` group, and their
+/// value never touches yours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_contributed_capture_group_joins_your_menu() {
+    if org_plugin_wasm().is_none() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let inbox = base.path().join("inbox.org");
+    let acme = base.path().join("acme.org");
+    let mut editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    set_org_option(
+        &mut editor,
+        "capture-templates",
+        &format!(
+            "[[template]]\nkey = \"t\"\ndescription = \"todo\"\n\
+             target = {{ file = \"{}\" }}\nbody = \"* TODO %?\"\n",
+            inbox.to_str().unwrap()
+        ),
+    );
+    use lattice_config::ConfigValue as V;
+    let rec = |fields: &[(&str, V)]| {
+        V::Record(
+            fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    };
+    let s = |v: &str| V::Str(v.to_string());
+    let a = acme.to_str().unwrap();
+    let target = rec(&[("file", s(a))]);
+    let value = V::List(vec![
+        rec(&[
+            ("key", s("t")),
+            ("description", s("their todo")),
+            ("target", target.clone()),
+        ]),
+        rec(&[("key", s("e")), ("description", s("Engagement"))]),
+        rec(&[
+            ("key", s("et")),
+            ("description", s("Task")),
+            ("target", target),
+            ("body", s("* TODO %?")),
+        ]),
+    ]);
+    editor
+        .config
+        .contribute("org.capture-templates", "acme-ext", Some(value))
+        .expect("org accepts contributions to its capture templates");
+
+    press_chord(&mut editor, "<leader>oc").await;
+    let (_, rows) = menu_rows(&editor);
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["t", "e", "q"], "yours, then theirs");
+    assert!(
+        rows.contains(&("t".to_string(), "todo".to_string())),
+        "your `t` wins the shared key: {rows:?}"
+    );
+
+    press_menu_key(&mut editor, "e").await;
+    let (title, _) = menu_rows(&editor);
+    assert_eq!(title, "Capture · Engagement", "their group drills down");
+}
+
+/// Org's exported commands are the ones another plugin's menu names: the
+/// agenda by key and the capture menu by group. Each must be a command org
+/// registers, because an exported name nothing registers exports nothing,
+/// and a typo there fails silently in the plugin that relies on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_exported_command_is_one_org_registers() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/wasm32-wasip2/release/lattice_org_plugin.wasm"
+    );
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let manifest = lattice_plugin_host::manifest::PluginManifest::from_component_bytes(&bytes)
+        .expect("the embedded manifest parses")
+        .expect("org embeds its manifest");
+    assert_eq!(
+        manifest.exported_commands,
+        vec![
+            "org-agenda-command".to_string(),
+            "org-capture-menu".to_string()
+        ]
+    );
+    let base = tempfile::tempdir().unwrap();
+    let editor = org_editor_with_caps(base.path(), "* One\n", &fs_write(base.path())).await;
+    for name in &manifest.exported_commands {
+        assert!(
+            editor.registry.load().id_by_name(name).is_some(),
+            "`{name}` is exported but org registers no such command"
+        );
+    }
 }

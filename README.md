@@ -32,7 +32,7 @@ of four routes:
 
 ### In `lattice.toml` — no Rust toolchain, no `init.rs`
 
-Needs **a lattice release later than 0.10.3**. Add a `[plugins.org]` table to
+Needs **lattice 0.10.6 or later**. Add a `[plugins.org]` table to
 `~/.config/lattice/lattice.toml`:
 
 ```toml
@@ -60,8 +60,8 @@ To install **and configure** org from the one file, see
 
 The same released build, declared in your config's `register_plugins`.
 It needs no Rust beyond the toolchain your `init.rs` already uses, and no
-`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.3 or
-later**.
+`wasm32-wasip2` target or clang for org itself. You need **lattice 0.10.6 or
+later**, the release that speaks plugin API 0.7.1.
 
 Your `init.rs` needs the `plugin-manager` seam. A config scaffolded by lattice 0.9.11 or later has it already:
 `register_plugins` is there, with a commented-out example that installs org.
@@ -109,7 +109,7 @@ starting the editor makes no network request.
 `release dhruvasagar/lattice-org-plugin@v…`, and opening a `.org` file puts
 you in `org-mode`. If it was refused, it is under the failed loads in
 `:plugins` with the reason — a release with no build for your editor says
-which it has, and an editor older than 0.10.3 says the version org needs.
+which it has, and an editor older than 0.10.6 says the version org needs.
 
 **Updating:** with a tag, change it and `:reload-config`. With `None`,
 `:plugin-update org` (or `u` on its row in `:plugins`) installs a newer
@@ -189,19 +189,21 @@ Headlines fold with `<Tab>`, and promote, demote and move as subtrees
 (`<leader>oh` / `<leader>ol`, `<leader>oH` / `<leader>oL`, `<leader>oK` /
 `<leader>oJ`). `]]` and `[[` jump between headlines. `ih` / `ah` select a
 headline and `ir` / `ar` a subtree, so `dar` deletes one and `yar` copies it. `<leader>ot` cycles the
-TODO keyword, `<leader>os` picks one from a menu, `<leader>o,` cycles the
-priority and `<leader>o:` sets tags. Checkboxes, lists, tables (`<Tab>`
+TODO keyword, `<leader>oS` (`C-c C-t`) picks one from a menu, `<leader>o,`
+cycles the priority and `<leader>o:` sets tags. `<leader>os` schedules an
+entry and `<leader>od` gives it a deadline. Checkboxes, lists, tables (`<Tab>`
 aligns), links (`<CR>` follows) and timestamps (`<C-a>` / `<C-x>` step the
 part under the cursor) all have their own keys.
 
-Your own TODO states, in emacs' syntax, each with a key for the menu:
+Your own TODO states, in emacs' syntax, one sequence per element, each state
+with a key for the menu:
 
 ```toml
 [org]
-todo-keywords = """
-sequence: TODO(t) NEXT(n) | DONE(d)
-sequence: WAITING(w) HOLD(h) | CANCELLED(c)
-"""
+todo-keywords = [
+  "sequence: TODO(t) NEXT(n) | DONE(d)",
+  "sequence: WAITING(w) HOLD(h) | CANCELLED(c)",
+]
 ```
 
 `:help org`, or [`doc/org.md`](doc/org.md).
@@ -212,8 +214,8 @@ sequence: WAITING(w) HOLD(h) | CANCELLED(c)
 scheduled, deadlined and dated headline across your files into one view. Its
 rows are the lines of your files, not copies: editing a row edits the file,
 and `:w` saves it. `<leader>ot` and `<leader>o,` change a row's state and
-priority in place, `m` marks rows and `x` acts on all the marked ones, and `r`
-shows the clock report.
+priority in place, `m` marks rows and `x` acts on all the marked ones, and `gD`
+changes the view: a day, week, month or year, the log, and the clock report.
 
 ```toml
 [org]
@@ -253,7 +255,7 @@ and placeholder.
 `<leader>oxi` clocks in on the entry at the cursor, `<leader>oxo` clocks out
 and writes the elapsed time into its `LOGBOOK`, and the running clock shows in
 your modeline. `<leader>oxj` jumps back to it and `<leader>oxr` resumes the
-last one. `r` in the agenda shows where the time went.
+last one. The agenda's clock report (`gD r`) shows where the time went.
 
 ### Org-roam
 
@@ -512,6 +514,22 @@ reached the network.
 | `events` | the clock's session, its minute wake and its modeline segment |
 | `llm-tools` | tools for lattice's LLM chats: `org.agenda` (what is scheduled, due and overdue, for a day, a week or a range, optionally by match), `org.query` (entries by tags, properties or TODO state), `org.entry` (one entry whole, by its ref or `ID`), `org.clock` (clocked time over a range, per entry, file or tag), `org.notes` (roam notes by title, alias or tag, with backlinks), read through the agenda's own scan so the assistant and `:org-agenda` agree; and `org.change`, which sets an entry's TODO state, schedule, deadline or tags, adds a note to its log or refiles it, or captures something new through one of your capture templates, through the verbs the keys use and hands the edit to lattice's review. Five workflows ride with them as chat profiles (`org`, `org-plan`, `org-review`, `org-report`, `org-research`), opened by `:org-plan-day`, `:org-plan-week`, `:org-review` and `:org-report`. The same tools reach Claude Code and other MCP or ACP agents through `lattice --mcp` (`llm.serve_tools`); see `:help org.assistant` |
 | `help` | `doc/org.md`, `doc/roam.md`, `doc/babel.md` and `doc/export.md`, shipped inside the component; `:help org`, `:help org.roam`, `:help org.babel`, `:help org.export`. The host adds the `org` prefix from the manifest id, so the files are named for the topic without it |
+
+### Extending it from another plugin
+
+Org is meant to be built on. Another plugin can add to three of its options,
+`org.agenda-files`, `org.capture-templates` and `org.agenda-custom-commands`,
+through lattice's option contributions: the user's own value comes first and
+is never changed, and `:describe-option` lists what each plugin added. And it
+may run two of org's commands from its own actions, picker rows and menus,
+because org's manifest exports them:
+
+| command | what another plugin uses it for |
+|---|---|
+| `org-agenda-command` | open a named agenda, optionally narrowed (`org-agenda-command e file:acme.org`) |
+| `org-capture-menu` | open the capture menu at a group (`capture-group`, the group's key, and optionally the file to capture into) |
+
+Every other org command stays org's own.
 
 The grammar is [`nvim-orgmode/tree-sitter-org`](https://github.com/nvim-orgmode/tree-sitter-org),
 compiled to wasm by `build.rs`.

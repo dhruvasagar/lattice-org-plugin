@@ -131,11 +131,11 @@ mod tests {
             key: key.to_string(),
             body: body.map(str::to_string),
             body_file: body_file.map(str::to_string),
-            target: RawTarget {
+            target: Some(RawTarget {
                 kind: Some("file".to_string()),
-                file: "%<%Y%m%d%H%M%S>-${slug}.org".to_string(),
+                file: Some("%<%Y%m%d%H%M%S>-${slug}.org".to_string()),
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         }
     }
@@ -215,20 +215,30 @@ mod tests {
         );
     }
 
-    /// CT.8: org-roam's `:target` is COMPULSORY, so a roam template without
-    /// one is refused — by the host, structurally, as a missing required field.
-    /// That is the same rule the capture list has.
+    /// org-roam's `:target` is COMPULSORY. The two lists share one schema, in
+    /// which a missing target makes a capture GROUP row, so the roam list
+    /// refuses one by name instead: roam has no groups.
     #[test]
     fn the_target_is_required_in_the_roam_list_too() {
-        use lattice_plugin_sdk::shape::{ConfigShape, Schema};
-        let Schema::List(inner) = <Declared as ConfigShape>::schema() else {
-            panic!("a list of templates");
-        };
-        let Schema::Record(fields) = inner.as_ref() else {
-            panic!("each template is a record");
-        };
-        let target = fields.iter().find(|f| f.name == "target").expect("target");
-        assert!(target.required, "org-roam requires :target");
+        let s = from_declared_for(
+            crate::capture_templates::TemplateList::Roam,
+            vec![
+                raw("d", Some("* %?"), None),
+                RawTemplate {
+                    key: "e".to_string(),
+                    description: Some("no target".to_string()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("the template with a target still resolves");
+        assert_eq!(s.templates.len(), 1);
+        assert!(s.groups.is_empty());
+        assert!(
+            s.skipped.iter().any(|m| m.contains("`e` has no `target`")),
+            "org-roam requires :target: {:?}",
+            s.skipped
+        );
     }
 
     #[test]
@@ -314,12 +324,12 @@ mod tests {
             vec![RawTemplate {
                 key: "d".to_string(),
                 body: Some("%?".to_string()),
-                target: RawTarget {
+                target: Some(RawTarget {
                     kind: Some("file+head".to_string()),
-                    file: "${slug}.org".to_string(),
+                    file: Some("${slug}.org".to_string()),
                     head: Some("#+title: ${title}".to_string()),
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             }],
         )
@@ -342,12 +352,12 @@ mod tests {
             vec![RawTemplate {
                 key: "d".to_string(),
                 body: Some("* entry".to_string()),
-                target: RawTarget {
+                target: Some(RawTarget {
                     kind: Some("file+head".to_string()),
-                    file: "%<%Y-%m-%d>.org".to_string(),
+                    file: Some("%<%Y-%m-%d>.org".to_string()),
                     head: Some("#+title: %<%Y-%m-%d>".to_string()),
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             }],
         )

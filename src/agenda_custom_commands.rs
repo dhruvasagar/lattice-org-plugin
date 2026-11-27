@@ -108,6 +108,10 @@ pub(crate) struct RawCommand {
     /// error, because a command with no blocks is a mistake a user makes while
     /// editing rather than a malformed file.
     pub(crate) section: Option<Vec<RawSection>>,
+    /// A folder whose `.org` files this agenda is about, one at a time.
+    /// Opening the command asks for one of them (the guess first) and shows
+    /// the command's sections filtered to it, `file:<name>`.
+    pub(crate) choose: Option<String>,
 }
 
 /// The declared shape of `org.agenda-custom-commands`.
@@ -119,6 +123,8 @@ pub struct CustomCommand {
     pub key: String,
     pub description: String,
     pub sections: Vec<Section>,
+    /// The folder the command chooses a file from, as declared.
+    pub choose: Option<String>,
 }
 
 /// A parsed set, plus what was dropped getting there.
@@ -222,10 +228,17 @@ pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands,
             Some(d) if !d.is_empty() => d.to_string(),
             _ => key.clone(),
         };
+        let choose = c
+            .choose
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
         commands.push(CustomCommand {
             key,
             description,
             sections,
+            choose,
         });
     }
 
@@ -240,12 +253,40 @@ pub fn from_declared(raw: Declared, default_days: u32) -> Result<ParsedCommands,
 /// `args` is what OA.11a carries from the view: empty means the default
 /// agenda, and a first element is a custom command's key. `fallback` is the
 /// Read `org.agenda-custom-commands` and resolve it.
+///
+/// Other plugins' contributed commands follow the user's own, so a key the
+/// user already uses keeps meaning theirs (first wins, the other named).
 pub fn read(default_days: u32) -> Result<ParsedCommands, CommandError> {
-    match crate::config_shape::read_option::<Declared>("agenda-custom-commands") {
-        Some(Ok(raw)) => from_declared(raw, default_days),
-        Some(Err(e)) => Err(CommandError::Malformed(e.to_string())),
-        None => Err(CommandError::Unset),
+    let user = match crate::config_shape::read_option::<Declared>("agenda-custom-commands") {
+        Some(Ok(raw)) => raw,
+        Some(Err(e)) => return Err(CommandError::Malformed(e.to_string())),
+        None => Vec::new(),
+    };
+    let contributed = crate::config_shape::contributions::<Declared>("agenda-custom-commands")
+        .into_iter()
+        .map(|(plugin, value)| (plugin, value.map_err(|e| e.to_string())))
+        .collect();
+    let (raw, notes) = merged(user, contributed);
+    let mut set = from_declared(raw, default_days)?;
+    set.skipped.extend(notes);
+    Ok(set)
+}
+
+/// The user's commands, then each contributing plugin's. A contribution
+/// that does not rebuild is skipped and its plugin named.
+pub(crate) fn merged(
+    user: Declared,
+    contributed: Vec<(String, Result<Declared, String>)>,
+) -> (Declared, Vec<String>) {
+    let mut raw = user;
+    let mut notes = Vec::new();
+    for (plugin, value) in contributed {
+        match value {
+            Ok(commands) => raw.extend(commands),
+            Err(e) => notes.push(format!("`{plugin}`'s commands did not load: {e}")),
+        }
     }
+    (raw, notes)
 }
 
 /// `org.agenda-sections` set the default agenda uses, already resolved.
@@ -294,6 +335,44 @@ pub fn resolve_with(
         },
         Err(e) => with_notice(fallback, e.notice()),
     }
+}
+
+/// What opening a command with `choose` needs, given the args it was fired
+/// with (`[key, terms…]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChosenScan {
+    /// Open the view with these scan args.
+    Open(Vec<String>),
+    /// No file yet: ask for one from this folder.
+    Ask(String),
+}
+
+/// Turn a choosing command's args into its scan args.
+///
+/// A term that is a path to one of the folder's files (what the chooser
+/// appends) becomes `file:<name>`, the agenda's own file filter. A `file:`
+/// term already there is kept, so `["e", "file:acme.org"]` opens directly.
+/// With no file term the command asks.
+pub fn chosen_scan(folder_dir: &str, args: &[String]) -> ChosenScan {
+    let folder = crate::chooser::folder(folder_dir);
+    let terms: Vec<String> = args
+        .iter()
+        .skip(1)
+        .map(|term| {
+            if crate::chooser::is_choice(&folder, term) {
+                let name = term.rsplit('/').next().unwrap_or(term);
+                format!("file:{name}")
+            } else {
+                term.clone()
+            }
+        })
+        .collect();
+    if !terms.iter().any(|t| t.starts_with("file:")) {
+        return ChosenScan::Ask(folder_dir.to_string());
+    }
+    let mut out = vec![args.first().cloned().unwrap_or_default()];
+    out.extend(terms);
+    ChosenScan::Open(out)
 }
 
 /// Prefix `notice` onto the first section's title, or return the set unchanged.
@@ -626,6 +705,123 @@ key = "b"
             sections, defaults,
             "unset is not an error, so there is no notice even here — the \
              fallback IS the answer"
+        );
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn contributed_commands_follow_the_users_and_lose_a_shared_key() {
+        let user = crate::config_shape::from_toml::<Declared>(TWO, "command");
+        let theirs = crate::config_shape::from_toml::<Declared>(
+            r#"
+[[command]]
+key = "w"
+description = "Theirs"
+
+  [[command.section]]
+  title = "Mine"
+  when = "any"
+
+[[command]]
+key = "e"
+description = "Engagement"
+
+  [[command.section]]
+  title = "Next"
+  when = "any"
+"#,
+            "command",
+        );
+        let (raw, notes) = merged(
+            user,
+            vec![
+                ("acme-ext".to_string(), Ok(theirs)),
+                (
+                    "broken-ext".to_string(),
+                    Err("[0].key: missing".to_string()),
+                ),
+            ],
+        );
+        assert_eq!(
+            notes,
+            vec!["`broken-ext`'s commands did not load: [0].key: missing".to_string()]
+        );
+        let set = from_declared(raw, SPAN).unwrap();
+        assert_eq!(
+            set.by_key("w").unwrap().description,
+            "Waiting and Postponed"
+        );
+        assert!(set.by_key("e").is_some());
+        assert!(set
+            .skipped
+            .iter()
+            .any(|s| s.contains("`w` is defined twice")));
+    }
+
+    #[test]
+    fn choose_is_read_onto_the_command() {
+        let set = parsedcommands_from(
+            r#"
+[[command]]
+key = "e"
+description = "Engagement"
+choose = "~/org/clients"
+
+  [[command.section]]
+  title = "Next"
+  when = "any"
+"#,
+            SPAN,
+        )
+        .unwrap();
+        assert_eq!(
+            set.by_key("e").unwrap().choose.as_deref(),
+            Some("~/org/clients")
+        );
+        assert_eq!(
+            parsedcommands_from(TWO, SPAN).unwrap().commands[0].choose,
+            None
+        );
+    }
+
+    #[test]
+    fn a_picked_path_becomes_the_agendas_file_filter() {
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "/home/u/org/clients/acme.org"])
+            ),
+            ChosenScan::Open(strings(&["e", "file:acme.org"]))
+        );
+    }
+
+    #[test]
+    fn a_file_term_already_given_opens_directly() {
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "file:acme.org", "tag:urgent"])
+            ),
+            ChosenScan::Open(strings(&["e", "file:acme.org", "tag:urgent"]))
+        );
+    }
+
+    #[test]
+    fn with_no_file_the_command_asks() {
+        assert_eq!(
+            chosen_scan("~/org/clients", &strings(&["e", "tag:urgent"])),
+            ChosenScan::Ask("~/org/clients".to_string())
+        );
+        assert_eq!(
+            chosen_scan(
+                "/home/u/org/clients",
+                &strings(&["e", "/home/u/org/elsewhere.org"])
+            ),
+            ChosenScan::Ask("/home/u/org/clients".to_string()),
+            "a path outside the folder is not a choice"
         );
     }
 }
